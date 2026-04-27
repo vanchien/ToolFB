@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import urllib.request
 import zipfile
@@ -89,33 +90,81 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _detect_update_payload_root(extracted_root: Path) -> Path:
+@dataclass(frozen=True)
+class UpdatePayloadLayout:
+    """Bố cục gói giải nén: mã nguồn portable + (tuỳ chọn) thư mục bản EXE đóng gói."""
+
+    code_root: Path
+    exe_gui_root: Path | None
+
+
+def _exe_gui_looks_valid(folder: Path) -> bool:
+    return (folder / "ToolFB_GUI.exe").is_file() and (folder / "_internal").is_dir()
+
+
+def _detect_update_payload_layout(extracted_root: Path) -> UpdatePayloadLayout:
     """
-    Tìm thư mục payload cần copy:
-    - ưu tiên release bundle: ``ToolFB_release_bundle/portable_clean``
-    - nếu không có thì dùng thư mục chứa ``main.py``.
+    Tìm thư mục mã nguồn cần copy và (nếu có) thư mục ``exe_gui`` cho bản PyInstaller.
+
+    Thứ tự ưu tiên:
+    - ``ToolFB_release_bundle/portable_clean`` (+ ``exe_gui`` cạnh đó)
+    - ``portable_clean`` trực tiếp dưới gốc giải nén
+    - gốc giải nén nếu đã là bản portable phẳng (legacy)
     """
-    candidates = [
-        extracted_root / "ToolFB_release_bundle" / "portable_clean",
-        extracted_root / "portable_clean",
-        extracted_root,
-    ]
-    for c in candidates:
-        if (c / "main.py").is_file() and (c / "src").is_dir():
-            return c
-    # quét 2 cấp
+    bundle = extracted_root / "ToolFB_release_bundle"
+    pc_bundle = bundle / "portable_clean"
+    eg_bundle = bundle / "exe_gui"
+    if (pc_bundle / "main.py").is_file() and (pc_bundle / "src").is_dir():
+        exe = eg_bundle if _exe_gui_looks_valid(eg_bundle) else None
+        return UpdatePayloadLayout(code_root=pc_bundle, exe_gui_root=exe)
+
+    pc2 = extracted_root / "portable_clean"
+    if (pc2 / "main.py").is_file() and (pc2 / "src").is_dir():
+        eg2 = extracted_root / "exe_gui"
+        return UpdatePayloadLayout(code_root=pc2, exe_gui_root=eg2 if _exe_gui_looks_valid(eg2) else None)
+
+    if (extracted_root / "main.py").is_file() and (extracted_root / "src").is_dir():
+        eg3 = extracted_root / "exe_gui"
+        return UpdatePayloadLayout(code_root=extracted_root, exe_gui_root=eg3 if _exe_gui_looks_valid(eg3) else None)
+
     for p in extracted_root.glob("**/main.py"):
         base = p.parent
         if (base / "src").is_dir():
-            return base
+            eg4 = base / "exe_gui"
+            return UpdatePayloadLayout(code_root=base, exe_gui_root=eg4 if _exe_gui_looks_valid(eg4) else None)
     raise RuntimeError("Không tìm thấy payload cập nhật hợp lệ (thiếu main.py/src).")
+
+
+def _merge_exe_gui_bundle(exe_gui: Path, project_root: Path) -> None:
+    """Cập nhật ToolFB_GUI.exe + ``_internal`` từ gói release (chỉ gọi khi chạy bản frozen)."""
+    for name in ("ToolFB_GUI.exe",):
+        src_f = exe_gui / name
+        if src_f.is_file():
+            shutil.copy2(src_f, project_root / name)
+    internal_src = exe_gui / "_internal"
+    internal_dst = project_root / "_internal"
+    if internal_src.is_dir():
+        if internal_dst.exists():
+            shutil.rmtree(internal_dst, ignore_errors=True)
+        internal_dst.mkdir(parents=True, exist_ok=True)
+        _copytree_resilient(internal_src, internal_dst)
 
 
 def apply_update_package(
     *,
     project_root: Path,
     manifest: UpdateManifest,
-    keep_dirs: tuple[str, ...] = ("data", ".venv", "logs", ".git", ".cursor", "dist", "build"),
+    backup_skip_dirs: tuple[str, ...] = ("data", ".venv", "logs", ".git", ".cursor", "dist", "build"),
+    preserve_on_apply_dirs: tuple[str, ...] = (
+        "data",
+        ".venv",
+        "logs",
+        ".git",
+        ".cursor",
+        "dist",
+        "build",
+        "config",
+    ),
 ) -> Path:
     """
     Tải và áp dụng gói cập nhật vào ``project_root``.
@@ -141,16 +190,17 @@ def apply_update_package(
         extract_root = Path(tdir)
         with zipfile.ZipFile(tmp_zip, "r") as zf:
             zf.extractall(extract_root)
-        payload_root = _detect_update_payload_root(extract_root)
+        layout = _detect_update_payload_layout(extract_root)
+        payload_root = layout.code_root
 
         backup_dir = updates_dir / f"backup_before_{manifest.version}"
         if backup_dir.exists():
             shutil.rmtree(backup_dir, ignore_errors=True)
         backup_dir.mkdir(parents=True, exist_ok=True)
 
-        excludes = set(keep_dirs)
+        backup_skip = set(backup_skip_dirs)
         for item in project_root.iterdir():
-            if item.name in excludes:
+            if item.name in backup_skip:
                 continue
             target = backup_dir / item.name
             if item.is_dir():
@@ -158,11 +208,12 @@ def apply_update_package(
             else:
                 shutil.copy2(item, target)
 
-        # copy payload sang project root, bỏ qua data/venv/logs...
+        # copy payload sang project root, bỏ qua data/venv/logs/config...
         # Riêng "tools" dùng copy resilient để luôn giữ Veo3Studio chạy được,
         # kể cả khi gặp file lẻ/symlink cache không còn tồn tại trong gói.
+        preserve = set(preserve_on_apply_dirs)
         for item in payload_root.iterdir():
-            if item.name in excludes:
+            if item.name in preserve:
                 continue
             target = project_root / item.name
             if item.is_dir():
@@ -175,6 +226,9 @@ def apply_update_package(
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(item, target)
+
+        if layout.exe_gui_root is not None and getattr(sys, "frozen", False):
+            _merge_exe_gui_bundle(layout.exe_gui_root, project_root)
 
         logger.info("Updater: áp dụng update {} thành công.", manifest.version)
         return backup_dir
