@@ -14,6 +14,8 @@ from typing import Any
 
 from loguru import logger
 
+from src.utils.app_restart import DEFERRED_GUI_BAT_NAME
+
 
 @dataclass(frozen=True)
 class UpdateManifest:
@@ -253,7 +255,7 @@ def _detect_update_payload_layout(extracted_root: Path) -> UpdatePayloadLayout:
 
 
 def _merge_exe_gui_bundle(exe_gui: Path, project_root: Path) -> None:
-    """Cập nhật ToolFB_GUI.exe + ``_internal`` từ gói release (chỉ gọi khi chạy bản frozen)."""
+    """Cập nhật ToolFB_GUI.exe + ``_internal`` từ gói release (non-Windows frozen hoặc công cụ ngoài)."""
     for name in ("ToolFB_GUI.exe",):
         src_f = exe_gui / name
         if src_f.is_file():
@@ -265,6 +267,52 @@ def _merge_exe_gui_bundle(exe_gui: Path, project_root: Path) -> None:
             shutil.rmtree(internal_dst, ignore_errors=True)
         internal_dst.mkdir(parents=True, exist_ok=True)
         _copytree_resilient(internal_src, internal_dst)
+
+
+def _stage_deferred_exe_gui_merge_windows(
+    *,
+    exe_gui_root: Path,
+    project_root: Path,
+    updates_dir: Path,
+    version: str,
+    bat_out: Path,
+) -> None:
+    """
+    Không ghi đè ``.exe``/``_internal`` khi process đang chạy (WinError 32).
+
+    Sao chép vào ``staged_gui_*`` + tạo batch chạy sau khi user relaunch; batch đợi file nhả
+    khóa rồi ``copy``/``robocopy`` rồi mở lại GUI và tự xóa.
+    """
+    for old in updates_dir.glob("staged_gui_*"):
+        shutil.rmtree(old, ignore_errors=True)
+    safe_ver = "".join(c if c.isalnum() or c in "-_" else "_" for c in version.strip())[:64] or "bundle"
+    staged = updates_dir / f"staged_gui_{safe_ver}"
+    staged.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(exe_gui_root / "ToolFB_GUI.exe", staged / "ToolFB_GUI.exe")
+    _copytree_resilient(exe_gui_root / "_internal", staged / "_internal")
+
+    pr_s = str(project_root.resolve())
+    st_s = str(staged.resolve())
+    exe_dst = str((project_root / "ToolFB_GUI.exe").resolve())
+
+    bat_lines = [
+        "@echo off",
+        "setlocal",
+        f'cd /d "{pr_s}"',
+        "echo [ToolFB] Dang cap nhat ToolFB_GUI.exe va _internal...",
+        ":L",
+        "ping -n 2 127.0.0.1 >nul",
+        f'copy /Y "{st_s}\\ToolFB_GUI.exe" "{exe_dst}" >nul 2>&1',
+        "if errorlevel 1 goto L",
+        f'robocopy "{st_s}\\_internal" "{pr_s}\\_internal" /MIR /R:3 /W:2 /NP',
+        "if errorlevel 8 goto L",
+        f'start "" "{exe_dst}" --gui',
+        f'rd /s /q "{st_s}" 2>nul',
+        'del "%~f0"',
+        "endlocal",
+        "",
+    ]
+    bat_out.write_text("\r\n".join(bat_lines), encoding="utf-8")
 
 
 def apply_update_package(
@@ -343,8 +391,22 @@ def apply_update_package(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(item, target)
 
-        if layout.exe_gui_root is not None and getattr(sys, "frozen", False):
-            _merge_exe_gui_bundle(layout.exe_gui_root, project_root)
+        defer_bat = updates_dir / DEFERRED_GUI_BAT_NAME
+        if layout.exe_gui_root is not None and getattr(sys, "frozen", False) and os.name == "nt":
+            _stage_deferred_exe_gui_merge_windows(
+                exe_gui_root=layout.exe_gui_root,
+                project_root=project_root,
+                updates_dir=updates_dir,
+                version=str(manifest.version),
+                bat_out=defer_bat,
+            )
+            logger.info("Updater: đã stage exe_gui; sau relaunch chạy {}", defer_bat.name)
+        else:
+            defer_bat.unlink(missing_ok=True)
+            for old in updates_dir.glob("staged_gui_*"):
+                shutil.rmtree(old, ignore_errors=True)
+            if layout.exe_gui_root is not None and getattr(sys, "frozen", False) and os.name != "nt":
+                _merge_exe_gui_bundle(layout.exe_gui_root, project_root)
 
         logger.info("Updater: áp dụng update {} thành công.", manifest.version)
         return backup_dir

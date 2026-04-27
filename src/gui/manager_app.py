@@ -73,7 +73,7 @@ from src.utils.app_secrets import (
     set_preferred_openai_key_id,
     set_preferred_nanobanana_key_id,
 )
-from src.utils.app_restart import relaunch_same_app_and_exit
+from src.utils.app_restart import DEFERRED_GUI_BAT_NAME, relaunch_same_app_and_exit
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager
 from src.utils.pages_manager import PageRecord, PagesManager
 from src.utils.page_schedule import scheduler_tz
@@ -4491,11 +4491,18 @@ class _ManagerWindow:
             pass
         fr = ttk.Frame(top, padding=16)
         fr.pack(fill=tk.BOTH, expand=True)
+        extra = ""
+        if getattr(sys, "frozen", False) and (project_root() / "data" / "updates" / DEFERRED_GUI_BAT_NAME).is_file():
+            extra = (
+                "\n\n(Windows) Bản .exe và thư mục _internal sẽ được thay sau khi bạn bấm mở lại "
+                "(có thể thấy cửa sổ lệnh tối thiểu vài giây — bình thường)."
+            )
         msg = (
             f"Đã cập nhật lên phiên bản {version}.\n\n"
             f"Backup trước update:\n{backup_dir}\n\n"
             "Nên bấm «Mở lại chương trình ngay» để dùng bản mới (cửa sổ hiện tại sẽ đóng và app mở lại).\n"
             "Phím Enter = mở lại ngay. Esc = để sau."
+            f"{extra}"
         )
         ttk.Label(fr, text=msg, wraplength=480, justify=tk.LEFT).pack(anchor="w", pady=(0, 14))
         btn_row = ttk.Frame(fr)
