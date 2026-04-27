@@ -206,6 +206,15 @@ def resolve_manifest_url(project_root: Path) -> str:
     dev_latest = (project_root / "dist" / "latest.json").resolve()
     if dev_latest.is_file():
         return dev_latest.as_uri()
+    # Clone git thường chưa có update_channel.json: thử dò owner/repo từ ``git remote origin``.
+    try:
+        from src.utils.github_repo_detect import github_owner_repo_from_git
+
+        r = github_owner_repo_from_git(project_root)
+        if r:
+            return github_latest_manifest_url(r)
+    except Exception:
+        pass
     return ""
 
 
