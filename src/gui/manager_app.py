@@ -4479,25 +4479,25 @@ class _ManagerWindow:
 
     def _show_update_success_restart_dialog(self, *, version: str, backup_dir: Path) -> None:
         """
-        Sau cập nhật thành công: cho phép «Khởi động lại app» để nạp code mới ngay (thay vì chỉ messagebox).
+        Sau cập nhật thành công: nút mở lại chương trình ngay (khuyến nghị) + để sau.
         """
         top = tk.Toplevel(self._root)
-        top.title("Cập nhật thành công")
+        top.title("Cập nhật xong — mở lại chương trình")
         top.transient(self._root)
         top.resizable(False, False)
         try:
             top.grab_set()
         except Exception:
             pass
-        fr = ttk.Frame(top, padding=14)
+        fr = ttk.Frame(top, padding=16)
         fr.pack(fill=tk.BOTH, expand=True)
         msg = (
             f"Đã cập nhật lên phiên bản {version}.\n\n"
             f"Backup trước update:\n{backup_dir}\n\n"
-            "Bấm «Khởi động lại app» để tự mở lại bản mới (phiên hiện tại sẽ đóng).\n"
-            "Hoặc «Để sau» nếu bạn muốn tự mở lại sau."
+            "Nên bấm «Mở lại chương trình ngay» để dùng bản mới (cửa sổ hiện tại sẽ đóng và app mở lại).\n"
+            "Phím Enter = mở lại ngay. Esc = để sau."
         )
-        ttk.Label(fr, text=msg, wraplength=460, justify=tk.LEFT).pack(anchor="w", pady=(0, 12))
+        ttk.Label(fr, text=msg, wraplength=480, justify=tk.LEFT).pack(anchor="w", pady=(0, 14))
         btn_row = ttk.Frame(fr)
         btn_row.pack(fill=tk.X)
 
@@ -4506,7 +4506,10 @@ class _ManagerWindow:
                 top.grab_release()
             except Exception:
                 pass
-            top.destroy()
+            try:
+                top.destroy()
+            except Exception:
+                pass
             relaunch_same_app_and_exit(cwd=project_root(), tk_root=self._root)
 
         def do_later() -> None:
@@ -4516,9 +4519,20 @@ class _ManagerWindow:
                 pass
             top.destroy()
 
-        ttk.Button(btn_row, text="Khởi động lại app", command=do_restart).pack(side=tk.LEFT, padx=(0, 8))
+        btn_restart = ttk.Button(
+            btn_row,
+            text="Mở lại chương trình ngay (khuyến nghị)",
+            command=do_restart,
+        )
+        btn_restart.pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(btn_row, text="Để sau", command=do_later).pack(side=tk.LEFT)
         top.protocol("WM_DELETE_WINDOW", do_later)
+        top.bind("<Return>", lambda _e: do_restart())
+        top.bind("<Escape>", lambda _e: do_later())
+        try:
+            top.after(80, lambda: btn_restart.focus_set())
+        except Exception:
+            pass
 
     def _on_apply_update(self) -> None:
         """Tải và áp dụng bản mới đã check được từ manifest."""
