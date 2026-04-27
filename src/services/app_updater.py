@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 import sys
-import tempfile
+import uuid
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -88,6 +88,123 @@ def _sha256_file(path: Path) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def _windows_long_path_str(path: Path) -> str:
+    """Chuỗi đường dẫn Windows dài (\\\\?\\) để vượt MAX_PATH khi cần."""
+    s = str(path.resolve())
+    if os.name != "nt":
+        return s
+    if s.startswith("\\\\?\\"):
+        return s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s[2:].lstrip("\\")
+    return "\\\\?\\" + s
+
+
+def _mkdir_for_long_path(path: Path) -> None:
+    if os.name == "nt":
+        lp = _windows_long_path_str(path)
+        os.makedirs(lp, exist_ok=True)
+        return
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _open_write_long_path(path: Path):
+    if os.name == "nt":
+        return open(_windows_long_path_str(path), "wb")
+    return path.open("wb")
+
+
+def _make_short_extract_root(*, project_root: Path, updates_dir: Path) -> Path:
+    """
+    Thư mục giải nén tạm càng ngắn càng tốt (Windows) để tránh vượt MAX_PATH trong zip sâu.
+
+    Thử lần lượt: ``%SystemDrive%\\tfe\\``, ``%LOCALAPPDATA%\\tfe\\``, ``data/updates/``.
+    """
+    token = uuid.uuid4().hex[:12]
+    bases: list[Path] = []
+    if os.name == "nt":
+        drv = (os.environ.get("SystemDrive") or "C:").rstrip("\\/") + "\\"
+        bases.append(Path(drv) / "tfe")
+        lad = os.environ.get("LOCALAPPDATA", "").strip()
+        if lad:
+            bases.append(Path(lad) / "tfe")
+    bases.append(updates_dir)
+    for b in bases:
+        try:
+            root = (b / f"e{token}").resolve()
+            _mkdir_for_long_path(root)
+            return root
+        except OSError as exc:
+            logger.warning("Updater: không dùng thư mục giải nén {}, thử tiếp: {}", b, exc)
+    raise RuntimeError("Không tạo được thư mục giải nén tạm (hết chỗ ghi hoặc quyền).")
+
+
+def _zip_member_should_skip_extract(member_name: str) -> bool:
+    """
+    Bỏ qua file cache Prisma/npm trong Veo3Studio — thường path cực dài, dễ lỗi extract,
+    và có thể tải lại khi chạy server (Prisma tự tải engine).
+    """
+    norm = member_name.replace("\\", "/").lower()
+    if "node_modules/.cache/prisma" in norm:
+        return True
+    if "node_modules/@prisma/engines/node_modules/.cache" in norm:
+        return True
+    return False
+
+
+def _zip_extract_resilient(zip_path: Path, dest_dir: Path) -> tuple[int, int]:
+    """
+    Giải nén zip thủ công: chống ZIP slip, hỗ trợ đường dẫn dài Windows, bỏ qua member cache Prisma.
+
+    Returns:
+        (số file đã ghi, số member đã bỏ qua)
+    """
+    dest_dir = dest_dir.resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    skipped = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            name = info.filename.replace("\\", "/")
+            if name.endswith("/") or not name.strip():
+                continue
+            if _zip_member_should_skip_extract(name):
+                skipped += 1
+                continue
+            parts = name.split("/")
+            if any(p == ".." or p.startswith(("/", "\\")) for p in parts):
+                raise RuntimeError(f"Gói cập nhật chứa đường dẫn không an toàn: {name!r}")
+            target = dest_dir.joinpath(*parts)
+            try:
+                target.relative_to(dest_dir)
+            except ValueError as exc:
+                raise RuntimeError(f"Gói cập nhật ZIP slip: {name!r}") from exc
+            try:
+                _mkdir_for_long_path(target.parent)
+                with zf.open(info, "r") as src, _open_write_long_path(target) as out:
+                    shutil.copyfileobj(src, out, length=1024 * 1024)
+                written += 1
+            except OSError as exc:
+                win_e = int(getattr(exc, "winerror", 0) or 0)
+                en = int(getattr(exc, "errno", 0) or 0)
+                longish = len(_windows_long_path_str(target)) > 300 if os.name == "nt" else len(str(target)) > 240
+                veo = "veo3studio" in norm
+                if veo and (longish or win_e in {3, 206} or en in {2, 22, 36}):
+                    logger.warning("Updater: bỏ qua member (path/IO): {} — {}", name[:180], exc)
+                    skipped += 1
+                    try:
+                        if target.exists():
+                            target.unlink(missing_ok=True)  # type: ignore[arg-type]
+                    except OSError:
+                        pass
+                    continue
+                raise
+    if skipped:
+        logger.info("Updater: đã bỏ qua {} file cache/ngoài giới hạn path khi giải nén.", skipped)
+    logger.info("Updater: đã giải nén {} file vào {}", written, dest_dir)
+    return written, skipped
 
 
 @dataclass(frozen=True)
@@ -177,19 +294,18 @@ def apply_update_package(
     tmp_zip = updates_dir / f"update_{manifest.version}.zip"
     logger.info("Updater: tải gói cập nhật từ {}", manifest.download_url)
     req = urllib.request.Request(manifest.download_url, headers={"User-Agent": "ToolFB-Updater/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp, tmp_zip.open("wb") as fh:
-        shutil.copyfileobj(resp, fh)
+    with urllib.request.urlopen(req, timeout=900) as resp, tmp_zip.open("wb") as fh:
+        shutil.copyfileobj(resp, fh, length=4 * 1024 * 1024)
 
     if manifest.sha256:
         got = _sha256_file(tmp_zip)
         if got.lower() != manifest.sha256.lower():
             raise RuntimeError(f"Sai checksum update package. expected={manifest.sha256} got={got}")
 
-    # Ưu tiên giải nén ngay trong project để đường dẫn ngắn hơn AppData\Temp (giảm lỗi path sâu trên Windows).
-    with tempfile.TemporaryDirectory(prefix="upd_", dir=str(updates_dir)) as tdir:
-        extract_root = Path(tdir)
-        with zipfile.ZipFile(tmp_zip, "r") as zf:
-            zf.extractall(extract_root)
+    # Giải nén ra thư mục tạm đường dẫn ngắn + extract thủ công (Windows path dài / bỏ cache Prisma).
+    extract_root = _make_short_extract_root(project_root=project_root, updates_dir=updates_dir)
+    try:
+        _zip_extract_resilient(tmp_zip, extract_root)
         layout = _detect_update_payload_layout(extract_root)
         payload_root = layout.code_root
 
@@ -232,6 +348,8 @@ def apply_update_package(
 
         logger.info("Updater: áp dụng update {} thành công.", manifest.version)
         return backup_dir
+    finally:
+        shutil.rmtree(extract_root, ignore_errors=True)
 
 
 def _copytree_resilient(src: Path, dst: Path) -> None:

@@ -29,6 +29,26 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _prune_veo3studio_node_caches(veo_root: Path) -> int:
+    """
+    Xóa ``node_modules/.cache`` trong Veo3Studio trước khi đóng gói.
+
+    Cache Prisma/npm tạo path cực dài, zip nặng và dễ lỗi khi giải nén trên Windows;
+    Prisma có thể tải lại engine khi chạy server lần đầu.
+    """
+    removed = 0
+    if not veo_root.is_dir():
+        return 0
+    for node_modules in veo_root.rglob("node_modules"):
+        if not node_modules.is_dir():
+            continue
+        cache = node_modules / ".cache"
+        if cache.is_dir():
+            shutil.rmtree(cache, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def _read_local_version(root: Path) -> str:
     vf = root / "version.json"
     if vf.is_file():
@@ -91,6 +111,11 @@ def build_release_bundle() -> tuple[Path, Path, Path]:
     shutil.copytree(clean_dir, bundle_dir / "portable_clean", dirs_exist_ok=True)
     shutil.copytree(exe_dir, bundle_dir / "exe_gui", dirs_exist_ok=True)
 
+    n1 = _prune_veo3studio_node_caches(bundle_dir / "portable_clean" / "tools" / "Veo3Studio")
+    n2 = _prune_veo3studio_node_caches(bundle_dir / "exe_gui" / "tools" / "Veo3Studio")
+    if n1 or n2:
+        print(f"PRUNED_VEO3_NODE_CACHE_DIRS portable={n1} exe_gui={n2}", file=sys.stderr)
+
     readme = bundle_dir / "README_RELEASE.txt"
     readme.write_text(
         "ToolFB Release Bundle\n"
@@ -103,7 +128,8 @@ def build_release_bundle() -> tuple[Path, Path, Path]:
         "- Co Start_ToolFB_GUI.bat de mo nhanh\n"
         "- BAT BUOC: copy ca thu muc exe_gui (gom ToolFB_GUI.exe + _internal/...), khong chi copy file .exe le\n"
         "- Ban build day du da dong goi Chromium + Firefox + WebKit (Playwright) trong _internal/ms-playwright — may dich khong can `playwright install`\n"
-        "- Kich thuoc zip lon (hang tram MB) do trinh duyet; build nhanh: dat TOOLFB_SKIP_BROWSER_BUNDLE=1 khi goi tools/build_exe_gui.py\n\n"
+        "- Kich thuoc zip lon (hang tram MB) do trinh duyet; build nhanh: dat TOOLFB_SKIP_BROWSER_BUNDLE=1 khi goi tools/build_exe_gui.py\n"
+        "- Veo3Studio: cache trong node_modules/.cache (Prisma/npm) duoc xoa truoc khi zip de giam dung luong + tranh path qua dai khi cap nhat; Prisma tai lai khi can.\n\n"
         "Goi y:\n"
         "- Neu may dich co Python/venv: dung portable_clean\n"
         "- Neu muon click-chay ngay tren may sach: dung exe_gui (build day du)\n",
