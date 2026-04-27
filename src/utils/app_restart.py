@@ -15,7 +15,7 @@ from src.utils.paths import project_root
 
 def build_restart_command() -> list[str]:
     """
-    Lệnh tương đương phiên hiện tại: bản đóng gói thêm ``--gui``; dev dùng ``sys.executable`` + ``sys.argv``.
+    Lệnh tương đương phiên hiện tại: bản đóng gói thêm ``--gui`` (tương thích); mặc định frozen đã là GUI, ``--cli`` để scheduler nền. Dev: ``sys.executable`` + ``sys.argv``.
     """
     if getattr(sys, "frozen", False):
         return [sys.executable, "--gui"]
