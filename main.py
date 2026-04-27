@@ -65,6 +65,25 @@ from src.utils.profile_cleanup import cleanup_orphan_profile_directories
 from src.utils.runtime_cleanup import cleanup_runtime_junk
 
 
+def _ensure_minimal_config_for_first_run() -> None:
+    """
+    Sau khi clone git, thường thiếu ``config/accounts.json`` → ``main.py`` thoát ngay, GUI không lên.
+    Tạo ``config/`` và file accounts rỗng ``[]`` nếu chưa có (không ghi đè file đã tồn tại).
+    """
+    from src.utils.paths import project_root
+
+    root = project_root()
+    cfg = root / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    path = _default_accounts_path()
+    if not path.is_file():
+        path.write_text("[]\n", encoding="utf-8")
+        logger.info(
+            "Đã tạo {} rỗng (máy mới / clone repo). Mở tab Tài khoản để thêm profile.",
+            path,
+        )
+
+
 def _preflight_or_exit() -> AccountsDatabaseManager:
     """
     Kiểm tra nhanh trước khi chạy 24/7: file cấu hình tồn tại, cảnh báo thiếu Gemini API key.
@@ -74,7 +93,7 @@ def _preflight_or_exit() -> AccountsDatabaseManager:
     """
     path = _default_accounts_path()
     if not path.is_file():
-        logger.error("Thiếu file cấu hình: {} — hãy tạo trước khi chạy.", path)
+        logger.error("Thiếu file cấu hình: {} — hãy tạo trước khi chạy (hoặc chạy lại bản app đã có bước bootstrap).", path)
         raise SystemExit(1)
     mgr = AccountsDatabaseManager()
     rows = mgr.load_all()
@@ -191,6 +210,7 @@ def main() -> None:
     _cleanup_previous_background_instances()
     cleanup_runtime_junk()
     logger.info("Facebook Automation — Giai đoạn 4 (AI + lịch). Đang khởi động...")
+    _ensure_minimal_config_for_first_run()
     apply_saved_gemini_key_to_environ()
     apply_saved_openai_key_to_environ()
     apply_saved_nanobanana_key_to_environ()
