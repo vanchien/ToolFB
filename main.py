@@ -1,7 +1,7 @@
 """
 Điểm vào chương trình: điều phối lịch đăng + log trạng thái trên terminal.
 
-Chạy: ``python main.py`` (chỉ terminal), ``python main.py --gui`` (Tkinter), hoặc ``streamlit run dashboard.py`` (dashboard web).
+Chạy: ``python main.py`` (chỉ terminal), ``python main.py --gui`` (Tkinter), ``ToolFB_GUI.exe`` (bản đóng gói: mặc định GUI; ``ToolFB_GUI.exe --cli`` = scheduler terminal), hoặc ``streamlit run dashboard.py`` (dashboard web).
 
 Biến môi trường quan trọng:
 - ``GEMINI_API_KEY``: bắt buộc để sinh nội dung.
@@ -204,6 +204,11 @@ def main() -> None:
         action="store_true",
         help="Mở bảng điều khiển Tkinter (xem log, bật/tắt lịch, làm mới tài khoản)",
     )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Bản .exe (PyInstaller): chạy scheduler 24/7 trên terminal, không mở GUI. Bỏ qua tham số này khi dev bằng python.",
+    )
     args = parser.parse_args()
 
     _configure_logging()
@@ -217,7 +222,14 @@ def main() -> None:
     apply_saved_nanobanana_config_to_environ()
     accounts = _preflight_or_exit()
 
-    if args.gui:
+    # Bản .exe: double-click / shortcut thường không có argv → phải mặc định GUI.
+    # Dev: ``python main.py`` không cờ → scheduler (giữ hành vi cũ).
+    is_frozen = getattr(sys, "frozen", False)
+    use_gui = (not is_frozen and args.gui) or (is_frozen and not args.cli)
+    if is_frozen and not args.gui and not args.cli:
+        logger.info("Bản đóng gói: mở GUI mặc định (chạy scheduler terminal: thêm --cli).")
+
+    if use_gui:
         from src.gui.manager_app import run_manager_gui
 
         run_manager_gui(accounts=accounts)
