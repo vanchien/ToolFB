@@ -39,3 +39,6 @@ Desktop.ini
 # API keys (GUI «Cài đặt AI» ghi file này)
 config/app_secrets.json
 config/app_secrets.json.corrupt.bak
+
+# Large local tool cache/binaries (khong day len GitHub)
+tools/ffmpeg/
