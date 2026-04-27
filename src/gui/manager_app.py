@@ -220,7 +220,8 @@ class _ManagerWindow:
         self._show_browser = os.environ.get("HEADLESS", "1").strip().lower() in {"0", "false", "off", "no"}
 
         self._root = tk.Tk()
-        self._root.title("Facebook Automation — Bảng điều khiển")
+        self._app_version_str = read_local_version(project_root())
+        self._root.title(f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         lock_raw = os.environ.get("FB_LOCK_BROWSER_DURING_JOB", "1").strip().lower()
         self._var_lock_browser_job = tk.BooleanVar(value=lock_raw not in {"0", "false", "off", "no"})
@@ -319,6 +320,12 @@ class _ManagerWindow:
         self._lbl_browser_mode.pack(side=tk.LEFT, padx=(0, 8))
         self._lbl_state = ttk.Label(bar, text="Lịch: đang tắt")
         self._lbl_state.pack(side=tk.RIGHT)
+        self._lbl_app_version = ttk.Label(
+            bar,
+            text=f"Phiên bản {self._app_version_str}",
+            foreground="gray",
+        )
+        self._lbl_app_version.pack(side=tk.RIGHT, padx=(0, 12))
         self._set_browser_visibility(self._show_browser, update_env=False)
 
         body = ttk.PanedWindow(main, orient=tk.VERTICAL)
