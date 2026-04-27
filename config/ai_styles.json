@@ -1,0 +1,204 @@
+{
+  "image_styles": [
+    {
+      "id": "realistic",
+      "name": "Realistic",
+      "prompt_addon": "realistic, high detail, clean composition"
+    },
+    {
+      "id": "cinematic_realistic",
+      "name": "Cinematic Realistic",
+      "prompt_addon": "cinematic realistic, dramatic composition, high detail"
+    },
+    {
+      "id": "photorealistic",
+      "name": "Photorealistic",
+      "prompt_addon": "photorealistic, lifelike textures, natural lighting"
+    }
+  ],
+  "character_image_styles": [
+    {
+      "id": "character_cinematic_realistic",
+      "name": "Cinematic Realistic Character",
+      "prompt_addon": "cinematic realistic portrait, natural skin texture, professional composition, soft cinematic lighting, high detail"
+    },
+    {
+      "id": "character_studio_portrait",
+      "name": "Studio Portrait",
+      "prompt_addon": "professional studio portrait, clean background, controlled lighting, clear face, high detail"
+    },
+    {
+      "id": "character_documentary",
+      "name": "Documentary Realistic",
+      "prompt_addon": "documentary realistic style, natural expression, authentic clothing, real-world lighting"
+    },
+    {
+      "id": "character_social_realistic",
+      "name": "Social Media Realistic",
+      "prompt_addon": "realistic social media portrait, natural phone-camera look, clean composition, relatable appearance"
+    },
+    {
+      "id": "character_fantasy",
+      "name": "Fantasy Character",
+      "prompt_addon": "fantasy character design, cinematic fantasy lighting, detailed costume, concept art quality"
+    },
+    {
+      "id": "character_anime",
+      "name": "Anime Character",
+      "prompt_addon": "anime character design, clean line art, expressive eyes, high-quality anime style"
+    }
+  ],
+  "environment_styles": [
+    {
+      "id": "environment_cinematic",
+      "name": "Cinematic Environment",
+      "prompt_addon": "cinematic environment, atmospheric lighting, rich details, movie still composition"
+    },
+    {
+      "id": "environment_realistic",
+      "name": "Realistic Environment",
+      "prompt_addon": "photorealistic environment, natural lighting, realistic textures, high detail"
+    },
+    {
+      "id": "environment_dark_mystery",
+      "name": "Dark Mystery",
+      "prompt_addon": "dark mysterious environment, low-key lighting, shadows, dramatic atmosphere"
+    },
+    {
+      "id": "environment_bright_clean",
+      "name": "Bright Clean",
+      "prompt_addon": "bright clean environment, soft natural light, minimal clutter, fresh commercial look"
+    },
+    {
+      "id": "environment_luxury",
+      "name": "Luxury Interior",
+      "prompt_addon": "luxury interior, premium materials, elegant lighting, high-end composition"
+    }
+  ],
+  "video_styles": [
+    {
+      "id": "cinematic_realistic",
+      "name": "Cinematic Realistic",
+      "prompt_addon": "cinematic realistic video, smooth camera movement, natural motion, high-quality details, coherent visual continuity"
+    },
+    {
+      "id": "social_viral_reel",
+      "name": "Social Viral Reel",
+      "prompt_addon": "vertical short-form social media video, strong visual hook, dynamic but smooth motion, engaging composition"
+    },
+    {
+      "id": "product_commercial",
+      "name": "Product Commercial",
+      "prompt_addon": "premium product commercial video, clean product reveal, smooth camera movement, polished lighting"
+    },
+    {
+      "id": "documentary_realistic",
+      "name": "Documentary Realistic",
+      "prompt_addon": "documentary realistic video, natural handheld motion, authentic environment, real-life atmosphere"
+    },
+    {
+      "id": "dark_mystery_cinematic",
+      "name": "Dark Mystery Cinematic",
+      "prompt_addon": "dark mysterious cinematic video, low-key lighting, suspenseful atmosphere, slow camera movement"
+    },
+    {
+      "id": "bright_lifestyle",
+      "name": "Bright Lifestyle",
+      "prompt_addon": "bright lifestyle video, soft natural lighting, warm friendly mood, smooth natural motion"
+    },
+    {
+      "id": "luxury_brand_film",
+      "name": "Luxury Brand Film",
+      "prompt_addon": "luxury brand film, premium cinematic lighting, elegant camera movement, high-end visual polish"
+    }
+  ],
+  "camera_styles": [
+    {
+      "id": "smooth_dolly_in",
+      "name": "Smooth dolly in",
+      "prompt_addon": "smooth dolly in"
+    },
+    {
+      "id": "slow_dolly_out",
+      "name": "Slow dolly out",
+      "prompt_addon": "slow dolly out"
+    },
+    {
+      "id": "tracking_shot",
+      "name": "Tracking shot",
+      "prompt_addon": "tracking shot"
+    },
+    {
+      "id": "handheld_realistic",
+      "name": "Handheld realistic",
+      "prompt_addon": "handheld realistic"
+    },
+    {
+      "id": "wide_establishing_shot",
+      "name": "Wide establishing shot",
+      "prompt_addon": "wide establishing shot"
+    }
+  ],
+  "lighting_styles": [
+    {
+      "id": "soft_natural_light",
+      "name": "Soft natural light",
+      "prompt_addon": "soft natural light"
+    },
+    {
+      "id": "golden_hour",
+      "name": "Golden hour",
+      "prompt_addon": "golden hour lighting"
+    },
+    {
+      "id": "studio_lighting",
+      "name": "Studio lighting",
+      "prompt_addon": "studio lighting"
+    },
+    {
+      "id": "cinematic_low_light",
+      "name": "Cinematic low light",
+      "prompt_addon": "cinematic low light"
+    },
+    {
+      "id": "bright_commercial_lighting",
+      "name": "Bright commercial lighting",
+      "prompt_addon": "bright commercial lighting"
+    }
+  ],
+  "motion_styles": [
+    {
+      "id": "slow_and_smooth",
+      "name": "Slow and smooth",
+      "prompt_addon": "slow and smooth"
+    },
+    {
+      "id": "natural_human_movement",
+      "name": "Natural human movement",
+      "prompt_addon": "natural human movement"
+    },
+    {
+      "id": "energetic_fast_cuts",
+      "name": "Energetic fast cuts",
+      "prompt_addon": "energetic fast cuts"
+    },
+    {
+      "id": "gentle_motion",
+      "name": "Gentle motion",
+      "prompt_addon": "gentle motion"
+    },
+    {
+      "id": "dynamic_movement",
+      "name": "Dynamic movement",
+      "prompt_addon": "dynamic movement"
+    }
+  ],
+  "defaults": {
+    "character_image_style_id": "character_cinematic_realistic",
+    "environment_style_id": "environment_cinematic",
+    "video_style_id": "cinematic_story",
+    "camera_style_id": "smooth_dolly_in",
+    "lighting_style_id": "soft_natural_light",
+    "motion_style_id": "slow_and_smooth"
+  }
+}

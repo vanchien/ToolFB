@@ -41,7 +41,7 @@ class AutoStyleSelector:
     def _fallback(self) -> dict[str, Any]:
         return {
             "image_style_id": default_style_id("character_image_style_id", "character_cinematic_realistic"),
-            "video_style_id": default_style_id("video_style_id", "video_cinematic_realistic"),
+            "video_style_id": default_style_id("video_style_id", "cinematic_story"),
             "camera_style_id": default_style_id("camera_style_id", "smooth_dolly_in"),
             "lighting_style_id": default_style_id("lighting_style_id", "soft_natural_light"),
             "motion_style_id": default_style_id("motion_style_id", "slow_and_smooth"),
@@ -63,7 +63,21 @@ class AutoStyleSelector:
                     out.add(sid)
         return out
 
-    def _validate(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _style_row(self, group: str, style_id: str) -> dict[str, Any] | None:
+        sid = str(style_id or "").strip()
+        if not sid:
+            return None
+        rows = self.style_registry.get(group)
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id", "")).strip() == sid:
+                return dict(row)
+        return None
+
+    def _validate(self, data: dict[str, Any], *, preferred_video_style_id: str = "") -> dict[str, Any]:
         out = dict(self._fallback())
         for key, group in (
             ("image_style_id", "character_image_styles"),
@@ -98,6 +112,9 @@ class AutoStyleSelector:
         rs = str(data.get("reason", "")).strip()
         if rs:
             out["reason"] = rs
+        preferred_sid = str(preferred_video_style_id or "").strip()
+        if preferred_sid and preferred_sid in self._id_set("video_styles"):
+            out["video_style_id"] = preferred_sid
         return out
 
     def select_styles(
@@ -107,6 +124,7 @@ class AutoStyleSelector:
         content_goal: str,
         language: str,
         *,
+        preferred_video_style_id: str = "",
         model: str | None = None,
     ) -> dict[str, Any]:
         """
@@ -121,6 +139,13 @@ class AutoStyleSelector:
             "lighting_styles": self.style_registry.get("lighting_styles") or [],
             "motion_styles": self.style_registry.get("motion_styles") or [],
         }
+        preferred_sid = str(preferred_video_style_id or "").strip()
+        preferred_row = self._style_row("video_styles", preferred_sid)
+        preferred_label = ""
+        preferred_addon = ""
+        if preferred_row:
+            preferred_label = str(preferred_row.get("name", "")).strip()
+            preferred_addon = str(preferred_row.get("prompt_addon", "")).strip()
         prompt = f"""You are an expert AI art director for image and video generation.
 
 User idea:
@@ -138,7 +163,12 @@ Language:
 Available style registry:
 {json.dumps(reg_min, ensure_ascii=False)}
 
-Choose the best style combination for this idea.
+Video style is the main anchor and should stay fixed if provided:
+- preferred_video_style_id: {preferred_sid or "none"}
+- preferred_video_style_label: {preferred_label or "none"}
+- preferred_video_style_prompt_addon: {preferred_addon or "none"}
+
+Choose the best complementary styles for camera, lighting, motion, mood, aspect ratio, and duration around the main video style.
 
 Return strict JSON only:
 {{
@@ -155,6 +185,7 @@ Return strict JSON only:
 
 Rules:
 - Only choose style IDs that exist in the registry.
+- If preferred_video_style_id is provided and valid, keep video_style_id exactly that value.
 - For Facebook Reels / TikTok / Shorts, prefer 9:16.
 - For cinematic story, prefer cinematic or dark mystery styles.
 - For product promotion, prefer product commercial / brand film.
@@ -164,7 +195,7 @@ Rules:
         try:
             text = self.ai_text_service.generate_text(prompt=prompt, model=model)
             parsed = _extract_json_object(text)
-            return self._validate(parsed)
+            return self._validate(parsed, preferred_video_style_id=preferred_sid)
         except Exception as exc:  # noqa: BLE001
             logger.warning("AutoStyleSelector lỗi, fallback default: {}", exc)
-            return self._fallback()
+            return self._validate({}, preferred_video_style_id=preferred_sid)

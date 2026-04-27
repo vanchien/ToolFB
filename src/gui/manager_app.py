@@ -33,11 +33,9 @@ from src.gui.account_management import (
     import_accounts_append,
     template_new_account,
 )
-from src.gui.ai_video_dialog import AIVideoDialog
 from src.gui.cookie_capture import account_cookie_path_field, cookie_storage_dest, run_fb_cookie_capture_dialog
 from src.gui.page_management import PageFormDialog
 from src.gui.page_scan_dialog import PageScanDialog
-from src.gui.schedule_batch_job_dialog import ScheduleBatchJobDialog
 from src.gui.schedule_job_dialog import SchedulePostJobDialog
 from src.modules.browser_engine import BrowserEngine
 from src.services.app_updater import (
@@ -75,6 +73,7 @@ from src.utils.app_secrets import (
     set_preferred_openai_key_id,
     set_preferred_nanobanana_key_id,
 )
+from src.utils.app_restart import relaunch_same_app_and_exit
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager
 from src.utils.pages_manager import PageRecord, PagesManager
 from src.utils.page_schedule import scheduler_tz
@@ -3079,6 +3078,8 @@ class _ManagerWindow:
         if not owner_ids:
             messagebox.showwarning("Chưa có tài khoản", "Thêm tài khoản ở tab 1 trước.", parent=self._root)
             return
+        from src.gui.schedule_batch_job_dialog import ScheduleBatchJobDialog
+
         dlg = ScheduleBatchJobDialog(
             self._root,
             self._schedule_posts,
@@ -4476,6 +4477,49 @@ class _ManagerWindow:
 
         threading.Thread(target=worker, name="check_updates", daemon=True).start()
 
+    def _show_update_success_restart_dialog(self, *, version: str, backup_dir: Path) -> None:
+        """
+        Sau cập nhật thành công: cho phép «Khởi động lại app» để nạp code mới ngay (thay vì chỉ messagebox).
+        """
+        top = tk.Toplevel(self._root)
+        top.title("Cập nhật thành công")
+        top.transient(self._root)
+        top.resizable(False, False)
+        try:
+            top.grab_set()
+        except Exception:
+            pass
+        fr = ttk.Frame(top, padding=14)
+        fr.pack(fill=tk.BOTH, expand=True)
+        msg = (
+            f"Đã cập nhật lên phiên bản {version}.\n\n"
+            f"Backup trước update:\n{backup_dir}\n\n"
+            "Bấm «Khởi động lại app» để tự mở lại bản mới (phiên hiện tại sẽ đóng).\n"
+            "Hoặc «Để sau» nếu bạn muốn tự mở lại sau."
+        )
+        ttk.Label(fr, text=msg, wraplength=460, justify=tk.LEFT).pack(anchor="w", pady=(0, 12))
+        btn_row = ttk.Frame(fr)
+        btn_row.pack(fill=tk.X)
+
+        def do_restart() -> None:
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            top.destroy()
+            relaunch_same_app_and_exit(cwd=project_root(), tk_root=self._root)
+
+        def do_later() -> None:
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            top.destroy()
+
+        ttk.Button(btn_row, text="Khởi động lại app", command=do_restart).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="Để sau", command=do_later).pack(side=tk.LEFT)
+        top.protocol("WM_DELETE_WINDOW", do_later)
+
     def _on_apply_update(self) -> None:
         """Tải và áp dụng bản mới đã check được từ manifest."""
         mf = self._latest_update_manifest
@@ -4502,17 +4546,11 @@ class _ManagerWindow:
                 backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
 
                 def done_ok() -> None:
-                    self._lbl_state.configure(text="Update: hoàn tất, cần khởi động lại")
+                    self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
                     self._clear_ui_busy()
-                    messagebox.showinfo(
-                        "Cập nhật thành công",
-                        (
-                            f"Đã cập nhật lên {mf.version}.\n"
-                            f"Backup trước update: {backup_dir}\n\n"
-                            "Vui lòng tắt và mở lại app để dùng bản mới."
-                        ),
-                        parent=self._root,
-                    )
+                    self._btn_check_updates.configure(state=tk.NORMAL)
+                    self._btn_apply_update.configure(state=tk.DISABLED)
+                    self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
 
                 self._root.after(0, done_ok)
             except Exception as exc:  # noqa: BLE001

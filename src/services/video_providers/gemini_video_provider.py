@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shutil
+from urllib.parse import urlparse
 import threading
 import time
 import uuid
@@ -33,6 +34,7 @@ from src.services.google_flow_veo_generate import (
 )
 from src.services.google_flow_text_to_video_runner import GoogleFlowVeoRunner
 from src.utils.app_secrets import get_nanobanana_runtime_config
+from src.utils.media_dedupe import partition_new_output_files
 from src.utils.paths import project_root
 
 
@@ -43,29 +45,16 @@ class GeminiVideoProvider(BaseVideoAIProvider):
 
     def submit_generation(self, request: dict[str, Any]) -> dict[str, Any]:
         """
-        Gửi request generate video lên Gemini/Veo và trả operation_id thật.
+        Gửi request generate video theo 1 luồng duy nhất: VEO browser queue.
         """
         mode = str(request.get("mode", "")).strip().lower()
         if not mode:
             raise ValueError("Thiếu mode cho Gemini video request.")
-        if _veo_browser_enabled():
-            op_id = f"veo_browser_{uuid.uuid4().hex[:16]}"
-            _save_browser_op(op_id, {"status": "generating", "request": request, "output_files": [], "error_message": ""})
-            return {"operation_id": op_id, "status": "generating"}
-        client, types = _build_genai_client()
-
-        prompt = str(request.get("prompt", "")).strip()
-        opts = dict(request.get("options") or {})
-        assets = dict(request.get("input_assets") or {})
-        model = str(request.get("model", "")).strip() or os.environ.get("GEMINI_VIDEO_MODEL", "").strip() or "veo-3.1-generate-preview"
-
-        source = self._build_source(mode=mode, prompt=prompt, assets=assets, types=types)
-        cfg = self._build_config(mode=mode, opts=opts, assets=assets, types=types)
-        operation = client.models.generate_videos(model=model, source=source, config=cfg)
-        op_name = str(getattr(operation, "name", "") or "").strip()
-        if not op_name:
-            raise RuntimeError("Gemini trả operation rỗng, không có tên operation.")
-        return {"operation_id": op_name, "status": "generating"}
+        if not _veo_browser_enabled():
+            logger.info("VEO3 single-flow: force dùng browser queue dù env chưa bật rõ.")
+        op_id = f"veo_browser_{uuid.uuid4().hex[:16]}"
+        _save_browser_op(op_id, {"status": "generating", "request": request, "output_files": [], "error_message": ""})
+        return {"operation_id": op_id, "status": "generating"}
 
     def poll_operation(self, operation_id: str) -> dict[str, Any]:
         """
@@ -112,20 +101,10 @@ class GeminiVideoProvider(BaseVideoAIProvider):
                 except Exception as exc:  # noqa: BLE001
                     _save_browser_op(operation_id, {"status": "failed", "error_message": str(exc)})
                     return {"operation_id": operation_id, "status": "failed", "error_message": str(exc)}
-        client, types = _build_genai_client()
-        op = types.GenerateVideosOperation(name=operation_id)
-        latest = client.operations.get(op)
-        err = getattr(latest, "error", None)
-        if err:
-            return {
-                "operation_id": operation_id,
-                "status": "failed",
-                "error_message": _safe_err_text(err),
-            }
-        done = bool(getattr(latest, "done", False))
         return {
             "operation_id": operation_id,
-            "status": "completed" if done else "generating",
+            "status": "failed",
+            "error_message": "Chỉ hỗ trợ operation browser (veo_browser_*) trong single-flow mode.",
         }
 
     def download_result(self, operation_id: str, output_dir: str) -> dict[str, Any]:
@@ -148,60 +127,11 @@ class GeminiVideoProvider(BaseVideoAIProvider):
                 "status": "completed",
                 "output_files": files,
             }
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        client, types = _build_genai_client()
-        op = types.GenerateVideosOperation(name=operation_id)
-        latest = client.operations.get(op)
-        err = getattr(latest, "error", None)
-        if err:
-            return {
-                "operation_id": operation_id,
-                "status": "failed",
-                "output_files": [],
-                "error_message": _safe_err_text(err),
-            }
-        if not bool(getattr(latest, "done", False)):
-            return {
-                "operation_id": operation_id,
-                "status": "generating",
-                "output_files": [],
-                "error_message": "Operation chưa hoàn tất, chưa thể tải file.",
-            }
-        result = getattr(latest, "result", None) or getattr(latest, "response", None)
-        generated = list(getattr(result, "generated_videos", None) or [])
-        if not generated:
-            return {
-                "operation_id": operation_id,
-                "status": "failed",
-                "output_files": [],
-                "error_message": "Operation completed nhưng không có generated_videos.",
-            }
-
-        files: list[str] = []
-        for i, item in enumerate(generated, start=1):
-            video_obj = getattr(item, "video", None) or item
-            try:
-                data = client.files.download(file=video_obj)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Gemini download video lỗi (operation_id={} idx={}): {}", operation_id, i, exc)
-                continue
-            suffix = _guess_video_suffix(video_obj)
-            fp = out / f"{operation_id.replace('/', '_')}_{i:02d}{suffix}"
-            fp.write_bytes(data)
-            files.append(str(fp))
-
-        if not files:
-            return {
-                "operation_id": operation_id,
-                "status": "failed",
-                "output_files": [],
-                "error_message": "Không tải được file video nào từ operation.",
-            }
         return {
             "operation_id": operation_id,
-            "status": "completed",
-            "output_files": files,
+            "status": "failed",
+            "output_files": [],
+            "error_message": "Chỉ hỗ trợ download từ operation browser (veo_browser_*) trong single-flow mode.",
         }
 
     def _build_source(self, *, mode: str, prompt: str, assets: dict[str, Any], types: Any):
@@ -511,6 +441,51 @@ def _fallback_lock_id(*, base_prompt: str, profile: dict[str, Any]) -> str:
     return f"char-{digest}"
 
 
+def _wait_for_next_queue_video_or_flow_done(
+    *,
+    page: Any,
+    seen_norm_urls: frozenset[str],
+    wait_ms: int,
+    prompt_index: int,
+) -> None:
+    """
+    Prompt đầu: chờ Flow báo xong (video + download, không generating).
+
+    Prompt 2+ trong ``prompt_queue``: Flow có thể vẫn hiện generating cho gen khác nên chờ full rất lâu;
+    ưu tiên phát hiện **URL video mới** trên DOM (chưa nằm trong ``seen_norm_urls``), rồi mới tải.
+    """
+    if prompt_index <= 1:
+        wait_flow_generation_done(page, timeout_ms=max(60_000, wait_ms))
+        return
+    # Giảm thời gian "đợi URL mới" để tránh đứng lâu ở prompt 2/3.
+    # Nếu không thấy tín hiệu mới sớm thì chuyển ngay sang nhánh chờ generation done ổn định hơn.
+    fast_budget = max(20.0, min(75.0, wait_ms / 8000.0))
+    end_fast = time.time() + fast_budget
+    while time.time() < end_fast:
+        for u in _extract_video_urls(page):
+            nu = _url_norm_for_dedupe(u)
+            if nu and nu not in seen_norm_urls:
+                try:
+                    page.wait_for_timeout(320)
+                except Exception:
+                    time.sleep(0.32)
+                logger.info(
+                    "VEO3 browser: prompt {} — có URL video mới trên DOM, không chờ full UI «done».",
+                    prompt_index,
+                )
+                return
+        try:
+            page.wait_for_timeout(420)
+        except Exception:
+            time.sleep(0.42)
+    logger.info(
+        "VEO3 browser: prompt {} — không thấy URL mới trong {:.0f}s, fallback chờ Flow generation done.",
+        prompt_index,
+        fast_budget,
+    )
+    wait_flow_generation_done(page, timeout_ms=max(60_000, wait_ms))
+
+
 def _run_veo_browser_generation(*, operation_id: str, request: dict[str, Any]) -> list[str]:
     base_prompt = _build_browser_consistency_prompt(request=request)
     if not base_prompt:
@@ -577,6 +552,7 @@ def _run_veo_browser_generation(*, operation_id: str, request: dict[str, Any]) -
                     pass
             # Phase A: submit nhanh toàn bộ prompt (xác nhận click xong là qua prompt kế tiếp).
             for idx, prompt in enumerate(prompts, start=1):
+                t_submit = time.time()
                 logger.info("VEO3 browser: submit prompt {}/{} ...", idx, len(prompts))
                 _set_prompt(page, prompt[:1800])
                 if action_delay_ms > 0:
@@ -602,25 +578,56 @@ def _run_veo_browser_generation(*, operation_id: str, request: dict[str, Any]) -
                 elif not _click_send(page):
                     _save_debug_screenshot(page, reason=f"{operation_id}_send_failed_{idx}")
                     raise RuntimeError(f"Prompt {idx}: không bấm được nút Send/Submit trên giao diện Gemini/Veo3.")
+                logger.info(
+                    "VEO3 browser timing: prompt {}/{} submit {:.2f}s",
+                    idx,
+                    len(prompts),
+                    time.time() - t_submit,
+                )
 
             # Phase B: đợi hoàn tất và download theo thứ tự prompt 1..N.
+            # Tránh tái tải cùng một URL / cùng nội dung file khi DOM vẫn còn video gen trước (Flow hay giữ nhiều thẻ).
             all_outputs: list[str] = []
+            seen_src_urls: set[str] = set()
+            seen_file_hashes: set[str] = set()
             for idx in range(1, len(prompts) + 1):
+                t_wait = time.time()
                 logger.info("VEO3 browser: chờ hoàn tất prompt {}/{} để tải video...", idx, len(prompts))
                 if is_google_flow_labs_url(web_url):
-                    wait_flow_generation_done(page, timeout_ms=max(60_000, wait_ms))
+                    _wait_for_next_queue_video_or_flow_done(
+                        page=page,
+                        seen_norm_urls=frozenset(seen_src_urls),
+                        wait_ms=wait_ms,
+                        prompt_index=idx,
+                    )
+                wait_elapsed = time.time() - t_wait
+                t_dl = time.time()
                 outputs = _wait_and_collect_videos(
                     page=page,
                     output_dir=out_dir,
                     operation_id=f"{operation_id}_p{idx:02d}",
                     timeout_sec=max(60, wait_ms // 1000),
                     preferred_resolution=preferred_resolution,
+                    seen_src_urls=seen_src_urls,
                 )
+                outputs = _consume_unseen_output_files(paths=outputs, seen_hashes=seen_file_hashes)
                 if not outputs:
                     _save_debug_screenshot(page, reason=f"{operation_id}_no_output_{idx}")
-                    raise RuntimeError(f"Prompt {idx}: không lấy được video output từ browser Veo3.")
+                    raise RuntimeError(
+                        f"Prompt {idx}: không lấy được video output mới từ browser "
+                        f"(có thể UI chưa sinh clip mới hoặc clip trùng với prompt trước)."
+                    )
+                dl_elapsed = time.time() - t_dl
                 all_outputs.extend(outputs)
-                logger.info("VEO3 browser: prompt {} đã tải {} file.", idx, len(outputs))
+                logger.info("VEO3 browser: prompt {} đã tải {} file (sau lọc trùng).", idx, len(outputs))
+                logger.info(
+                    "VEO3 browser timing: prompt {}/{} wait {:.2f}s | download {:.2f}s | total {:.2f}s",
+                    idx,
+                    len(prompts),
+                    wait_elapsed,
+                    dl_elapsed,
+                    wait_elapsed + dl_elapsed,
+                )
             return all_outputs
         finally:
             try:
@@ -656,13 +663,41 @@ def _normalize_resolution_label(raw: str) -> str:
     s = str(raw or "").strip().lower().replace(" ", "")
     if not s:
         return ""
-    if s in {"4k", "2160p"}:
+    if s in {"4k", "2160p", "uhd"}:
         return "4K"
-    if s in {"1080", "1080p", "fullhd", "fhd"}:
+    if s in {"1080", "1080p", "fullhd", "fhd", "1920x1080"}:
         return "1080p"
-    if s in {"720", "720p", "hd"}:
+    if s in {"720", "720p", "hd", "1280x720"}:
         return "720p"
     return ""
+
+
+def _url_norm_for_dedupe(url: str) -> str:
+    """
+    Chuẩn hóa URL video để tránh tải lặp.
+    Giữ cả query-string vì một số phiên Flow dùng cùng path nhưng query khác cho clip mới.
+    """
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    try:
+        p = urlparse(u)
+        query = f"?{p.query}" if p.query else ""
+        base = f"{p.scheme}://{p.netloc}{p.path}{query}".lower().rstrip("/")
+        return base or u.lower()
+    except Exception:
+        return u.lower()
+
+
+def _consume_unseen_output_files(*, paths: list[str], seen_hashes: set[str]) -> list[str]:
+    """
+    Giữ các file output chưa xuất hiện (theo fingerprint); xóa file trùng nội dung với prompt trước.
+    """
+    n_in = len(paths)
+    kept = partition_new_output_files(paths, seen_hashes, delete_duplicate_files=True)
+    if n_in > len(kept):
+        logger.info("VEO3 browser: lọc trùng nội dung {} -> {} file.", n_in, len(kept))
+    return kept
 
 
 def _launch_persistent_context_with_retry(*, pw: Any, profile: Path):
@@ -872,6 +907,7 @@ def _wait_and_collect_videos(
     operation_id: str,
     timeout_sec: int,
     preferred_resolution: str = "",
+    seen_src_urls: set[str],
 ) -> list[str]:
     deadline = time.time() + max(40, int(timeout_sec))
     files: list[str] = []
@@ -890,14 +926,22 @@ def _wait_and_collect_videos(
         urls = _extract_video_urls(page)
         if urls:
             saw_video_node = True
-        files.extend(_download_video_urls(page=page, urls=urls, output_dir=output_dir, operation_id=operation_id))
+        files.extend(
+            _download_video_urls(
+                page=page,
+                urls=urls,
+                output_dir=output_dir,
+                operation_id=operation_id,
+                seen_src_urls=seen_src_urls,
+            )
+        )
         if files:
             break
         # nếu đã thấy video node thì ưu tiên chờ thêm chút để nút download hiện ra.
         if saw_video_node:
-            time.sleep(2.5)
+            time.sleep(0.65)
             continue
-        time.sleep(2.0)
+        time.sleep(0.85)
     # unique + existing
     out: list[str] = []
     seen: set[str] = set()
@@ -1041,25 +1085,50 @@ def _extract_video_urls(page: Any) -> list[str]:
     return [str(x).strip() for x in got if str(x).strip()]
 
 
-def _download_video_urls(*, page: Any, urls: list[str], output_dir: Path, operation_id: str) -> list[str]:
-    out: list[str] = []
-    for idx, u in enumerate(urls, start=1):
-        try:
-            resp = page.context.request.get(u, timeout=45_000)
-            if not resp.ok:
-                continue
-            ctype = str(resp.headers.get("content-type", "")).lower()
-            data = bytes(resp.body())
-            if not data:
-                continue
-            if "video" not in ctype and not re.search(r"\.(mp4|webm|mov)(\?|$)", u, flags=re.I):
-                continue
-            ext = ".webm" if "webm" in ctype or ".webm" in u.lower() else ".mp4"
-            fp = output_dir / f"{operation_id}_url_{idx:02d}{ext}"
-            fp.write_bytes(data)
-            out.append(str(fp))
-        except Exception:
+def _download_video_urls(
+    *,
+    page: Any,
+    urls: list[str],
+    output_dir: Path,
+    operation_id: str,
+    seen_src_urls: set[str],
+) -> list[str]:
+    """
+    Chỉ tải các URL video chưa gặp; nếu nhiều URL mới, chỉ lấy URL cuối (gen mới nhất trong DOM).
+    """
+    fresh: list[tuple[str, str]] = []
+    for u in urls:
+        nu = _url_norm_for_dedupe(u)
+        if not nu or nu in seen_src_urls:
             continue
+        fresh.append((nu, str(u).strip()))
+    if fresh:
+        norm_pick, raw_pick = fresh[-1]
+    else:
+        # Fallback cho Flow queue: có trường hợp clip mới vẫn dùng URL cũ (hoặc path cũ),
+        # nếu chặn tuyệt đối theo seen URL sẽ chỉ tải được prompt đầu tiên.
+        raw_pick = str(urls[-1]).strip() if urls else ""
+        norm_pick = _url_norm_for_dedupe(raw_pick)
+        if not raw_pick:
+            return []
+    out: list[str] = []
+    try:
+        resp = page.context.request.get(raw_pick, timeout=45_000)
+        if not resp.ok:
+            return []
+        ctype = str(resp.headers.get("content-type", "")).lower()
+        data = bytes(resp.body())
+        if not data:
+            return []
+        if "video" not in ctype and not re.search(r"\.(mp4|webm|mov)(\?|$)", raw_pick, flags=re.I):
+            return []
+        ext = ".webm" if "webm" in ctype or ".webm" in raw_pick.lower() else ".mp4"
+        fp = output_dir / f"{operation_id}_url_01{ext}"
+        fp.write_bytes(data)
+        seen_src_urls.add(norm_pick)
+        out.append(str(fp))
+    except Exception:
+        return []
     return out
 
 

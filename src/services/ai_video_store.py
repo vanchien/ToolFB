@@ -11,7 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from src.services.ai_video_config import load_ai_video_config
+from src.utils.media_dedupe import dedupe_output_file_paths
 from src.utils.paths import project_root
 
 
@@ -283,7 +286,11 @@ class AIVideoStore:
         p = self.metadata_path
         if not p.is_file():
             return []
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+            logger.warning("Không đọc được AI video metadata ({}): {} — trả danh sách rỗng.", p, exc)
+            return []
         if not isinstance(raw, list):
             return []
         return [x for x in raw if isinstance(x, dict)]
@@ -310,6 +317,7 @@ class AIVideoStore:
             "idea": str(request.get("idea") or "").strip(),
             "topic": str(request.get("topic") or "").strip(),
             "goal": str(request.get("goal") or "").strip(),
+            "topic_goal": dict(request.get("topic_goal") or {}),
             "language": str(request.get("language") or "").strip(),
             "visual_style": str(request.get("visual_style") or "").strip(),
             "status": "draft",
@@ -341,11 +349,56 @@ class AIVideoStore:
         for i, row in enumerate(rows):
             if str(row.get("id", "")) == video_id:
                 row = dict(row)
-                row.update(patch)
+                patch2 = dict(patch)
+                if "output_files" in patch2:
+                    raw = patch2.get("output_files")
+                    if isinstance(raw, list):
+                        try:
+                            patch2["output_files"] = dedupe_output_file_paths(
+                                [str(x) for x in raw], delete_duplicate_files=True
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("dedupe output_files bỏ qua (video_id={}): {}", video_id, exc)
+                row.update(patch2)
                 rows[i] = row
                 self.save_all(rows)
                 return row
         raise ValueError(f"Không tìm thấy video_id={video_id}")
+
+    def compact_duplicate_output_files(self) -> int:
+        """
+        Quét metadata: gỡ ``output_files`` trùng nội dung (xóa file dư, giữ một path mỗi fingerprint).
+        Trả về số bản ghi đã chỉnh.
+        """
+        try:
+            rows = self.load_all()
+            if not rows:
+                return 0
+            changed = 0
+            new_rows: list[dict[str, Any]] = []
+            for row in rows:
+                r = dict(row)
+                ofs = r.get("output_files")
+                if not isinstance(ofs, list) or len(ofs) < 2:
+                    new_rows.append(r)
+                    continue
+                before = [str(x) for x in ofs]
+                try:
+                    ded = dedupe_output_file_paths(before, delete_duplicate_files=True)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("compact: bỏ qua một bản ghi (id={}): {}", r.get("id"), exc)
+                    new_rows.append(r)
+                    continue
+                if ded != before:
+                    r["output_files"] = ded
+                    changed += 1
+                new_rows.append(r)
+            if changed:
+                self.save_all(new_rows)
+            return changed
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("compact_duplicate_output_files thất bại: {}", exc)
+            return 0
 
     def delete_records_for_project(self, project_id: str) -> int:
         """Xóa mọi record video có ``project_id`` trùng; trả số bản ghi đã xóa."""
