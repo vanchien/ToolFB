@@ -21,7 +21,7 @@ def normalize_flow_video_input(raw_input: dict[str, Any]) -> dict[str, Any]:
     settings = dict(raw_input.get("settings") or {})
     default_video_style = style_prompt_addon(
         "video_styles",
-        default_style_id("video_style_id", "video_cinematic_realistic"),
+        default_style_id("video_style_id", "cinematic_story"),
         fallback="cinematic realistic video, smooth camera movement, natural motion, high-quality details, coherent visual continuity",
     )
     default_camera = style_prompt_addon(

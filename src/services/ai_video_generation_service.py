@@ -9,6 +9,7 @@ from loguru import logger
 
 from src.services.ai_video_config import load_ai_video_config
 from src.services.ai_video_store import AIVideoStore, ai_video_project_output_dir, ensure_ai_video_layout
+from src.utils.media_dedupe import dedupe_output_file_paths
 from src.services.video_providers.gemini_video_provider import GeminiVideoProvider
 
 VIDEO_STATUSES: tuple[str, ...] = (
@@ -92,12 +93,22 @@ class AIVideoGenerationService:
         prov = self._provider(rec.get("provider", "gemini"))
         res = prov.download_result(op, str(out_dir))
         st = str(res.get("status", "failed")).strip().lower()
-        patch: dict[str, Any] = {"status": st, "output_files": list(res.get("output_files") or [])}
+        raw_files = list(res.get("output_files") or [])
+        try:
+            files = dedupe_output_file_paths(raw_files, delete_duplicate_files=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dedupe output sau download bỏ qua (video_id={}): {}", video_id, exc)
+            files = raw_files
+        patch: dict[str, Any] = {"status": st, "output_files": files}
         if res.get("error_message"):
             patch["error_message"] = str(res["error_message"])
         if st in {"completed", "failed"}:
             patch["completed_at"] = _now_iso()
         return self._store.update_record(video_id, patch)
+
+    def compact_duplicate_video_outputs(self) -> int:
+        """Gom metadata + xóa file output trùng nội dung (an toàn khi mở lại app)."""
+        return self._store.compact_duplicate_output_files()
 
     def sync_pending_videos(self) -> None:
         rows = self._store.load_all()

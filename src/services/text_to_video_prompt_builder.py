@@ -36,9 +36,22 @@ SUPPORTED_LANGUAGES: dict[str, str] = {
 
 SUPPORTED_GOALS: set[str] = {
     "viral",
+    "storytelling",
+    "kids_discovery",
+    "mystery",
+    "alien_discovery",
+    "cave_exploration",
+    "beauty_macro",
+    "product_promo",
+    "education",
+    "entertainment",
+    "cinematic",
+    # Backward compatibility
     "bán hàng",
+    "gioi thieu san pham",
     "giới thiệu sản phẩm",
     "kể chuyện",
+    "giao duc",
     "giáo dục",
     "cinematic reel",
 }
@@ -90,8 +103,21 @@ class TextToVideoPromptBuilder:
             scene_plan=scene_plan,
         )
         text_cast_suffix = self._text_only_full_cast_block(normalized, scene_plan)
-        if pipeline and str(pipeline.get("final_prompt") or "").strip():
-            final_prompt = str(pipeline.get("final_prompt") or "").strip()
+        prebuilt_final = str(pipeline.get("final_prompt") or "").strip() if isinstance(pipeline, dict) else ""
+        source_idea = str((prebuilt_pipeline or {}).get("source_idea") or "").strip()
+        current_idea = str(normalized.get("idea") or "").strip()
+        # Chỉ tái dùng bản final_prompt đã cache từ Gemini khi ý tưởng input vẫn là bản đã phân tích
+        # (cùng biến thể). Nếu khác (vd. tập 2/3 chuỗi series), giữ final_prompt sinh từ idea hiện tại
+        # để «Main concept» phản ánh đúng tập đó — tránh 3 prompt giống hệt biến thể 1.
+        reuse_cached_final = bool(
+            prebuilt_final
+            and (
+                not source_idea
+                or source_idea == current_idea
+            )
+        )
+        if pipeline and prebuilt_final and reuse_cached_final:
+            final_prompt = prebuilt_final
             if text_cast_suffix.strip():
                 final_prompt = f"{final_prompt.rstrip()}\n\n{text_cast_suffix.strip()}\n"
         return TextToVideoBuildResult(
@@ -108,8 +134,13 @@ class TextToVideoPromptBuilder:
 
     def normalize_video_input(self, raw_input: dict[str, Any]) -> dict[str, Any]:
         idea = str(raw_input.get("idea", "")).strip()
+        topic_goal = dict(raw_input.get("topic_goal") or {})
         topic = str(raw_input.get("topic", "")).strip()
+        if not topic:
+            topic = str(topic_goal.get("main_topic", "")).strip()
         goal = str(raw_input.get("goal", "")).strip().lower()
+        if not goal:
+            goal = str(topic_goal.get("goal_id", "")).strip().lower()
         language = str(raw_input.get("language", "")).strip()
         visual_style = str(raw_input.get("visual_style", "")).strip()
         camera_style = str(raw_input.get("camera_style", "")).strip()
@@ -119,6 +150,7 @@ class TextToVideoPromptBuilder:
         aspect_ratio = str(raw_input.get("aspect_ratio", "")).strip()
         resolution = str(raw_input.get("resolution", "")).strip()
         style_prompt = str(raw_input.get("style_prompt", "")).strip()
+        video_style_id = str(raw_input.get("video_style_id", "")).strip()
         character_mode = str(raw_input.get("character_mode", "auto")).strip().lower()
         lock_character_roles = bool(raw_input.get("lock_character_roles", True))
         character_manual = dict(raw_input.get("character_manual") or {})
@@ -146,8 +178,14 @@ class TextToVideoPromptBuilder:
 
         default_video_style = style_prompt_addon(
             "video_styles",
-            default_style_id("video_style_id", "video_cinematic_realistic"),
+            default_style_id("video_style_id", "cinematic_story"),
             fallback="cinematic realistic video, smooth camera movement, natural motion, high-quality details, coherent visual continuity",
+        )
+        selected_video_style = style_prompt_addon("video_styles", video_style_id, fallback="")
+        primary_video_style = selected_video_style or style_prompt or visual_style or default_video_style
+        primary_style_lock = (
+            "PRIMARY VIDEO STYLE LOCK (apply to all character/environment/scene details): "
+            + str(primary_video_style).strip()
         )
         default_camera = style_prompt_addon(
             "camera_styles",
@@ -174,18 +212,21 @@ class TextToVideoPromptBuilder:
             default_style_id("character_image_style_id", "character_cinematic_realistic"),
             fallback="cinematic realistic portrait, natural skin texture, professional composition, soft cinematic lighting, high detail",
         )
+        env_style_prompt = f"{primary_style_lock}. {env_style_prompt}".strip()
+        char_img_style_prompt = f"{primary_style_lock}. {char_img_style_prompt}".strip()
         return {
             "idea": idea,
             "topic": topic,
             "goal": goal or "viral",
+            "topic_goal": topic_goal,
             "language": language,
             "language_provider_label": SUPPORTED_LANGUAGES.get(language, language),
-            "visual_style": visual_style or default_video_style,
+            "visual_style": primary_video_style,
             "camera_style": camera_style or default_camera,
             "lighting": lighting or default_lighting,
             "motion_style": motion_style or default_motion,
             "mood": mood or "inspiring",
-            "style_prompt": style_prompt,
+            "style_prompt": f"{primary_style_lock}. {style_prompt}".strip(". "),
             "aspect_ratio": aspect_ratio or "9:16",
             "duration_sec": duration_sec,
             "resolution": resolution or "720p",
@@ -495,13 +536,14 @@ class TextToVideoPromptBuilder:
 
     def build_final_prompt(self, input_data: dict[str, Any], character_profile: dict[str, Any], scene_plan: dict[str, Any]) -> str:
         lock_id = str(character_profile.get("character_lock_id", "")).strip() or self._character_lock_id(character_profile)
+        # Final prompt cho model tạo video luôn giữ tiếng Anh để ổn định chất lượng instruction.
         idea_localized = self._localize_text_for_language(
             text=str(input_data.get("idea", "")).strip(),
-            language_label=str(input_data.get("language_provider_label", "")).strip(),
+            language_label="English",
         )
         topic_localized = self._localize_text_for_language(
             text=str(input_data.get("topic", "")).strip(),
-            language_label=str(input_data.get("language_provider_label", "")).strip(),
+            language_label="English",
         )
         scene_text = "\n".join([f"- {k}: {v}" for k, v in scene_plan.items()])
         consistency = "\n".join([f"- {x}" for x in character_profile.get("consistency_rules", [])])
@@ -516,6 +558,24 @@ class TextToVideoPromptBuilder:
         text_cast_block = self._text_only_full_cast_block(input_data, scene_plan)
         style_lock = str(input_data.get("style_prompt", "")).strip()
         context_lines = [f"- {str(x).strip()}" for x in list(input_data.get("story_contexts") or []) if str(x).strip()]
+        tg = dict(input_data.get("topic_goal") or {})
+        tg_sub_topics = [str(x).strip() for x in list(tg.get("sub_topics") or []) if str(x).strip()]
+        tg_hooks = [str(x).strip() for x in list(tg.get("visual_hooks") or []) if str(x).strip()]
+        tg_content_type = str(tg.get("content_type", "")).strip()
+        tg_emotional = str(tg.get("emotional_hook", "")).strip()
+        tg_sub_topic_lines = "\n".join([f"- {x}" for x in tg_sub_topics]) if tg_sub_topics else "- None"
+        tg_hook_lines = "\n".join([f"- {x}" for x in tg_hooks]) if tg_hooks else "- None"
+        visual_style_text = str(input_data.get("visual_style", "")).strip()
+        style_lock_text = f"{visual_style_text} {style_lock}".lower()
+        non_realistic_style = any(
+            k in style_lock_text
+            for k in ("cartoon", "anime", "3d", "pixar", "stylized", "toon", "chibi", "hoạt hình")
+        )
+        visual_quality_line = (
+            "Keep stylized non-photorealistic rendering. Do NOT generate realistic live-action look."
+            if non_realistic_style
+            else "High-quality realistic details."
+        )
         return f"""Create a {input_data['duration_sec']}-second {input_data['aspect_ratio']} video.
 
 Global language enforcement:
@@ -533,6 +593,18 @@ Story contexts:
 
 Goal:
 {input_data['goal']}
+
+Content type:
+{tg_content_type or "short-form narrative video"}
+
+Sub-topics:
+{tg_sub_topic_lines}
+
+Visual hooks:
+{tg_hook_lines}
+
+Emotional hook:
+{tg_emotional or "curiosity and emotional engagement"}
 
 Character:
 Character lock id: {lock_id}
@@ -572,7 +644,7 @@ Lighting:
 {input_data['lighting']}
 
 Visual style:
-{input_data['visual_style']}. High-quality realistic details.
+{visual_style_text}. {visual_quality_line}
 Mood:
 {input_data['mood']}
 Environment style:
@@ -596,6 +668,8 @@ Character reference image mapping (strict):
 {text_cast_block if text_cast_block.strip() else ""}
 Style lock rules (strict):
 - Keep ONE consistent visual style across the whole clip; do not mix cartoon/realistic styles.
+- Treat the selected Video Style as the single source of truth for characters, environments, props, and all scene renders.
+- Do not override the selected Video Style with camera/lighting/mood defaults; those are only supporting constraints.
 - If reference character images are provided, match face identity, body proportions, hair, outfit palette, and overall rendering style to those references.
 - If no usable reference files exist for some characters, strictly follow the FULL CAST — TEXT-ONLY section, Environment style, and Scene plan together as the source of truth for identity and staging.
 - Prioritize selected style + reference images over random stylistic variation.
@@ -1030,10 +1104,26 @@ Rules:
         related_threads = "\n".join([f"- {x}" for x in list(video_map.get("related_story_threads") or []) if str(x).strip()]) or "- None"
         continuity = "\n".join([f"- {x}" for x in list(video_map.get("continuity_rules") or [])]) or "- Keep continuity stable."
         negative = ", ".join([str(x).strip() for x in list(video_map.get("negative_rules") or []) if str(x).strip()])
+        main_concept = self._to_english_for_final_prompt(str(video_map.get("main_concept", "")).strip())
+        story_arc_text = self._to_english_for_final_prompt(story_arc_text)
+        micro_beats = self._to_english_for_final_prompt(micro_beats)
+        related_threads = self._to_english_for_final_prompt(related_threads)
+        scene_desc = self._to_english_for_final_prompt(scene_desc)
+        continuity = self._to_english_for_final_prompt(continuity)
+        visual_style_text = str(st.get("visual_style", "")).strip()
+        non_realistic_style = any(
+            k in f"{visual_style_text} {str(st.get('mood', '')).strip()}".lower()
+            for k in ("cartoon", "anime", "3d", "pixar", "stylized", "toon", "chibi", "hoạt hình")
+        )
+        visual_quality_line = (
+            "Keep stylized non-photorealistic rendering. Do NOT generate realistic live-action look."
+            if non_realistic_style
+            else "High-quality realistic details."
+        )
         return f"""Create an {int(st.get('duration_sec', 8))}-second {str(st.get('aspect_ratio', '9:16')).strip()} video for Google Flow / Veo 3.
 
 Main concept:
-{str(video_map.get('main_concept', '')).strip()}
+{main_concept}
 
 Narrative arc (strict):
 {story_arc_text}
@@ -1069,7 +1159,10 @@ Lighting:
 {str(st.get('lighting', '')).strip()}
 
 Visual style:
-{str(st.get('visual_style', '')).strip()}. {str(st.get('mood', '')).strip()} mood. High-quality realistic details.
+{visual_style_text}. {str(st.get('mood', '')).strip()} mood. {visual_quality_line}
+PRIMARY VIDEO STYLE LOCK:
+Use the selected video style above as the single source of truth for characters, environment, props, and scene rendering.
+Do not drift to another genre/style.
 
 Language rules:
 If any visible text, subtitle, sign, or spoken line appears, it must be in {str(st.get('language', 'Vietnamese')).strip()}. Keep it short, natural and readable.
@@ -1077,6 +1170,17 @@ If any visible text, subtitle, sign, or spoken line appears, it must be in {str(
 Negative rules:
 {negative}
 """
+
+    def _to_english_for_final_prompt(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return raw
+        out = self._localize_text_for_language(text=raw, language_label="English").strip()
+        if out:
+            return out
+        if self._contains_vietnamese_chars(raw):
+            return "Convert this section to natural English while preserving the original story meaning."
+        return raw
 
     def _duration_micro_beats(self, duration_sec: int) -> str:
         d = int(duration_sec or 8)
@@ -1294,12 +1398,9 @@ Negative rules:
             translated = self._translate_text_public_api(text=raw, target_lang=target)
         if translated:
             return translated
-        # Ép cứng: nếu không dịch được mà text có dấu tiếng Việt và target không phải tiếng Việt thì fail rõ ràng.
-        if target != "vi" and self._contains_vietnamese_chars(raw):
-            raise ValueError(
-                f"Không thể chuyển Main concept/Topic sang {language_label}. "
-                "Vui lòng kiểm tra mạng hoặc GEMINI_API_KEY để bật dịch bắt buộc."
-            )
+        # Khi ép prompt tiếng Anh mà dịch thất bại, tránh để lọt tiếng Việt vào final prompt.
+        if target == "en" and self._contains_vietnamese_chars(raw):
+            return "Translate source idea/topic to natural English and keep original meaning."
         return raw
 
     def _language_to_iso639_1(self, language_label: str) -> str:

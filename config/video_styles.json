@@ -1,0 +1,238 @@
+{
+  "video_styles": [
+    {
+      "id": "cinematic_story",
+      "label": "Cinematic Story",
+      "category": "story",
+      "prompt_addon": "cinematic storytelling video, smooth transitions, emotional pacing, high visual continuity"
+    },
+    {
+      "id": "movie_trailer",
+      "label": "Movie Trailer",
+      "category": "story",
+      "prompt_addon": "movie trailer style, dramatic pacing, high intensity, cinematic shots"
+    },
+    {
+      "id": "short_film",
+      "label": "Short Film",
+      "category": "story",
+      "prompt_addon": "short film style, narrative driven, cinematic lighting"
+    },
+    {
+      "id": "dramatic_scene",
+      "label": "Dramatic Scene",
+      "category": "story",
+      "prompt_addon": "dramatic cinematic scene, emotional expressions, strong lighting contrast"
+    },
+    {
+      "id": "viral_reel",
+      "label": "Viral Reel",
+      "category": "social",
+      "prompt_addon": "short-form vertical video, strong hook, engaging composition, fast attention grab"
+    },
+    {
+      "id": "tiktok_trend",
+      "label": "TikTok Trend",
+      "category": "social",
+      "prompt_addon": "tiktok trend style, dynamic pacing, relatable content"
+    },
+    {
+      "id": "ugc_video",
+      "label": "UGC Video",
+      "category": "social",
+      "prompt_addon": "user-generated content style, casual, natural motion"
+    },
+    {
+      "id": "influencer_vlog",
+      "label": "Influencer Vlog",
+      "category": "social",
+      "prompt_addon": "vlog style, personal perspective, direct engagement"
+    },
+    {
+      "id": "product_showcase",
+      "label": "Product Showcase",
+      "category": "product",
+      "prompt_addon": "product showcase video, clean background, smooth rotation"
+    },
+    {
+      "id": "product_demo",
+      "label": "Product Demo",
+      "category": "product",
+      "prompt_addon": "product demonstration video, step-by-step action"
+    },
+    {
+      "id": "beauty_commercial",
+      "label": "Beauty Commercial",
+      "category": "product",
+      "prompt_addon": "beauty product commercial, smooth skin tones, soft lighting"
+    },
+    {
+      "id": "luxury_brand",
+      "label": "Luxury Brand Film",
+      "category": "product",
+      "prompt_addon": "luxury brand film, cinematic lighting, elegant visuals"
+    },
+    {
+      "id": "food_commercial",
+      "label": "Food Commercial",
+      "category": "product",
+      "prompt_addon": "food commercial video, close-up textures, appetizing visuals"
+    },
+    {
+      "id": "explainer_video",
+      "label": "Explainer",
+      "category": "education",
+      "prompt_addon": "explainer video style, clear visuals, easy-to-understand storytelling"
+    },
+    {
+      "id": "tutorial_video",
+      "label": "Tutorial",
+      "category": "education",
+      "prompt_addon": "tutorial style, step-by-step demonstration"
+    },
+    {
+      "id": "educational",
+      "label": "Educational",
+      "category": "education",
+      "prompt_addon": "educational content, structured explanation"
+    },
+    {
+      "id": "comedy_sketch",
+      "label": "Comedy Sketch",
+      "category": "entertainment",
+      "prompt_addon": "comedy sketch, humorous timing, expressive acting"
+    },
+    {
+      "id": "drama_scene",
+      "label": "Drama",
+      "category": "entertainment",
+      "prompt_addon": "dramatic acting, emotional storytelling"
+    },
+    {
+      "id": "romantic_scene",
+      "label": "Romantic",
+      "category": "entertainment",
+      "prompt_addon": "romantic scene, soft lighting, emotional connection"
+    },
+    {
+      "id": "horror_scene",
+      "label": "Horror",
+      "category": "entertainment",
+      "prompt_addon": "horror style, dark lighting, suspense"
+    },
+    {
+      "id": "ai_surreal",
+      "label": "AI Surreal",
+      "category": "creative",
+      "prompt_addon": "surreal AI-generated visuals, dreamlike scenes"
+    },
+    {
+      "id": "fantasy_world",
+      "label": "Fantasy",
+      "category": "creative",
+      "prompt_addon": "fantasy cinematic world, magical environment"
+    },
+    {
+      "id": "sci_fi",
+      "label": "Sci-Fi",
+      "category": "creative",
+      "prompt_addon": "science fiction style, futuristic environment"
+    },
+    {
+      "id": "cyberpunk",
+      "label": "Cyberpunk",
+      "category": "creative",
+      "prompt_addon": "cyberpunk style, neon lighting"
+    },
+    {
+      "id": "alien_world",
+      "label": "Alien World",
+      "category": "alien",
+      "prompt_addon": "alien planet environment, strange landscapes, non-human life forms"
+    },
+    {
+      "id": "extraterrestrial",
+      "label": "Extraterrestrial",
+      "category": "alien",
+      "prompt_addon": "extraterrestrial beings, glowing skin, otherworldly appearance"
+    },
+    {
+      "id": "alien_contact",
+      "label": "Alien Contact",
+      "category": "alien",
+      "prompt_addon": "first contact with alien life, suspenseful atmosphere"
+    },
+    {
+      "id": "mysterious_cave",
+      "label": "Mysterious Cave",
+      "category": "cave",
+      "prompt_addon": "dark cave environment, glowing crystals, mysterious atmosphere"
+    },
+    {
+      "id": "crystal_cave",
+      "label": "Crystal Cave",
+      "category": "cave",
+      "prompt_addon": "cave filled with glowing crystals, reflections"
+    },
+    {
+      "id": "underground_world",
+      "label": "Underground World",
+      "category": "cave",
+      "prompt_addon": "hidden underground world, bioluminescent plants"
+    },
+    {
+      "id": "kids_exploration",
+      "label": "Kids Exploration",
+      "category": "kids",
+      "prompt_addon": "child-friendly exploration video, bright colors, joyful atmosphere"
+    },
+    {
+      "id": "kids_storybook",
+      "label": "Storybook",
+      "category": "kids",
+      "prompt_addon": "storybook style video, soft lighting, magical tone"
+    },
+    {
+      "id": "macro_beauty",
+      "label": "Macro Beauty",
+      "category": "macro",
+      "prompt_addon": "macro close-up shot, ultra detailed textures"
+    },
+    {
+      "id": "slow_detail_reveal",
+      "label": "Detail Reveal",
+      "category": "macro",
+      "prompt_addon": "slow reveal of fine details, smooth motion"
+    },
+    {
+      "id": "nature_exploration",
+      "label": "Nature Exploration",
+      "category": "nature",
+      "prompt_addon": "exploring nature, vibrant environment, natural lighting"
+    },
+    {
+      "id": "micro_world",
+      "label": "Micro World",
+      "category": "nature",
+      "prompt_addon": "tiny world perspective, macro realism"
+    },
+    {
+      "id": "3d_pixar",
+      "label": "Pixar 3D",
+      "category": "3d",
+      "prompt_addon": "3D Pixar-style animation, expressive characters"
+    },
+    {
+      "id": "3d_disney",
+      "label": "Disney 3D",
+      "category": "3d",
+      "prompt_addon": "Disney-style 3D animation, colorful world"
+    },
+    {
+      "id": "3d_cartoon",
+      "label": "3D Cartoon",
+      "category": "3d",
+      "prompt_addon": "cartoon-style 3D animation, vibrant colors"
+    }
+  ]
+}

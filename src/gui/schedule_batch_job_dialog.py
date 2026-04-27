@@ -43,6 +43,7 @@ from src.utils.schedule_batch_preview import (
     scan_video_files,
 )
 from src.utils.schedule_posts_manager import SchedulePostsManager
+from src.utils.ffmpeg_paths import portable_ffmpeg_bin_dir, resolve_ffmpeg_ffprobe_paths
 
 _FFMPEG_INSTALL_ATTEMPTED = False
 
@@ -243,22 +244,8 @@ def _project_root_dir() -> Path:
     return project_root()
 
 
-def _portable_ffmpeg_bin_dir() -> Path:
-    return _project_root_dir() / "tools" / "ffmpeg" / "bin"
-
-
 def _resolve_ffmpeg_probe_paths() -> tuple[str | None, str | None]:
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if ffmpeg and ffprobe:
-        return ffmpeg, ffprobe
-    exe_ffmpeg = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    exe_ffprobe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
-    pff = _portable_ffmpeg_bin_dir() / exe_ffmpeg
-    pfp = _portable_ffmpeg_bin_dir() / exe_ffprobe
-    if pff.is_file() and pfp.is_file():
-        return str(pff), str(pfp)
-    return ffmpeg, ffprobe
+    return resolve_ffmpeg_ffprobe_paths()
 
 
 def _install_portable_ffmpeg_into_tool() -> bool:
@@ -267,7 +254,7 @@ def _install_portable_ffmpeg_into_tool() -> bool:
     """
     exe_ffmpeg = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
     exe_ffprobe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
-    bin_dir = _portable_ffmpeg_bin_dir()
+    bin_dir = portable_ffmpeg_bin_dir()
     local_ffmpeg = bin_dir / exe_ffmpeg
     local_ffprobe = bin_dir / exe_ffprobe
     if local_ffmpeg.is_file() and local_ffprobe.is_file():

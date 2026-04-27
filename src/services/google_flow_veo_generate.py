@@ -7,6 +7,7 @@ Bước chuẩn: nhập prompt xong → bấm nút tạo video → chờ Veo / F
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import time
@@ -635,9 +636,16 @@ def input_prompt_to_flow(page: Page, final_prompt: str) -> None:
 
 
 def wait_flow_generation_done(page: Page, *, timeout_ms: int = 30 * 60 * 1000) -> None:
-    """Chờ video render xong ổn định: video + download + không còn generating."""
+    """
+    Chờ video render xong ổn định: video + download + không còn generating.
+
+    Poll ngắn hơn khi đã có video (Flow hay cập nhật chậm nếu chờ cố định 5s/vòng).
+    Số tick ổn định có thể chỉnh qua VEO3_FLOW_STABLE_TICKS (mặc 2), chu kỳ qua VEO3_FLOW_DONE_POLL_MS (mặc 900).
+    """
     deadline = time.time() + max(60.0, timeout_ms / 1000.0)
     download_names = re.compile(r"Download|Tải xuống|Save|Lưu", re.I)
+    stable_need = max(1, min(5, int(float(os.environ.get("VEO3_FLOW_STABLE_TICKS", "2") or "2"))))
+    poll_base = max(300, min(5000, int(float(os.environ.get("VEO3_FLOW_DONE_POLL_MS", "900") or "900"))))
     stable_count = 0
     while time.time() < deadline:
         has_video = False
@@ -658,19 +666,19 @@ def wait_flow_generation_done(page: Page, *, timeout_ms: int = 30 * 60 * 1000) -
             pass
         try:
             tx = page.locator("text=/Generating|Đang tạo|Creating|Rendering|Processing/i").first
-            if tx.is_visible(timeout=600):
+            if tx.is_visible(timeout=400):
                 still_generating = True
         except Exception:
             pass
         try:
             pb = page.locator("[role='progressbar']").first
-            if pb.is_visible(timeout=300):
+            if pb.is_visible(timeout=200):
                 still_generating = True
         except Exception:
             pass
         try:
             busy = page.locator("[aria-busy='true']").first
-            if busy.is_visible(timeout=300):
+            if busy.is_visible(timeout=200):
                 still_generating = True
         except Exception:
             pass
@@ -678,9 +686,15 @@ def wait_flow_generation_done(page: Page, *, timeout_ms: int = 30 * 60 * 1000) -
             stable_count += 1
         else:
             stable_count = 0
-        if stable_count >= 3:
+        if stable_count >= stable_need:
             return
-        page.wait_for_timeout(5000)
+        if has_video and has_download:
+            sleep_ms = min(1600, poll_base)
+        elif has_video:
+            sleep_ms = min(2400, int(poll_base * 1.35))
+        else:
+            sleep_ms = min(4000, int(poll_base * 2.4))
+        page.wait_for_timeout(sleep_ms)
     raise RuntimeError("Timeout khi chờ video tạo xong.")
 
 

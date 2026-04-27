@@ -26,6 +26,10 @@ def styles_registry_path() -> Path:
     return project_root() / "config" / "ai_styles.json"
 
 
+def video_styles_registry_path() -> Path:
+    return project_root() / "config" / "video_styles.json"
+
+
 def default_style_registry() -> StyleRegistry:
     p = styles_registry_path()
     try:
@@ -46,10 +50,17 @@ def _normalize_style_rows(raw_rows: Any) -> list[StyleItem]:
         if not isinstance(row, dict):
             continue
         sid = str(row.get("id", "")).strip()
-        name = str(row.get("name", "")).strip()
+        name = str(row.get("name", "") or row.get("label", "")).strip()
         addon = str(row.get("prompt_addon", "")).strip()
         if sid and name and addon:
-            out.append({"id": sid, "name": name, "prompt_addon": addon})
+            item: StyleItem = {"id": sid, "name": name, "prompt_addon": addon}
+            category = str(row.get("category", "")).strip()
+            if category:
+                item["category"] = category
+            description_vi = str(row.get("description_vi", "")).strip()
+            if description_vi:
+                item["description_vi"] = description_vi
+            out.append(item)
     return out
 
 
@@ -63,11 +74,34 @@ def _normalize_registry(raw: dict[str, Any]) -> StyleRegistry:
         or "character_cinematic_realistic",
         "environment_style_id": str(d.get("environment_style_id", "environment_cinematic")).strip()
         or "environment_cinematic",
-        "video_style_id": str(d.get("video_style_id", "video_cinematic_realistic")).strip() or "video_cinematic_realistic",
+        "video_style_id": str(d.get("video_style_id", "cinematic_story")).strip() or "cinematic_story",
         "camera_style_id": str(d.get("camera_style_id", "smooth_dolly_in")).strip() or "smooth_dolly_in",
         "lighting_style_id": str(d.get("lighting_style_id", "soft_natural_light")).strip() or "soft_natural_light",
         "motion_style_id": str(d.get("motion_style_id", "slow_and_smooth")).strip() or "slow_and_smooth",
     }
+    return out
+
+
+def _load_video_styles_override() -> list[StyleItem]:
+    p = video_styles_registry_path()
+    if not p.is_file():
+        return []
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, dict):
+        return []
+    rows = _normalize_style_rows(raw.get("video_styles"))
+    return rows
+
+
+def _style_ids(rows: list[StyleItem]) -> set[str]:
+    out: set[str] = set()
+    for row in rows:
+        sid = str(row.get("id", "")).strip()
+        if sid:
+            out.add(sid)
     return out
 
 
@@ -86,7 +120,19 @@ def load_style_registry() -> StyleRegistry:
     for g in _GROUPS:
         if cur[g]:
             merged[g] = cur[g]
+    video_override = _load_video_styles_override()
+    if video_override:
+        merged["video_styles"] = video_override
     merged["defaults"] = {**dict(merged.get("defaults") or {}), **dict(cur.get("defaults") or {})}
+    d = dict(merged.get("defaults") or {})
+    video_default = str(d.get("video_style_id", "")).strip()
+    valid_video_ids = _style_ids(list(merged.get("video_styles") or []))
+    if not video_default or video_default not in valid_video_ids:
+        d["video_style_id"] = "cinematic_story" if "cinematic_story" in valid_video_ids else next(
+            iter(valid_video_ids),
+            "cinematic_story",
+        )
+    merged["defaults"] = d
     return merged
 
 

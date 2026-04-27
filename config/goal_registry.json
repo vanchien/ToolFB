@@ -1,0 +1,57 @@
+[
+  {
+    "id": "viral",
+    "label": "Viral",
+    "description": "Toi uu hook manh, gay to mo, de chia se"
+  },
+  {
+    "id": "storytelling",
+    "label": "Storytelling",
+    "description": "Tap trung ke chuyen co mo dau, cao trao, ket thuc"
+  },
+  {
+    "id": "kids_discovery",
+    "label": "Kids Discovery",
+    "description": "Video tre em kham pha the gioi ky dieu"
+  },
+  {
+    "id": "mystery",
+    "label": "Mystery",
+    "description": "Tao cam giac bi an, hoi hop, kham pha"
+  },
+  {
+    "id": "alien_discovery",
+    "label": "Alien Discovery",
+    "description": "Kham pha nguoi ngoai hanh tinh / hanh tinh la"
+  },
+  {
+    "id": "cave_exploration",
+    "label": "Cave Exploration",
+    "description": "Kham pha hang dong, the gioi ngam, bi an"
+  },
+  {
+    "id": "beauty_macro",
+    "label": "Beauty / Macro",
+    "description": "Can canh ve dep, texture, chi tiet nho"
+  },
+  {
+    "id": "product_promo",
+    "label": "Product Promotion",
+    "description": "Quang cao san pham"
+  },
+  {
+    "id": "education",
+    "label": "Education",
+    "description": "Giai thich / giao duc / huong dan"
+  },
+  {
+    "id": "entertainment",
+    "label": "Entertainment",
+    "description": "Giai tri, hai, thu vi"
+  },
+  {
+    "id": "cinematic",
+    "label": "Cinematic",
+    "description": "Phong cach dien anh, cam xuc, tham my"
+  }
+]

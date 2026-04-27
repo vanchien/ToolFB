@@ -8,6 +8,7 @@ from pathlib import Path
 from loguru import logger
 
 from src.utils.paths import project_root
+from src.utils.profile_cleanup import iter_profile_leaf_dirs, profiles_data_dir
 
 
 @dataclass
@@ -143,6 +144,149 @@ def _cleanup_screenshots(root: Path, stats: CleanupStats) -> None:
     )
 
 
+def _cleanup_ai_video_artifacts(root: Path, stats: CleanupStats) -> None:
+    """
+    Dọn file phát sinh lớn nhưng có thể tái tạo lại trong AI video.
+    Không đụng vào output video thật để tránh mất dữ liệu người dùng.
+    """
+    ai_root = root / "data" / "ai_video"
+    thumbs = ai_root / "thumbnails" / "grid_cards"
+    prompt_bundles = ai_root / "inputs" / "prompts"
+    _cleanup_old_files_in_dir(
+        thumbs,
+        max_age_days=5,
+        keep_latest=300,
+        patterns=("*.jpg", "*.jpeg", "*.png", "*.webp"),
+        stats=stats,
+    )
+    _cleanup_old_files_in_dir(
+        prompt_bundles,
+        max_age_days=14,
+        keep_latest=40,
+        patterns=("prompt_bundle_*.json", "*.json"),
+        stats=stats,
+    )
+
+
+def _cleanup_backups_dir(root: Path, stats: CleanupStats) -> None:
+    """
+    Dọn backup reset profile cũ để giảm phình đĩa.
+    Giữ lại vài bản mới nhất để vẫn có khả năng rollback khi cần.
+    """
+    d = root / "data" / "backups"
+    if not d.is_dir():
+        return
+    dirs = [p for p in d.iterdir() if p.is_dir()]
+    if not dirs:
+        return
+    dirs.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    # Aggressive mode: chỉ giữ đúng 1 bản backup mới nhất để giảm dung lượng tối đa.
+    keep = set(dirs[:1])
+    for old in dirs:
+        if old in keep:
+            continue
+        for sub in sorted(old.rglob("*"), reverse=True):
+            if sub.is_file():
+                _safe_unlink(sub, stats)
+            elif sub.is_dir():
+                _safe_rmdir(sub, stats)
+        _safe_rmdir(old, stats)
+
+
+def _cleanup_browser_profile_caches(root: Path, stats: CleanupStats) -> None:
+    """
+    Dọn cache trong profile browser persistent (NanoBanana/Flow).
+    Chỉ dọn thư mục cache tái tạo được, không đụng cookie/login state.
+    """
+    profile = root / "data" / "nanobanana" / "browser_profile"
+    if not profile.is_dir():
+        return
+    cache_dirs = [
+        profile / "Default" / "Cache",
+        profile / "Default" / "Code Cache",
+        profile / "Default" / "GPUCache",
+        profile / "Default" / "DawnCache",
+        profile / "Default" / "GrShaderCache",
+        profile / "ShaderCache",
+    ]
+    for cd in cache_dirs:
+        if not cd.is_dir():
+            continue
+        for sub in sorted(cd.rglob("*"), reverse=True):
+            if sub.is_file():
+                _safe_unlink(sub, stats)
+            elif sub.is_dir():
+                _safe_rmdir(sub, stats)
+        _safe_rmdir(cd, stats)
+
+
+def _cleanup_profiles_cache_dirs(root: Path, stats: CleanupStats) -> None:
+    """
+    Dọn cache nặng trong data/profiles/* để giảm dung lượng lớn.
+    Chỉ xóa thư mục cache tái tạo được, không xóa cookie/login state.
+    """
+    profiles_root = profiles_data_dir(root)
+    if not profiles_root.is_dir():
+        return
+    cache_rel_paths = (
+        Path("Default") / "Cache",
+        Path("Default") / "Code Cache",
+        Path("Default") / "GPUCache",
+        Path("Default") / "DawnCache",
+        Path("Default") / "GrShaderCache",
+        Path("Default") / "Service Worker" / "CacheStorage",
+        Path("ShaderCache"),
+    )
+    for leaf in iter_profile_leaf_dirs(profiles_root):
+        for rel in cache_rel_paths:
+            cd = leaf / rel
+            if not cd.is_dir():
+                continue
+            for sub in sorted(cd.rglob("*"), reverse=True):
+                if sub.is_file():
+                    _safe_unlink(sub, stats)
+                elif sub.is_dir():
+                    _safe_rmdir(sub, stats)
+            _safe_rmdir(cd, stats)
+
+
+def _cleanup_profiles_redundant_logs(root: Path, stats: CleanupStats) -> None:
+    """
+    Dọn file log/crash tái tạo được trong profile đang dùng.
+    Không xóa DB/cookie/session chính.
+    """
+    profiles_root = profiles_data_dir(root)
+    if not profiles_root.is_dir():
+        return
+    removable_dirs = (
+        Path("Crashpad"),
+        Path("BrowserMetrics"),
+        Path("Default") / "BrowserMetrics",
+    )
+    removable_file_patterns = (
+        "Default/**/LOG",
+        "Default/**/LOG.old",
+        "Default/**/*.log",
+        "Default/**/*.tmp",
+    )
+    for leaf in iter_profile_leaf_dirs(profiles_root):
+        for rel in removable_dirs:
+            d = leaf / rel
+            if not d.is_dir():
+                continue
+            for sub in sorted(d.rglob("*"), reverse=True):
+                if sub.is_file():
+                    _safe_unlink(sub, stats)
+                elif sub.is_dir():
+                    _safe_rmdir(sub, stats)
+            _safe_rmdir(d, stats)
+        for pat in removable_file_patterns:
+            for f in leaf.glob(pat):
+                if not f.is_file():
+                    continue
+                _safe_unlink(f, stats)
+
+
 def _cleanup_temp_json(stats: CleanupStats) -> None:
     tmp = Path(tempfile.gettempdir())
     if not tmp.is_dir():
@@ -177,6 +321,11 @@ def cleanup_runtime_junk() -> CleanupStats:
     Dọn rác nhẹ lúc startup để giảm nặng đĩa/RAM I/O cache:
     - ``__pycache__`` cũ trong project (trừ ``.venv/dist/build``)
     - update zip/backup cũ trong ``data/updates``
+    - backup profile cũ trong ``data/backups``
+    - cache profile browser trong ``data/nanobanana/browser_profile``
+    - cache nặng trong ``data/profiles/*`` (Cache/GPUCache/Code Cache...)
+    - log/crash tái tạo được trong ``data/profiles/*``
+    - thumbnail/prompt-bundle cũ trong ``data/ai_video``
     - screenshot lỗi cũ trong ``logs/screenshots``
     - file ``*.tmp.json`` cũ trong thư mục temp hệ thống.
     """
@@ -185,6 +334,11 @@ def cleanup_runtime_junk() -> CleanupStats:
     try:
         _cleanup_pycache(root, stats)
         _cleanup_updater_artifacts(root, stats)
+        _cleanup_backups_dir(root, stats)
+        _cleanup_browser_profile_caches(root, stats)
+        _cleanup_profiles_cache_dirs(root, stats)
+        _cleanup_profiles_redundant_logs(root, stats)
+        _cleanup_ai_video_artifacts(root, stats)
         _cleanup_screenshots(root, stats)
         _cleanup_temp_json(stats)
     except Exception as exc:  # noqa: BLE001

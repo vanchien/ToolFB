@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Cinematic",
+    "prompt": "cinematic lighting, dramatic composition, smooth camera movement, high detail"
+  },
+  {
+    "name": "Realistic",
+    "prompt": "photorealistic, natural lighting, realistic textures, lifelike motion"
+  },
+  {
+    "name": "Anime",
+    "prompt": "anime style, vibrant colors, expressive composition, clean outlines"
+  },
+  {
+    "name": "Commercial",
+    "prompt": "commercial advertising style, polished look, studio lighting, product-focused framing"
+  },
+  {
+    "name": "Documentary",
+    "prompt": "documentary style, handheld realism, natural scene transitions, authentic atmosphere"
+  }
+]
