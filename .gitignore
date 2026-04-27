@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# Test / tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Project runtime (optional: bỏ comment nếu muốn git theo dõi data local)
+# data/profiles/
+# data/cookies/
+# logs/
+
+# API keys (GUI «Cài đặt AI» ghi file này)
+config/app_secrets.json
+config/app_secrets.json.corrupt.bak

@@ -1,0 +1,78 @@
+# Build release bundle, attach zip + latest.json, bump version.
+# Chay: tab Actions -> "Publish GitHub Release" -> Run workflow.
+# May nguoi dung: manifest_url = .../releases/latest/download/latest.json
+
+name: Publish GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver bump (version.json + latest.json)
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      notes:
+        description: Release notes (optional)
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: toolfb-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install -U pip wheel
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.0" "pyinstaller-hooks-contrib>=2024.0"
+
+      - name: Setup GitHub CLI
+        uses: cli/gh-actions/setup-gh@v2
+
+      - name: Build and create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "${{ inputs.notes }}"
+          $publishArgs = @(
+            "tools/publish_all.py",
+            "--repo", "${{ github.repository }}",
+            "--bump", "${{ inputs.bump }}",
+            "--no-write-update-channel"
+          )
+          if ($notes.Trim().Length -gt 0) {
+            $publishArgs += "--notes"
+            $publishArgs += $notes
+          }
+          python @publishArgs
+
+      - name: Step summary (manifest URL for clients)
+        if: success()
+        shell: pwsh
+        run: |
+          $m = "https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
+          @"
+          ### Auto-update (manifest_url)
+          - ``$m``
+          - Ghi vao ``config/update_channel.json`` roi commit de ban build co kenh cap nhat.
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8

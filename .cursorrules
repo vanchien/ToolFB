@@ -1,0 +1,31 @@
+# Facebook Automation Project Rules
+
+## 1. Technical Stack & Standards
+- Language: Python 3.10+
+- Library: Playwright (Sync API)
+- Anti-Detection: Always use `playwright-stealth`.
+- Architecture: Modular and Object-Oriented Programming (OOP).
+- Localization: Căn cứ vào ngữ cảnh, ưu tiên viết comment và logs bằng tiếng Việt để dễ quản lý.
+
+## 2. Browser & Identity Rules
+- **Profile Management:** Luôn sử dụng `launch_persistent_context` để trỏ vào thư mục Portable có sẵn. Tuyệt đối không tạo profile mới nếu đã có path.
+- **Proxy Handling:** Mọi instance trình duyệt phải đi kèm với Proxy được định nghĩa trong `accounts.json`.
+- **Session:** Ưu tiên nạp Cookie trước khi thực hiện thao tác đăng nhập.
+
+## 3. Automation & Anti-Checkpoint Logic
+- **Human-like Behavior:** - Luôn thêm `random delay` (1-3s) giữa các click.
+    - Sử dụng `page.type(text, delay=random_ms)` thay vì `page.fill()` để giả lập tốc độ gõ phím.
+    - Thêm thao tác cuộn trang (scroll) ngẫu nhiên để giả lập người dùng thật đang xem bảng tin.
+- **Selector Strategy:** Tuân thủ thứ tự ưu tiên: 
+    1. `aria-label` hoặc `role` (Accessibility attributes).
+    2. Text content (XPath text()).
+    3. CSS Selector (chỉ dùng khi 2 cái trên không có, và tránh dùng các class có mã ngẫu nhiên).
+
+## 4. Safety & Error Handling
+- **No OAuth:** Tuyệt đối không sử dụng Facebook Graph API hay tạo App trên Facebook Developers. 
+- **Privacy:** Không hard-code thông tin cá nhân/proxy/cookie vào file script. Luôn đọc từ file config.
+- **Screenshots:** Luôn tự động chụp ảnh màn hình và lưu vào thư mục `logs/screenshots/` khi một thao tác UI bị thất bại (Timeout/Error).
+
+## 5. Coding Style
+- Mỗi function phải có docstring giải thích rõ chức năng.
+- Sử dụng Loguru hoặc thư viện logging tiêu chuẩn để ghi lại tiến trình thay vì dùng hàm `print` đơn thuần.
