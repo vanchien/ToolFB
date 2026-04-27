@@ -136,7 +136,8 @@ def apply_update_package(
         if got.lower() != manifest.sha256.lower():
             raise RuntimeError(f"Sai checksum update package. expected={manifest.sha256} got={got}")
 
-    with tempfile.TemporaryDirectory(prefix="toolfb_update_extract_") as tdir:
+    # Ưu tiên giải nén ngay trong project để đường dẫn ngắn hơn AppData\Temp (giảm lỗi path sâu trên Windows).
+    with tempfile.TemporaryDirectory(prefix="upd_", dir=str(updates_dir)) as tdir:
         extract_root = Path(tdir)
         with zipfile.ZipFile(tmp_zip, "r") as zf:
             zf.extractall(extract_root)
@@ -158,11 +159,16 @@ def apply_update_package(
                 shutil.copy2(item, target)
 
         # copy payload sang project root, bỏ qua data/venv/logs...
+        # Riêng "tools" dùng copy resilient để luôn giữ Veo3Studio chạy được,
+        # kể cả khi gặp file lẻ/symlink cache không còn tồn tại trong gói.
         for item in payload_root.iterdir():
             if item.name in excludes:
                 continue
             target = project_root / item.name
             if item.is_dir():
+                if item.name == "tools":
+                    _copytree_resilient(item, target)
+                    continue
                 if target.exists():
                     shutil.rmtree(target, ignore_errors=True)
                 shutil.copytree(item, target, dirs_exist_ok=True)
@@ -172,6 +178,36 @@ def apply_update_package(
 
         logger.info("Updater: áp dụng update {} thành công.", manifest.version)
         return backup_dir
+
+
+def _copytree_resilient(src: Path, dst: Path) -> None:
+    """
+    Merge tree an toàn cho thư mục tools:
+    - không fail toàn bộ chỉ vì 1 file cache/symlink thiếu.
+    - vẫn copy phần còn lại để tool chạy được sau update.
+    """
+    src = src.resolve()
+    dst.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(src):
+        root_p = Path(root)
+        rel = root_p.relative_to(src)
+        out_dir = dst / rel
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for d in dirs:
+            try:
+                (out_dir / d).mkdir(parents=True, exist_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Updater tools: bỏ qua mkdir {}: {}", out_dir / d, exc)
+        for f in files:
+            s = root_p / f
+            t = out_dir / f
+            try:
+                t.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(s, t)
+            except FileNotFoundError:
+                logger.warning("Updater tools: file nguồn không còn, bỏ qua {}", s)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Updater tools: không copy được {} -> {}: {}", s, t, exc)
 
 
 def resolve_manifest_url(project_root: Path) -> str:
