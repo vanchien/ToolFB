@@ -315,6 +315,66 @@ def _stage_deferred_exe_gui_merge_windows(
     bat_out.write_text("\r\n".join(bat_lines), encoding="utf-8")
 
 
+def _stage_deferred_full_apply_windows(
+    *,
+    payload_root: Path,
+    exe_gui_root: Path | None,
+    project_root: Path,
+    updates_dir: Path,
+    version: str,
+    bat_out: Path,
+    preserve_on_apply_dirs: tuple[str, ...],
+) -> None:
+    """
+    Windows frozen: stage toàn bộ update và apply sau khi process hiện tại thoát.
+
+    Mục tiêu: không còn copy/rmtree trực tiếp khi app đang chạy (tránh WinError 32).
+    """
+    for old in updates_dir.glob("staged_apply_*"):
+        shutil.rmtree(old, ignore_errors=True)
+    for old in updates_dir.glob("staged_gui_*"):
+        shutil.rmtree(old, ignore_errors=True)
+    safe_ver = "".join(c if c.isalnum() or c in "-_" else "_" for c in version.strip())[:64] or "bundle"
+    staged = updates_dir / f"staged_apply_{safe_ver}"
+    staged_payload = staged / "portable_apply"
+    staged_payload.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(payload_root, staged_payload, dirs_exist_ok=True)
+
+    if exe_gui_root is not None and _exe_gui_looks_valid(exe_gui_root):
+        staged_gui = staged / "exe_gui"
+        staged_gui.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(exe_gui_root / "ToolFB_GUI.exe", staged_gui / "ToolFB_GUI.exe")
+        _copytree_resilient(exe_gui_root / "_internal", staged_gui / "_internal")
+
+    pr_s = str(project_root.resolve())
+    st_s = str(staged.resolve())
+    exe_dst = str((project_root / "ToolFB_GUI.exe").resolve())
+    excl = " ".join(preserve_on_apply_dirs)
+    bat_lines = [
+        "@echo off",
+        "setlocal",
+        f'cd /d "{pr_s}"',
+        "echo [ToolFB] Dang apply update sau khi thoat app...",
+        ":L",
+        "ping -n 2 127.0.0.1 >nul",
+        (
+            f'robocopy "{st_s}\\portable_apply" "{pr_s}" /E /R:3 /W:2 /NP '
+            f"/XD {excl}"
+        ),
+        "if errorlevel 8 goto L",
+        f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" copy /Y "{st_s}\\exe_gui\\ToolFB_GUI.exe" "{exe_dst}" >nul 2>&1',
+        f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" if errorlevel 1 goto L',
+        f'if exist "{st_s}\\exe_gui\\_internal" robocopy "{st_s}\\exe_gui\\_internal" "{pr_s}\\_internal" /MIR /R:3 /W:2 /NP',
+        f'if exist "{st_s}\\exe_gui\\_internal" if errorlevel 8 goto L',
+        f'start "" "{exe_dst}" --gui',
+        f'rd /s /q "{st_s}" 2>nul',
+        'del "%~f0"',
+        "endlocal",
+        "",
+    ]
+    bat_out.write_text("\r\n".join(bat_lines), encoding="utf-8")
+
+
 def apply_update_package(
     *,
     project_root: Path,
@@ -356,6 +416,30 @@ def apply_update_package(
         _zip_extract_resilient(tmp_zip, extract_root)
         layout = _detect_update_payload_layout(extract_root)
         payload_root = layout.code_root
+        defer_bat = updates_dir / DEFERRED_GUI_BAT_NAME
+
+        # Windows frozen: không patch trực tiếp file đang chạy.
+        if getattr(sys, "frozen", False) and os.name == "nt":
+            backup_dir = updates_dir / f"backup_before_{manifest.version}"
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            (backup_dir / "_deferred_apply_note.txt").write_text(
+                "Deferred update mode: changes are staged and applied after app exits.\n",
+                encoding="utf-8",
+            )
+            _stage_deferred_full_apply_windows(
+                payload_root=payload_root,
+                exe_gui_root=layout.exe_gui_root,
+                project_root=project_root,
+                updates_dir=updates_dir,
+                version=str(manifest.version),
+                bat_out=defer_bat,
+                preserve_on_apply_dirs=preserve_on_apply_dirs,
+            )
+            logger.info("Updater: staged deferred apply; sau relaunch chạy {}", defer_bat.name)
+            logger.info("Updater: áp dụng update {} thành công.", manifest.version)
+            return backup_dir
 
         backup_dir = updates_dir / f"backup_before_{manifest.version}"
         if backup_dir.exists():
@@ -391,22 +475,13 @@ def apply_update_package(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(item, target)
 
-        defer_bat = updates_dir / DEFERRED_GUI_BAT_NAME
-        if layout.exe_gui_root is not None and getattr(sys, "frozen", False) and os.name == "nt":
-            _stage_deferred_exe_gui_merge_windows(
-                exe_gui_root=layout.exe_gui_root,
-                project_root=project_root,
-                updates_dir=updates_dir,
-                version=str(manifest.version),
-                bat_out=defer_bat,
-            )
-            logger.info("Updater: đã stage exe_gui; sau relaunch chạy {}", defer_bat.name)
-        else:
-            defer_bat.unlink(missing_ok=True)
-            for old in updates_dir.glob("staged_gui_*"):
-                shutil.rmtree(old, ignore_errors=True)
-            if layout.exe_gui_root is not None and getattr(sys, "frozen", False) and os.name != "nt":
-                _merge_exe_gui_bundle(layout.exe_gui_root, project_root)
+        defer_bat.unlink(missing_ok=True)
+        for old in updates_dir.glob("staged_gui_*"):
+            shutil.rmtree(old, ignore_errors=True)
+        for old in updates_dir.glob("staged_apply_*"):
+            shutil.rmtree(old, ignore_errors=True)
+        if layout.exe_gui_root is not None and getattr(sys, "frozen", False) and os.name != "nt":
+            _merge_exe_gui_bundle(layout.exe_gui_root, project_root)
 
         logger.info("Updater: áp dụng update {} thành công.", manifest.version)
         return backup_dir
