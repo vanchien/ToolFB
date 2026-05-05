@@ -1,0 +1,6 @@
+# Dữ liệu chạy app / reverse bridge — mỗi máy tự tạo
+data/
+
+# Cache npm/Prisma — có thể tải lại (giảm dung lượng clone)
+**/node_modules/**/.cache/
+**/node_modules/.cache/

@@ -1,0 +1,7 @@
+owner: dongochoan97
+repo: veo3studio
+provider: github
+private: false
+updaterCacheDirName: veo3studio-updater
+publisherName:
+  - Veo3Studio

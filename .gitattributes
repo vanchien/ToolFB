@@ -1,0 +1,1 @@
+tools/Veo3Studio/Veo3Studio.exe filter=lfs diff=lfs merge=lfs -text

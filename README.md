@@ -14,15 +14,17 @@ Công cụ hỗ trợ Facebook + lên lịch bài + AI (Gemini / Veo) + tải vi
    python main.py --gui
    ```
 
-## Veo3 / Veo3Studio (máy khác — bắt buộc tự thêm)
+## Veo3 / Veo3Studio (trong repo — Git LFS)
 
-Thư mục `tools/Veo3Studio/` **không nằm trong Git** (dung lượng lớn). Trên mỗi máy cần:
+`tools/Veo3Studio/` được đưa lên GitHub; file **`Veo3Studio.exe`** (~180MB) dùng **Git LFS** (GitHub giới hạn 100MB/file với git thường).
 
-- Copy toàn bộ bản build **Veo3Studio** (có `Veo3Studio.exe`) vào:
-  - `ToolFB/tools/Veo3Studio/`
-- Hoặc đặt `Veo3Studio.exe` ở đâu cũng được, rồi trong app mở **AI Video** → chỉnh đường dẫn **tool / Veo3Studio.exe** (biến nội bộ `tool_exe`).
+**Máy mới sau khi clone:**
 
-Sau khi file `.exe` tồn tại, luồng bridge / mở Veo3 từ app sẽ chạy được.
+1. Cài [Git LFS](https://git-lfs.com/) (một lần): `git lfs install`
+2. Clone như bình thường — nếu exe chỉ vài trăm byte (pointer), chạy tại thư mục repo: `git lfs pull`
+3. Đường dẫn chuẩn: `ToolFB/tools/Veo3Studio/Veo3Studio.exe`
+
+Thư mục `data/` bên trong Veo3Studio không nằm trong Git (dữ liệu chạy từng máy). Nếu cần chỉnh tay: tab **AI Video** → đường dẫn `tool_exe`.
 
 ## Cấu hình riêng từng máy (không commit)
 
@@ -30,4 +32,9 @@ Các file như `config/app_secrets.json`, tài khoản, lịch đăng, v.v. đư
 
 ## Cập nhật từ GitHub
 
-`git pull` trên `main` để lấy code mới; Veo3Studio vẫn cần bản local như trên (hoặc gói phát hành riêng nếu bạn dùng `dist`/release).
+```bash
+git pull origin main
+git lfs pull
+```
+
+Nếu `Veo3Studio.exe` không chạy được sau pull, kiểm tra đã cài Git LFS và chạy `git lfs pull`.

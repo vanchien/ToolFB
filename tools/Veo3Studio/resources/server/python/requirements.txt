@@ -1,0 +1,33 @@
+# Video Analyzer Python Dependencies
+# These are auto-installed on first run (Windows) or via setup-venv.sh (macOS/Linux)
+
+# Video processing
+yt-dlp>=2023.10.13         # YouTube download
+scenedetect[opencv]>=0.6.2 # Scene detection
+opencv-python>=4.8.0       # Video processing
+
+# Image processing
+pillow>=10.0.0             # Image manipulation
+numpy>=1.24.0              # Numerical computing
+
+# TTS (Text-to-Speech)
+edge-tts>=6.1.0            # Microsoft Edge TTS (free, no API key)
+
+# API & Utils
+requests>=2.31.0           # HTTP requests
+google-genai>=0.4.0        # Google Gemini API
+
+# ═══════════════════════════════════════════════════════════════════════
+# OPTIONAL: WhisperX for audio transcription (~2-3GB, install separately)
+# ═══════════════════════════════════════════════════════════════════════
+# WhisperX requires PyTorch which is very large.
+# Install manually if you need transcription features:
+#
+# For CPU (smaller, ~2GB):
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#   pip install whisperx
+#
+# For NVIDIA GPU (larger but faster):
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+#   pip install whisperx
+# ═══════════════════════════════════════════════════════════════════════

@@ -1,0 +1,18 @@
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Whisper models cache
+~/.cache/whisper/
+
+# Temp files
+*.mp4
+*.wav
+*.jpg
+*.png
+temp_*
+
