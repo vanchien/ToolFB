@@ -218,6 +218,8 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "max_scroll_rounds": 100,
             "max_scan_minutes": 30,
             "scroll_until_end": True,
+            "show_browser": False,
+            "account_id": "",
         },
     }
 
@@ -256,6 +258,8 @@ def persist_facebook_reels_settings(
     max_scroll_rounds: int | None = None,
     max_scan_minutes: int | None = None,
     scroll_until_end: bool | None = None,
+    show_browser: bool | None = None,
+    account_id: str | None = None,
 ) -> None:
     """Merge ``facebook_reels`` vào ``config/universal_video_downloader.json``. Chỉ cập nhật tham số khác ``None``."""
     cfg_path = project_root() / "config" / "universal_video_downloader.json"
@@ -279,6 +283,10 @@ def persist_facebook_reels_settings(
         fb["max_scan_minutes"] = max(1, min(180, int(max_scan_minutes)))
     if scroll_until_end is not None:
         fb["scroll_until_end"] = bool(scroll_until_end)
+    if show_browser is not None:
+        fb["show_browser"] = bool(show_browser)
+    if account_id is not None:
+        fb["account_id"] = str(account_id or "").strip()
     uvd["facebook_reels"] = fb
     raw["universal_video_downloader"] = uvd
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,6 +411,25 @@ def classify_url_type(url: str) -> str:
     if "/videos/" in u:
         return "single_video"
     return "unknown"
+
+
+def normalize_youtube_download_url(url: str) -> str:
+    """
+    Chuẩn hóa URL tải YouTube: /shorts/<id> và youtu.be/<id> → watch?v=<id>
+    (yt-dlp ổn định hơn với watch URL cho Shorts).
+    """
+    s = str(url or "").strip()
+    if not s:
+        return s
+    m = re.search(r"(?:youtube\.com/)shorts/([A-Za-z0-9_-]{6,})", s, re.I)
+    if m:
+        vid = m.group(1)[:11]
+        return f"https://www.youtube.com/watch?v={vid}"
+    m2 = re.search(r"youtu\.be/([A-Za-z0-9_-]{6,})\b", s, re.I)
+    if m2 and "watch?v=" not in s.lower():
+        vid = m2.group(1)[:11]
+        return f"https://www.youtube.com/watch?v={vid}"
+    return s
 
 
 class DownloadFolderManager:
@@ -677,6 +704,7 @@ class UniversalYTDLPWrapper:
         )
 
     def get_info(self, url: str) -> dict[str, Any]:
+        url = normalize_youtube_download_url(url)
         ut = classify_url_type(url)
         cmd = [
             *self._resolve_prefix(),
@@ -813,32 +841,39 @@ class UniversalYTDLPWrapper:
         skip_existing: bool,
         write_info_json: bool,
         write_thumbnail: bool,
+        download_video: bool,
+        extract_title: bool,
+        extract_hashtags: bool,
         cancel_event: threading.Event | None,
         cookie_path: str = "",
         log_lines: LogFn | None = None,
     ) -> dict[str, Any]:
         log_lines = log_lines or self._log
+        url = normalize_youtube_download_url(url)
         prefix = self._resolve_prefix()
         fmt = str(self._yt.get("format") or "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best")
         merge_fmt = str(self._yt.get("merge_output_format") or "mp4")
         sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
-        cmd: list[str] = [
-            *prefix,
-            "-f",
-            fmt,
-            "--merge-output-format",
-            merge_fmt,
-            "--newline",
-            "--no-progress",
-            "--print",
-            "after_move:%(filepath)s",
-            "--max-filesize",
-            f"{max_fs}M",
-            "-o",
-            output_template,
-        ]
+        cmd: list[str] = [*prefix, "--newline", "--no-progress", "-o", output_template]
+        if download_video:
+            cmd.extend(
+                [
+                    "-f",
+                    fmt,
+                    "--merge-output-format",
+                    merge_fmt,
+                    "--print",
+                    "after_move:%(filepath)s",
+                    "--max-filesize",
+                    f"{max_fs}M",
+                ]
+            )
+        else:
+            cmd.append("--skip-download")
+        if extract_title or extract_hashtags:
+            cmd.extend(["--print", "meta:%(webpage_url)s\t%(title)s\t%(tags)s"])
         if sleep_sec:
             cmd.extend(["--sleep-interval", str(sleep_sec), "--max-sleep-interval", str(max(sleep_sec, 5))])
         if write_info_json:
@@ -872,6 +907,8 @@ class UniversalYTDLPWrapper:
             errors="replace",
         )
         filepaths: list[str] = []
+        thumbnail_paths: list[str] = []
+        meta_entries: list[dict[str, str]] = []
         stderr_chunks: list[str] = []
 
         def _read_stderr() -> None:
@@ -879,8 +916,29 @@ class UniversalYTDLPWrapper:
                 return
             for line in proc.stderr:
                 stderr_chunks.append(line)
-                if len(stderr_chunks) <= 30 or "ERROR" in line:
+                low = line.lower()
+                n = len(stderr_chunks)
+                is_dl = "[download]" in low
+                noisy_fragment = is_dl and "fragment" in low and "%" not in line
+                # yt-dlp gửi tiến trình chủ yếu qua stderr; bỏ fragment từng mảnh để log không tràn.
+                show = (
+                    n <= 80
+                    or "error" in low
+                    or "warning" in low
+                    or "merging" in low
+                    or "ffmpeg" in low
+                    or "destination:" in low
+                    or (is_dl and not noisy_fragment)
+                )
+                if show:
                     log_lines(line.rstrip())
+                if "destination:" in low:
+                    try:
+                        dest = line.split(":", 1)[1].strip().strip('"')
+                        if dest and dest.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) and Path(dest).is_file():
+                            thumbnail_paths.append(dest)
+                    except Exception:
+                        pass
 
         rt = threading.Thread(target=_read_stderr, daemon=True)
         rt.start()
@@ -898,6 +956,14 @@ class UniversalYTDLPWrapper:
                     fp = line.split(":", 1)[1].strip().strip('"')
                     if fp and Path(fp).is_file():
                         filepaths.append(fp)
+                elif line.startswith("meta:"):
+                    raw = line[5:]
+                    parts = raw.split("\t", 2)
+                    src_url = (parts[0] if len(parts) > 0 else "").strip()
+                    title = (parts[1] if len(parts) > 1 else "").strip()
+                    tags = (parts[2] if len(parts) > 2 else "").strip()
+                    if src_url or title or tags:
+                        meta_entries.append({"url": src_url, "title": title, "hashtags": tags})
                 elif Path(line).is_file() and line.lower().endswith((".mp4", ".webm", ".mkv", ".mov")):
                     filepaths.append(line)
 
@@ -912,7 +978,13 @@ class UniversalYTDLPWrapper:
         if cancel_event and cancel_event.is_set():
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
-            return {"success": False, "error": "Đã hủy/tạm dừng bởi người dùng.", "filepaths": filepaths, "stderr": err_full[-2000:]}
+            return {
+                "success": False,
+                "error": "Đã hủy/tạm dừng bởi người dùng.",
+                "filepaths": filepaths,
+                "thumbnail_paths": thumbnail_paths,
+                "stderr": err_full[-2000:],
+            }
         if rc != 0:
             low = err_full.lower()
             if any(x in low for x in ("private", "login required", "sign in", "drm", "members only")):
@@ -924,20 +996,47 @@ class UniversalYTDLPWrapper:
                     "message": "Không tải được bằng yt-dlp (private/login/DRM). Vui lòng tải tay và chọn file local.",
                     "stderr": err_full[-2000:],
                     "filepaths": filepaths,
+                    "thumbnail_paths": thumbnail_paths,
                 }
             err_snip = err_full.strip()[-1200:] or f"yt-dlp exit {rc}"
             err_snip = augment_facebook_unsupported_url_message(url, err_snip)
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
-            return {"success": False, "error": err_snip[:2200], "filepaths": filepaths}
+            return {"success": False, "error": err_snip[:2200], "filepaths": filepaths, "thumbnail_paths": thumbnail_paths}
         if not filepaths:
+            if (not download_video) and meta_entries:
+                if cookie_tmp is not None:
+                    cookie_tmp.unlink(missing_ok=True)
+                return {
+                    "success": True,
+                    "filepaths": [],
+                    "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
+                    "meta_entries": meta_entries,
+                    "stderr": err_full[-1200:],
+                }
+            if (not download_video) and thumbnail_paths:
+                if cookie_tmp is not None:
+                    cookie_tmp.unlink(missing_ok=True)
+                return {
+                    "success": True,
+                    "filepaths": [],
+                    "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
+                    "meta_entries": meta_entries,
+                    "stderr": err_full[-1200:],
+                }
             low = err_full.lower()
             if skip_existing and any(
                 x in low for x in ("already been downloaded", "has already been recorded", "skipping", "in the archive")
             ):
                 if cookie_tmp is not None:
                     cookie_tmp.unlink(missing_ok=True)
-                return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "skipped_only": True}
+                return {
+                    "success": True,
+                    "filepaths": [],
+                    "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
+                    "stderr": err_full[-1500:],
+                    "skipped_only": True,
+                }
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
             return {
@@ -945,10 +1044,17 @@ class UniversalYTDLPWrapper:
                 "error": "Không nhận được đường dẫn file từ yt-dlp (có thể đã skip vì trùng archive).",
                 "stderr": err_full[-1500:],
                 "filepaths": [],
+                "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
             }
         if cookie_tmp is not None:
             cookie_tmp.unlink(missing_ok=True)
-        return {"success": True, "filepaths": filepaths, "stderr": err_full[-1000:]}
+        return {
+            "success": True,
+            "filepaths": filepaths,
+            "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
+            "meta_entries": meta_entries,
+            "stderr": err_full[-1000:],
+        }
 
 
 class BulkDownloadManager:
@@ -986,6 +1092,9 @@ class DownloadJobOptions:
     skip_existing: bool
     write_info_json: bool
     write_thumbnail: bool
+    download_video: bool
+    extract_title: bool
+    extract_hashtags: bool
 
 
 class UniversalVideoDownloader:
@@ -1092,6 +1201,9 @@ class UniversalVideoDownloader:
             "skip_existing": bool(options.get("skip_existing", dl.get("skip_existing", True))),
             "write_info_json": bool(options.get("write_info_json", self._uvd.get("yt_dlp", {}).get("write_info_json", True))),
             "write_thumbnail": bool(options.get("write_thumbnail", self._uvd.get("yt_dlp", {}).get("write_thumbnail", True))),
+            "download_video": bool(options.get("download_video", True)),
+            "extract_title": bool(options.get("extract_title", False)),
+            "extract_hashtags": bool(options.get("extract_hashtags", False)),
             "cookie_path": str(options.get("cookie_path") or ""),
             "status": "pending",
             "downloaded_files": [],
@@ -1126,11 +1238,16 @@ class UniversalVideoDownloader:
             skip_existing=bool(job["skip_existing"]),
             write_info_json=bool(job["write_info_json"]),
             write_thumbnail=bool(job["write_thumbnail"]),
+            download_video=bool(job.get("download_video", True)),
+            extract_title=bool(job.get("extract_title", False)),
+            extract_hashtags=bool(job.get("extract_hashtags", False)),
             cookie_path=str(job.get("cookie_path") or ""),
             cancel_event=self._cancel,
             log_lines=self._log,
         )
         filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
+        thumbnail_paths: list[str] = list(dict.fromkeys(ret.get("thumbnail_paths") or []))
+        meta_entries: list[dict[str, str]] = list(ret.get("meta_entries") or [])
         if ret.get("skipped_only"):
             job["status"] = "completed"
             job["completed_at"] = _now_iso()
@@ -1153,6 +1270,26 @@ class UniversalVideoDownloader:
             self._active_job_id = None
             return job
 
+        if (not filepaths) and (meta_entries or thumbnail_paths):
+            export_file = ""
+            if meta_entries:
+                export_file = self._write_meta_export(
+                    job=job,
+                    rows=meta_entries,
+                    include_title=bool(job.get("extract_title", False)),
+                    include_hashtags=bool(job.get("extract_hashtags", False)),
+                )
+            job["downloaded_files"] = []
+            job["status"] = "completed"
+            job["completed_at"] = _now_iso()
+            if export_file:
+                job["metadata_export_file"] = export_file
+            if thumbnail_paths:
+                job["thumbnail_files"] = thumbnail_paths
+            self._store.save_job(job)
+            self._active_job_id = None
+            return job
+
         records: list[dict[str, Any]] = []
         for fp in filepaths:
             rec = self._build_video_record(video_path=fp, job=job)
@@ -1164,6 +1301,34 @@ class UniversalVideoDownloader:
         self._store.save_job(job)
         self._active_job_id = None
         return job
+
+    def _write_meta_export(
+        self,
+        *,
+        job: dict[str, Any],
+        rows: list[dict[str, str]],
+        include_title: bool,
+        include_hashtags: bool,
+    ) -> str:
+        out_dir = Path(str(job.get("output_dir") or "")).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        job_id = str(job.get("id") or "job")
+        out_file = out_dir / f"{job_id}_title_hashtags.csv"
+        cols = ["url"]
+        if include_title:
+            cols.append("title")
+        if include_hashtags:
+            cols.append("hashtags")
+        lines = [",".join(cols)]
+        for r in rows:
+            vals = [str(r.get("url") or "")]
+            if include_title:
+                vals.append(str(r.get("title") or ""))
+            if include_hashtags:
+                vals.append(str(r.get("hashtags") or ""))
+            lines.append(",".join(f"\"{v.replace('"', '\"\"')}\"" for v in vals))
+        out_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return str(out_file)
 
     def _build_video_record(self, *, video_path: str, job: dict[str, Any]) -> dict[str, Any]:
         vp = Path(video_path).resolve()

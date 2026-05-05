@@ -26,12 +26,13 @@ from src.services.universal_video_downloader import (
     load_universal_video_downloader_config,
     persist_facebook_reels_settings,
 )
+from src.utils.db_manager import AccountsDatabaseManager
 from src.utils.app_secrets import get_nanobanana_runtime_config
 from src.utils.paths import project_root
 
 _INTERNAL_TOOL_DIR = project_root() / "tools" / "Veo3Studio"
 _INTERNAL_TOOL_EXE = _INTERNAL_TOOL_DIR / "Veo3Studio.exe"
-_EXTERNAL_TOOL_DIR = Path(r"C:\Users\Hello\Desktop\Tool")
+_EXTERNAL_TOOL_DIR = Path.home() / "Desktop" / "ToolFB" / "tools" / "Veo3Studio"
 _EXTERNAL_TOOL_EXE = _EXTERNAL_TOOL_DIR / "Veo3Studio.exe"
 
 
@@ -52,6 +53,21 @@ def ai_video_project_gate_dialog(parent: tk.Misc) -> dict[str, Any] | None:
         "action": "open_clean_module",
         "created_at": datetime.now().replace(microsecond=0).isoformat(),
     }
+
+
+def _nearest_existing_parent(path_like: Path) -> Path | None:
+    p = Path(path_like)
+    for cand in (p, *p.parents):
+        if cand.exists():
+            return cand
+    return None
+
+
+def _normalize_user_path(raw: str) -> Path:
+    s = str(raw or "").strip().strip('"').strip("'")
+    if not s:
+        return Path()
+    return Path(os.path.expandvars(os.path.expanduser(s)))
 
 
 class AIVideoDialog:
@@ -87,6 +103,7 @@ class AIVideoDialog:
         self._reverse_paths = ensure_reverse_video_layout()
         self._ai_video_service = AIVideoGenerationService()
         self._uv_downloader: UniversalVideoDownloader | None = None
+        self._uv_accounts = AccountsDatabaseManager()
         self._last_download_job_id: str | None = None
         self._notebook: ttk.Notebook | None = None
         self._txt_uv_log: tk.Text | None = None
@@ -101,16 +118,19 @@ class AIVideoDialog:
         self._uv_yt_entry_rows: list[dict[str, str]] = []
         self._var_uv_yt_list_max = tk.StringVar(value="500")
         self._var_uv_yt_scan_status = tk.StringVar(value="")
-        self._var_uv_fb_cookie = tk.StringVar(value="")
         self._var_uv_fb_scan_status = tk.StringVar(value="")
         self._var_uv_fb_max_collect = tk.StringVar(value="200")
         self._var_uv_fb_max_scroll = tk.StringVar(value="100")
         self._var_uv_fb_scan_minutes = tk.StringVar(value="30")
         self._var_uv_fb_scroll_until_end = tk.BooleanVar(value=True)
+        self._var_uv_fb_show_browser = tk.BooleanVar(value=False)
+        self._var_uv_fb_account_label = tk.StringVar(value="Public (không dùng login)")
+        self._uv_fb_account_label_to_id: dict[str, str] = {"Public (không dùng login)": ""}
         self._uv_download_scroll_canvas: tk.Canvas | None = None
         self._uv_log_buffer: list[str] = []
         self._uv_log_flush_after_id: str | None = None
-        self._uv_last_partial_ui_ts: float = 0.0
+        self._uv_fb_partial_after_id: str | None = None
+        self._uv_fb_reel_partial_latest: list[str] = []
         self._start_tab = str(start_tab or "reverse").strip().lower()
         if self._embedded_download_host is None:
             self._build_ui()
@@ -226,6 +246,31 @@ class AIVideoDialog:
                 c.yview_moveto(0.11)
             except tk.TclError:
                 pass
+
+    def _cancel_fb_reel_partial_ui(self) -> None:
+        if self._uv_fb_partial_after_id is None:
+            return
+        try:
+            self._top.after_cancel(self._uv_fb_partial_after_id)
+        except (tk.TclError, ValueError):
+            pass
+        self._uv_fb_partial_after_id = None
+
+    def _schedule_fb_reel_partial_ui(self, urls: list[str]) -> None:
+        """Luồng worker: luôn gom snapshot mới nhất; không bỏ qua cập nhật như throttle cũ."""
+        self._uv_fb_reel_partial_latest = list(urls)
+        self._cancel_fb_reel_partial_ui()
+
+        def _apply() -> None:
+            self._uv_fb_partial_after_id = None
+            snap = list(self._uv_fb_reel_partial_latest)
+            self._refresh_fb_reel_tree(snap)
+            if snap:
+                self._var_uv_fb_scan_status.set(
+                    f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng)."
+                )
+
+        self._uv_fb_partial_after_id = self._top.after(0, _apply)
 
     def _append_uv_log(self, msg: str) -> None:
         text = f"{msg}\n"
@@ -457,7 +502,7 @@ class AIVideoDialog:
             st_fr,
             text=(
                 "Tool tự tìm: PATH -> config -> python -m yt_dlp (pip). "
-                "Reels: dùng cookie JSON khi cần đăng nhập."
+                "Tải video Facebook qua yt-dlp: có thể chỉ định cookie riêng trong tùy chọn tải nếu cần."
             ),
             wraplength=820,
             justify=tk.LEFT,
@@ -478,6 +523,9 @@ class AIVideoDialog:
         self._var_uv_skip_existing = tk.BooleanVar(value=bool(dl_cfg.get("skip_existing", True)))
         self._var_uv_info_json = tk.BooleanVar(value=bool(yt_cfg.get("write_info_json", True)))
         self._var_uv_thumbnail = tk.BooleanVar(value=bool(yt_cfg.get("write_thumbnail", True)))
+        self._var_uv_download_video = tk.BooleanVar(value=True)
+        self._var_uv_extract_title = tk.BooleanVar(value=False)
+        self._var_uv_extract_hashtags = tk.BooleanVar(value=False)
         var_detect_hint = tk.StringVar(value="")
 
         ttk.Label(form, text="URL:").grid(row=0, column=0, sticky="w")
@@ -516,6 +564,20 @@ class AIVideoDialog:
         cb_url_type.grid(row=0, column=3, sticky="w", padx=(6, 12))
         ttk.Label(quick, text="Tối đa").grid(row=0, column=4, sticky="w")
         ttk.Entry(quick, textvariable=self._var_uv_max_videos, width=8).grid(row=0, column=5, sticky="w", padx=(6, 0))
+        ttk.Label(quick, text="Tài khoản").grid(row=0, column=6, sticky="w", padx=(12, 0))
+        cb_fb_account = ttk.Combobox(
+            quick,
+            textvariable=self._var_uv_fb_account_label,
+            values=["Public (không dùng login)"],
+            state="readonly",
+            width=34,
+        )
+        cb_fb_account.grid(row=0, column=7, sticky="w", padx=(6, 0))
+        ttk.Button(
+            quick,
+            text="Làm mới TK",
+            command=lambda c=cb_fb_account: c.configure(values=self._uv_refresh_fb_accounts(self._uv_selected_fb_account_id())),
+        ).grid(row=0, column=8, sticky="w", padx=(8, 0))
 
         def _refresh_detect_hint(_e: Any = None) -> None:
             url = self._var_uv_url.get().strip()
@@ -567,6 +629,13 @@ class AIVideoDialog:
         ttk.Checkbutton(opt, text="Không tải trùng", variable=self._var_uv_skip_existing).grid(row=0, column=2, sticky="w", padx=(12, 0))
         ttk.Checkbutton(opt, text="Lưu metadata JSON", variable=self._var_uv_info_json).grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Checkbutton(opt, text="Lưu thumbnail", variable=self._var_uv_thumbnail).grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(4, 0))
+        ttk.Checkbutton(opt, text="Tải file video", variable=self._var_uv_download_video).grid(
+            row=2, column=0, sticky="w", pady=(4, 0)
+        )
+        ttk.Checkbutton(opt, text="Lấy tiêu đề", variable=self._var_uv_extract_title).grid(row=2, column=1, sticky="w", padx=(12, 0), pady=(4, 0))
+        ttk.Checkbutton(opt, text="Lấy hashtags", variable=self._var_uv_extract_hashtags).grid(
+            row=2, column=2, sticky="w", padx=(12, 0), pady=(4, 0)
+        )
 
         def _toggle_advanced() -> None:
             show = not bool(var_show_adv.get())
@@ -582,11 +651,13 @@ class AIVideoDialog:
         btn_adv.configure(command=_toggle_advanced)
 
         fb_cfg = ucfg.get("facebook_reels") or {}
-        self._var_uv_fb_cookie.set(str(fb_cfg.get("cookie_path") or "").strip())
         self._var_uv_fb_max_collect.set(str(int(fb_cfg.get("max_collect") or 300)))
         self._var_uv_fb_max_scroll.set(str(int(fb_cfg.get("max_scroll_rounds") or 100)))
         self._var_uv_fb_scan_minutes.set(str(int(fb_cfg.get("max_scan_minutes") or 30)))
         self._var_uv_fb_scroll_until_end.set(bool(fb_cfg.get("scroll_until_end", True)))
+        self._var_uv_fb_show_browser.set(bool(fb_cfg.get("show_browser", False)))
+        _saved_fb_account = str(fb_cfg.get("account_id") or "").strip()
+        cb_fb_account.configure(values=self._uv_refresh_fb_accounts(_saved_fb_account))
         self._var_uv_fb_scan_status.set("Chưa quét. Dán URL tab Reels (hoặc profile) ở ô URL phía trên.")
 
         fb_fr = ttk.LabelFrame(
@@ -599,7 +670,7 @@ class AIVideoDialog:
         ttk.Label(
             fb_fr,
             text=(
-                "Quét public-only (không dùng cookies/session). "
+                "Có thể quét public hoặc dùng profile đã login theo tài khoản chọn ở Bước 1. "
                 "Có thể tăng phút quét + bật «Cuộn tới hết trang» để quét sâu."
             ),
             wraplength=820,
@@ -617,24 +688,38 @@ class AIVideoDialog:
         ttk.Checkbutton(lim, text="Cuộn tới hết trang", variable=self._var_uv_fb_scroll_until_end).grid(
             row=0, column=6, sticky="w", padx=(4, 10)
         )
-        ttk.Button(lim, text="Lưu giới hạn", command=self._on_uv_save_fb_reel_limits).grid(row=0, column=7, sticky="w")
+        ttk.Checkbutton(lim, text="Hiện trình duyệt Playwright", variable=self._var_uv_fb_show_browser).grid(
+            row=0, column=7, sticky="w", padx=(4, 10)
+        )
+        ttk.Button(lim, text="Lưu giới hạn", command=self._on_uv_save_fb_reel_limits).grid(row=0, column=8, sticky="w")
         ttk.Label(fb_fr, textvariable=self._var_uv_fb_scan_status, wraplength=860, justify=tk.LEFT).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(6, 0)
         )
         fb_act = ttk.Frame(fb_fr)
         fb_act.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        fb_act_r1 = ttk.Frame(fb_act)
+        fb_act_r1.pack(anchor="w")
+        fb_act_r2 = ttk.Frame(fb_act)
+        fb_act_r2.pack(anchor="w", pady=(4, 0))
 
-        def _fb_busy_btn(text: str, cmd: Callable[[], None]) -> ttk.Button:
-            b = ttk.Button(fb_act, text=text, command=cmd)
+        def _fb_busy_btn(parent: ttk.Frame, text: str, cmd: Callable[[], None]) -> ttk.Button:
+            b = ttk.Button(parent, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=(0, 8))
             self._uv_busy_disable_widgets.append(b)
             return b
 
-        _fb_busy_btn("Quét Reels (Playwright)", self._on_uv_scan_fb_reels)
-        ttk.Button(fb_act, text="Chọn hết", command=self._on_uv_fb_select_all).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(fb_act, text="Bỏ chọn", command=self._on_uv_fb_select_none).pack(side=tk.LEFT, padx=(0, 8))
-        _fb_busy_btn("Tải reel đã chọn", self._on_uv_download_fb_reels_selected)
-        _fb_busy_btn("Tải tất cả reel", self._on_uv_download_fb_reels_all)
+        _fb_busy_btn(fb_act_r1, "Quét Reels (Playwright)", self._on_uv_scan_fb_reels)
+        ttk.Button(fb_act_r1, text="Chọn hết", command=self._on_uv_fb_select_all).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(fb_act_r1, text="Bỏ chọn", command=self._on_uv_fb_select_none).pack(side=tk.LEFT, padx=(0, 8))
+        _fb_busy_btn(fb_act_r1, "Tải reel đã chọn", self._on_uv_download_fb_reels_selected)
+        _fb_busy_btn(fb_act_r1, "Tải tất cả reel", self._on_uv_download_fb_reels_all)
+        ttk.Button(fb_act_r2, text="Lưu danh sách…", command=self._on_uv_save_fb_scan_list).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(fb_act_r2, text="Mở danh sách (thay)…", command=self._on_uv_load_fb_scan_list_replace).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(fb_act_r2, text="Mở danh sách (gộp)…", command=self._on_uv_load_fb_scan_list_merge).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
 
         fb_tree_fr = ttk.Frame(fb_fr)
         fb_tree_fr.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
@@ -689,18 +774,29 @@ class AIVideoDialog:
         )
         yt_act = ttk.Frame(yt_fr)
         yt_act.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        yt_act_r1 = ttk.Frame(yt_act)
+        yt_act_r1.pack(anchor="w")
+        yt_act_r2 = ttk.Frame(yt_act)
+        yt_act_r2.pack(anchor="w", pady=(4, 0))
 
-        def _yt_busy_btn(text: str, cmd: Callable[[], None]) -> ttk.Button:
-            b = ttk.Button(yt_act, text=text, command=cmd)
+        def _yt_busy_btn(parent: ttk.Frame, text: str, cmd: Callable[[], None]) -> ttk.Button:
+            b = ttk.Button(parent, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=(0, 8))
             self._uv_busy_disable_widgets.append(b)
             return b
 
-        _yt_busy_btn("Quét kênh (yt-dlp)", self._on_uv_scan_yt_channel)
-        ttk.Button(yt_act, text="Chọn hết", command=self._on_uv_yt_select_all).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(yt_act, text="Bỏ chọn", command=self._on_uv_yt_select_none).pack(side=tk.LEFT, padx=(0, 8))
-        _yt_busy_btn("Tải video đã chọn", self._on_uv_download_yt_selected)
-        _yt_busy_btn("Tải tất cả video", self._on_uv_download_yt_all)
+        _yt_busy_btn(yt_act_r1, "Quét kênh (yt-dlp)", self._on_uv_scan_yt_channel)
+        ttk.Button(yt_act_r1, text="Chọn hết", command=self._on_uv_yt_select_all).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(yt_act_r1, text="Bỏ chọn", command=self._on_uv_yt_select_none).pack(side=tk.LEFT, padx=(0, 8))
+        _yt_busy_btn(yt_act_r1, "Tải video đã chọn", self._on_uv_download_yt_selected)
+        _yt_busy_btn(yt_act_r1, "Tải tất cả video", self._on_uv_download_yt_all)
+        ttk.Button(yt_act_r2, text="Lưu danh sách…", command=self._on_uv_save_yt_scan_list).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(yt_act_r2, text="Mở danh sách (thay)…", command=self._on_uv_load_yt_scan_list_replace).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(yt_act_r2, text="Mở danh sách (gộp)…", command=self._on_uv_load_yt_scan_list_merge).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
 
         yt_tree_fr = ttk.Frame(yt_fr)
         yt_tree_fr.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
@@ -832,7 +928,41 @@ class AIVideoDialog:
             "skip_existing": bool(self._var_uv_skip_existing.get()),
             "write_info_json": bool(self._var_uv_info_json.get()),
             "write_thumbnail": bool(self._var_uv_thumbnail.get()),
+            "download_video": bool(self._var_uv_download_video.get()),
+            "extract_title": bool(self._var_uv_extract_title.get()),
+            "extract_hashtags": bool(self._var_uv_extract_hashtags.get()),
         }
+
+    def _uv_refresh_fb_accounts(self, preferred_id: str = "") -> list[str]:
+        labels = ["Public (không dùng login)"]
+        self._uv_fb_account_label_to_id = {labels[0]: ""}
+        target_id = str(preferred_id or "").strip()
+        try:
+            rows = self._uv_accounts.load_all()
+        except Exception:
+            rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            aid = str(row.get("id") or "").strip()
+            if not aid:
+                continue
+            name = str(row.get("name") or "").strip()
+            label = f"{aid} — {name}" if name else aid
+            labels.append(label)
+            self._uv_fb_account_label_to_id[label] = aid
+        if target_id:
+            for lb, aid in self._uv_fb_account_label_to_id.items():
+                if aid == target_id:
+                    self._var_uv_fb_account_label.set(lb)
+                    break
+        elif self._var_uv_fb_account_label.get() not in self._uv_fb_account_label_to_id:
+            self._var_uv_fb_account_label.set(labels[0])
+        return labels
+
+    def _uv_selected_fb_account_id(self) -> str:
+        lb = self._var_uv_fb_account_label.get().strip()
+        return str(self._uv_fb_account_label_to_id.get(lb, "")).strip()
 
     def _on_uv_pick_folder(self) -> None:
         d = filedialog.askdirectory(parent=self._top, title="Chọn thư mục lưu video")
@@ -848,7 +978,7 @@ class AIVideoDialog:
         o["max_videos"] = 1
         return o
 
-    def _parse_fb_reel_limits(self) -> tuple[int, int, int, bool]:
+    def _parse_fb_reel_limits(self) -> tuple[int, int, int, bool, bool]:
         try:
             mc = int(self._var_uv_fb_max_collect.get().strip())
         except ValueError:
@@ -865,38 +995,30 @@ class AIVideoDialog:
         ms = max(5, min(280, ms))
         mins = max(1, min(180, mins))
         till_end = bool(self._var_uv_fb_scroll_until_end.get())
-        return mc, ms, mins, till_end
+        show_browser = bool(self._var_uv_fb_show_browser.get())
+        return mc, ms, mins, till_end, show_browser
 
     def _on_uv_save_fb_reel_limits(self) -> None:
-        mc, ms, mins, till_end = self._parse_fb_reel_limits()
+        mc, ms, mins, till_end, show_browser = self._parse_fb_reel_limits()
+        fb_account_id = self._uv_selected_fb_account_id()
         self._var_uv_fb_max_collect.set(str(mc))
         self._var_uv_fb_max_scroll.set(str(ms))
         self._var_uv_fb_scan_minutes.set(str(mins))
         self._var_uv_fb_scroll_until_end.set(till_end)
+        self._var_uv_fb_show_browser.set(show_browser)
         try:
             persist_facebook_reels_settings(
                 max_collect=mc,
                 max_scroll_rounds=ms,
                 max_scan_minutes=mins,
                 scroll_until_end=till_end,
+                show_browser=show_browser,
+                account_id=fb_account_id,
             )
         except OSError as exc:
             messagebox.showerror("Cấu hình", str(exc), parent=self._top)
             return
         messagebox.showinfo("Cấu hình", "Đã lưu giới hạn quét Reels vào config.", parent=self._top)
-
-    def _on_uv_pick_fb_cookie(self) -> None:
-        path = filedialog.askopenfilename(
-            parent=self._top,
-            title="Chọn file cookie Playwright (JSON)",
-            filetypes=[("JSON", "*.json"), ("All", "*.*")],
-        )
-        if path:
-            self._var_uv_fb_cookie.set(path)
-            try:
-                persist_facebook_reels_settings(cookie_path=path)
-            except OSError as exc:
-                messagebox.showwarning("Cookie", f"Đã chọn file nhưng không ghi được config: {exc}", parent=self._top)
 
     def _refresh_fb_reel_tree(self, urls: list[str]) -> None:
         self._uv_fb_reel_urls = list(urls)
@@ -943,25 +1065,33 @@ class AIVideoDialog:
             return
         page_url = normalize_facebook_reels_tab_url(raw)
         self._var_uv_url.set(page_url)
-        max_reels, max_scroll, max_minutes, till_end = self._parse_fb_reel_limits()
+        max_reels, max_scroll, max_minutes, till_end, show_browser = self._parse_fb_reel_limits()
+        fb_account_id = self._uv_selected_fb_account_id()
         self._var_uv_fb_max_collect.set(str(max_reels))
         self._var_uv_fb_max_scroll.set(str(max_scroll))
         self._var_uv_fb_scan_minutes.set(str(max_minutes))
         self._var_uv_fb_scroll_until_end.set(till_end)
+        self._var_uv_fb_show_browser.set(show_browser)
         try:
             persist_facebook_reels_settings(
                 max_collect=max_reels,
                 max_scroll_rounds=max_scroll,
                 max_scan_minutes=max_minutes,
                 scroll_until_end=till_end,
+                show_browser=show_browser,
+                account_id=fb_account_id,
             )
         except OSError:
             pass
         mode_txt = "cuộn tới hết trang" if till_end else "dừng theo vòng cuộn"
+        browser_txt = "hiện trình duyệt" if show_browser else "ẩn trình duyệt"
+        account_txt = f"TK {fb_account_id}" if fb_account_id else "public-only"
         self._uv_set_busy(
             True,
-            f"Đang mở Playwright và quét tab Reels ({mode_txt}, tối đa {max_minutes} phút)…",
+            f"Đang mở Playwright và quét tab Reels ({mode_txt}, {browser_txt}, {account_txt}, tối đa {max_minutes} phút)…",
         )
+        self._cancel_fb_reel_partial_ui()
+        self._uv_fb_reel_partial_latest = []
         self._refresh_fb_reel_tree([])
         self._var_uv_fb_scan_status.set("Đang quét — bảng «URL reel» sẽ hiện dần…")
 
@@ -969,18 +1099,7 @@ class AIVideoDialog:
             self._top.after(0, lambda m=msg: self._var_uv_fb_scan_status.set(m))
 
         def _partial(urls: list[str]) -> None:
-            snap = list(urls)
-            now = time.monotonic()
-            if now - self._uv_last_partial_ui_ts < 0.45:
-                return
-            self._uv_last_partial_ui_ts = now
-
-            def _apply() -> None:
-                self._refresh_fb_reel_tree(snap)
-                if snap:
-                    self._var_uv_fb_scan_status.set(f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng).")
-
-            self._top.after(0, _apply)
+            self._top.after(0, lambda u=list(urls): self._schedule_fb_reel_partial_ui(u))
 
         def _work() -> None:
             res = scan_facebook_profile_reels_page(
@@ -989,11 +1108,14 @@ class AIVideoDialog:
                 max_scroll_rounds=max_scroll,
                 max_scan_minutes=max_minutes,
                 scroll_until_end=till_end,
+                headless=not show_browser,
+                account_id=fb_account_id,
                 status=_status,
                 on_partial=_partial,
             )
 
             def _ui() -> None:
+                self._cancel_fb_reel_partial_ui()
                 self._uv_set_busy(False)
                 if res.get("ok"):
                     items = res.get("items") or []
@@ -1135,6 +1257,253 @@ class AIVideoDialog:
             url = str(r.get("url") or "")
             tr.insert("", "end", iid=str(i), values=(str(i + 1), title, url))
         self._sync_uv_download_scrollregion(scroll_to_content=bool(rows))
+
+    _SCAN_LIST_V1 = "toolfb_scan_list_v1"
+
+    def _uv_scan_lists_dir(self) -> Path:
+        d = project_root() / "data" / "downloader" / "scan_lists"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _merge_fb_urls(existing: list[str], new_urls: list[str]) -> list[str]:
+        seen: set[str] = set(existing)
+        merged = list(existing)
+        for u in new_urls:
+            u = str(u).strip()
+            if u and u not in seen:
+                seen.add(u)
+                merged.append(u)
+        return merged
+
+    @staticmethod
+    def _merge_yt_rows(
+        existing: list[dict[str, str]],
+        new_rows: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        seen: set[str] = {str(r.get("url") or "").strip() for r in existing if str(r.get("url") or "").strip()}
+        merged: list[dict[str, str]] = list(existing)
+        for r in new_rows:
+            u = str(r.get("url") or "").strip()
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            merged.append(
+                {
+                    "title": str(r.get("title") or u)[:500],
+                    "url": u,
+                }
+            )
+        return merged
+
+    def _read_fb_scan_file(self, path: str) -> tuple[list[str], str] | None:
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Mở danh sách", str(exc), parent=self._top)
+            return None
+        if not isinstance(raw, dict) or raw.get("format") != self._SCAN_LIST_V1:
+            messagebox.showerror("Mở danh sách", "File không đúng định dạng ToolFB (scan list v1).", parent=self._top)
+            return None
+        if raw.get("kind") != "facebook_reels":
+            messagebox.showerror("Mở danh sách", "File này không phải danh sách Facebook Reels.", parent=self._top)
+            return None
+        urls_raw = raw.get("urls")
+        if not isinstance(urls_raw, list):
+            messagebox.showerror("Mở danh sách", "Thiếu hoặc sai trường urls.", parent=self._top)
+            return None
+        urls = [str(u).strip() for u in urls_raw if str(u).strip()]
+        hint = str(raw.get("source_url") or "").strip()
+        return urls, hint
+
+    def _read_yt_scan_file(self, path: str) -> tuple[list[dict[str, str]], str] | None:
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Mở danh sách", str(exc), parent=self._top)
+            return None
+        if not isinstance(raw, dict) or raw.get("format") != self._SCAN_LIST_V1:
+            messagebox.showerror("Mở danh sách", "File không đúng định dạng ToolFB (scan list v1).", parent=self._top)
+            return None
+        if raw.get("kind") != "youtube_channel":
+            messagebox.showerror("Mở danh sách", "File này không phải danh sách YouTube đã quét.", parent=self._top)
+            return None
+        entries = raw.get("entries")
+        if not isinstance(entries, list):
+            messagebox.showerror("Mở danh sách", "Thiếu hoặc sai trường entries.", parent=self._top)
+            return None
+        rows: list[dict[str, str]] = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            u = str(e.get("url") or "").strip()
+            if not u:
+                continue
+            rows.append({"title": str(e.get("title") or u)[:500], "url": u})
+        hint = str(raw.get("source_url") or "").strip()
+        return rows, hint
+
+    def _on_uv_save_fb_scan_list(self) -> None:
+        if not self._uv_fb_reel_urls:
+            messagebox.showwarning(
+                "Lưu danh sách",
+                "Bảng Reels đang trống — hãy quét hoặc mở danh sách trước.",
+                parent=self._top,
+            )
+            return
+        base = self._uv_scan_lists_dir()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        path = filedialog.asksaveasfilename(
+            parent=self._top,
+            title="Lưu danh sách Reels",
+            initialdir=str(base),
+            initialfile=f"facebook_reels_{stamp}.json",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        payload = {
+            "format": self._SCAN_LIST_V1,
+            "kind": "facebook_reels",
+            "saved_at": datetime.now().replace(microsecond=0).isoformat(),
+            "source_url": self._var_uv_url.get().strip(),
+            "urls": list(self._uv_fb_reel_urls),
+        }
+        try:
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Lưu danh sách", str(exc), parent=self._top)
+            return
+        messagebox.showinfo("Lưu danh sách", f"Đã lưu {len(self._uv_fb_reel_urls)} URL.\n{path}", parent=self._top)
+
+    def _on_uv_load_fb_scan_list_replace(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self._top,
+            title="Mở danh sách Reels (thay thế bảng hiện tại)",
+            initialdir=str(self._uv_scan_lists_dir()),
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        got = self._read_fb_scan_file(path)
+        if not got:
+            return
+        urls, hint = got
+        if not urls:
+            messagebox.showwarning("Mở danh sách", "File không có URL nào.", parent=self._top)
+            return
+        self._refresh_fb_reel_tree(urls)
+        self._var_uv_fb_scan_status.set(f"Đã mở (thay): {len(urls)} reel — {Path(path).name}")
+        if hint:
+            self._append_uv_log(f"[INFO] Gợi ý URL nguồn khi quét: {hint}")
+
+    def _on_uv_load_fb_scan_list_merge(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self._top,
+            title="Mở danh sách Reels (gộp thêm, bỏ trùng URL)",
+            initialdir=str(self._uv_scan_lists_dir()),
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        got = self._read_fb_scan_file(path)
+        if not got:
+            return
+        urls, hint = got
+        if not urls:
+            messagebox.showwarning("Mở danh sách", "File không có URL nào.", parent=self._top)
+            return
+        before = len(self._uv_fb_reel_urls)
+        merged = self._merge_fb_urls(self._uv_fb_reel_urls, urls)
+        self._refresh_fb_reel_tree(merged)
+        added = len(merged) - before
+        self._var_uv_fb_scan_status.set(
+            f"Đã gộp: +{added} URL mới (tổng {len(merged)}) — {Path(path).name}"
+        )
+        if hint:
+            self._append_uv_log(f"[INFO] Gợi ý URL nguồn khi quét: {hint}")
+
+    def _on_uv_save_yt_scan_list(self) -> None:
+        if not self._uv_yt_entry_rows:
+            messagebox.showwarning(
+                "Lưu danh sách",
+                "Bảng YouTube đang trống — hãy quét kênh hoặc mở danh sách trước.",
+                parent=self._top,
+            )
+            return
+        base = self._uv_scan_lists_dir()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        path = filedialog.asksaveasfilename(
+            parent=self._top,
+            title="Lưu danh sách YouTube đã quét",
+            initialdir=str(base),
+            initialfile=f"youtube_channel_{stamp}.json",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        payload = {
+            "format": self._SCAN_LIST_V1,
+            "kind": "youtube_channel",
+            "saved_at": datetime.now().replace(microsecond=0).isoformat(),
+            "source_url": self._var_uv_url.get().strip(),
+            "entries": list(self._uv_yt_entry_rows),
+        }
+        try:
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Lưu danh sách", str(exc), parent=self._top)
+            return
+        messagebox.showinfo("Lưu danh sách", f"Đã lưu {len(self._uv_yt_entry_rows)} video.\n{path}", parent=self._top)
+
+    def _on_uv_load_yt_scan_list_replace(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self._top,
+            title="Mở danh sách YouTube (thay thế bảng hiện tại)",
+            initialdir=str(self._uv_scan_lists_dir()),
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        got = self._read_yt_scan_file(path)
+        if not got:
+            return
+        rows, hint = got
+        if not rows:
+            messagebox.showwarning("Mở danh sách", "File không có video nào.", parent=self._top)
+            return
+        self._refresh_yt_channel_tree(rows)
+        self._var_uv_yt_scan_status.set(f"Đã mở (thay): {len(rows)} video — {Path(path).name}")
+        if hint:
+            self._append_uv_log(f"[INFO] Gợi ý URL kênh khi quét: {hint}")
+
+    def _on_uv_load_yt_scan_list_merge(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self._top,
+            title="Mở danh sách YouTube (gộp thêm, bỏ trùng URL)",
+            initialdir=str(self._uv_scan_lists_dir()),
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        got = self._read_yt_scan_file(path)
+        if not got:
+            return
+        rows, hint = got
+        if not rows:
+            messagebox.showwarning("Mở danh sách", "File không có video nào.", parent=self._top)
+            return
+        before = len(self._uv_yt_entry_rows)
+        merged = self._merge_yt_rows(self._uv_yt_entry_rows, rows)
+        self._refresh_yt_channel_tree(merged)
+        added = len(merged) - before
+        self._var_uv_yt_scan_status.set(
+            f"Đã gộp: +{added} video mới (tổng {len(merged)}) — {Path(path).name}"
+        )
+        if hint:
+            self._append_uv_log(f"[INFO] Gợi ý URL kênh khi quét: {hint}")
 
     def _on_uv_yt_select_all(self) -> None:
         tr = self._tree_yt_channel
@@ -1375,6 +1744,20 @@ class AIVideoDialog:
         except (ValueError, tk.TclError, TypeError) as exc:  # noqa: BLE001
             messagebox.showerror("Tải video", f"Tùy chọn không hợp lệ: {exc}", parent=self._top)
             return
+        if not any(
+            [
+                bool(opts.get("download_video")),
+                bool(opts.get("extract_title")),
+                bool(opts.get("extract_hashtags")),
+                bool(opts.get("write_thumbnail")),
+            ]
+        ):
+            messagebox.showwarning(
+                "Tải video",
+                "Hãy chọn ít nhất một mục để tải/lấy dữ liệu: Video, Tiêu đề, Hashtags hoặc Thumbnail.",
+                parent=self._top,
+            )
+            return
         self._uv_set_busy(True, "Đang kiểm tra yt-dlp trước khi tạo job…")
         down = self._uv_downloader
 
@@ -1417,15 +1800,30 @@ class AIVideoDialog:
 
             try:
                 down.clear_cancel()
-                down.run_download_job(jid)
-                self._top.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "Tải video",
-                        f"Hoàn tất job {jid}. Xem bảng Video đã tải.",
-                        parent=self._top,
-                    ),
-                )
+                done = down.run_download_job(jid)
+
+                def _ok_msg() -> None:
+                    meta_file = str(done.get("metadata_export_file") or "").strip()
+                    thumbs = list(done.get("thumbnail_files") or [])
+                    if (meta_file or thumbs) and not (done.get("downloaded_files") or []):
+                        extra = ""
+                        if meta_file:
+                            extra += f"\nĐã xuất tiêu đề/hashtags:\n{meta_file}"
+                        if thumbs:
+                            extra += f"\nThumbnail: {len(thumbs)} file."
+                        messagebox.showinfo(
+                            "Tải video",
+                            f"Hoàn tất job {jid} (không tải video).{extra}",
+                            parent=self._top,
+                        )
+                    else:
+                        messagebox.showinfo(
+                            "Tải video",
+                            f"Hoàn tất job {jid}. Xem bảng Video đã tải.",
+                            parent=self._top,
+                        )
+
+                self._top.after(0, _ok_msg)
             except Exception as e:  # noqa: BLE001
                 self._top.after(0, lambda err=e: messagebox.showerror("Tải video", str(err), parent=self._top))
             finally:
@@ -1625,6 +2023,7 @@ class AIVideoDialog:
 
         acts = ttk.Frame(launcher)
         acts.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(acts, text="Chọn file .exe...", command=self._on_pick_tool_exe).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(acts, text="Mở Veo3Studio.exe", command=self._on_launch_tool).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(acts, text="Mở thư mục Tool", command=self._on_open_tool_folder).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(acts, text="Kiểm tra đường dẫn", command=self._on_validate_tool_path).pack(side=tk.LEFT)
@@ -2555,22 +2954,47 @@ class AIVideoDialog:
         self._top.destroy()
 
     def _on_validate_tool_path(self) -> None:
-        exe = Path(self._var_tool_exe.get().strip())
+        exe = _normalize_user_path(self._var_tool_exe.get())
         if exe.is_file():
             messagebox.showinfo("AI Video", f"Đường dẫn hợp lệ:\n{exe}", parent=self._top)
             return
         messagebox.showwarning("AI Video", f"Không tìm thấy exe:\n{exe}", parent=self._top)
 
+    def _on_pick_tool_exe(self) -> None:
+        cur = _normalize_user_path(self._var_tool_exe.get())
+        initial_dir = str((_nearest_existing_parent(cur.parent) or _nearest_existing_parent(self._tool_exe.parent) or project_root()))
+        picked = filedialog.askopenfilename(
+            parent=self._top,
+            title="Chọn Veo3Studio.exe",
+            initialdir=initial_dir,
+            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+        )
+        if not picked:
+            return
+        exe = _normalize_user_path(picked)
+        self._var_tool_exe.set(str(exe))
+        self._tool_exe = exe
+        if exe.is_file():
+            messagebox.showinfo("AI Video", f"Đã chọn tool:\n{exe}", parent=self._top)
+        else:
+            messagebox.showwarning("AI Video", f"Đường dẫn đã chọn không tồn tại:\n{exe}", parent=self._top)
+
     def _on_open_tool_folder(self) -> None:
-        exe = Path(self._var_tool_exe.get().strip())
-        folder = exe.parent if exe.parent.exists() else _EXTERNAL_TOOL_DIR
+        exe = _normalize_user_path(self._var_tool_exe.get())
+        folder = (
+            _nearest_existing_parent(exe.parent)
+            or _nearest_existing_parent(self._tool_exe.parent)
+            or _nearest_existing_parent(_INTERNAL_TOOL_DIR)
+            or _nearest_existing_parent(project_root() / "tools")
+            or project_root()
+        )
         try:
             os.startfile(str(folder))  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("AI Video", f"Không mở được thư mục tool:\n{exc}", parent=self._top)
 
     def _on_launch_tool(self) -> None:
-        exe = Path(self._var_tool_exe.get().strip())
+        exe = _normalize_user_path(self._var_tool_exe.get())
         if not exe.is_file():
             messagebox.showwarning("AI Video", f"Không tìm thấy Veo3Studio.exe:\n{exe}", parent=self._top)
             return

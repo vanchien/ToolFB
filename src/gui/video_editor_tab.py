@@ -8,6 +8,7 @@ import copy
 import os
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -52,7 +53,12 @@ from src.services.video_editor.remote_stock_audio import (
     search_openverse,
     take_next_background_fill_topic,
 )
-from src.services.video_editor.stock_audio_library import list_stock_audio_paths, stock_audio_dir_display_hint
+from src.services.video_editor.stock_audio_library import (
+    STOCK_TOPIC_FILTER_ALL,
+    filter_stock_paths_by_topic,
+    list_stock_audio_paths,
+    stock_audio_dir_display_hint,
+)
 from src.utils.ffmpeg_paths import resolve_ffmpeg_executable, resolve_ffplay_executable
 
 # Preset FFmpeg libx264 + CRF cho dropdown «Chất lượng xuất» (nhãn, preset, crf)
@@ -1916,14 +1922,129 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> None:
 
     ttk.Button(p2_fr, text="Thêm vùng ducking BGM", command=add_duck).grid(row=7, column=1, columnspan=2, sticky="w", pady=(4, 0))
 
+    stock_paths_all: list[str] = []
     stock_paths_mem: list[str] = []
+    stock_preview_proc_ref: dict[str, Any] = {"proc": None, "after_id": None, "lock": threading.Lock()}
+    var_stock_autoplay = tk.BooleanVar(value=True)
+    var_stock_topic = tk.StringVar(value=STOCK_TOPIC_FILTER_ALL)
 
-    def refresh_stock_audio_box() -> None:
+    def _cancel_stock_preview_after() -> None:
+        aid = stock_preview_proc_ref.get("after_id")
+        if aid is not None:
+            try:
+                root.after_cancel(str(aid))
+            except (tk.TclError, ValueError):
+                pass
+            stock_preview_proc_ref["after_id"] = None
+
+    def _terminate_ffplay_process(p: Any) -> None:
+        """Dừng hẳn ffplay (Windows thường cần kill, không chỉ terminate)."""
+        try:
+            if p.poll() is not None:
+                return
+            if os.name == "nt":
+                p.kill()
+                try:
+                    p.wait(timeout=2.5)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            else:
+                p.terminate()
+                try:
+                    p.wait(timeout=1.2)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def stop_stock_audio_preview() -> None:
+        _cancel_stock_preview_after()
+        with stock_preview_proc_ref["lock"]:
+            p = stock_preview_proc_ref.get("proc")
+            stock_preview_proc_ref["proc"] = None
+        if p is not None:
+            _terminate_ffplay_process(p)
+
+    def play_stock_audio_preview(*, quiet: bool = False) -> None:
+        ffplay = resolve_ffplay_executable()
+        if not ffplay:
+            if not quiet:
+                messagebox.showinfo(
+                    "Nghe thử stock",
+                    "Không tìm thấy ffplay (đi kèm ffmpeg).\n"
+                    "Cài ffmpeg vào PATH hoặc đặt ffplay.exe trong tools/ffmpeg/bin/.",
+                    parent=root,
+                )
+            return
+        sel = lb_stock.curselection()
+        if not sel:
+            if not quiet:
+                messagebox.showinfo("Nghe thử stock", "Chọn một file trong danh sách.", parent=root)
+            return
+        fp = stock_paths_mem[int(sel[0])]
+        if not Path(fp).is_file():
+            if not quiet:
+                messagebox.showerror("Nghe thử stock", f"File không tồn tại:\n{fp}", parent=root)
+            return
+        _cancel_stock_preview_after()
+        with stock_preview_proc_ref["lock"]:
+            old = stock_preview_proc_ref.get("proc")
+            stock_preview_proc_ref["proc"] = None
+        if old is not None:
+            _terminate_ffplay_process(old)
+        # Giải phóng WASAPI / thiết bị âm thanh trước khi mở ffplay mới (tránh lần sau không phát).
+        time.sleep(0.12 if os.name == "nt" else 0.05)
+        popen_kw: dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            proc = subprocess.Popen(
+                [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", fp],
+                **popen_kw,
+            )
+        except OSError as exc:
+            if not quiet:
+                messagebox.showerror("Nghe thử stock", str(exc), parent=root)
+            return
+        with stock_preview_proc_ref["lock"]:
+            stock_preview_proc_ref["proc"] = proc
+
+    def _schedule_stock_preview_from_selection() -> None:
+        _cancel_stock_preview_after()
+        if not var_stock_autoplay.get():
+            return
+
+        def _go() -> None:
+            stock_preview_proc_ref["after_id"] = None
+            play_stock_audio_preview(quiet=True)
+
+        stock_preview_proc_ref["after_id"] = root.after(320, _go)
+
+    def _play_stock_preview_immediate() -> None:
+        _cancel_stock_preview_after()
+        play_stock_audio_preview(quiet=False)
+
+    def apply_stock_topic_filter() -> None:
         nonlocal stock_paths_mem
-        stock_paths_mem = [str(p) for p in list_stock_audio_paths(mm._paths)]
+        paths = [Path(p) for p in stock_paths_all]
+        topic = var_stock_topic.get().strip()
+        filtered = filter_stock_paths_by_topic(paths, topic)
+        stock_paths_mem = [str(p) for p in filtered]
         lb_stock.delete(0, tk.END)
         for p in stock_paths_mem:
             lb_stock.insert(tk.END, Path(p).name)
+
+    def refresh_stock_audio_box() -> None:
+        nonlocal stock_paths_all, stock_paths_mem
+        stop_stock_audio_preview()
+        stock_paths_all = [str(p) for p in list_stock_audio_paths(mm._paths)]
+        apply_stock_topic_filter()
 
     def open_stock_audio_folder() -> None:
         d = Path(stock_audio_dir_display_hint(mm._paths))
@@ -1943,6 +2064,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> None:
         if not sel:
             messagebox.showinfo("Stock audio", "Chọn một file trong danh sách thư viện.")
             return
+        stop_stock_audio_preview()
         fp = stock_paths_mem[int(sel[0])]
         try:
             rec = mm.import_media(fp, "audio", copy_to_library=True)
@@ -1967,11 +2089,27 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> None:
     lf_stock.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(4, 6))
     ttk.Label(
         lf_stock,
-        text=f"Thư mục: {stock_audio_dir_display_hint(mm._paths)} — chép file .mp3, .wav, .m4a… vào đây.",
+        text=(
+            f"Thư mục: {stock_audio_dir_display_hint(mm._paths)} — chép file .mp3, .wav, .m4a… vào đây. "
+            "Bật «Tự nghe khi chọn» để đổi dòng là nghe sau ~0,3s (cần ffplay). "
+            "«Chủ đề» lọc theo từ khóa trong tên file (khớp một phần)."
+        ),
         foreground="#555",
         font=("Segoe UI", 8),
         wraplength=420,
     ).pack(anchor="w")
+    stock_topic_fr = ttk.Frame(lf_stock)
+    stock_topic_fr.pack(fill=tk.X, pady=(4, 0))
+    ttk.Label(stock_topic_fr, text="Chủ đề:").pack(side=tk.LEFT)
+    cb_stock_topic = ttk.Combobox(
+        stock_topic_fr,
+        textvariable=var_stock_topic,
+        values=[STOCK_TOPIC_FILTER_ALL] + [t[0] for t in FREE_AUDIO_TOPIC_QUERIES],
+        state="readonly",
+        width=42,
+    )
+    cb_stock_topic.pack(side=tk.LEFT, padx=(6, 0))
+    cb_stock_topic.bind("<<ComboboxSelected>>", lambda _e: apply_stock_topic_filter())
     f_stock = ttk.Frame(lf_stock)
     f_stock.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
     sb_stock = ttk.Scrollbar(f_stock)
@@ -1979,10 +2117,19 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> None:
     sb_stock.config(command=lb_stock.yview)
     lb_stock.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     sb_stock.pack(side=tk.RIGHT, fill=tk.Y)
+    lb_stock.bind("<<ListboxSelect>>", lambda _e: _schedule_stock_preview_from_selection())
+    lb_stock.bind("<Double-Button-1>", lambda _e: _play_stock_preview_immediate())
     bf_stock = ttk.Frame(lf_stock)
     bf_stock.pack(fill=tk.X, pady=(6, 0))
+    ttk.Checkbutton(
+        bf_stock,
+        text="Tự nghe khi chọn",
+        variable=var_stock_autoplay,
+    ).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Button(bf_stock, text="Làm mới", command=refresh_stock_audio_box).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(bf_stock, text="Mở thư mục", command=open_stock_audio_folder).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(bf_stock, text="Nghe thử", command=_play_stock_preview_immediate).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(bf_stock, text="Dừng nghe", command=stop_stock_audio_preview).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(bf_stock, text="Thêm vào Media", command=lambda: add_selected_stock_to_project(as_bgm=False)).pack(
         side=tk.LEFT, padx=(0, 4)
     )

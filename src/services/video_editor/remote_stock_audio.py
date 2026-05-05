@@ -98,6 +98,13 @@ FREE_AUDIO_TOPIC_QUERIES: tuple[tuple[str, str], ...] = (
     ("Động lực / workout", "energetic motivation workout sport"),
     ("Hài hước / quirky", "funny quirky cartoon playful"),
     ("Hùng vĩ / drone", "dark drone atmospheric tension"),
+    ("Percussion / trống & rhythm", "percussion drums rhythm beat sticks"),
+    ("Bass / sub & low end", "bass sub low 808 groove"),
+    ("Piano / keyboard nhẹ", "piano keyboard soft gentle keys"),
+    ("Jazz / lounge", "jazz lounge swing sax"),
+    ("Hip-hop / trap beat", "hip hop trap beat rap instrumental"),
+    ("Strings / orchestra", "strings violin cello orchestral"),
+    ("Stems / stem & mix", "stems stem multitrack mix session bus"),
 )
 
 
