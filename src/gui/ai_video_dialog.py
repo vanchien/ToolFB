@@ -90,7 +90,7 @@ class AIVideoDialog:
         self._reverse_source_change_after: str | None = None
         self._last_reverse_source_signature = ""
         default_exe = _INTERNAL_TOOL_EXE if _INTERNAL_TOOL_EXE.is_file() else _EXTERNAL_TOOL_EXE
-        self._tool_exe = Path(self._project_spec.get("tool_exe") or default_exe)
+        self._tool_exe = _normalize_user_path(str(self._project_spec.get("tool_exe") or default_exe))
         self._embedded_download_host = embedded_download_host
         if self._embedded_download_host is None:
             self._top = tk.Toplevel(parent)
@@ -1968,7 +1968,10 @@ class AIVideoDialog:
             self._suspend_reverse_source_reset = False
         self._last_reverse_source_signature = self._current_reverse_source_signature()
         self._save_reverse_session_state()
-        self._notebook.select(2)
+        if self._notebook is not None:
+            tabs = self._notebook.tabs()
+            if len(tabs) >= 2:
+                self._notebook.select(1)
         messagebox.showinfo(
             "Reverse Video",
             "Đã nạp video vào tab Reverse Video Prompt.\nChạy B1 (Import + Tách keyframes) rồi B2.",
@@ -2324,7 +2327,7 @@ class AIVideoDialog:
     def _schedule_reverse_source_reset(self) -> None:
         if self._suspend_reverse_source_reset:
             return
-        if self._reverse_source_change_after:
+        if self._reverse_source_change_after is not None:
             try:
                 self._top.after_cancel(self._reverse_source_change_after)
             except Exception:
@@ -2484,6 +2487,7 @@ class AIVideoDialog:
             payload = self._collect_reverse_payload()
             state = {
                 "saved_at": datetime.now().replace(microsecond=0).isoformat(),
+                "tool_exe": str(_normalize_user_path(self._var_tool_exe.get() or str(self._tool_exe))),
                 "payload": payload,
             }
             self._reverse_session_file().write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -2499,6 +2503,9 @@ class AIVideoDialog:
         except Exception:
             return
         data = dict(raw.get("payload") or {})
+        saved_tool = _normalize_user_path(str(raw.get("tool_exe") or ""))
+        if saved_tool:
+            self._set_tool_exe_path(saved_tool)
         if not data:
             return
         self._var_job_id.set(str(data.get("id") or self._var_job_id.get()))
@@ -2528,6 +2535,18 @@ class AIVideoDialog:
         self._var_upload_mode.set(str(gb.get("upload_mode") or "auto_optimal"))
         self._append_reverse_log(f"[INFO] Da khoi phuc phien Reverse theo Ma job: {self._var_job_id.get().strip()}")
         self._sync_wizard_from_checkpoints()
+
+    def _set_tool_exe_path(self, exe_path: Path | str) -> None:
+        exe = _normalize_user_path(str(exe_path))
+        if not exe:
+            return
+        self._tool_exe = exe
+        self._project_spec["tool_exe"] = str(exe)
+        if hasattr(self, "_var_tool_exe") and self._var_tool_exe is not None:
+            try:
+                self._var_tool_exe.set(str(exe))
+            except Exception:
+                pass
 
     def _on_pick_local_video(self) -> None:
         path = filedialog.askopenfilename(
@@ -2972,8 +2991,8 @@ class AIVideoDialog:
         if not picked:
             return
         exe = _normalize_user_path(picked)
-        self._var_tool_exe.set(str(exe))
-        self._tool_exe = exe
+        self._set_tool_exe_path(exe)
+        self._save_reverse_session_state()
         if exe.is_file():
             messagebox.showinfo("AI Video", f"Đã chọn tool:\n{exe}", parent=self._top)
         else:
@@ -2994,12 +3013,62 @@ class AIVideoDialog:
             messagebox.showerror("AI Video", f"Không mở được thư mục tool:\n{exc}", parent=self._top)
 
     def _on_launch_tool(self) -> None:
-        exe = _normalize_user_path(self._var_tool_exe.get())
-        if not exe.is_file():
-            messagebox.showwarning("AI Video", f"Không tìm thấy Veo3Studio.exe:\n{exe}", parent=self._top)
-            return
+        raw_exe = _normalize_user_path(self._var_tool_exe.get())
+        base_dir = (
+            _nearest_existing_parent(raw_exe.parent)
+            or _nearest_existing_parent(self._tool_exe.parent)
+            or _nearest_existing_parent(_EXTERNAL_TOOL_DIR)
+            or _nearest_existing_parent(_INTERNAL_TOOL_DIR)
+            or project_root()
+        )
+        dev_launcher = Path(base_dir) / "run_dev_auto_login.bat"
+
+        candidates: list[Path] = []
+        if raw_exe:
+            candidates.append(raw_exe)
+        candidates.extend(
+            [
+                Path(base_dir) / "Veo3Studio.exe",
+                Path(base_dir) / "Veo3StudioLite.exe",
+                _EXTERNAL_TOOL_EXE,
+                _INTERNAL_TOOL_EXE,
+            ]
+        )
+        exe: Path | None = None
+        for cand in candidates:
+            try:
+                p = _normalize_user_path(str(cand))
+            except Exception:
+                continue
+            if p.is_file():
+                exe = p
+                break
         try:
+            if dev_launcher.is_file():
+                cmd = ["cmd", "/c", str(dev_launcher)]
+                cwd = str(Path(base_dir))
+                if exe is not None:
+                    cmd.append(str(exe))
+                    cwd = str(exe.parent)
+                subprocess.Popen(cmd, cwd=cwd, shell=False)
+                messagebox.showinfo(
+                    "AI Video",
+                    f"Đã mở tool qua DEV launcher:\n{dev_launcher}",
+                    parent=self._top,
+                )
+                return
+            if exe is None:
+                messagebox.showwarning(
+                    "AI Video",
+                    "Không tìm thấy file chạy Veo3Studio.\n"
+                    f"Đường dẫn đang nhập: {raw_exe}\n"
+                    "Hãy bấm «Chọn file .exe...» và chọn lại đúng file.",
+                    parent=self._top,
+                )
+                return
             subprocess.Popen([str(exe)], cwd=str(exe.parent))
+            self._set_tool_exe_path(exe)
+            self._save_reverse_session_state()
             messagebox.showinfo("AI Video", f"Đã mở tool:\n{exe}", parent=self._top)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("AI Video", f"Mở tool thất bại:\n{exc}", parent=self._top)
