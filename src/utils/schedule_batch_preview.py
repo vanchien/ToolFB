@@ -32,6 +32,7 @@ POST_TYPE_TO_PAGE_STYLE: dict[str, str] = {
     "video": "video",
     "text_image": "image",
     "text_video": "video",
+    "reel": "video",
 }
 
 
@@ -276,4 +277,7 @@ def preview_row_to_schedule_job(
         dam = 0
     if "delay_applied_min" in row:
         job["schedule_delay_applied_min"] = max(0, min(180, dam))
+    rtc = str(row.get("reel_thumbnail_choice", "")).strip()
+    if rtc:
+        job["reel_thumbnail_choice"] = rtc
     return job

@@ -31,14 +31,28 @@ htmlcov/
 Thumbs.db
 Desktop.ini
 
-# Project runtime (optional: bỏ comment nếu muốn git theo dõi data local)
-# data/profiles/
-# data/cookies/
-# logs/
+# Project runtime — không đẩy lên GitHub (profiles, cookies, download cache, DB…)
+data/
+logs/
+
+# Cursor IDE (chỉ máy local)
+.cursor/
 
 # API keys (GUI «Cài đặt AI» ghi file này)
 config/app_secrets.json
 config/app_secrets.json.corrupt.bak
+data/video_editor/remote_audio_config.json
 
-# Large local tool cache/binaries (khong day len GitHub)
+# Cấu hình theo máy / tài khoản (giữ bản *.example.json nếu có)
+config/accounts.json
+config/pages.json
+config/entities.json
+config/schedule.json
+config/schedule_posts.json
+config/ai_image_config.json
+config/universal_video_downloader.json
+
+# Large local tool cache/binaries (không đẩy lên GitHub)
 tools/ffmpeg/
+tools/Veo3Studio/
+tools/yt-dlp/

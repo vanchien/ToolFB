@@ -57,6 +57,8 @@ def merge_queue_job_content_into_page_row(
         out["content_style"] = str(queue_job["ai_content_style"]).strip()
     if str(queue_job.get("job_post_image_path", "")).strip():
         out["post_image_path"] = str(queue_job["job_post_image_path"]).strip()
+    if str(queue_job.get("page_url", "")).strip():
+        out["page_url"] = str(queue_job["page_url"]).strip()
     cfg = queue_job.get("ai_config")
     if isinstance(cfg, dict):
         parts: list[str] = []

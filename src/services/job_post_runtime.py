@@ -174,9 +174,13 @@ def validate_queue_job_payload(
                 raise ValueError(f"File ảnh không tồn tại: {p}")
             if not _IMG_EXT.search(p.name):
                 raise ValueError(f"Định dạng ảnh không hỗ trợ: {p.name}")
-    elif pt in ("video", "text_video"):
+    elif pt in ("video", "text_video", "reel"):
         if not paths:
-            raise ValueError("Job video cần media_files không rỗng.")
+            vp = str(job.get("video_path", "")).strip()
+            if vp:
+                paths = [vp]
+            else:
+                raise ValueError("Job video/reel cần media_files hoặc video_path không rỗng.")
         if len(paths) > 1:
             logger.warning(
                 "[Job:VALIDATE_JOB] Nhiều video trong một job — chuẩn an toàn là 1 video/job; sẽ chỉ xử lý file đầu."
@@ -189,3 +193,7 @@ def validate_queue_job_payload(
                 raise ValueError(f"File video không tồn tại: {p}")
             if not _VID_EXT.search(p.name):
                 raise ValueError(f"Định dạng video không hỗ trợ: {p.name}")
+        if pt == "reel":
+            purl = str(job.get("page_url", "")).strip()
+            if purl and not purl.startswith(("http://", "https://")):
+                raise ValueError("Job reel có page_url không hợp lệ (phải bắt đầu http/https).")
