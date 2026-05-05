@@ -54,5 +54,6 @@ config/universal_video_downloader.json
 
 # Large local tool cache/binaries (không đẩy lên GitHub)
 tools/ffmpeg/
-tools/Veo3Studio/
 tools/yt-dlp/
+
+# Veo3Studio: đã theo dõi trong repo (xem tools/Veo3Studio/.gitignore; exe >100MB dùng Git LFS)
