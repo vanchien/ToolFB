@@ -30,6 +30,7 @@ from src.automation.facebook_actions import (
     fill_content,
     go_to_posting_target_and_open_composer,
     prime_facebook_session_page,
+    post_reel_via_page_dashboard,
     resolve_posting_entity,
     set_reel_strict_log_job_id,
     upload_photo,
@@ -52,6 +53,11 @@ from src.utils.posting_browser import PostingBrowserEngine
 from src.utils.screenshot import capture_page_screenshot
 
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv"})
+
+_JOB_FLOW_CATALOG: tuple[str, ...] = (
+    "FLOW_REEL_DASHBOARD: OPEN_PAGE_URL -> SWITCH -> CONTENT_LIBRARY -> CREATE -> REEL -> UPLOAD -> NEXT1 -> INPUT -> NEXT2 -> POST -> VERIFY",
+    "FLOW_TEXT_IMAGE_LEGACY: ENSURE_SESSION -> NAV_TARGET -> OPEN_COMPOSER -> UPLOAD_MEDIA(optional) -> FILL_CONTENT -> POST -> VERIFY",
+)
 
 
 def _browser_interaction_lock_enabled() -> bool:
@@ -77,6 +83,16 @@ def _human_step_delay(*, label: str = "") -> None:
     if label:
         logger.info("[FB human-delay] {}: {} ms", label, d_ms)
     time.sleep(d_ms / 1000.0)
+
+
+def _log_job_flow_catalog(pt: str, *, tracker: JobRunTracker | None) -> None:
+    msg = " | ".join(_JOB_FLOW_CATALOG)
+    logger.info("[FB pipeline] CÁC LUỒNG ĐĂNG JOB HIỆN TẠI: {}", msg)
+    active = "FLOW_REEL_DASHBOARD" if str(pt).strip().lower() in {"video", "text_video", "reel"} else "FLOW_TEXT_IMAGE_LEGACY"
+    logger.info("[FB pipeline] LUỒNG ĐANG CHẠY CHO JOB: {} (post_type={})", active, pt)
+    if tracker is not None:
+        tracker.set_step("FLOW_CATALOG", msg)
+        tracker.set_step("FLOW_ACTIVE", f"{active} | post_type={pt}")
 
 
 def _process_memory_mb() -> float | None:
@@ -153,6 +169,10 @@ def _run_chromium_posting_flow(
     job_scheduled_at_iso: str | None,
     reel_tags: list[str] | None = None,
     reel_description_override: str | None = None,
+    reel_thumbnail_choice: str | None = None,
+    reel_title: str | None = None,
+    reel_content: str | None = None,
+    reel_video_path: str | None = None,
 ) -> None:
     """
     Các bước đăng Meta Business Composer (Reel / caption / Publish) — dùng chung mọi engine Playwright.
@@ -170,7 +190,10 @@ def _run_chromium_posting_flow(
     row = pages_json_row or {}
     page_display_name = str(row.get("page_name", "")).strip() or None
     pt = str(post_type or "text").strip().lower()
-    use_video_upload = pt in ("video", "text_video")
+    _log_job_flow_catalog(pt, tracker=tracker)
+    # Luồng job mới: toàn bộ job video/reel đi qua Dashboard Reel flow.
+    is_reel_dashboard_flow = pt in ("video", "text_video", "reel")
+    use_video_upload = pt in ("video", "text_video", "reel")
     share_now_fb = bool(force_share_now)
     if not share_now_fb and job_scheduled_at_iso:
         try:
@@ -207,6 +230,43 @@ def _run_chromium_posting_flow(
         ensure_facebook_session_for_post(page, cookie_path)
         t0 = _perf_mark(perf_on, "ensure_session_for_post", t0)
         _track(STEP_NAV_TARGET, "Điều hướng tới đích đăng")
+        if is_reel_dashboard_flow:
+            logger.info(
+                "[FB pipeline] ĐANG DÙNG LUỒNG REEL MỚI | post_type={} | page_url={!r}",
+                pt,
+                str(row.get("page_url", "")).strip() or str((resolved or {}).get("target_url", "")).strip(),
+            )
+            _track(STEP_NAV_TARGET, "Reel mới: mở page_url theo job")
+            row_url = str(row.get("page_url", "")).strip()
+            target_url = str((resolved or {}).get("target_url", "")).strip() if isinstance(resolved, dict) else ""
+            page_url = row_url or target_url
+            video_path: Path | None = None
+            for mp in draft_media_paths:
+                if Path(mp).suffix.lower() in _VIDEO_SUFFIXES:
+                    video_path = Path(mp)
+                    break
+            if video_path is None and str(reel_video_path or "").strip():
+                video_path = Path(str(reel_video_path).strip())
+            if video_path is None:
+                raise RuntimeError("Job reel thiếu video_path/media video để upload.")
+            _track(STEP_COMPOSER, "Reel: Professional Dashboard -> Create -> Reel")
+            post_reel_via_page_dashboard(
+                page,
+                page_url=page_url,
+                video_path=video_path,
+                title=str(reel_title or "").strip(),
+                content=str(reel_content or reel_description_override or text_body or "").strip(),
+                hashtags=list(reel_tags or []),
+                on_step=lambda k, m: _track("REEL_" + str(k), m),
+            )
+            _track(STEP_VERIFY_RESULT, "Xác nhận đã đăng (Reel Dashboard)")
+            _perf_mark(perf_on, "reel_dashboard_posted", t0)
+            return
+        logger.info(
+            "[FB pipeline] ĐANG DÙNG LUỒNG CŨ TEXT/IMAGE | post_type={} | target={!r}",
+            pt,
+            str((resolved or {}).get("target_url", "")).strip() if isinstance(resolved, dict) else "",
+        )
         go_to_posting_target_and_open_composer(page, resolved, page_display_name=page_display_name)
         t0 = _perf_mark(perf_on, "open_composer", t0)
         _track(STEP_COMPOSER, "Composer sẵn sàng")
@@ -273,6 +333,7 @@ def _run_chromium_posting_flow(
                         reel_tags=list(reel_tags or []),
                         share_now=share_now_fb,
                         scheduled_at_utc_iso=(str(job_scheduled_at_iso).strip() or None) if not share_now_fb else None,
+                        reel_thumbnail_choice=reel_thumbnail_choice,
                     )
                     t0 = _perf_mark(perf_on, "reel_complete_wizard", t0)
                 finally:
@@ -392,6 +453,10 @@ def _run_firefox_posting_flow(
     job_scheduled_at_iso: str | None,
     reel_tags: list[str] | None = None,
     reel_description_override: str | None = None,
+    reel_thumbnail_choice: str | None = None,
+    reel_title: str | None = None,
+    reel_content: str | None = None,
+    reel_video_path: str | None = None,
 ) -> None:
     """
     Luồng đăng khi profile là Firefox (Gecko).
@@ -415,6 +480,10 @@ def _run_firefox_posting_flow(
         job_scheduled_at_iso=job_scheduled_at_iso,
         reel_tags=reel_tags,
         reel_description_override=reel_description_override,
+        reel_thumbnail_choice=reel_thumbnail_choice,
+        reel_title=reel_title,
+        reel_content=reel_content,
+        reel_video_path=reel_video_path,
     )
 
 
@@ -434,6 +503,10 @@ def execute_facebook_post_sequence(
     posting_engine: PostingBrowserEngine | str | None = None,
     reel_tags: list[str] | None = None,
     reel_description_override: str | None = None,
+    reel_thumbnail_choice: str | None = None,
+    reel_title: str | None = None,
+    reel_content: str | None = None,
+    reel_video_path: str | None = None,
 ) -> None:
     """
     Mở Facebook → phiên → composer → nội dung / Reel → đăng → verify.
@@ -457,6 +530,10 @@ def execute_facebook_post_sequence(
             job_scheduled_at_iso=job_scheduled_at_iso,
             reel_tags=reel_tags,
             reel_description_override=reel_description_override,
+            reel_thumbnail_choice=reel_thumbnail_choice,
+            reel_title=reel_title,
+            reel_content=reel_content,
+            reel_video_path=reel_video_path,
         )
         return
     _run_chromium_posting_flow(
@@ -474,6 +551,10 @@ def execute_facebook_post_sequence(
         job_scheduled_at_iso=job_scheduled_at_iso,
         reel_tags=reel_tags,
         reel_description_override=reel_description_override,
+        reel_thumbnail_choice=reel_thumbnail_choice,
+        reel_title=reel_title,
+        reel_content=reel_content,
+        reel_video_path=reel_video_path,
     )
 
 

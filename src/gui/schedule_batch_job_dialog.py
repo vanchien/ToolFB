@@ -34,6 +34,7 @@ from src.services.video_ai_service import (
 from src.utils.page_schedule import parse_date_only_yyyy_mm_dd, scheduler_tz
 from src.utils.page_workspace import load_page_ai_config
 from src.utils.pages_manager import PagesManager
+from src.utils.reel_thumbnail_choice import REEL_THUMBNAIL_METHOD1_FIRST_AUTO
 from src.utils.schedule_batch_preview import (
     build_schedule_by_daily_slots,
     compute_scheduled_at_series,
@@ -1002,6 +1003,16 @@ class ScheduleBatchJobDialog:
         ttk.Label(self._vid_fr, text="Caption").grid(row=vr, column=0, sticky="nw")
         self._v_caption_mode.grid(row=vr, column=1, sticky="w")
         self._v_caption_mode.bind("<<ComboboxSelected>>", lambda _e: self._toggle_video_caption_fields())
+        vr += 1
+        ttk.Label(self._vid_fr, text="Reel thumbnail (wizard Meta)").grid(row=vr, column=0, sticky="nw")
+        self._v_reel_thumb = ttk.Combobox(
+            self._vid_fr,
+            values=("Mặc định (Meta tự chọn)", "Cách 1 — Thumbnail auto đầu tiên"),
+            state="readonly",
+            width=38,
+        )
+        self._v_reel_thumb.set("Mặc định (Meta tự chọn)")
+        self._v_reel_thumb.grid(row=vr, column=1, sticky="w")
         vr += 1
         self._v_cap_fr = ttk.Frame(self._vid_fr)
         self._v_cap_fr.grid(row=vr, column=1, sticky="ew")
@@ -2396,6 +2407,8 @@ class ScheduleBatchJobDialog:
                 job.pop("schedule_delay_applied_min", None)
             if hide_browser_mode and hide_browser_mode != "inherit":
                 job["hide_browser"] = hide_browser_mode
+            if jpt in ("video", "text_video") and "Cách 1" in self._v_reel_thumb.get():
+                job["reel_thumbnail_choice"] = REEL_THUMBNAIL_METHOD1_FIRST_AUTO
             try:
                 self._store.upsert(job)  # type: ignore[arg-type]
                 n += 1

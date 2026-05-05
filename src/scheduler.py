@@ -53,6 +53,7 @@ from src.utils.drafts_store import load_draft, save_draft
 from src.utils.entities_manager import get_default_entities_manager
 from src.utils.page_schedule import parse_page_schedule_for_apscheduler
 from src.utils.pages_manager import get_default_pages_manager
+from src.utils.reel_thumbnail_choice import normalize_reel_thumbnail_choice
 from src.utils.schedule_job_content import compute_next_daily_scheduled_utc_iso, merge_queue_job_content_into_page_row
 from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
 
@@ -691,7 +692,7 @@ def _compose_job_text_payload(text_body: str, queue_job: dict[str, Any] | None) 
     if not queue_job:
         return base
     pt = str(queue_job.get("post_type", "")).strip().lower()
-    if pt in {"video", "text_video"}:
+    if pt in {"video", "text_video", "reel"}:
         # Job video thuần: không fallback caption AI từ Page nếu job không có nội dung.
         # Chỉ dùng caption user nhập trực tiếp trong queue job (title/content).
         base = _strip_image_note_from_text(str(queue_job.get("content") or ""))
@@ -701,7 +702,7 @@ def _compose_job_text_payload(text_body: str, queue_job: dict[str, Any] | None) 
         if not base.lower().startswith(title.lower()):
             base = (title + "\n\n" + base).strip()
     # Với job video/reel, tags được nhập vào ô Tags riêng trong wizard -> không append vào mô tả.
-    if pt in {"video", "text_video"}:
+    if pt in {"video", "text_video", "reel"}:
         return base
     raw = queue_job.get("hashtags")
     if not isinstance(raw, list):
@@ -760,7 +761,7 @@ def _extract_reel_description_from_queue_job(queue_job: dict[str, Any] | None, f
     if not queue_job:
         return str(fallback or "").strip()
     pt = str(queue_job.get("post_type", "")).strip().lower()
-    if pt not in {"video", "text_video"}:
+    if pt not in {"video", "text_video", "reel"}:
         return str(fallback or "").strip()
     title = str(queue_job.get("title") or "").strip()
     content = _strip_image_note_from_text(str(queue_job.get("content") or ""))
@@ -1251,6 +1252,13 @@ def run_scheduled_post_for_account(
         content_page_row = merge_queue_job_content_into_page_row(page_row, queue_job)
 
         if queue_job:
+            if str(queue_job.get("post_type", "")).strip().lower() == "reel":
+                media = queue_job.get("media_files")
+                has_media = isinstance(media, list) and any(str(x).strip() for x in media)
+                if not has_media:
+                    vp = str(queue_job.get("video_path", "")).strip()
+                    if vp:
+                        queue_job["media_files"] = [vp]
             qpid = str(queue_job.get("page_id", "")).strip()
             if qpid:
                 prq = get_default_pages_manager().get_by_id(qpid)
@@ -1370,6 +1378,7 @@ def run_scheduled_post_for_account(
         ctx = None
         page = None
         post_ok = False
+        q_post_type = ""
         pool.acquire_slot(account_id, engine=posting_engine)
         try:
             logger.info("[Đăng bài] {} — mở trình duyệt (headless={})...", account_id, use_headless)
@@ -1393,8 +1402,12 @@ def run_scheduled_post_for_account(
                 tracker.set_step(STEP_OPEN_BROWSER, "Đã mở trình duyệt / context")
             q_post_type = str((queue_job or {}).get("post_type", "text")).strip().lower()
             job_sched = str((queue_job or {}).get("scheduled_at", "")).strip() or None
-            reel_tags = _extract_reel_tags_from_queue_job(queue_job, limit=12) if q_post_type in {"video", "text_video"} else []
+            reel_tags = _extract_reel_tags_from_queue_job(queue_job, limit=12) if q_post_type in {"video", "text_video", "reel"} else []
             reel_description = _extract_reel_description_from_queue_job(queue_job, text_body)
+            reel_thumb_choice = normalize_reel_thumbnail_choice((queue_job or {}).get("reel_thumbnail_choice"))
+            reel_title = str((queue_job or {}).get("title") or "").strip()
+            reel_content = str((queue_job or {}).get("content") or "").strip()
+            reel_video_path = str((queue_job or {}).get("video_path") or "").strip()
             execute_facebook_post_sequence(
                 page,
                 cookie_path=cookie_arg,
@@ -1410,6 +1423,10 @@ def run_scheduled_post_for_account(
                 posting_engine=posting_engine,
                 reel_tags=reel_tags,
                 reel_description_override=reel_description,
+                reel_thumbnail_choice=reel_thumb_choice,
+                reel_title=reel_title,
+                reel_content=reel_content,
+                reel_video_path=reel_video_path,
             )
             post_ok = True
         except Exception as exc:  # noqa: BLE001
@@ -1419,12 +1436,20 @@ def run_scheduled_post_for_account(
             capture_failure_screenshot(page, account_id)
             err_msg = str(exc)[:900]
         finally:
-            sync_close_persistent_context(ctx, log_label=account_id)
-            if factory is not None:
-                try:
-                    factory.close()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Lỗi khi đóng BrowserFactory ({}): {}", account_id, exc)
+            keep_open = _keep_browser_open_after_post_debug()
+            if keep_open:
+                logger.warning(
+                    "[FB debug] Giữ browser mở để kiểm tra sau Post. account_id={} | post_type={}",
+                    account_id,
+                    q_post_type or "unknown",
+                )
+            else:
+                sync_close_persistent_context(ctx, log_label=account_id)
+                if factory is not None:
+                    try:
+                        factory.close()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Lỗi khi đóng BrowserFactory ({}): {}", account_id, exc)
             pool.release_slot(account_id, engine=posting_engine)
 
         if not post_ok and not err_msg:
@@ -1489,6 +1514,14 @@ def __env_headless_default() -> bool:
     """
     v = os.environ.get("HEADLESS", "1").strip().lower()
     return v in {"1", "true", "yes", "on"}
+
+
+def _keep_browser_open_after_post_debug() -> bool:
+    raw = str(os.environ.get("FB_KEEP_BROWSER_OPEN_AFTER_POST", "")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    raw2 = str(os.environ.get("FB_REEL_PAUSE_AFTER_POST", "")).strip().lower()
+    return raw2 in {"1", "true", "yes", "on"}
 
 
 _default_pool: BrowserSlotPool | None = None

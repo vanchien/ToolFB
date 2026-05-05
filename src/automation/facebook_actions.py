@@ -15,7 +15,7 @@ import time
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from loguru import logger
@@ -23,6 +23,10 @@ from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout
 
 from src.automation.browser_factory import _env_bool, _env_int, _project_root
 from src.utils.page_schedule import scheduler_tz
+from src.utils.reel_thumbnail_choice import (
+    REEL_THUMBNAIL_METHOD1_FIRST_AUTO,
+    normalize_reel_thumbnail_choice,
+)
 
 _REEL_STRICT_JOB_ID: ContextVar[str] = ContextVar("_REEL_STRICT_JOB_ID", default="")
 
@@ -3063,6 +3067,67 @@ def dismiss_meta_video_post_processing_modal_best_effort(
     return False
 
 
+def _choose_first_reel_thumbnail_method1_best_effort(page: Page) -> bool:
+    """
+    Cách 1 (wizard nhiều bước): chọn **thumbnail / frame preview đầu tiên** trong lưới Meta
+    (ô ``role=button`` hoặc ``tabindex=0`` có ``img`` vừa phải — bỏ qua icon nhỏ).
+
+    Khớp ý định HTML mẫu: lưới thumbnail dưới tiêu đề kiểu «Choose thumbnail»; nếu không thấy
+    tiêu đề vẫn thử trong ``role=dialog``.
+    """
+    stage = _reel_strict_prefix("Wizard")
+    js = r"""
+() => {
+  function area(el) {
+    const r = el.getBoundingClientRect();
+    return Math.max(0, r.width) * Math.max(0, r.height);
+  }
+  const dialog = document.querySelector('[role="dialog"]');
+  const rootWide = dialog || document.body;
+  const hdrRx = /choose\s+thumbnail|chọn.*thumbnail|thumbnail.*reel|video\s+thumbnail|edit\s+cover|chỉnh\s+sửa\s+ảnh/i;
+  let scope = rootWide;
+  const labels = Array.from(rootWide.querySelectorAll("span,div,h1,h2,h3,h4"));
+  for (const el of labels) {
+    const t = (el.textContent || "").trim();
+    if (!t || t.length > 120) continue;
+    if (!hdrRx.test(t)) continue;
+    let n = el;
+    for (let d = 0; d < 22 && n; d++) {
+      n = n.parentElement;
+      if (!n) break;
+      if (area(n) > 80000) {
+        scope = n;
+        break;
+      }
+    }
+    break;
+  }
+  const nodes = scope.querySelectorAll('div[role="button"],div[tabindex="0"]');
+  for (const btn of nodes) {
+    const img = btn.querySelector("img[src],img[srcset]");
+    if (!img) continue;
+    const r = img.getBoundingClientRect();
+    if (r.width < 56 || r.height < 40) continue;
+    if (r.width > 560 || r.height > 560) continue;
+    try {
+      btn.click();
+      return true;
+    } catch (e) {}
+  }
+  return false;
+}
+"""
+    try:
+        clicked = bool(page.evaluate(js))
+    except Exception as exc:
+        logger.debug("{} Chọn thumbnail (JS): {}", stage, exc)
+        clicked = False
+    if clicked:
+        logger.info("{} Đã chọn thumbnail đầu tiên (Cách 1).", stage)
+        return True
+    return False
+
+
 def complete_meta_business_reel_post_wizard(
     page: Page,
     *,
@@ -3070,6 +3135,7 @@ def complete_meta_business_reel_post_wizard(
     reel_tags: list[str] | None = None,
     share_now: bool,
     scheduled_at_utc_iso: str | None,
+    reel_thumbnail_choice: str | None = None,
 ) -> bool:
     """
     Hoàn tất đăng Reel sau upload: mô tả (tuỳ chọn) → Tags từ ``#hashtag`` (tuỳ chọn) → Next → Next → Share now hoặc Schedule + giờ job;
@@ -3108,8 +3174,17 @@ def complete_meta_business_reel_post_wizard(
         _human_pause()
         return True
 
+    thumb_mode = normalize_reel_thumbnail_choice(reel_thumbnail_choice)
+
     fill_meta_reel_description(page, description)
     fill_meta_reel_tags_best_effort(page, description, reel_tags=reel_tags)
+
+    if thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
+        try:
+            page.wait_for_timeout(random.randint(380, 780))
+        except Exception:
+            pass
+        _choose_first_reel_thumbnail_method1_best_effort(page)
 
     if not share_now:
         raise RuntimeError("Luồng chuẩn video/reel hiện chỉ hỗ trợ Share now.")
@@ -3212,6 +3287,12 @@ def complete_meta_business_reel_post_wizard(
             page.wait_for_timeout(650)
         if not advanced:
             raise PlaywrightTimeoutError(f"Next lần {idx} không đổi step ({before}).")
+        if idx == 1 and thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
+            try:
+                page.wait_for_timeout(random.randint(420, 900))
+            except Exception:
+                pass
+            _choose_first_reel_thumbnail_method1_best_effort(page)
 
     def _click_share_strict(timeout_ms: int = 20_000) -> bool:
         stage = _reel_strict_prefix("Wizard")
@@ -3302,6 +3383,657 @@ def complete_meta_business_reel_post_wizard(
     if not submit_clicked:
         raise PlaywrightTimeoutError("Đã bấm Share nhưng không thấy Done/processing xác nhận.")
     return True
+
+
+def _click_visible_enabled_button(candidates: Locator, *, timeout_ms: int = 1200) -> bool:
+    """Click button đầu tiên visible + enabled trong danh sách locator."""
+    try:
+        n = int(candidates.count())
+    except Exception:
+        return False
+    for i in range(max(0, n)):
+        b = candidates.nth(i)
+        try:
+            if not b.is_visible(timeout=timeout_ms):
+                continue
+            if (b.get_attribute("aria-disabled") or "").strip().lower() == "true":
+                continue
+            if b.get_attribute("disabled") is not None:
+                continue
+            try:
+                b.click(timeout=timeout_ms)
+            except Exception:
+                b.click(timeout=timeout_ms, force=True, no_wait_after=True)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_next_in_dialog(page: Page, dialog: Locator) -> None:
+    """Click nút Next/Tiếp theo đang usable trong dialog."""
+    pat = re.compile(r"Next|Tiếp|Tiếp theo", re.I)
+    cands = dialog.get_by_role("button", name=pat)
+    if _click_visible_enabled_button(cands, timeout_ms=1400):
+        page.wait_for_timeout(1800)
+        return
+    txt_cands = dialog.get_by_text(pat)
+    if _click_visible_enabled_button(txt_cands, timeout_ms=1200):
+        page.wait_for_timeout(1800)
+        return
+    raise PlaywrightTimeoutError("Không tìm thấy nút Next usable trong popup Reel.")
+
+
+def _wait_post_button_in_dialog(dialog: Locator, *, timeout_ms: int = 20_000) -> Locator:
+    pat = re.compile(r"Post|Đăng|Publish", re.I)
+    candidates: list[Locator] = [
+        # Khớp đúng HTML bạn cung cấp: div[role='none'] chứa span text "Post".
+        dialog.locator(
+            "xpath=(//div[@role='none' and .//span[normalize-space()='Post' and contains(@class,'x1j85h84')])[last()]"
+        ).first,
+        dialog.get_by_role("button", name=pat).first,
+        dialog.locator("xpath=(//div[@role='none' and .//span[normalize-space()='Post']])[last()]").first,
+        dialog.locator("xpath=(//*[self::div or self::span][normalize-space()='Post'])[last()]").first,
+    ]
+    deadline = time.time() + (max(1500, timeout_ms) / 1000.0)
+    while time.time() < deadline:
+        for c in candidates:
+            try:
+                if c.count() > 0 and c.is_visible(timeout=250):
+                    return c
+            except Exception:
+                continue
+        dialog.page.wait_for_timeout(280)
+    raise PlaywrightTimeoutError("Không thấy nút Post/Publish usable trong popup Reel.")
+
+
+def _click_post_strict_for_reel(page: Page, dialog: Locator) -> None:
+    """
+    Click đúng nút Post theo cấu trúc popup Reel, tránh click nhầm nhánh Share to groups.
+    """
+    cands: list[Locator] = [
+        dialog.locator(
+            "xpath=(//div[@role='none' and .//span[normalize-space()='Post' and contains(@class,'x1j85h84')])[last()]"
+        ).first,
+        dialog.locator("xpath=(//div[@role='none' and .//span[normalize-space()='Post']])[last()]").first,
+        page.locator("xpath=(//div[@role='none' and .//span[normalize-space()='Post']])[last()]").first,
+        dialog.locator("xpath=(//*[self::div or self::span][normalize-space()='Post']/ancestor::div[@role='none'][1])[last()]").first,
+    ]
+    for c in cands:
+        try:
+            if c.count() <= 0 or not c.is_visible(timeout=600):
+                continue
+            try:
+                c.evaluate(
+                    """el => {
+                        if (!el) return;
+                        const clickable = el.closest("[tabindex='0'], [role='button'], [role='none']") || el;
+                        if (clickable && typeof clickable.click === "function") clickable.click();
+                    }"""
+                )
+                logger.info("{} [POST_TARGET] strict_post_js_click", _reel_strict_prefix("Wizard"))
+            except Exception:
+                c.click(timeout=1400, force=True, no_wait_after=True)
+                logger.info("{} [POST_TARGET] strict_post_force_click", _reel_strict_prefix("Wizard"))
+            page.wait_for_timeout(900)
+            return
+        except Exception:
+            continue
+    raise PlaywrightTimeoutError("Không click được nút Post strict theo popup Reel.")
+
+
+def _build_reel_text_payload(title: str, content: str, hashtags: list[str] | str | None) -> str:
+    t = str(title or "").strip()
+    c = str(content or "").strip()
+    htxt = ""
+    if isinstance(hashtags, list):
+        vals: list[str] = []
+        for h in hashtags:
+            s = str(h or "").strip()
+            if not s:
+                continue
+            if not s.startswith("#"):
+                s = "#" + s.lstrip("#")
+            vals.append(s.replace(" ", ""))
+        htxt = " ".join(vals).strip()
+    else:
+        htxt = str(hashtags or "").strip()
+    parts = [x for x in (t, c, htxt) if x]
+    return "\n\n".join(parts).strip()
+
+
+def _input_reel_text_in_dialog(dialog: Locator, text: str) -> None:
+    raw = str(text or "").strip()
+    if not raw:
+        return
+    tb = dialog.locator("[role='textbox'], textarea, [contenteditable='true']").last
+    tb.wait_for(state="visible", timeout=10_000)
+    try:
+        tb.click(timeout=1200)
+    except Exception:
+        tb.click(timeout=1200, force=True)
+    try:
+        tb.fill(raw)
+    except Exception:
+        tb.press_sequentially(raw, delay=30)
+
+
+def _normalize_hashtags_for_input(hashtags: list[str] | str | None) -> list[str]:
+    if isinstance(hashtags, str):
+        raw_items = [x.strip() for x in hashtags.split() if x.strip()]
+    elif isinstance(hashtags, list):
+        raw_items = [str(x or "").strip() for x in hashtags if str(x or "").strip()]
+    else:
+        raw_items = []
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in raw_items:
+        tag = x if x.startswith("#") else "#" + x.lstrip("#")
+        tag = tag.replace(" ", "")
+        key = tag.lower()
+        if not tag or key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
+
+
+def _input_reel_title_content_and_hashtags(
+    dialog: Locator,
+    *,
+    title: str,
+    content: str,
+    hashtags: list[str] | str | None,
+) -> None:
+    """
+    Nhập theo yêu cầu:
+    - Title + Content trước
+    - Hashtag nhập từng cái, mỗi hashtag Enter (kèm Space trước Enter).
+    """
+    tb = dialog.locator("[role='textbox'], textarea, [contenteditable='true']").last
+    tb.wait_for(state="visible", timeout=10_000)
+    try:
+        tb.click(timeout=1200)
+    except Exception:
+        tb.click(timeout=1200, force=True)
+
+    title_s = str(title or "").strip()
+    content_s = str(content or "").strip()
+    # Tránh lặp title khi content đã bắt đầu bằng title.
+    if title_s and content_s.lower().startswith(title_s.lower()):
+        content_s = content_s[len(title_s) :].lstrip(" \n\r\t-:|")
+    base_parts = [title_s, content_s]
+    base_text = "\n\n".join([p for p in base_parts if p]).strip()
+    if base_text:
+        # Tránh nhập lặp: nếu textbox đã chứa title/content thì bỏ qua phần base.
+        existing = ""
+        try:
+            existing = str(tb.inner_text(timeout=700) or "").strip()
+        except Exception:
+            existing = ""
+        norm_existing = re.sub(r"\s+", " ", existing).lower()
+        norm_base = re.sub(r"\s+", " ", base_text).lower()
+        already_has_base = bool(norm_base and norm_base in norm_existing)
+        if not already_has_base:
+            try:
+                # Clear trước khi nhập để tránh append đúp.
+                tb.press("ControlOrMeta+a")
+                tb.press("Backspace")
+                dialog.page.wait_for_timeout(180)
+            except Exception:
+                pass
+            # Contenteditable của Meta đôi khi append khi dùng fill(); dùng gõ tuần tự ổn định hơn.
+            tb.press_sequentially(base_text, delay=28)
+            # Delay sau khi nhập phần title/content để UI ổn định.
+            dialog.page.wait_for_timeout(random.randint(700, 1400))
+            tb.press("Enter")
+            tb.press("Enter")
+            dialog.page.wait_for_timeout(random.randint(500, 1100))
+
+    tags = _normalize_hashtags_for_input(hashtags)
+
+    def _pick_first_hashtag_suggestion() -> bool:
+        pg = dialog.page
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            try:
+                lb = pg.locator("ul[role='listbox'][aria-busy='false']").last
+                if lb.count() > 0 and lb.is_visible(timeout=180):
+                    # Ưu tiên item đang selected=true; nếu không có thì lấy option đầu tiên.
+                    opt_selected = lb.locator("li[role='option'][aria-selected='true']").first
+                    if opt_selected.count() > 0 and opt_selected.is_visible(timeout=120):
+                        try:
+                            opt_selected.click(timeout=900)
+                        except Exception:
+                            opt_selected.click(timeout=900, force=True)
+                        return True
+                    opt_first = lb.locator("li[role='option']").first
+                    if opt_first.count() > 0 and opt_first.is_visible(timeout=120):
+                        try:
+                            opt_first.click(timeout=900)
+                        except Exception:
+                            opt_first.click(timeout=900, force=True)
+                        return True
+            except Exception:
+                pass
+            pg.wait_for_timeout(160)
+        return False
+
+    for t in tags:
+        tb.press_sequentially(t, delay=26)
+        dialog.page.wait_for_timeout(random.randint(280, 650))
+        # Luồng hashtag mới: nếu có list gợi ý thì chọn option đầu tiên.
+        picked = _pick_first_hashtag_suggestion()
+        if not picked:
+            # Fallback khi list không hiện: Enter để commit hashtag hiện tại.
+            tb.press("Enter")
+            dialog.page.wait_for_timeout(random.randint(180, 420))
+        # Sau khi chọn, bấm Space để nhập hashtag tiếp theo.
+        tb.press("Space")
+        dialog.page.wait_for_timeout(random.randint(550, 1200))
+
+
+def _reel_textbox_visible(dialog: Locator, *, timeout_ms: int = 700) -> bool:
+    """Kiểm tra ô nhập mô tả Reel (Describe your reel...) đã sẵn sàng chưa."""
+    try:
+        if dialog.locator("[role='textbox'][contenteditable='true']").first.is_visible(timeout=timeout_ms):
+            return True
+    except Exception:
+        pass
+    try:
+        if dialog.get_by_text(re.compile(r"Describe your reel", re.I)).first.is_visible(timeout=timeout_ms):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _env_reel_pause_after_post() -> bool:
+    raw = str(os.environ.get("FB_REEL_PAUSE_AFTER_POST", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _reel_post_pending_actions_visible(page: Page, dialog: Locator | None = None) -> bool:
+    """Còn action phải xử lý sau Post (Done/Post/modal) thì chưa được coi là success."""
+    try:
+        done_btn = page.get_by_role("button", name=re.compile(r"^Done$|^Xong$", re.I)).first
+        if done_btn.is_visible(timeout=180):
+            return True
+    except Exception:
+        pass
+    try:
+        post_btn = page.get_by_role("button", name=re.compile(r"Post|Đăng|Publish", re.I)).first
+        if post_btn.is_visible(timeout=180):
+            return True
+    except Exception:
+        pass
+    # Modal Reel/Share vẫn còn mở -> chưa xong.
+    try:
+        if dialog is not None and dialog.count() > 0 and dialog.first.is_visible(timeout=180):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.get_by_text(re.compile(r"Share to groups|Create reel|Edit reel", re.I)).first.is_visible(timeout=180):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def post_reel_via_page_dashboard(
+    page: Page,
+    *,
+    page_url: str,
+    video_path: Path,
+    title: str = "",
+    content: str = "",
+    hashtags: list[str] | str | None = None,
+    on_step: Callable[[str, str], None] | None = None,
+) -> None:
+    """
+    Luồng Reel mới theo Page + Account:
+    page_url -> Switch Now -> Professional Dashboard Content Library -> Create -> Reel -> Upload -> Next -> Post.
+    """
+    stage = _reel_strict_prefix("Wizard")
+    current_step = "INIT"
+    _ordered_steps = (
+        "OPEN_PAGE_URL",
+        "SCROLL_PAGE",
+        "CLICK_SWITCH_NOW",
+        "CLICK_SWITCH_CONFIRM",
+        "OPEN_CONTENT_LIBRARY",
+        "CLICK_CREATE",
+        "SELECT_REEL",
+        "WAIT_REEL_POPUP",
+        "UPLOAD_VIDEO",
+        "CLICK_NEXT_1",
+        "CLICK_NEXT_2",
+        "INPUT_TITLE_CONTENT_HASHTAGS",
+        "CLICK_NEXT_3",
+        "WAIT_POST_BUTTON",
+        "CLICK_POST",
+        "VERIFY_POST_SUBMITTED",
+        "MARK_SUCCESS",
+    )
+
+    def _step(step_key: str, message: str) -> None:
+        nonlocal current_step
+        current_step = step_key
+        try:
+            idx = _ordered_steps.index(step_key) + 1
+            prog = f"{idx:02d}/{len(_ordered_steps):02d}"
+        except ValueError:
+            prog = "--/--"
+        logger.info("{} [REEL FLOW {}] {} - {}", stage, prog, step_key, message)
+        if on_step is not None:
+            try:
+                on_step(step_key, message)
+            except Exception:
+                pass
+
+    def _step_pause(min_ms: int = 900, max_ms: int = 1800, *, label: str = "") -> None:
+        lo = max(120, int(min_ms))
+        hi = max(lo, int(max_ms))
+        wait_ms = random.randint(lo, hi)
+        if label:
+            logger.info("{} [REEL FLOW DELAY] {} ms | {}", stage, wait_ms, label)
+        page.wait_for_timeout(wait_ms)
+    purl = str(page_url or "").strip()
+    if not purl:
+        raise ValueError("Thiếu page_url cho luồng Reel dashboard.")
+    if not video_path.is_file():
+        raise FileNotFoundError(f"video_path không tồn tại: {video_path}")
+
+    _step("OPEN_PAGE_URL", f"Mở page_url: {purl}")
+    page.goto(purl, wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+    _step_pause(800, 1600, label="sau OPEN_PAGE_URL")
+    _step("SCROLL_PAGE", "Scroll nhẹ để kích hoạt UI page.")
+    try:
+        page.mouse.wheel(0, 500)
+    except Exception:
+        pass
+    page.wait_for_timeout(1400)
+    _step_pause(700, 1400, label="sau SCROLL_PAGE")
+
+    _step("CLICK_SWITCH_NOW", "Tìm và bấm Switch (cách 1: Switch Now, cách 2: từ panel Page).")
+    sw_pat = re.compile(r"Switch Now|Chuyển ngay|Switch", re.I)
+    sw_btns = page.get_by_role("button", name=sw_pat)
+    clicked_switch = _click_visible_enabled_button(sw_btns, timeout_ms=1300)
+    if not clicked_switch:
+        # Cách 2: từ trang Page có block "Switch into ... Page ..." và nút/label "Switch" dạng div.
+        try:
+            sw_method2 = page.locator(
+                "xpath=(//*[contains(translate(normalize-space(.), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
+                "//*[self::div or self::span][normalize-space()='Switch'])[last()]"
+            )
+            clicked_switch = _click_visible_enabled_button(sw_method2, timeout_ms=1500)
+        except Exception:
+            clicked_switch = False
+    if not clicked_switch:
+        # Fallback nhẹ: text "Switch" visible đầu tiên (chỉ dùng khi 2 cách trên không match).
+        try:
+            sw_text_any = page.get_by_text(re.compile(r"^Switch$", re.I))
+            clicked_switch = _click_visible_enabled_button(sw_text_any, timeout_ms=1000)
+        except Exception:
+            clicked_switch = False
+
+    if clicked_switch:
+        logger.info("{} Đã bấm Switch (cách 1/2).", stage)
+        page.wait_for_timeout(random.randint(3200, 7800))
+        _step_pause(1000, 2200, label="sau CLICK_SWITCH_NOW")
+        _step("CLICK_SWITCH_CONFIRM", "Nếu có popup Switch profiles thì bấm nút Switch để xác nhận.")
+        sw_confirm = page.get_by_role("button", name=re.compile(r"^Switch$", re.I))
+        if _click_visible_enabled_button(sw_confirm, timeout_ms=1600):
+            logger.info("{} Đã bấm Switch trong popup Switch profiles.", stage)
+            page.wait_for_timeout(random.randint(2200, 4200))
+            _step_pause(1000, 2200, label="sau CLICK_SWITCH_CONFIRM(button)")
+        else:
+            # Fallback theo HTML user cung cấp: text span "Switch" trong popup.
+            sw_text = page.get_by_text(re.compile(r"^Switch$", re.I))
+            if _click_visible_enabled_button(sw_text, timeout_ms=1200):
+                logger.info("{} Đã bấm Switch (fallback text) trong popup.", stage)
+                page.wait_for_timeout(random.randint(2200, 4200))
+                _step_pause(1000, 2200, label="sau CLICK_SWITCH_CONFIRM(text)")
+    else:
+        logger.info("{} Không thấy Switch Now, tiếp tục kiểm tra dashboard.", stage)
+
+    _step("OPEN_CONTENT_LIBRARY", "Mở Professional Dashboard Content Library.")
+    dash_url = "https://www.facebook.com/professional_dashboard/content/content_library/"
+    page.goto(dash_url, wait_until="domcontentloaded")
+    page.wait_for_timeout(4000)
+    _step_pause(1200, 2400, label="sau OPEN_CONTENT_LIBRARY")
+    cur = str(page.url or "").lower()
+    if "professional_dashboard" not in cur:
+        _failure_screenshot(page, "reel_dashboard_not_reachable")
+        raise RuntimeError("Không vào được Professional Dashboard Content Library (có thể chưa switch đúng quyền Page).")
+
+    _step("CLICK_CREATE", "Tìm và bấm Create / Create a post.")
+    create_btns = page.get_by_role("button", name=re.compile(r"Create|Tạo|Create a post|Tạo bài viết", re.I))
+    clicked_create = _click_visible_enabled_button(create_btns, timeout_ms=1800)
+    if not clicked_create:
+        # Một số UI chỉ render theo menuitem/card thay vì button.
+        create_menu = page.get_by_role("menuitem", name=re.compile(r"Create|Tạo|Create a post|Tạo bài viết", re.I))
+        clicked_create = _click_visible_enabled_button(create_menu, timeout_ms=1400)
+    if not clicked_create:
+        _failure_screenshot(page, "reel_create_not_found")
+        raise PlaywrightTimeoutError("Không thấy nút Create/Create a post trong Content Library.")
+    page.wait_for_timeout(900)
+    _step_pause(900, 1900, label="sau CLICK_CREATE")
+
+    _step("SELECT_REEL", "Chọn mục Reel trong menu tạo bài.")
+    # Ưu tiên đúng cấu trúc bạn gửi: role=menuitem chứa text "Reel".
+    reel_menu = page.get_by_role("menuitem", name=re.compile(r"Reel|Thước phim", re.I))
+    if not _click_visible_enabled_button(reel_menu, timeout_ms=1800):
+        reel_item = page.get_by_text(re.compile(r"Reel|Thước phim", re.I)).first
+        try:
+            reel_item.wait_for(state="visible", timeout=8_000)
+            reel_item.click(timeout=1600)
+        except Exception as exc:
+            _failure_screenshot(page, f"reel_menu_item_not_clickable: {exc}")
+            raise PlaywrightTimeoutError("Không chọn được mục Reel trong menu Create.") from exc
+
+    _step_pause(1400, 2600, label="sau SELECT_REEL")
+    _step("WAIT_REEL_POPUP", "Chờ popup Reel xuất hiện.")
+    dialog = page.locator("[role='dialog']").last
+    dialog.wait_for(state="visible", timeout=25_000)
+    # Sau khi popup xuất hiện, chờ state ổn định.
+    # Lưu ý: UI Create reel thường CHƯA có Next trước khi upload, và input[type=file]
+    # có thể ẩn. Vì vậy cần chấp nhận tín hiệu "Add video"/"Upload" là ready.
+    wait_deadline = time.time() + 25.0
+    ready = False
+    while time.time() < wait_deadline:
+        try:
+            fi = dialog.locator("input[type='file']")
+            has_file = fi.count() > 0 and fi.first.is_visible(timeout=250)
+        except Exception:
+            has_file = False
+        try:
+            has_next = dialog.get_by_role("button", name=re.compile(r"Next|Tiếp|Tiếp theo", re.I)).first.is_visible(timeout=250)
+        except Exception:
+            has_next = False
+        try:
+            has_add_video = dialog.get_by_text(re.compile(r"Add video|or drag and drop", re.I)).first.is_visible(timeout=250)
+        except Exception:
+            has_add_video = False
+        try:
+            has_upload = dialog.get_by_role("button", name=re.compile(r"Upload", re.I)).first.is_visible(timeout=250)
+        except Exception:
+            has_upload = False
+        if has_file or has_next or has_add_video or has_upload:
+            ready = True
+            break
+        page.wait_for_timeout(350)
+    if not ready:
+        # Không fail cứng ở đây nữa: để bước UPLOAD_VIDEO thử nhiều chiến lược import.
+        logger.warning(
+            "{} Popup Reel chưa thấy marker ready rõ ràng; tiếp tục thử import video trực tiếp.",
+            stage,
+        )
+    _step_pause(900, 1700, label="sau WAIT_REEL_POPUP")
+
+    _step("UPLOAD_VIDEO", f"Upload video: {video_path}")
+    abs_video = str(video_path.resolve())
+
+    def _try_set_input_direct() -> bool:
+        # Ưu tiên input trong dialog hiện tại; không yêu cầu visible.
+        for cand in (
+            dialog.locator("input[type='file']").last,
+            dialog.locator("input[type='file']").first,
+            page.locator("input[type='file']").last,
+        ):
+            try:
+                if cand.count() <= 0:
+                    continue
+                cand.set_input_files(abs_video)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _try_set_via_filechooser(trigger: Locator, *, label: str) -> bool:
+        try:
+            if trigger.count() <= 0:
+                return False
+            with page.expect_file_chooser(timeout=5_000) as fc_info:
+                if not _click_visible_enabled_button(trigger, timeout_ms=1800):
+                    return False
+            fc = fc_info.value
+            fc.set_files(abs_video)
+            logger.info("{} Đã set video qua file chooser ({})", stage, label)
+            return True
+        except Exception:
+            return False
+
+    uploaded = _try_set_input_direct()
+    if not uploaded:
+        # Theo HTML bạn gửi: khu Add video + nút Upload trong popup Create reel.
+        uploaded = _try_set_via_filechooser(
+            dialog.get_by_text(re.compile(r"Add video|or drag and drop", re.I)),
+            label="Add video",
+        )
+    if not uploaded:
+        uploaded = _try_set_via_filechooser(
+            dialog.get_by_role("button", name=re.compile(r"Upload", re.I)),
+            label="Upload button",
+        )
+    if not uploaded:
+        uploaded = _try_set_via_filechooser(
+            dialog.get_by_text(re.compile(r"^Upload$", re.I)),
+            label="Upload text",
+        )
+    if not uploaded:
+        _failure_screenshot(page, "reel_file_input_missing")
+        raise PlaywrightTimeoutError(
+            "Không import được video: không tìm thấy input[type=file] usable hoặc trigger Add video/Upload."
+        )
+
+    page.wait_for_timeout(1800)
+    # Chờ upload thực sự được nhận trước khi Next.
+    upload_deadline = time.time() + 60.0
+    upload_ok = False
+    while time.time() < upload_deadline:
+        try:
+            # Placeholder trước upload thường chứa text này.
+            placeholder_vis = dialog.get_by_text(
+                re.compile(r"Upload your video in order to see a preview here", re.I)
+            ).first.is_visible(timeout=200)
+        except Exception:
+            placeholder_vis = False
+        try:
+            next_btn = dialog.get_by_role("button", name=re.compile(r"Next|Tiếp|Tiếp theo", re.I)).first
+            next_ready = next_btn.is_visible(timeout=200) and (next_btn.get_attribute("aria-disabled") or "").lower() != "true"
+        except Exception:
+            next_ready = False
+        if (not placeholder_vis) or next_ready:
+            upload_ok = True
+            break
+        page.wait_for_timeout(450)
+    if not upload_ok:
+        _failure_screenshot(page, "reel_upload_not_accepted")
+        raise PlaywrightTimeoutError("Đã import video nhưng UI chưa nhận upload (placeholder vẫn còn / Next chưa sẵn sàng).")
+
+    _step_pause(1200, 2600, label="sau UPLOAD_VIDEO")
+
+    _step("CLICK_NEXT_1", "Bấm Next lần 1.")
+    _click_next_in_dialog(page, dialog)
+    _step_pause(900, 1800, label="sau CLICK_NEXT_1")
+
+    # Hỗ trợ 2 flow:
+    # - Flow A: Next1 đã có ô text.
+    # - Flow B: Next1 chưa có ô text -> Next2 mới có ô text.
+    def _wait_textbox(timeout_s: float) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if _reel_textbox_visible(dialog, timeout_ms=350):
+                return True
+            page.wait_for_timeout(240)
+        return _reel_textbox_visible(dialog, timeout_ms=300)
+
+    text_ready = _wait_textbox(9.0)
+    if not text_ready:
+        _step("CLICK_NEXT_2", "Sau Next 1 chưa có ô text -> bấm Next lần 2 để mở màn nhập.")
+        _click_next_in_dialog(page, dialog)
+        _step_pause(900, 1800, label="sau CLICK_NEXT_2 (mở màn nhập)")
+        text_ready = _wait_textbox(10.0)
+        if not text_ready:
+            _failure_screenshot(page, "reel_textbox_not_visible_after_next2")
+            raise PlaywrightTimeoutError("Sau Next lần 2 vẫn chưa thấy ô nhập mô tả Reel.")
+
+    _step("INPUT_TITLE_CONTENT_HASHTAGS", "Nhập title/content/hashtags.")
+    _input_reel_title_content_and_hashtags(
+        dialog,
+        title=str(title or "").strip(),
+        content=str(content or "").strip(),
+        hashtags=hashtags,
+    )
+    _step_pause(700, 1500, label="sau INPUT_TITLE_CONTENT_HASHTAGS")
+
+    # Nếu đã hiện Post sau khi nhập thì bấm luôn; nếu chưa, mới Next thêm 1 bước.
+    post_btn: Locator | None = None
+    try:
+        post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=2200)
+    except Exception:
+        post_btn = None
+    if post_btn is None:
+        _step("CLICK_NEXT_2", "Chưa thấy Post sau khi nhập -> bấm Next để sang màn Post.")
+        _click_next_in_dialog(page, dialog)
+        _step_pause(900, 1800, label="sau CLICK_NEXT_2 (sang màn Post)")
+        post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
+    _step("WAIT_POST_BUTTON", "Chờ nút Post/Publish xuất hiện.")
+    if post_btn is None:
+        post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
+    _step("CLICK_POST", "Bấm Post.")
+    logger.info(
+        "{} [STRICT_FLOW] NEXT1 -> INPUT -> NEXT2 -> POST (khóa luồng thẳng)",
+        _reel_strict_prefix("Wizard"),
+    )
+    try:
+        _click_post_strict_for_reel(page, dialog)
+    except Exception:
+        # fallback cuối: dùng locator đã wait được trước đó
+        try:
+            post_btn.evaluate("el => el && el.click && el.click()")
+            logger.info("{} [POST_TARGET] fallback_post_btn_js_click", _reel_strict_prefix("Wizard"))
+        except Exception:
+            post_btn.click(timeout=1800, force=True, no_wait_after=True)
+            logger.info("{} [POST_TARGET] fallback_post_btn_force_click", _reel_strict_prefix("Wizard"))
+    page.wait_for_timeout(1400)
+    if _env_reel_pause_after_post():
+        _step(
+            "VERIFY_POST_SUBMITTED",
+            "Đã bấm Post. TẠM DỪNG để bạn kiểm tra (FB_REEL_PAUSE_AFTER_POST=1), browser sẽ không tự đóng.",
+        )
+        # Giữ để người dùng kiểm tra thủ công. Có thể tắt bằng cách unset env rồi chạy lại.
+        while True:
+            page.wait_for_timeout(5000)
+
+    _step("VERIFY_POST_SUBMITTED", "Đã bấm Post, chờ 8 giây theo cấu hình rồi kết thúc job.")
+    page.wait_for_timeout(8000)
+    _step("MARK_SUCCESS", "Đăng thành công (sau delay 8 giây hậu Post).")
+    return
 
 
 def _submit_button_is_enabled_js() -> str:

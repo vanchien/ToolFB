@@ -35,3 +35,13 @@ def resolve_ffmpeg_executable() -> str | None:
     """Chỉ cần ffmpeg (thumbnail, transcode đơn giản)."""
     ff, _ = resolve_ffmpeg_ffprobe_paths()
     return ff
+
+
+def resolve_ffplay_executable() -> str | None:
+    """ffplay (PATH hoặc cạnh ffmpeg trong tools/ffmpeg/bin)."""
+    fp = shutil.which("ffplay")
+    if fp:
+        return fp
+    exe = "ffplay.exe" if os.name == "nt" else "ffplay"
+    p = portable_ffmpeg_bin_dir() / exe
+    return str(p) if p.is_file() else None

@@ -19,6 +19,12 @@ def test_post_type_for_kind() -> None:
     assert post_type_for_kind("VIDEO") == "video"
 
 
+def test_page_post_style_supports_reel() -> None:
+    from src.utils.schedule_batch_preview import page_post_style_for_post_type
+
+    assert page_post_style_for_post_type("reel") == "video"
+
+
 def test_compute_scheduled_at_series_daily_count_and_iso() -> None:
     series = compute_scheduled_at_series(
         3,

@@ -44,7 +44,9 @@ class SchedulePostJob(TypedDict, total=False):
     hashtags: list[str]
     cta: str
     link: str
+    page_url: str
     media_files: list[str]
+    video_path: str
     scheduled_at: str
     timezone: str
     jitter_minutes: int
@@ -66,6 +68,8 @@ class SchedulePostJob(TypedDict, total=False):
     # Per-job override: hiển thị browser khi chạy job.
     # "inherit" | "hide" | "show" — mặc định "inherit" (theo toggle global ở manager_app).
     hide_browser: str
+    # Reel Meta Business wizard (Cách 1): ``off`` | ``method1_first_auto`` — Cách 2 dùng composer khác, bỏ qua.
+    reel_thumbnail_choice: str
 
 
 def _default_schedule_posts_path() -> Path:
@@ -75,7 +79,7 @@ def _default_schedule_posts_path() -> Path:
 class SchedulePostsManager:
     """Đọc/ghi ``schedule_posts.json`` — danh sách job đăng."""
 
-    POST_TYPES: tuple[str, ...] = ("text", "image", "video", "text_image", "text_video")
+    POST_TYPES: tuple[str, ...] = ("text", "image", "video", "text_image", "text_video", "reel")
     STATUSES: tuple[str, ...] = (
         "pending",
         "processing",

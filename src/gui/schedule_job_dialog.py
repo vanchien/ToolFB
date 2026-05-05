@@ -21,6 +21,7 @@ from src.utils.schedule_job_content import (
     deserialize_job_schedule_for_ui,
     once_local_wall_to_utc_iso,
 )
+from src.utils.reel_thumbnail_choice import REEL_THUMBNAIL_METHOD1_FIRST_AUTO, normalize_reel_thumbnail_choice
 from src.utils.schedule_posts_manager import SchedulePostJob, SchedulePostsManager
 
 
@@ -155,11 +156,27 @@ class SchedulePostJobDialog:
             if pid0 in vals:
                 self._cb_page.set(pid0)
 
-        pt_vals = ("text", "image", "video", "text_image", "text_video")
+        pt_vals = ("text", "image", "video", "text_image", "text_video", "reel")
         self._cb_pt = ttk.Combobox(form, values=pt_vals, state="readonly", width=46)
         pt = str(self._init.get("post_type", "text")).strip().lower()
         self._cb_pt.set(pt if pt in pt_vals else "text")
+        self._cb_pt.bind("<<ComboboxSelected>>", lambda _e: self._sync_reel_thumbnail_visibility())
         n = row(n, "Loại bài (post_type) *", self._cb_pt)
+
+        self._lbl_reel_thumb = ttk.Label(form, text="Reel thumbnail (wizard Meta, Cách 1)")
+        self._cb_reel_thumb = ttk.Combobox(
+            form,
+            values=("Mặc định (Meta tự chọn)", "Cách 1 — Thumbnail auto đầu tiên"),
+            state="readonly",
+            width=44,
+        )
+        init_thumb = normalize_reel_thumbnail_choice(self._init.get("reel_thumbnail_choice"))
+        self._cb_reel_thumb.set(
+            "Cách 1 — Thumbnail auto đầu tiên" if init_thumb == REEL_THUMBNAIL_METHOD1_FIRST_AUTO else "Mặc định (Meta tự chọn)"
+        )
+        self._lbl_reel_thumb.grid(row=n, column=0, sticky="nw", pady=3, padx=(0, 8))
+        self._cb_reel_thumb.grid(row=n, column=1, sticky="ew", pady=3)
+        n += 1
 
         sch_fr = ttk.LabelFrame(form, text="Lịch đăng", padding=8)
         sch_fr.grid(row=n, column=0, columnspan=2, sticky="ew", pady=(8, 4))
@@ -312,6 +329,7 @@ class SchedulePostJobDialog:
         self._default_label_fg = self._lbl_daily_slots.cget("foreground")
 
         self._on_schedule_rule_changed()
+        self._sync_reel_thumbnail_visibility()
 
         ttk.Label(
             form,
@@ -383,15 +401,19 @@ class SchedulePostJobDialog:
         self._e_job_img = ttk.Entry(ai_fr, width=48)
         self._e_job_img.insert(0, str(self._init.get("job_post_image_path", "")))
         self._e_job_img.grid(row=7, column=1, sticky="ew", pady=2)
-        ttk.Label(ai_fr, text="hashtags (phẩy)").grid(row=8, column=0, sticky="nw", pady=2, padx=(0, 8))
+        ttk.Label(ai_fr, text="video_path (cho reel/video)").grid(row=8, column=0, sticky="nw", pady=2, padx=(0, 8))
+        self._e_video_path = ttk.Entry(ai_fr, width=48)
+        self._e_video_path.insert(0, str(self._init.get("video_path", "")))
+        self._e_video_path.grid(row=8, column=1, sticky="ew", pady=2)
+        ttk.Label(ai_fr, text="hashtags (phẩy)").grid(row=9, column=0, sticky="nw", pady=2, padx=(0, 8))
         self._e_hashtags = ttk.Entry(ai_fr, width=48)
         ht = self._init.get("hashtags") or []
         self._e_hashtags.insert(0, ", ".join(str(x) for x in ht) if isinstance(ht, list) else "")
-        self._e_hashtags.grid(row=8, column=1, sticky="ew", pady=2)
-        ttk.Label(ai_fr, text="cta").grid(row=9, column=0, sticky="nw", pady=2, padx=(0, 8))
+        self._e_hashtags.grid(row=9, column=1, sticky="ew", pady=2)
+        ttk.Label(ai_fr, text="cta").grid(row=10, column=0, sticky="nw", pady=2, padx=(0, 8))
         self._e_cta = ttk.Entry(ai_fr, width=48)
         self._e_cta.insert(0, str(self._init.get("cta", "")))
-        self._e_cta.grid(row=9, column=1, sticky="ew", pady=2)
+        self._e_cta.grid(row=10, column=1, sticky="ew", pady=2)
 
         cfg_fr = ttk.LabelFrame(form, text="AI nâng cao (ai_config)", padding=8)
         cfg_fr.grid(row=n, column=0, columnspan=2, sticky="ew", pady=(4, 4))
@@ -452,6 +474,16 @@ class SchedulePostJobDialog:
         self._top.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox("all"))
         self._top.wait_window()
+
+    def _sync_reel_thumbnail_visibility(self) -> None:
+        pt = self._cb_pt.get().strip().lower()
+        show = pt in ("video", "text_video", "reel")
+        if show:
+            self._lbl_reel_thumb.grid()
+            self._cb_reel_thumb.grid()
+        else:
+            self._lbl_reel_thumb.grid_remove()
+            self._cb_reel_thumb.grid_remove()
 
     def _on_schedule_rule_changed(self) -> None:
         rule = self._schedule_rule_key()
@@ -714,6 +746,28 @@ class SchedulePostJobDialog:
             row["ai_content_style"] = ai_lang_instr
         if self._e_job_img.get().strip():
             row["job_post_image_path"] = self._e_job_img.get().strip()
+        video_path = self._e_video_path.get().strip()
+        if video_path:
+            row["video_path"] = video_path
+            if pt in ("video", "text_video", "reel"):
+                row["media_files"] = [video_path]
+        if pt == "reel":
+            purl = str(self._init.get("page_url") or "").strip()
+            if not purl:
+                try:
+                    for p in self._pages.load_all():
+                        if str(p.get("id", "")).strip() == pid:
+                            purl = str(p.get("page_url", "")).strip()
+                            break
+                except Exception:
+                    purl = ""
+            if purl:
+                row["page_url"] = purl
+        if pt in ("video", "text_video", "reel"):
+            if "Cách 1" in self._cb_reel_thumb.get():
+                row["reel_thumbnail_choice"] = REEL_THUMBNAIL_METHOD1_FIRST_AUTO
+        else:
+            row.pop("reel_thumbnail_choice", None)
         row["ai_config"] = ai_cfg
         if draft:
             row["draft_id"] = draft
@@ -725,6 +779,13 @@ class SchedulePostJobDialog:
             row["retry_count"] = int(self._init.get("retry_count", 0))
         if self._init.get("media_files"):
             row["media_files"] = list(self._init["media_files"])
+        if pt == "reel":
+            if not str(row.get("video_path", "")).strip():
+                messagebox.showerror("Lỗi", "Job reel bắt buộc có video_path.", parent=self._top)
+                return
+            if not str(row.get("page_url", "")).strip():
+                messagebox.showerror("Lỗi", "Job reel bắt buộc có page_url hợp lệ của Page.", parent=self._top)
+                return
         hb_init = str(self._init.get("hide_browser") or "").strip().lower()
         if hb_init in ("hide", "show"):
             row["hide_browser"] = hb_init

@@ -20,21 +20,23 @@ def build_clean_portable() -> tuple[Path, Path]:
         shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ignore_names = shutil.ignore_patterns(
-        ".git",
-        ".venv",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "dist",
-        "logs",
-        "data",
-        ".cursor",
-        "*.pyc",
-        "*.pyo",
-    )
-    shutil.copytree(root, out_dir, dirs_exist_ok=True, ignore=ignore_names)
+    def _ignore(cur_dir: str, names: list[str]) -> set[str]:
+        cur = Path(cur_dir).resolve()
+        out: set[str] = set()
+        # Luôn bỏ rác dev.
+        for n in names:
+            if n in {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cursor"}:
+                out.add(n)
+            if n.endswith(".pyc") or n.endswith(".pyo"):
+                out.add(n)
+        # Chỉ bỏ dist/build/logs/data ở ROOT; không bỏ nested dist trong Veo3Studio.
+        if cur == root:
+            for n in ("dist", "build", "logs", "data"):
+                if n in names:
+                    out.add(n)
+        return out
+
+    shutil.copytree(root, out_dir, dirs_exist_ok=True, ignore=_ignore)
 
     seed_default_runtime_at(out_dir)
 

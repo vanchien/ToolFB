@@ -95,6 +95,7 @@ from src.utils.schedule_posts_missing_fields import (
 from src.utils.browser_exe_discover import find_browser_exe_in_directory
 from src.utils.github_repo_detect import github_owner_repo_from_git
 from src.utils.paths import project_root
+from src.gui.video_editor_tab import build_video_editor_tab
 from src.utils.proxy_check import check_http_proxy
 
 
@@ -833,6 +834,37 @@ class _ManagerWindow:
         )
 
         self._jobs_tab_index = nb.index(tab_jobs)
+
+        tab_ve = ttk.Frame(nb, padding=4)
+        nb.add(tab_ve, text="  5. Video Editor  ")
+        tab_ve.columnconfigure(0, weight=1)
+        tab_ve.rowconfigure(0, weight=1)
+        ve_host = ttk.Frame(tab_ve)
+        ve_host.grid(row=0, column=0, sticky="nsew")
+        ve_host.columnconfigure(0, weight=1)
+        ve_host.rowconfigure(0, weight=1)
+        build_video_editor_tab(ve_host, self._root)
+
+        tab_dl = ttk.Frame(nb, padding=4)
+        nb.add(tab_dl, text="  6. Tải Video  ")
+        tab_dl.columnconfigure(0, weight=1)
+        tab_dl.rowconfigure(0, weight=1)
+        try:
+            from src.gui.ai_video_dialog import AIVideoDialog
+
+            self._embedded_download_panel = AIVideoDialog(
+                self._root,
+                project_spec={},
+                start_tab="download",
+                embedded_download_host=tab_dl,
+            )
+        except Exception as exc:  # noqa: BLE001
+            ttk.Label(tab_dl, text="Không khởi tạo được module tải video.", foreground="#b00020").grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Label(tab_dl, text=str(exc), foreground="#555", wraplength=800, justify="left").grid(
+                row=1, column=0, sticky="w", pady=(6, 0)
+            )
 
         body.add(nb_host, weight=5)
 
@@ -1669,6 +1701,7 @@ class _ManagerWindow:
             AIVideoDialog(self._root, project_spec=spec)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("AI Video", str(exc), parent=self._root)
+
 
     def _refresh_all(self) -> None:
         self._refresh_tree()
