@@ -5440,7 +5440,8 @@ class _ManagerWindow:
                             (
                                 f"Đã tìm thấy bản mới: {mf.version}\n"
                                 f"Bản hiện tại: {local_v}\n\n"
-                                f"Ghi chú: {mf.notes or '—'}"
+                                f"Ghi chú: {mf.notes or '—'}\n\n"
+                                "Đóng hộp thoại này, rồi bấm «Cập nhật ngay» trên thanh công cụ để tải và áp dụng."
                             ),
                             parent=self._root,
                         )

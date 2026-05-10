@@ -26,6 +26,16 @@ Các file như `config/app_secrets.json`, tài khoản, lịch đăng, v.v. đư
 
 ## Cập nhật từ GitHub
 
+**Mã nguồn (git):**
+
 ```bash
 git pull origin main
 ```
+
+**Trong GUI — «Kiểm tra cập nhật» / «Cập nhật ngay»**
+
+- Repo đã kèm `config/update_channel.json` trỏ tới `…/releases/latest/download/latest.json` (GitHub Release **mới nhất** phải đính kèm file `latest.json` và gói zip trong manifest).
+- Bấm **Kiểm tra cập nhật**: nếu có bản mới, đóng hộp thoại rồi bấm **Cập nhật ngay** để tải gói và áp dụng (bản `.exe` Windows có thể cần **mở lại chương trình** để script nền thay `ToolFB_GUI.exe` / `_internal`).
+- Máy không có `.git` hoặc đổi kênh: **Cấu hình kênh cập nhật** (hoặc biến môi trường `TOOLFB_UPDATE_MANIFEST_URL`). Mẫu: `config/update_channel.example.json`.
+
+**Người phát hành:** khi đẩy bản mới, cập nhật `version.json` trong repo, tạo/đổi GitHub Release, đính kèm `ToolFB_release_bundle.zip` và `latest.json` (đúng `version`, `download_url`, `sha256` của zip) để các máy khách nhận bản mới khi kiểm tra cập nhật.
