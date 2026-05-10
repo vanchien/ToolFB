@@ -10,11 +10,9 @@ from __future__ import annotations
 import copy
 import json
 import os
-import queue
 import re
 import subprocess
 import sys
-import threading
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -23,10 +21,8 @@ from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from loguru import logger
-
-from src.automation.browser_factory import BrowserFactory
 from src.gui.cookie_capture import account_cookie_path_field, cookie_storage_dest, run_fb_cookie_capture_dialog
+from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.utils.browser_exe_discover import find_browser_exe_in_directory as _find_browser_exe_in_directory
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager
 from src.utils.paths import project_root
@@ -751,6 +747,7 @@ class AccountFormDialog:
         self._tree_folder.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=4)
         self._tree_folder.bind("<Double-1>", self._on_folder_tree_double)
         self._tree_folder.bind("<<TreeviewSelect>>", self._on_folder_tree_select)
+        install_treeview_shortcuts(self._tree_folder, owner=self._top, info_callback=self._set_status)
         self._frm_folder.rowconfigure(2, weight=1)
 
         ttk.Label(self._frm_folder, text="Profile đang chọn — đường dẫn đầy đủ").grid(
@@ -805,7 +802,7 @@ class AccountFormDialog:
         ttk.Button(bf, text="Parse cookie", command=self._on_parse_cookies).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(bf, text="Bỏ dòng đang chọn", command=self._on_cookie_remove_selected).pack(side=tk.LEFT)
         cols2 = ("stt", "name", "valid", "c_user", "xs", "path", "err")
-        self._tree_cookie = ttk.Treeview(self._frm_cookie, columns=cols2, show="headings", height=7)
+        self._tree_cookie = ttk.Treeview(self._frm_cookie, columns=cols2, show="headings", height=7, selectmode="extended")
         for c, h, w, stretch in (
             ("stt", "STT", 36, False),
             ("name", "Tên gợi ý", 96, True),
@@ -818,6 +815,7 @@ class AccountFormDialog:
             self._tree_cookie.heading(c, text=h)
             self._tree_cookie.column(c, width=w, minwidth=32, stretch=stretch)
         self._tree_cookie.grid(row=7, column=0, sticky="nsew", pady=4)
+        install_treeview_shortcuts(self._tree_cookie, owner=self._top, info_callback=self._set_status)
         self._lbl_cookie_stats = ttk.Label(self._frm_cookie, text="Chưa parse.", foreground="gray")
         self._lbl_cookie_stats.grid(row=8, column=0, sticky="w")
         self._frm_cookie.rowconfigure(5, weight=1)

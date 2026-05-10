@@ -14,17 +14,11 @@ Công cụ hỗ trợ Facebook + lên lịch bài + AI (Gemini / Veo) + tải vi
    python main.py --gui
    ```
 
-## Veo3 / Veo3Studio (trong repo — Git LFS)
+## Veo3 / Veo3Studio (cài local — không có trong repo)
 
-`tools/Veo3Studio/` được đưa lên GitHub; file **`Veo3Studio.exe`** (~180MB) dùng **Git LFS** (GitHub giới hạn 100MB/file với git thường).
+Thư mục **`tools/Veo3Studio/`** bị `.gitignore` để repo nhẹ và tránh binary lớn trên GitHub.
 
-**Máy mới sau khi clone:**
-
-1. Cài [Git LFS](https://git-lfs.com/) (một lần): `git lfs install`
-2. Clone như bình thường — nếu exe chỉ vài trăm byte (pointer), chạy tại thư mục repo: `git lfs pull`
-3. Đường dẫn chuẩn: `ToolFB/tools/Veo3Studio/Veo3Studio.exe`
-
-Thư mục `data/` bên trong Veo3Studio không nằm trong Git (dữ liệu chạy từng máy). Nếu cần chỉnh tay: tab **AI Video** → đường dẫn `tool_exe`.
+**Máy mới sau khi clone:** cài bản Veo3Studio Lite (hoặc copy từ máy khác) vào `ToolFB/tools/Veo3Studio/`, đảm bảo có `Veo3Studio.exe` (hoặc chỉnh đường dẫn trong tab **AI Video** → `tool_exe`).
 
 ## Cấu hình riêng từng máy (không commit)
 
@@ -34,7 +28,4 @@ Các file như `config/app_secrets.json`, tài khoản, lịch đăng, v.v. đư
 
 ```bash
 git pull origin main
-git lfs pull
 ```
-
-Nếu `Veo3Studio.exe` không chạy được sau pull, kiểm tra đã cài Git LFS và chạy `git lfs pull`.

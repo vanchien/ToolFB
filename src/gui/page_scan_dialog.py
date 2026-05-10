@@ -20,6 +20,7 @@ from loguru import logger
 from src.automation.browser_factory import BrowserFactory, sync_close_persistent_context
 from src.automation.facebook_page_scanner import ScannedPage
 from src.automation.meta_business_scanner import scan_meta_business_pages_for_account
+from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.utils.db_manager import AccountsDatabaseManager
 from src.utils.pages_manager import PagesManager
 
@@ -53,6 +54,7 @@ class PageScanDialog:
         self._top.transient(parent)
         self._top.grab_set()
         self._top.geometry(_DEFAULT_GEOMETRY)
+        self._top.minsize(680, 460)
         self._top.columnconfigure(0, weight=1)
         self._top.rowconfigure(2, weight=1)
 
@@ -98,21 +100,33 @@ class PageScanDialog:
             variable=self._lock_ui_var,
         )
         self._cb_lock_ui.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(
+        lbl_scan_hint = ttk.Label(
             btnf,
             text="Sẽ mở trình duyệt với profile của tài khoản (không cần nhập lại mật khẩu nếu đã login).",
             foreground="gray",
             wraplength=640,
             font=("Segoe UI", 8),
-        ).pack(side=tk.LEFT, padx=(10, 0))
+        )
+        lbl_scan_hint.pack(side=tk.LEFT, padx=(10, 0))
+        self._top.bind(
+            "<Configure>",
+            lambda _e: lbl_scan_hint.configure(wraplength=max(320, int(self._top.winfo_width()) - 220)),
+            add="+",
+        )
 
     def _build_log(self) -> None:
         frm = ttk.LabelFrame(self._top, text="Tiến trình", padding=6)
         frm.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
         frm.columnconfigure(0, weight=1)
         self._log_var = tk.StringVar(value="Sẵn sàng. Chọn tài khoản và bấm «Quét».")
-        ttk.Label(frm, textvariable=self._log_var, foreground="#0a4fa0", wraplength=800).grid(
+        self._lbl_log = ttk.Label(frm, textvariable=self._log_var, foreground="#0a4fa0", wraplength=800)
+        self._lbl_log.grid(
             row=0, column=0, sticky="w"
+        )
+        self._top.bind(
+            "<Configure>",
+            lambda _e: self._lbl_log.configure(wraplength=max(360, int(self._top.winfo_width()) - 80)),
+            add="+",
         )
 
     def _build_tree(self) -> None:
@@ -167,6 +181,7 @@ class PageScanDialog:
         self._tree.configure(yscrollcommand=sy.set)
         self._tree.grid(row=0, column=0, sticky="nsew")
         sy.grid(row=0, column=1, sticky="ns")
+        install_treeview_shortcuts(self._tree, owner=self._top, info_callback=self._append_status)
 
         # Toggle checkbox khi click cột đầu.
         self._tree.bind("<Button-1>", self._on_tree_click)

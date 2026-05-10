@@ -33,9 +33,9 @@ _CONFIG_NAME = "remote_audio_config.json"
 DEFAULT_REMOTE_AUDIO_CONFIG: dict[str, Any] = {
     "freesound_api_key": "",
     "jamendo_client_id": "",
-    "auto_download_to_stock": True,
+    "auto_download_to_stock": False,
     "auto_download_max": 5,
-    "background_fill_enabled": True,
+    "background_fill_enabled": False,
     "background_fill_max": 8,
     "background_fill_interval_minutes": 0,
     "background_fill_topic_index": 0,
@@ -60,12 +60,12 @@ def load_remote_audio_config(paths: dict[str, Path] | None = None) -> dict[str, 
         pass
     out["freesound_api_key"] = str(out.get("freesound_api_key") or "")
     out["jamendo_client_id"] = str(out.get("jamendo_client_id") or "")
-    out["auto_download_to_stock"] = bool(out.get("auto_download_to_stock"))
+    out["auto_download_to_stock"] = bool(out.get("auto_download_to_stock", False))
     try:
         out["auto_download_max"] = max(1, min(30, int(out.get("auto_download_max") or 5)))
     except (TypeError, ValueError):
         out["auto_download_max"] = 5
-    out["background_fill_enabled"] = bool(out.get("background_fill_enabled", True))
+    out["background_fill_enabled"] = bool(out.get("background_fill_enabled", False))
     try:
         out["background_fill_max"] = max(1, min(25, int(out.get("background_fill_max") or 8)))
     except (TypeError, ValueError):
@@ -98,13 +98,6 @@ FREE_AUDIO_TOPIC_QUERIES: tuple[tuple[str, str], ...] = (
     ("Động lực / workout", "energetic motivation workout sport"),
     ("Hài hước / quirky", "funny quirky cartoon playful"),
     ("Hùng vĩ / drone", "dark drone atmospheric tension"),
-    ("Percussion / trống & rhythm", "percussion drums rhythm beat sticks"),
-    ("Bass / sub & low end", "bass sub low 808 groove"),
-    ("Piano / keyboard nhẹ", "piano keyboard soft gentle keys"),
-    ("Jazz / lounge", "jazz lounge swing sax"),
-    ("Hip-hop / trap beat", "hip hop trap beat rap instrumental"),
-    ("Strings / orchestra", "strings violin cello orchestral"),
-    ("Stems / stem & mix", "stems stem multitrack mix session bus"),
 )
 
 
@@ -291,13 +284,11 @@ def _http_download(url: str, dest: Path, *, headers: dict[str, str] | None = Non
     fallbacks: list[dict[str, str]] = [base]
     if headers:
         fallbacks.append({"User-Agent": DEFAULT_HTTP_UA, "Accept": "*/*"})
-    last: urllib.error.HTTPError | None = None
     for i, hdr in enumerate(fallbacks):
         try:
             _http_download_once(url, dest, hdr, timeout=timeout)
             return
         except urllib.error.HTTPError as e:
-            last = e
             if e.code in (401, 403) and i < len(fallbacks) - 1:
                 continue
             raise

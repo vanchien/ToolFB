@@ -48,12 +48,16 @@ def _job_search_haystack(job: dict[str, Any]) -> str:
         "page_id",
         "account_id",
         "post_type",
+        "created_by",
         "ai_language",
         "title",
         "content",
         "image_prompt",
         "image_alt",
         "status",
+        "source_download_job_id",
+        "source_download_job_label",
+        "source_download_video_id",
     ):
         parts.append(_norm(job.get(key)))
     sched_raw = _norm(job.get("scheduled_at"))

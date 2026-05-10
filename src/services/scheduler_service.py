@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Optional
 
 from src.models.post_job import SchedulePostJob
-from src.scheduler import tick_schedule_post_jobs
+from src.scheduler import tick_cross_platform_schedule_jobs
 from src.utils.schedule_posts_manager import SchedulePostsManager, get_default_schedule_posts_manager
 
 
@@ -37,5 +37,5 @@ class SchedulerService:
         return self._mgr.update_job_fields(job_id, **fields)
 
     def poll_due_jobs(self) -> None:
-        """Một vòng quét pending đến hạn → gọi PostExecutor qua ``scheduler``."""
-        tick_schedule_post_jobs()
+        """Một vòng quét pending đến hạn (Facebook + TikTok; trùng giờ → tuần tự có ưu tiên)."""
+        tick_cross_platform_schedule_jobs()

@@ -15,14 +15,20 @@ from urllib.parse import quote
 
 from loguru import logger
 from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
-from playwright_stealth import Stealth
+try:
+    from playwright_stealth import Stealth  # type: ignore
+except Exception as _stealth_import_exc:  # noqa: BLE001
+    Stealth = None  # type: ignore[assignment]
+    _STEALTH_IMPORT_ERROR = _stealth_import_exc
+else:
+    _STEALTH_IMPORT_ERROR = None
 
 from src.automation.mobile_viewport import resolve_mobile_viewport
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager, ProxyConfig
 from src.utils.paths import project_root as _project_root
 
 
-def _stealth_for_project(*, use_mobile_fingerprint: bool = False) -> Stealth:
+def _stealth_for_project(*, use_mobile_fingerprint: bool = False) -> Any:
     """
     Stealth đầy đủ cho desktop; bản rút gọn khi dùng fingerprint mobile (viewport hẹp / FB_MOBILE_MODE).
 
@@ -31,6 +37,8 @@ def _stealth_for_project(*, use_mobile_fingerprint: bool = False) -> Stealth:
 
     Các override tắt rõ ``None`` để tránh UserWarning của playwright-stealth.
     """
+    if Stealth is None:
+        return None
     if not use_mobile_fingerprint or _env_bool("FB_STEALTH_FULL", False):
         return Stealth()
     return Stealth(
@@ -780,8 +788,19 @@ class BrowserFactory:
                     context = self._playwright.chromium.launch_persistent_context(**fallback_kwargs)
             else:
                 raise
-        _stealth_for_project(use_mobile_fingerprint=effective_mobile).apply_stealth_sync(context)
-        logger.info("Đã áp dụng playwright-stealth lên BrowserContext (account={}).", account_id)
+        stealth = _stealth_for_project(use_mobile_fingerprint=effective_mobile)
+        if stealth is None:
+            if _STEALTH_IMPORT_ERROR is not None:
+                logger.warning(
+                    "Không nạp được playwright-stealth, tiếp tục không stealth: {}",
+                    _STEALTH_IMPORT_ERROR,
+                )
+        else:
+            try:
+                stealth.apply_stealth_sync(context)
+                logger.info("Đã áp dụng playwright-stealth lên BrowserContext (account={}).", account_id)
+            except Exception as stealth_exc:  # noqa: BLE001
+                logger.warning("Lỗi apply playwright-stealth, tiếp tục không stealth: {}", stealth_exc)
         return context
 
 

@@ -56,6 +56,7 @@ from src.utils.pages_manager import get_default_pages_manager
 from src.utils.reel_thumbnail_choice import normalize_reel_thumbnail_choice
 from src.utils.schedule_job_content import compute_next_daily_scheduled_utc_iso, merge_queue_job_content_into_page_row
 from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
+from src.services.cross_platform_schedule_ctx import unified_chain_is_active
 
 _schedule_posts_tick_lock = threading.Lock()
 _schedule_dispatch_lock = threading.Lock()
@@ -243,12 +244,20 @@ def _log_dispatch_done(
             engine,
             exc,
         )
+    if unified_chain_is_active():
+        return
     # Job vừa xong -> thử đẩy ngay hàng đợi due đang chờ slot, không phải đợi poll interval kế tiếp.
     if os.environ.get("SCHEDULE_DRAIN_QUEUE_ON_DONE", "1").strip().lower() in {"1", "true", "yes", "on"}:
         try:
             tick_schedule_post_jobs()
         except Exception as exc:  # noqa: BLE001
             logger.debug("[Queue dispatcher] Drain queue sau job done lỗi (bỏ qua): {}", exc)
+        try:
+            from src.services.tiktok.schedule_tick import tick_tiktok_upload_jobs
+
+            tick_tiktok_upload_jobs()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Queue dispatcher] Drain TikTok queue sau job done (bỏ qua): {}", exc)
 
 
 def _cron_timezone() -> Any:
@@ -1113,6 +1122,313 @@ def tick_schedule_post_jobs() -> None:
         )
 
 
+def _peek_facebook_due_pending() -> bool:
+    now = datetime.now(timezone.utc)
+    try:
+        sp = get_default_schedule_posts_manager()
+        for job in sp.load_all():
+            if str(job.get("status", "")).strip().lower() != "pending":
+                continue
+            when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
+            if when > now:
+                continue
+            jid = str(job.get("id", "")).strip()
+            aid = str(job.get("account_id", "")).strip()
+            pid = str(job.get("page_id", "")).strip()
+            if jid and aid and pid:
+                return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("peek facebook due: {}", exc)
+    return False
+
+
+def _peek_tiktok_due_pending() -> bool:
+    now = datetime.now(timezone.utc)
+    try:
+        from src.services.tiktok.job_manager import TikTokJobStore
+        from src.services.tiktok.schedule_tick import parse_tiktok_scheduled_utc
+
+        store = TikTokJobStore()
+        for job in store.load_all():
+            if str(job.get("status", "")).strip().lower() != "pending":
+                continue
+            if not bool(job.get("schedule_enabled")):
+                continue
+            raw = str(job.get("scheduled_at") or job.get("schedule_time") or "").strip()
+            when = parse_tiktok_scheduled_utc(raw)
+            if when is None or when > now:
+                continue
+            jid = str(job.get("id", "")).strip()
+            aid = str(job.get("account_id", "")).strip()
+            if jid and aid:
+                return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("peek tiktok due: {}", exc)
+    return False
+
+
+def _tick_merged_serial_facebook_tiktok() -> None:
+    """
+    Cùng một cửa sổ poll: cả Facebook queue và TikTok đều có job đến hạn →
+    sắp xếp một hàng (mặc định Facebook trước TikTok; env ``CROSS_PLATFORM_SCHEDULE_PRIORITY=tiktok_first`` đổi thứ tự),
+    chạy tuần tự qua cùng pool — không bỏ qua job vì trùng giờ / tranh browser.
+    """
+    global _queue_next_due_hint_utc, _queue_idle_probe_after_utc, _queue_hint_refresh_after_utc
+    from src.services.cross_platform_schedule_ctx import unified_chain_begin, unified_chain_end
+    from src.services.tiktok.job_manager import TikTokJobStore
+    from src.services.tiktok.schedule_tick import (
+        _tiktok_worker_done,
+        parse_tiktok_scheduled_utc,
+        run_tiktok_scheduled_slot_job,
+        tiktok_schedule_tick_lock,
+    )
+
+    accounts_mgr = AccountsDatabaseManager()
+    now = datetime.now(timezone.utc)
+    prefetch_sec = _prefetch_window_seconds()
+    fb_batch: list[tuple[datetime, str, str, str, str | None, str, float]] = []
+    tt_batch: list[tuple[datetime, str, float]] = []
+    queued_due_count = 0
+
+    with _schedule_posts_tick_lock:
+        with tiktok_schedule_tick_lock():
+            try:
+                sp = get_default_schedule_posts_manager()
+                jobs = sp.load_all()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("merged tick: không đọc schedule_posts: {}", exc)
+                return
+            next_due: datetime | None = None
+            account_planned: dict[str, int] = {}
+            per_acc_limit = _per_account_parallel_limit()
+            for job in jobs:
+                if str(job.get("status", "")).strip().lower() != "pending":
+                    continue
+                when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
+                if next_due is None or when < next_due:
+                    next_due = when
+                jid = str(job.get("id", "")).strip()
+                if (
+                    jid
+                    and now < when <= now + timedelta(seconds=prefetch_sec)
+                    and _queue_prefetched_until_iso_by_job.get(jid) != str(job.get("scheduled_at", ""))
+                ):
+                    try:
+                        _draft_id_for_queue_job(dict(job))
+                        _queue_prefetched_until_iso_by_job[jid] = str(job.get("scheduled_at", ""))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("[Queue prefetch merged] job={} lỗi: {}", jid, exc)
+                if when > now:
+                    continue
+                aid = str(job.get("account_id", "")).strip()
+                pid = str(job.get("page_id", "")).strip()
+                if not jid or not aid or not pid:
+                    continue
+                inflight = _account_inflight_count(aid)
+                planned = account_planned.get(aid, 0)
+                if (inflight + planned) >= per_acc_limit:
+                    queued_due_count += 1
+                    continue
+                fresh = sp.get_by_id(jid)
+                if not fresh or str(fresh.get("status", "")).strip().lower() != "pending":
+                    continue
+                did = _draft_id_for_queue_job(dict(job))
+                engine = _resolve_engine_for_account(aid, accounts=accounts_mgr)
+                waited_seconds = max(0.0, (now - when).total_seconds())
+                fb_batch.append((when, jid, aid, pid, did or None, engine, waited_seconds))
+                account_planned[aid] = planned + 1
+
+            job_store = TikTokJobStore()
+            try:
+                rows = job_store.load_all()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("merged tick: không đọc TikTok jobs: {}", exc)
+                rows = []
+            for job in rows:
+                if str(job.get("status", "")).strip().lower() != "pending":
+                    continue
+                if not bool(job.get("schedule_enabled")):
+                    continue
+                raw = str(job.get("scheduled_at") or job.get("schedule_time") or "").strip()
+                tw = parse_tiktok_scheduled_utc(raw)
+                if tw is None:
+                    continue
+                if next_due is None or tw < next_due:
+                    next_due = tw
+                if tw > now:
+                    continue
+                jid = str(job.get("id", "")).strip()
+                aid = str(job.get("account_id", "")).strip()
+                if not jid or not aid:
+                    continue
+                fresh_tt = job_store.get_by_id(jid)
+                if not fresh_tt or str(fresh_tt.get("status", "")).strip().lower() != "pending":
+                    continue
+                if not bool(fresh_tt.get("schedule_enabled")):
+                    continue
+                waited_seconds = max(0.0, (now - tw).total_seconds())
+                tt_batch.append((tw, jid, waited_seconds))
+
+            _queue_next_due_hint_utc = next_due
+            if next_due is None:
+                _queue_idle_probe_after_utc = now + timedelta(seconds=_idle_probe_seconds())
+            else:
+                _queue_idle_probe_after_utc = None
+            _queue_hint_refresh_after_utc = now + timedelta(seconds=_hint_refresh_seconds())
+
+            fb_first = (
+                os.environ.get("CROSS_PLATFORM_SCHEDULE_PRIORITY", "facebook_first").strip().lower() != "tiktok_first"
+            )
+            merged: list[Any] = []
+            for when, jid, aid, pid, did, engine, waited in fb_batch:
+                merged.append(("fb", when, jid, aid, pid, did, engine, waited))
+            for tw, jid, waited in tt_batch:
+                merged.append(("tt", tw, jid, waited))
+            merged.sort(
+                key=lambda x: (
+                    x[1],
+                    (0 if x[0] == "fb" else 1) if fb_first else (1 if x[0] == "fb" else 0),
+                    x[2],
+                )
+            )
+
+            chain_steps: list[Any] = []
+            for item in merged:
+                if item[0] == "fb":
+                    _, when, jid, aid, pid, did, engine, waited = item
+                    try:
+                        sp.update_job_fields(jid, status="running")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Merged: không chuyển running FB job {}: {}", jid, exc)
+                        continue
+                    chain_steps.append(("fb", jid, aid, pid, did, engine, waited))
+                else:
+                    _, tw, jid, waited = item
+                    fresh2 = job_store.get_by_id(jid)
+                    if not fresh2 or str(fresh2.get("status", "")).strip().lower() != "pending":
+                        continue
+                    row = dict(fresh2)
+                    row["status"] = "running"
+                    row["step"] = "DISPATCHED"
+                    try:
+                        job_store.upsert(row)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Merged: không chuyển running TikTok job {}: {}", jid, exc)
+                        continue
+                    chain_steps.append(("tt", jid, waited))
+
+    if queued_due_count > 0:
+        logger.info(
+            "[Cross-platform queue] {} job FB đến hạn đang chờ slot account — vẫn xử lý phần gộp.",
+            queued_due_count,
+        )
+    if not chain_steps:
+        return
+
+    pool = get_schedule_posts_dispatch_pool()
+    n = len(chain_steps)
+    logger.info(
+        "[Cross-platform queue] Gộp FB+TikTok: chạy tuần tự {} bước (ưu tiên {}).",
+        n,
+        "Facebook trước" if fb_first else "TikTok trước",
+    )
+
+    unified_chain_begin()
+
+    def drain_both() -> None:
+        unified_chain_end()
+        try:
+            tick_schedule_post_jobs()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Cross-platform queue] Drain FB: {}", exc)
+        try:
+            from src.services.tiktok.schedule_tick import tick_tiktok_upload_jobs
+
+            tick_tiktok_upload_jobs()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Cross-platform queue] Drain TikTok: {}", exc)
+
+    def submit_one(idx: int) -> None:
+        step = chain_steps[idx]
+        kind = step[0]
+        if kind == "fb":
+            _, jid, aid, pid, did, engine, waited = step
+            _mark_dispatch_submitted(engine)
+            logger.info(
+                "[Cross-platform queue] ({}/{}) FB job={} account={} page={} | waited={:.1f}s",
+                idx + 1,
+                n,
+                jid,
+                aid,
+                pid,
+                waited,
+            )
+
+            def on_fb_done(fut: Future[bool], i: int = idx) -> None:
+                _log_dispatch_done(
+                    fut,
+                    job_id=jid,
+                    account_id=aid,
+                    page_id=pid,
+                    engine=engine,
+                )
+                if i + 1 < n:
+                    submit_one(i + 1)
+                else:
+                    drain_both()
+
+            fut2 = pool.submit(
+                run_scheduled_post_for_account,
+                aid,
+                page_id=pid,
+                draft_id=did,
+                schedule_post_job_id=jid,
+            )
+            fut2.add_done_callback(on_fb_done)
+        else:
+            _, jid, waited = step
+            logger.info(
+                "[Cross-platform queue] ({}/{}) TikTok job={} | waited={:.1f}s",
+                idx + 1,
+                n,
+                jid,
+                waited,
+            )
+
+            def on_tt_done(fut: Future[Any], i: int = idx) -> None:
+                _tiktok_worker_done(fut)
+                if i + 1 < n:
+                    submit_one(i + 1)
+                else:
+                    drain_both()
+
+            fut3 = pool.submit(run_tiktok_scheduled_slot_job, jid)
+            fut3.add_done_callback(on_tt_done)
+
+    try:
+        submit_one(0)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[Cross-platform queue] Lỗi khởi chạy chuỗi: {}", exc)
+        drain_both()
+
+
+def tick_cross_platform_schedule_jobs() -> None:
+    """
+    Một tick cho cả ``schedule_posts.json`` và TikTok: nếu **cùng lúc** cả hai nền tảng có job đến hạn,
+    chạy tuần tự có thứ tự ưu tiên; không thì giữ hành vi song song như trước.
+    """
+    if _peek_facebook_due_pending() and _peek_tiktok_due_pending():
+        _tick_merged_serial_facebook_tiktok()
+    else:
+        tick_schedule_post_jobs()
+        try:
+            from src.services.tiktok.schedule_tick import tick_tiktok_upload_jobs
+
+            tick_tiktok_upload_jobs()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tick TikTok: {}", exc)
+
+
 def run_scheduled_post_for_account(
     account_id: str,
     *,
@@ -1718,12 +2034,15 @@ def build_scheduler(
     poll_sec = int(os.environ.get("SCHEDULE_POSTS_POLL_SEC", "60"))
     if poll_sec >= 15:
         scheduler.add_job(
-            tick_schedule_post_jobs,
+            tick_cross_platform_schedule_jobs,
             IntervalTrigger(seconds=poll_sec),
-            id="fb_schedule_posts_tick",
+            id="cross_platform_schedule_tick",
             replace_existing=True,
         )
-        logger.info("Đã đăng ký quét schedule_posts.json mỗi {} giây.", poll_sec)
+        logger.info(
+            "Đã đăng ký quét lịch gộp (schedule_posts + TikTok) mỗi {} giây — trùng giờ hai nền tảng sẽ xếp hàng tuần tự.",
+            poll_sec,
+        )
     else:
         logger.info("Bỏ qua quét schedule_posts (SCHEDULE_POSTS_POLL_SEC={} < 15).", poll_sec)
     return scheduler

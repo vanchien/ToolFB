@@ -52,7 +52,20 @@ class TimelineManager:
     def __init__(self, *, project_manager: VideoEditorProjectManager | None = None) -> None:
         self._pm = project_manager or VideoEditorProjectManager()
 
-    def add_clip(self, project: dict[str, Any], media_id: str, track_type: str) -> dict[str, Any]:
+    def refresh_project_duration(self, project: dict[str, Any]) -> None:
+        """Cập nhật ``project['duration']`` từ toàn bộ clip (gọi sau thao tác hàng loạt nếu đã tắt recompute từng bước)."""
+        _update_project_duration(project)
+
+    def add_clip(
+        self,
+        project: dict[str, Any],
+        media_id: str,
+        track_type: str,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+        out_new_clip: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         tt = str(track_type or "").strip().lower()
         media = None
         for m in project.get("media") or []:
@@ -117,7 +130,6 @@ class TimelineManager:
                     "keep_aspect": True,
                 },
                 "canvas_mode": "fit",
-                "blur_background": {"enabled": False, "blur": 20},
             }
             if clips:
                 last_end = 0.0
@@ -164,8 +176,12 @@ class TimelineManager:
             raise ValueError("Track text dùng add_text_clip hoặc clip type text.")
 
         clips.append(clip)
-        _update_project_duration(project)
-        self._pm.save_project(project)
+        if recompute_duration:
+            _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
+        if out_new_clip is not None:
+            out_new_clip.append(clip)
         return project
 
     def add_text_clip(
@@ -175,6 +191,9 @@ class TimelineManager:
         *,
         timeline_start: float = 0.0,
         duration: float = 5.0,
+        persist: bool = True,
+        recompute_duration: bool = True,
+        out_new_clip: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         tr = _find_track(project, "text")
         if not tr:
@@ -199,45 +218,112 @@ class TimelineManager:
             "random_motion_smooth": True,
         }
         tr.setdefault("clips", []).append(clip)
-        _update_project_duration(project)
-        self._pm.save_project(project)
+        if recompute_duration:
+            _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
+        if out_new_clip is not None:
+            out_new_clip.append(clip)
         return project
 
-    def flip_clip(self, project: dict[str, Any], clip_id: str, *, horizontal: bool = False, vertical: bool = False) -> dict[str, Any]:
-        return self.update_clip(project, clip_id, {"flip_horizontal": bool(horizontal), "flip_vertical": bool(vertical)})
-
-    def rotate_clip(self, project: dict[str, Any], clip_id: str, rotation: int) -> dict[str, Any]:
-        r = int(rotation) % 360
-        if r not in (0, 90, 180, 270):
-            raise ValueError("rotation phải là 0, 90, 180 hoặc 270")
-        return self.update_clip(project, clip_id, {"rotation": r})
-
-    def crop_clip(self, project: dict[str, Any], clip_id: str, crop: dict[str, Any]) -> dict[str, Any]:
-        return self.update_clip(project, clip_id, {"crop": deepcopy(crop)})
-
-    def set_canvas_mode(self, project: dict[str, Any], clip_id: str, mode: str) -> dict[str, Any]:
-        m = str(mode or "fit").lower().strip()
-        if m not in ("fit", "fill", "stretch"):
-            raise ValueError("canvas_mode phải là fit, fill hoặc stretch")
-        return self.update_clip(project, clip_id, {"canvas_mode": m})
-
-    def set_blur_background(self, project: dict[str, Any], clip_id: str, enabled: bool, blur: int = 20) -> dict[str, Any]:
+    def flip_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        *,
+        horizontal: bool = False,
+        vertical: bool = False,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
         return self.update_clip(
             project,
             clip_id,
-            {"blur_background": {"enabled": bool(enabled), "blur": int(blur)}},
+            {"flip_horizontal": bool(horizontal), "flip_vertical": bool(vertical)},
+            persist=persist,
+            recompute_duration=recompute_duration,
         )
 
-    def set_speed(self, project: dict[str, Any], clip_id: str, speed: float) -> dict[str, Any]:
+    def rotate_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        rotation: int,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
+        r = int(rotation) % 360
+        if r not in (0, 90, 180, 270):
+            raise ValueError("rotation phải là 0, 90, 180 hoặc 270")
+        return self.update_clip(project, clip_id, {"rotation": r}, persist=persist, recompute_duration=recompute_duration)
+
+    def crop_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        crop: dict[str, Any],
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
+        return self.update_clip(
+            project,
+            clip_id,
+            {"crop": deepcopy(crop)},
+            persist=persist,
+            recompute_duration=recompute_duration,
+        )
+
+    def set_canvas_mode(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        mode: str,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
+        m = str(mode or "fit").lower().strip()
+        if m not in ("fit", "fill", "stretch"):
+            raise ValueError("canvas_mode phải là fit, fill hoặc stretch")
+        return self.update_clip(project, clip_id, {"canvas_mode": m}, persist=persist, recompute_duration=recompute_duration)
+
+    def set_speed(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        speed: float,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
         sp = float(speed)
         if sp <= 0:
             raise ValueError("speed phải > 0")
-        return self.update_clip(project, clip_id, {"speed": sp})
+        return self.update_clip(project, clip_id, {"speed": sp}, persist=persist, recompute_duration=recompute_duration)
 
-    def mute_clip(self, project: dict[str, Any], clip_id: str, muted: bool) -> dict[str, Any]:
-        return self.update_clip(project, clip_id, {"muted": bool(muted)})
+    def mute_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        muted: bool,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
+        return self.update_clip(project, clip_id, {"muted": bool(muted)}, persist=persist, recompute_duration=recompute_duration)
 
-    def trim_clip(self, project: dict[str, Any], clip_id: str, source_start: float, source_end: float) -> dict[str, Any]:
+    def trim_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        source_start: float,
+        source_end: float,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
         found = _find_clip(project, clip_id)
         if not found:
             raise ValueError("Không tìm thấy clip.")
@@ -252,11 +338,21 @@ class TimelineManager:
         clip["source_end"] = se
         du = _clip_duration(ss, se)
         clip["duration"] = round(du, 4)
-        _update_project_duration(project)
-        self._pm.save_project(project)
+        if recompute_duration:
+            _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
         return project
 
-    def split_clip(self, project: dict[str, Any], clip_id: str, split_time: float) -> dict[str, Any]:
+    def split_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        split_time: float,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
         """split_time: thời điểm trên timeline (giây)."""
         found = _find_clip(project, clip_id)
         if not found:
@@ -320,32 +416,61 @@ class TimelineManager:
         else:
             raise ValueError(f"Không hỗ trợ split cho type {ctype}")
 
-        _update_project_duration(project)
-        self._pm.save_project(project)
+        if recompute_duration:
+            _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
         return project
 
-    def move_clip(self, project: dict[str, Any], clip_id: str, new_start: float) -> dict[str, Any]:
+    def move_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        new_start: float,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
         found = _find_clip(project, clip_id)
         if not found:
             raise ValueError("Không tìm thấy clip.")
         _, clip = found
         clip["timeline_start"] = float(new_start)
-        _update_project_duration(project)
-        self._pm.save_project(project)
+        if recompute_duration:
+            _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
         return project
 
-    def delete_clip(self, project: dict[str, Any], clip_id: str) -> dict[str, Any]:
+    def delete_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
         cid = str(clip_id)
         for tr in project.get("tracks") or []:
             if not isinstance(tr, dict):
                 continue
             clips = tr.get("clips") or []
             tr["clips"] = [c for c in clips if not (isinstance(c, dict) and str(c.get("id") or "") == cid)]
-        _update_project_duration(project)
-        self._pm.save_project(project)
+        if recompute_duration:
+            _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
         return project
 
-    def update_clip(self, project: dict[str, Any], clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    def update_clip(
+        self,
+        project: dict[str, Any],
+        clip_id: str,
+        patch: dict[str, Any],
+        *,
+        persist: bool = True,
+        recompute_duration: bool = True,
+    ) -> dict[str, Any]:
         found = _find_clip(project, clip_id)
         if not found:
             raise ValueError("Không tìm thấy clip.")
@@ -359,6 +484,8 @@ class TimelineManager:
             se = float(clip.get("source_end") or 0)
             if str(clip.get("type")) == "video":
                 clip["duration"] = round(max(0.0, se - ss), 4)
-        _update_project_duration(project)
-        self._pm.save_project(project)
+        if recompute_duration:
+            _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
         return project

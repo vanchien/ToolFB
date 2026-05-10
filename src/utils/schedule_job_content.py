@@ -41,6 +41,15 @@ def once_local_wall_to_utc_iso(once_local_yyyy_mm_dd_hh_mm: str) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def internal_post_title_from_body(body: str, *, fallback: str = "") -> str:
+    """Dòng đầu tiên khác rỗng của văn bản (bỏ hẳn các dòng sau). Dùng cho tiêu đề nội bộ và ``content`` khi chỉ đăng một dòng caption."""
+    for line in str(body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        s = line.strip()
+        if s:
+            return s
+    return str(fallback or "").strip()
+
+
 def merge_queue_job_content_into_page_row(
     page_row: dict[str, Any] | None,
     queue_job: dict[str, Any] | None,

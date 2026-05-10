@@ -69,6 +69,7 @@ class PageFormDialog:
         self._top.transient(parent)
         self._top.grab_set()
         self._top.geometry("580x560")
+        self._top.minsize(500, 420)
         self._top.columnconfigure(0, weight=1)
         self._top.rowconfigure(0, weight=1)
 
@@ -141,14 +142,20 @@ class PageFormDialog:
         )
         add_row("", biz_cb)
 
-        ttk.Label(
+        lbl_hint = ttk.Label(
             form,
             text="Lịch đăng (giờ 24h), post_style, chủ đề AI… nằm ở tab «3. Job lịch đăng» — mỗi job một cấu hình. "
             "Scheduler vẫn có thể đăng theo lịch Page trong pages.json nếu còn schedule_time (tương thích cũ).",
             foreground="gray",
             wraplength=520,
             font=("Segoe UI", 8),
-        ).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        )
+        lbl_hint.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        self._top.bind(
+            "<Configure>",
+            lambda _e: lbl_hint.configure(wraplength=max(320, int(self._top.winfo_width()) - 60)),
+            add="+",
+        )
 
     @property
     def result(self) -> dict[str, Any] | None:

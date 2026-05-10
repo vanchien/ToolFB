@@ -37,6 +37,8 @@ logs/
 
 # Cursor IDE (chỉ máy local)
 .cursor/
+.cursorignore
+.cursorindexingignore
 
 # API keys (GUI «Cài đặt AI» ghi file này)
 config/app_secrets.json
@@ -56,4 +58,5 @@ config/universal_video_downloader.json
 tools/ffmpeg/
 tools/yt-dlp/
 
-# Veo3Studio: đã theo dõi trong repo (xem tools/Veo3Studio/.gitignore; exe >100MB dùng Git LFS)
+# Veo3Studio — cài tay từng máy (tab AI Video / đường dẫn tool_exe), không đưa lên GitHub
+tools/Veo3Studio/

@@ -23,6 +23,141 @@ LogFn = Callable[[str], None]
 
 YTDLP_PYPI_JSON_URL = "https://pypi.org/pypi/yt-dlp/json"
 
+_YTDLP_MEDIA_EXTENSIONS = frozenset({".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"})
+
+# Chuỗi stderr yt-dlp khi đã có trong archive / bỏ qua tải lại (đa ngôn ngữ / nhiều phiên bản).
+_YTDLP_SKIP_OR_ARCHIVE_MARKERS = (
+    "already been downloaded",
+    "has already been recorded",
+    "has already been downloaded",
+    "in the archive",
+    "in archive",
+    "skipping",
+    "already present",
+    "was skipped",
+    "nothing to download",
+    "not downloading",
+    "video already exists",
+    "already in the archive",
+    "đã có trong archive",
+    "recorded in the archive",
+)
+
+
+def _output_root_dir_from_ytdlp_template(output_template: str) -> Path | None:
+    """Phần thư mục thật trước ký hiệu %(… trong -o template của yt-dlp."""
+    tmpl = str(output_template or "").strip().replace("/", os.sep)
+    if "%(" in tmpl:
+        tmpl = tmpl.split("%(", 1)[0].rstrip(os.sep)
+    if not tmpl:
+        return None
+    try:
+        p = Path(tmpl)
+        if not p.is_absolute():
+            return (Path.cwd() / p).resolve()
+        return p
+    except OSError:
+        return None
+
+
+def _extract_video_id_for_scan(url: str) -> str:
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    m = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]{11})", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"/embed/([A-Za-z0-9_-]{11})", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"tiktok\.com/@[^/]+/video/(\d+)", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"facebook\.com/reel/(\d+)", u, re.I)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _norm_url_key(u: str) -> str:
+    u = str(u or "").strip().split("&list=", 1)[0].strip()
+    return u.rstrip("/")
+
+
+def scan_output_dir_for_existing_media(*, root: Path, url: str) -> list[str]:
+    """
+    Khi yt-dlp không in after_move (skip archive, merge, v.v.) nhưng file đã nằm trên đĩa.
+    """
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    vid = _extract_video_id_for_scan(url)
+    hits: list[tuple[float, str]] = []
+    key = _norm_url_key(url)
+
+    if vid and len(vid) >= 8:
+        try:
+            for p in root.rglob(f"*{vid}*"):
+                if p.is_file() and p.suffix.lower() in _YTDLP_MEDIA_EXTENSIONS:
+                    try:
+                        hits.append((p.stat().st_mtime, str(p.resolve())))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    try:
+        for meta_path in root.rglob("*.info.json"):
+            if not meta_path.is_file():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(meta, dict):
+                continue
+            mid = str(meta.get("id") or "").strip()
+            purl = str(meta.get("webpage_url") or meta.get("original_url") or "").strip()
+            match = False
+            if vid and mid == vid:
+                match = True
+            elif key and purl:
+                pk = _norm_url_key(purl)
+                if pk == key or key in pk or pk in key:
+                    match = True
+            if not match:
+                continue
+            stem = meta_path.name
+            if not stem.endswith(".info.json"):
+                continue
+            base = stem[: -len(".info.json")]
+            parent = meta_path.parent
+            for ext in _YTDLP_MEDIA_EXTENSIONS:
+                cand = parent / (base + ext)
+                if cand.is_file():
+                    try:
+                        hits.append((cand.stat().st_mtime, str(cand.resolve())))
+                    except OSError:
+                        pass
+                    break
+    except OSError:
+        pass
+
+    hits.sort(key=lambda x: x[0], reverse=True)
+    seen: set[str] = set()
+    out: list[str] = []
+    for _, fp in hits:
+        if fp not in seen:
+            seen.add(fp)
+            out.append(fp)
+    return out
+
 
 def _parse_ytdlp_semverish(text: str) -> tuple[int, ...]:
     """Chuỗi từ ``yt-dlp --version`` hoặc PyPI ``info.version`` → tuple số để so sánh."""
@@ -218,8 +353,6 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "max_scroll_rounds": 100,
             "max_scan_minutes": 30,
             "scroll_until_end": True,
-            "show_browser": False,
-            "account_id": "",
         },
     }
 
@@ -258,8 +391,6 @@ def persist_facebook_reels_settings(
     max_scroll_rounds: int | None = None,
     max_scan_minutes: int | None = None,
     scroll_until_end: bool | None = None,
-    show_browser: bool | None = None,
-    account_id: str | None = None,
 ) -> None:
     """Merge ``facebook_reels`` vào ``config/universal_video_downloader.json``. Chỉ cập nhật tham số khác ``None``."""
     cfg_path = project_root() / "config" / "universal_video_downloader.json"
@@ -283,10 +414,6 @@ def persist_facebook_reels_settings(
         fb["max_scan_minutes"] = max(1, min(180, int(max_scan_minutes)))
     if scroll_until_end is not None:
         fb["scroll_until_end"] = bool(scroll_until_end)
-    if show_browser is not None:
-        fb["show_browser"] = bool(show_browser)
-    if account_id is not None:
-        fb["account_id"] = str(account_id or "").strip()
     uvd["facebook_reels"] = fb
     raw["universal_video_downloader"] = uvd
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -413,23 +540,52 @@ def classify_url_type(url: str) -> str:
     return "unknown"
 
 
-def normalize_youtube_download_url(url: str) -> str:
+def _extract_hashtags_from_text(text: str) -> list[str]:
+    raw = str(text or "")
+    if not raw:
+        return []
+    found = re.findall(r"#([A-Za-z0-9_]{2,64})", raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in found:
+        v = "#" + str(tag).strip()
+        k = v.lower()
+        if not tag or k in seen:
+            continue
+        seen.add(k)
+        out.append(v)
+        if len(out) >= 50:
+            break
+    return out
+
+
+def _prune_empty_parent_dirs(start_path: Path, *, stop_at_parent: Path | None = None) -> None:
     """
-    Chuẩn hóa URL tải YouTube: /shorts/<id> và youtu.be/<id> → watch?v=<id>
-    (yt-dlp ổn định hơn với watch URL cho Shorts).
+    Xóa dần thư mục rỗng từ thư mục chứa file đi lên trên.
+    Dừng ở ``stop_at_parent`` (không xóa thư mục này).
     """
-    s = str(url or "").strip()
-    if not s:
-        return s
-    m = re.search(r"(?:youtube\.com/)shorts/([A-Za-z0-9_-]{6,})", s, re.I)
-    if m:
-        vid = m.group(1)[:11]
-        return f"https://www.youtube.com/watch?v={vid}"
-    m2 = re.search(r"youtu\.be/([A-Za-z0-9_-]{6,})\b", s, re.I)
-    if m2 and "watch?v=" not in s.lower():
-        vid = m2.group(1)[:11]
-        return f"https://www.youtube.com/watch?v={vid}"
-    return s
+    cur = Path(start_path).expanduser().resolve()
+    if cur.is_file():
+        cur = cur.parent
+    stop = Path(stop_at_parent).expanduser().resolve() if stop_at_parent else None
+    while True:
+        if stop and cur == stop:
+            break
+        if not cur.exists() or not cur.is_dir():
+            break
+        try:
+            if any(cur.iterdir()):
+                break
+        except OSError:
+            break
+        try:
+            cur.rmdir()
+        except OSError:
+            break
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
 
 
 class DownloadFolderManager:
@@ -522,7 +678,7 @@ class DownloadMetadataStore:
                 return r
         return None
 
-    def delete_video_record(self, video_id: str, *, delete_file: bool = False) -> bool:
+    def delete_video_record(self, video_id: str, *, delete_file: bool = False, prune_empty_dirs: bool = False) -> bool:
         rows = self._read_videos()
         found = None
         rest: list[dict[str, Any]] = []
@@ -535,20 +691,68 @@ class DownloadMetadataStore:
             return False
         if delete_file:
             vp = str(found.get("video_path") or "")
+            removed_paths: list[Path] = []
             if vp:
                 try:
-                    Path(vp).unlink(missing_ok=True)
+                    p = Path(vp)
+                    p.unlink(missing_ok=True)
+                    removed_paths.append(p)
                 except OSError:
                     pass
             for key in ("thumbnail_path", "info_json_path"):
                 pp = str(found.get(key) or "")
                 if pp:
                     try:
-                        Path(pp).unlink(missing_ok=True)
+                        p = Path(pp)
+                        p.unlink(missing_ok=True)
+                        removed_paths.append(p)
                     except OSError:
+                        pass
+            if prune_empty_dirs:
+                for p in removed_paths:
+                    try:
+                        _prune_empty_parent_dirs(p)
+                    except Exception:
                         pass
         self._write_videos(rest)
         return True
+
+    def delete_job(self, job_id: str) -> bool:
+        jid = str(job_id or "").strip()
+        if not jid:
+            return False
+        rows = self._read_jobs()
+        new_rows = [r for r in rows if str(r.get("id") or "").strip() != jid]
+        if len(new_rows) == len(rows):
+            return False
+        self._write_jobs(new_rows)
+        return True
+
+    def delete_videos_by_job(
+        self,
+        job_id: str,
+        *,
+        delete_file: bool = False,
+        prune_empty_dirs: bool = False,
+    ) -> int:
+        jid = str(job_id or "").strip()
+        if not jid:
+            return 0
+        rows = self._read_videos()
+        targets = [r for r in rows if str(r.get("download_job_id") or "").strip() == jid]
+        if not targets:
+            return 0
+        if delete_file:
+            for r in targets:
+                self.delete_video_record(
+                    str(r.get("id") or ""),
+                    delete_file=True,
+                    prune_empty_dirs=prune_empty_dirs,
+                )
+            return len(targets)
+        rest = [r for r in rows if str(r.get("download_job_id") or "").strip() != jid]
+        self._write_videos(rest)
+        return len(targets)
 
 
 class UniversalYTDLPWrapper:
@@ -704,7 +908,6 @@ class UniversalYTDLPWrapper:
         )
 
     def get_info(self, url: str) -> dict[str, Any]:
-        url = normalize_youtube_download_url(url)
         ut = classify_url_type(url)
         cmd = [
             *self._resolve_prefix(),
@@ -744,36 +947,50 @@ class UniversalYTDLPWrapper:
         }
 
     @staticmethod
-    def _flat_playlist_entry_url(entry: dict[str, Any]) -> str:
-        """Lấy URL tải được từ một phần tử JSON flat-playlist (YouTube)."""
-        u = str(entry.get("url") or "").strip()
-        if u.startswith("http://") or u.startswith("https://"):
-            return u
-        if u.startswith("watch?"):
-            return "https://www.youtube.com/" + u
-        if u.startswith("/watch"):
-            return "https://www.youtube.com" + u
+    def _flat_playlist_entry_url(entry: dict[str, Any], *, source_url: str, platform: str) -> str:
+        """Lấy URL tải được từ một phần tử JSON flat-playlist (YouTube/TikTok)."""
+        for key in ("webpage_url", "original_url", "url"):
+            u = str(entry.get(key) or "").strip()
+            if u.startswith("http://") or u.startswith("https://"):
+                return u
+            if platform == "youtube":
+                if u.startswith("watch?"):
+                    return "https://www.youtube.com/" + u
+                if u.startswith("/watch"):
+                    return "https://www.youtube.com" + u
         vid = str(entry.get("id") or "").strip()
-        if vid and re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+        if platform == "youtube" and vid and re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
             return f"https://www.youtube.com/watch?v={vid}"
+        if platform == "tiktok" and vid:
+            owner = str(entry.get("uploader_id") or entry.get("channel_id") or "").strip()
+            if owner:
+                if not owner.startswith("@"):
+                    owner = "@" + owner
+                return f"https://www.tiktok.com/{owner}/video/{vid}"
+            m = re.search(r"tiktok\.com/@[^/?#]+", source_url, re.I)
+            if m:
+                return f"{m.group(0)}/video/{vid}"
         return ""
 
     def list_flat_playlist_entries(self, url: str, *, max_entries: int = 500) -> dict[str, Any]:
         """
         Liệt kê entry trong kênh / playlist (``--flat-playlist``) không tải video.
-        Chỉ YouTube + loại URL ``channel`` hoặc ``playlist``.
+        Hỗ trợ YouTube (channel/playlist) và TikTok (profile).
         """
         raw = str(url or "").strip()
         if not raw:
             return {"success": False, "error": "Thiếu URL."}
-        if detect_platform(raw) != "youtube":
-            return {"success": False, "error": "Chỉ hỗ trợ quét danh sách cho YouTube."}
+        platform = detect_platform(raw)
+        if platform not in ("youtube", "tiktok"):
+            return {"success": False, "error": "Chỉ hỗ trợ quét danh sách cho YouTube hoặc TikTok."}
         ut = classify_url_type(raw)
-        if ut not in ("playlist", "channel"):
+        if platform == "youtube" and ut not in ("playlist", "channel"):
             return {
                 "success": False,
                 "error": "Cần URL kênh hoặc playlist (ví dụ tab Shorts, /videos, ?list=…), không phải một video đơn.",
             }
+        if platform == "tiktok" and ut != "profile":
+            return {"success": False, "error": "TikTok cần URL profile (dạng https://www.tiktok.com/@user)."}
         n = max(1, min(int(max_entries or 500), 2000))
         cmd = [
             *self._resolve_prefix(),
@@ -818,7 +1035,7 @@ class UniversalYTDLPWrapper:
             for e in entries_raw:
                 if not isinstance(e, dict):
                     continue
-                play_url = self._flat_playlist_entry_url(e)
+                play_url = self._flat_playlist_entry_url(e, source_url=raw, platform=platform)
                 if not play_url:
                     continue
                 title = str(e.get("title") or e.get("id") or play_url)[:500]
@@ -841,39 +1058,32 @@ class UniversalYTDLPWrapper:
         skip_existing: bool,
         write_info_json: bool,
         write_thumbnail: bool,
-        download_video: bool,
-        extract_title: bool,
-        extract_hashtags: bool,
         cancel_event: threading.Event | None,
         cookie_path: str = "",
         log_lines: LogFn | None = None,
     ) -> dict[str, Any]:
         log_lines = log_lines or self._log
-        url = normalize_youtube_download_url(url)
         prefix = self._resolve_prefix()
         fmt = str(self._yt.get("format") or "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best")
         merge_fmt = str(self._yt.get("merge_output_format") or "mp4")
         sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
-        cmd: list[str] = [*prefix, "--newline", "--no-progress", "-o", output_template]
-        if download_video:
-            cmd.extend(
-                [
-                    "-f",
-                    fmt,
-                    "--merge-output-format",
-                    merge_fmt,
-                    "--print",
-                    "after_move:%(filepath)s",
-                    "--max-filesize",
-                    f"{max_fs}M",
-                ]
-            )
-        else:
-            cmd.append("--skip-download")
-        if extract_title or extract_hashtags:
-            cmd.extend(["--print", "meta:%(webpage_url)s\t%(title)s\t%(tags)s"])
+        cmd: list[str] = [
+            *prefix,
+            "-f",
+            fmt,
+            "--merge-output-format",
+            merge_fmt,
+            "--newline",
+            "--no-progress",
+            "--print",
+            "after_move:%(filepath)s",
+            "--max-filesize",
+            f"{max_fs}M",
+            "-o",
+            output_template,
+        ]
         if sleep_sec:
             cmd.extend(["--sleep-interval", str(sleep_sec), "--max-sleep-interval", str(max(sleep_sec, 5))])
         if write_info_json:
@@ -907,8 +1117,6 @@ class UniversalYTDLPWrapper:
             errors="replace",
         )
         filepaths: list[str] = []
-        thumbnail_paths: list[str] = []
-        meta_entries: list[dict[str, str]] = []
         stderr_chunks: list[str] = []
 
         def _read_stderr() -> None:
@@ -916,29 +1124,8 @@ class UniversalYTDLPWrapper:
                 return
             for line in proc.stderr:
                 stderr_chunks.append(line)
-                low = line.lower()
-                n = len(stderr_chunks)
-                is_dl = "[download]" in low
-                noisy_fragment = is_dl and "fragment" in low and "%" not in line
-                # yt-dlp gửi tiến trình chủ yếu qua stderr; bỏ fragment từng mảnh để log không tràn.
-                show = (
-                    n <= 80
-                    or "error" in low
-                    or "warning" in low
-                    or "merging" in low
-                    or "ffmpeg" in low
-                    or "destination:" in low
-                    or (is_dl and not noisy_fragment)
-                )
-                if show:
+                if len(stderr_chunks) <= 30 or "ERROR" in line:
                     log_lines(line.rstrip())
-                if "destination:" in low:
-                    try:
-                        dest = line.split(":", 1)[1].strip().strip('"')
-                        if dest and dest.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) and Path(dest).is_file():
-                            thumbnail_paths.append(dest)
-                    except Exception:
-                        pass
 
         rt = threading.Thread(target=_read_stderr, daemon=True)
         rt.start()
@@ -954,17 +1141,10 @@ class UniversalYTDLPWrapper:
                 # after_move:/path/to/file.mp4
                 if line.startswith("after_move:"):
                     fp = line.split(":", 1)[1].strip().strip('"')
-                    if fp and Path(fp).is_file():
+                    # Không ép is_file ngay lúc stream stdout vì một số hệ/FS báo trễ.
+                    if fp:
                         filepaths.append(fp)
-                elif line.startswith("meta:"):
-                    raw = line[5:]
-                    parts = raw.split("\t", 2)
-                    src_url = (parts[0] if len(parts) > 0 else "").strip()
-                    title = (parts[1] if len(parts) > 1 else "").strip()
-                    tags = (parts[2] if len(parts) > 2 else "").strip()
-                    if src_url or title or tags:
-                        meta_entries.append({"url": src_url, "title": title, "hashtags": tags})
-                elif Path(line).is_file() and line.lower().endswith((".mp4", ".webm", ".mkv", ".mov")):
+                elif line.lower().endswith((".mp4", ".webm", ".mkv", ".mov")):
                     filepaths.append(line)
 
         try:
@@ -978,13 +1158,7 @@ class UniversalYTDLPWrapper:
         if cancel_event and cancel_event.is_set():
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
-            return {
-                "success": False,
-                "error": "Đã hủy/tạm dừng bởi người dùng.",
-                "filepaths": filepaths,
-                "thumbnail_paths": thumbnail_paths,
-                "stderr": err_full[-2000:],
-            }
+            return {"success": False, "error": "Đã hủy/tạm dừng bởi người dùng.", "filepaths": filepaths, "stderr": err_full[-2000:]}
         if rc != 0:
             low = err_full.lower()
             if any(x in low for x in ("private", "login required", "sign in", "drm", "members only")):
@@ -996,47 +1170,61 @@ class UniversalYTDLPWrapper:
                     "message": "Không tải được bằng yt-dlp (private/login/DRM). Vui lòng tải tay và chọn file local.",
                     "stderr": err_full[-2000:],
                     "filepaths": filepaths,
-                    "thumbnail_paths": thumbnail_paths,
                 }
             err_snip = err_full.strip()[-1200:] or f"yt-dlp exit {rc}"
             err_snip = augment_facebook_unsupported_url_message(url, err_snip)
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
-            return {"success": False, "error": err_snip[:2200], "filepaths": filepaths, "thumbnail_paths": thumbnail_paths}
-        if not filepaths:
-            if (not download_video) and meta_entries:
-                if cookie_tmp is not None:
-                    cookie_tmp.unlink(missing_ok=True)
-                return {
-                    "success": True,
-                    "filepaths": [],
-                    "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
-                    "meta_entries": meta_entries,
-                    "stderr": err_full[-1200:],
-                }
-            if (not download_video) and thumbnail_paths:
-                if cookie_tmp is not None:
-                    cookie_tmp.unlink(missing_ok=True)
-                return {
-                    "success": True,
-                    "filepaths": [],
-                    "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
-                    "meta_entries": meta_entries,
-                    "stderr": err_full[-1200:],
-                }
+            return {"success": False, "error": err_snip[:2200], "filepaths": filepaths}
+        # Chuẩn hóa danh sách đường dẫn báo về và lọc file thực sự tồn tại.
+        resolved_paths: list[str] = []
+        seen_resolved: set[str] = set()
+
+        def _consume_fps(raw_list: list[str]) -> None:
+            for fp in raw_list:
+                raw = str(fp or "").strip().strip('"')
+                if not raw:
+                    continue
+                p = Path(raw).expanduser()
+                candidates: list[Path] = [p]
+                if not p.is_absolute():
+                    candidates.append((Path.cwd() / p).resolve())
+                for cand in candidates:
+                    try:
+                        if cand.is_file():
+                            s = str(cand.resolve())
+                            if s not in seen_resolved:
+                                seen_resolved.add(s)
+                                resolved_paths.append(s)
+                            break
+                    except OSError:
+                        continue
+
+        _consume_fps(filepaths)
+
+        if not resolved_paths and rc == 0:
+            od = _output_root_dir_from_ytdlp_template(output_template)
+            if od is not None:
+                _consume_fps(scan_output_dir_for_existing_media(root=od, url=url))
+
+        if not resolved_paths:
             low = err_full.lower()
-            if skip_existing and any(
-                x in low for x in ("already been downloaded", "has already been recorded", "skipping", "in the archive")
-            ):
+            if skip_existing and any(x in low for x in _YTDLP_SKIP_OR_ARCHIVE_MARKERS):
                 if cookie_tmp is not None:
                     cookie_tmp.unlink(missing_ok=True)
-                return {
-                    "success": True,
-                    "filepaths": [],
-                    "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
-                    "stderr": err_full[-1500:],
-                    "skipped_only": True,
-                }
+                return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "skipped_only": True}
+            # Có trường hợp yt-dlp tải xong nhưng không in đúng after_move/path parser.
+            # Nếu rc=0 và stderr có dấu hiệu hoàn tất download thì coi là thành công mềm.
+            if any(x in low for x in ("[download] 100%", "destination:", "merging formats into")):
+                if cookie_tmp is not None:
+                    cookie_tmp.unlink(missing_ok=True)
+                return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "paths_unreported": True}
+            # Một số bản yt-dlp + extractor Facebook trả rc=0 nhưng không in after_move/stderr.
+            # Trường hợp này coi như skip mềm để UI không báo lỗi giả.
+            if rc == 0:
+                if cookie_tmp is not None:
+                    cookie_tmp.unlink(missing_ok=True)
+                return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "skipped_only": True}
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
             return {
@@ -1044,17 +1232,10 @@ class UniversalYTDLPWrapper:
                 "error": "Không nhận được đường dẫn file từ yt-dlp (có thể đã skip vì trùng archive).",
                 "stderr": err_full[-1500:],
                 "filepaths": [],
-                "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
             }
         if cookie_tmp is not None:
             cookie_tmp.unlink(missing_ok=True)
-        return {
-            "success": True,
-            "filepaths": filepaths,
-            "thumbnail_paths": list(dict.fromkeys(thumbnail_paths)),
-            "meta_entries": meta_entries,
-            "stderr": err_full[-1000:],
-        }
+        return {"success": True, "filepaths": resolved_paths, "stderr": err_full[-1000:]}
 
 
 class BulkDownloadManager:
@@ -1092,9 +1273,6 @@ class DownloadJobOptions:
     skip_existing: bool
     write_info_json: bool
     write_thumbnail: bool
-    download_video: bool
-    extract_title: bool
-    extract_hashtags: bool
 
 
 class UniversalVideoDownloader:
@@ -1189,8 +1367,11 @@ class UniversalVideoDownloader:
             out_dir = str(project_root() / "data" / "downloads")
         out_dir = str(Path(out_dir).expanduser().resolve())
         max_videos = int(options.get("max_videos") or self._uvd.get("yt_dlp", {}).get("max_videos_default") or 50)
+        raw_job_name = str(options.get("job_name") or "").strip()
+        job_name = raw_job_name[:120]
         job = {
             "id": f"dl_{uuid.uuid4().hex[:10]}",
+            "name": job_name,
             "url": url,
             "platform": platform,
             "url_type": url_type,
@@ -1201,9 +1382,6 @@ class UniversalVideoDownloader:
             "skip_existing": bool(options.get("skip_existing", dl.get("skip_existing", True))),
             "write_info_json": bool(options.get("write_info_json", self._uvd.get("yt_dlp", {}).get("write_info_json", True))),
             "write_thumbnail": bool(options.get("write_thumbnail", self._uvd.get("yt_dlp", {}).get("write_thumbnail", True))),
-            "download_video": bool(options.get("download_video", True)),
-            "extract_title": bool(options.get("extract_title", False)),
-            "extract_hashtags": bool(options.get("extract_hashtags", False)),
             "cookie_path": str(options.get("cookie_path") or ""),
             "status": "pending",
             "downloaded_files": [],
@@ -1238,16 +1416,18 @@ class UniversalVideoDownloader:
             skip_existing=bool(job["skip_existing"]),
             write_info_json=bool(job["write_info_json"]),
             write_thumbnail=bool(job["write_thumbnail"]),
-            download_video=bool(job.get("download_video", True)),
-            extract_title=bool(job.get("extract_title", False)),
-            extract_hashtags=bool(job.get("extract_hashtags", False)),
             cookie_path=str(job.get("cookie_path") or ""),
             cancel_event=self._cancel,
             log_lines=self._log,
         )
         filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
-        thumbnail_paths: list[str] = list(dict.fromkeys(ret.get("thumbnail_paths") or []))
-        meta_entries: list[dict[str, str]] = list(ret.get("meta_entries") or [])
+        if ret.get("skipped_only") and not filepaths:
+            od = Path(str(job.get("output_dir") or "")).expanduser().resolve()
+            if od.is_dir():
+                rescue = scan_output_dir_for_existing_media(root=od, url=str(job.get("url") or ""))
+                if rescue:
+                    filepaths = list(dict.fromkeys(rescue))
+                    ret = {**ret, "skipped_only": False, "filepaths": filepaths, "success": True}
         if ret.get("skipped_only"):
             job["status"] = "completed"
             job["completed_at"] = _now_iso()
@@ -1270,65 +1450,224 @@ class UniversalVideoDownloader:
             self._active_job_id = None
             return job
 
-        if (not filepaths) and (meta_entries or thumbnail_paths):
-            export_file = ""
-            if meta_entries:
-                export_file = self._write_meta_export(
-                    job=job,
-                    rows=meta_entries,
-                    include_title=bool(job.get("extract_title", False)),
-                    include_hashtags=bool(job.get("extract_hashtags", False)),
-                )
-            job["downloaded_files"] = []
-            job["status"] = "completed"
-            job["completed_at"] = _now_iso()
-            if export_file:
-                job["metadata_export_file"] = export_file
-            if thumbnail_paths:
-                job["thumbnail_files"] = thumbnail_paths
-            self._store.save_job(job)
-            self._active_job_id = None
-            return job
-
         records: list[dict[str, Any]] = []
+        seen_lower: set[str] = set()
+        for r in self._store.list_downloaded_videos():
+            if str(r.get("download_job_id") or "") != str(job.get("id") or ""):
+                continue
+            vp = str(r.get("video_path") or "").strip()
+            if not vp:
+                continue
+            try:
+                seen_lower.add(str(Path(vp).expanduser().resolve()).lower())
+            except OSError:
+                seen_lower.add(vp.lower())
         for fp in filepaths:
+            try:
+                pl = str(Path(fp).expanduser().resolve()).lower()
+            except OSError:
+                pl = str(fp).lower()
+            if pl in seen_lower:
+                continue
             rec = self._build_video_record(video_path=fp, job=job)
             records.append(rec)
             self._store.save_downloaded_video(rec)
-        job["downloaded_files"] = [r["video_path"] for r in records]
+            seen_lower.add(pl)
+        job["downloaded_files"] = [
+            str(r.get("video_path") or "")
+            for r in self._store.list_downloaded_videos()
+            if str(r.get("download_job_id") or "") == str(job.get("id") or "") and str(r.get("video_path") or "").strip()
+        ]
         job["status"] = "completed"
         job["completed_at"] = _now_iso()
+        if ret.get("paths_unreported") and not job["downloaded_files"]:
+            job["error_message"] = "yt-dlp hoàn tất nhưng không trả về đường dẫn file; kiểm tra thư mục tải."
+        else:
+            job["error_message"] = ""
         self._store.save_job(job)
         self._active_job_id = None
         return job
 
-    def _write_meta_export(
-        self,
-        *,
-        job: dict[str, Any],
-        rows: list[dict[str, str]],
-        include_title: bool,
-        include_hashtags: bool,
-    ) -> str:
-        out_dir = Path(str(job.get("output_dir") or "")).expanduser().resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        job_id = str(job.get("id") or "job")
-        out_file = out_dir / f"{job_id}_title_hashtags.csv"
-        cols = ["url"]
-        if include_title:
-            cols.append("title")
-        if include_hashtags:
-            cols.append("hashtags")
-        lines = [",".join(cols)]
+    def run_download_url_for_job(self, job_id: str, item_url: str) -> dict[str, Any]:
+        """
+        Tải một URL đơn và gộp kết quả vào job có sẵn (dùng cho batch: một job — nhiều video).
+        Giữ ``status=running`` cho tới khi gọi ``finalize_batch_download_job``.
+        """
+        item_url = str(item_url or "").strip()
+        if not item_url:
+            raise ValueError("Thiếu URL")
+        job = self._store.get_job(job_id)
+        if not job:
+            raise KeyError(f"Không có job: {job_id}")
+        if self.is_cancel_requested():
+            self._active_job_id = None
+            return job
+        self._active_job_id = job_id
+        DownloadFolderManager.validate_output_dir(job["output_dir"])
+        tmpl = DownloadFolderManager.build_output_template(job)
+        if not str(job.get("started_at") or "").strip():
+            job["status"] = "running"
+            job["started_at"] = _now_iso()
+        job["error_message"] = ""
+        self._store.save_job(job)
+
+        ret = self._yt.download(
+            url=item_url,
+            output_template=tmpl,
+            archive_path=self._paths["archive"],
+            url_type="single_video",
+            max_videos=1,
+            skip_existing=bool(job["skip_existing"]),
+            write_info_json=bool(job["write_info_json"]),
+            write_thumbnail=bool(job["write_thumbnail"]),
+            cookie_path=str(job.get("cookie_path") or ""),
+            cancel_event=self._cancel,
+            log_lines=self._log,
+        )
+        filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
+        if ret.get("skipped_only") and not filepaths:
+            od = Path(str(job.get("output_dir") or "")).expanduser().resolve()
+            if od.is_dir():
+                rescue = scan_output_dir_for_existing_media(root=od, url=item_url)
+                if rescue:
+                    filepaths = list(dict.fromkeys(rescue))
+                    ret = {**ret, "skipped_only": False, "filepaths": filepaths, "success": True}
+        if ret.get("skipped_only"):
+            job = self._store.get_job(job_id) or job
+            self._attach_existing_sources_to_job(job=job, source_url=item_url)
+            job["status"] = "running"
+            self._store.save_job(job)
+            self._active_job_id = None
+            return job
+        if not bool(ret.get("success")):
+            err = str(ret.get("error") or "Lỗi không xác định")
+            job = self._store.get_job(job_id) or job
+            failed_items = list(job.get("failed_items") or [])
+            if err == "need_manual_upload":
+                failed_items.append({"url": item_url, "error": str(ret.get("message") or err)})
+            else:
+                failed_items.append({"url": item_url, "error": err[:1500]})
+            job["failed_items"] = failed_items
+            job["status"] = "running"
+            self._store.save_job(job)
+            self._active_job_id = None
+            return job
+
+        job = self._store.get_job(job_id) or job
+        seen_lower: set[str] = set()
+        for r in self._store.list_downloaded_videos():
+            if str(r.get("download_job_id") or "") != str(job.get("id") or ""):
+                continue
+            vp = str(r.get("video_path") or "").strip()
+            if not vp:
+                continue
+            try:
+                seen_lower.add(str(Path(vp).expanduser().resolve()).lower())
+            except OSError:
+                seen_lower.add(vp.lower())
+        for fp in filepaths:
+            try:
+                pl = str(Path(fp).expanduser().resolve()).lower()
+            except OSError:
+                pl = str(fp).lower()
+            if pl in seen_lower:
+                continue
+            rec = self._build_video_record(video_path=fp, job=job)
+            self._store.save_downloaded_video(rec)
+            seen_lower.add(pl)
+        job["downloaded_files"] = [
+            str(r.get("video_path") or "")
+            for r in self._store.list_downloaded_videos()
+            if str(r.get("download_job_id") or "") == str(job.get("id") or "") and str(r.get("video_path") or "").strip()
+        ]
+        job["status"] = "running"
+        if ret.get("paths_unreported") and not filepaths:
+            pass
+        self._store.save_job(job)
+        self._active_job_id = None
+        return job
+
+    def _attach_existing_sources_to_job(self, *, job: dict[str, Any], source_url: str) -> int:
+        """
+        Nếu URL bị skip (archive) nhưng video đã tồn tại từ job cũ, tạo bản ghi mới
+        trỏ cùng file vào job hiện tại để Bước 4/Video Editor nhìn thấy theo job mới.
+        """
+        jid = str(job.get("id") or "").strip()
+        if not jid:
+            return 0
+        src_key = _norm_url_key(source_url).lower()
+        src_vid = _extract_video_id_for_scan(source_url)
+        if not src_key and not src_vid:
+            return 0
+        rows = [r for r in self._store.list_downloaded_videos() if isinstance(r, dict)]
+        existing_by_path: set[str] = set()
         for r in rows:
-            vals = [str(r.get("url") or "")]
-            if include_title:
-                vals.append(str(r.get("title") or ""))
-            if include_hashtags:
-                vals.append(str(r.get("hashtags") or ""))
-            lines.append(",".join(f"\"{v.replace('"', '\"\"')}\"" for v in vals))
-        out_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return str(out_file)
+            if str(r.get("download_job_id") or "").strip() != jid:
+                continue
+            p = str(r.get("video_path") or "").strip()
+            if p:
+                existing_by_path.add(p.lower())
+        added = 0
+        for r in rows:
+            old_job = str(r.get("download_job_id") or "").strip()
+            if not old_job or old_job == jid:
+                continue
+            vp = str(r.get("video_path") or "").strip()
+            if not vp:
+                continue
+            rk = _norm_url_key(str(r.get("source_url") or "")).lower()
+            rvid = _extract_video_id_for_scan(str(r.get("source_url") or ""))
+            matched = False
+            if src_vid and rvid and src_vid == rvid:
+                matched = True
+            elif src_key and rk and (src_key == rk or src_key in rk or rk in src_key):
+                matched = True
+            if not matched:
+                continue
+            if vp.lower() in existing_by_path:
+                continue
+            clone = dict(r)
+            clone["id"] = f"src_video_{uuid.uuid4().hex[:10]}"
+            clone["download_job_id"] = jid
+            clone["download_job_name"] = str(job.get("name") or "")
+            clone["created_at"] = _now_iso()
+            self._store.save_downloaded_video(clone)
+            existing_by_path.add(vp.lower())
+            added += 1
+        if added > 0:
+            job["downloaded_files"] = [
+                str(r.get("video_path") or "")
+                for r in self._store.list_downloaded_videos()
+                if str(r.get("download_job_id") or "") == jid and str(r.get("video_path") or "").strip()
+            ]
+        return added
+
+    def finalize_batch_download_job(self, job_id: str) -> dict[str, Any]:
+        """Đóng batch: cập nhật trạng thái job sau khi đã gọi ``run_download_url_for_job`` nhiều lần."""
+        job = self._store.get_job(job_id)
+        if not job:
+            raise KeyError(f"Không có job: {job_id}")
+        paths = [
+            str(r.get("video_path") or "")
+            for r in self._store.list_downloaded_videos()
+            if str(r.get("download_job_id") or "") == str(job.get("id") or "") and str(r.get("video_path") or "").strip()
+        ]
+        job["downloaded_files"] = paths
+        fails = list(job.get("failed_items") or [])
+        n_ok = len(paths)
+        n_fail = len(fails)
+        if n_ok == 0 and n_fail > 0:
+            job["status"] = "failed"
+            job["error_message"] = f"Tất cả {n_fail} URL lỗi (xem failed_items / log)."
+        elif n_fail > 0:
+            job["status"] = "completed"
+            job["error_message"] = f"Hoàn tất: {n_ok} file, {n_fail} URL lỗi."
+        else:
+            job["status"] = "completed"
+            job["error_message"] = ""
+        job["completed_at"] = _now_iso()
+        self._store.save_job(job)
+        return job
 
     def _build_video_record(self, *, video_path: str, job: dict[str, Any]) -> dict[str, Any]:
         vp = Path(video_path).resolve()
@@ -1343,6 +1682,8 @@ class UniversalVideoDownloader:
         duration = 0.0
         upload_date = ""
         source_url = str(job.get("url") or "")
+        description = ""
+        hashtags: list[str] = []
         if info_path.is_file():
             try:
                 meta = json.loads(info_path.read_text(encoding="utf-8"))
@@ -1352,14 +1693,32 @@ class UniversalVideoDownloader:
                     duration = float(meta.get("duration") or 0)
                     upload_date = str(meta.get("upload_date") or "")
                     source_url = str(meta.get("webpage_url") or meta.get("original_url") or source_url)
+                    description = str(meta.get("description") or "").strip()
+                    tags_raw = meta.get("tags")
+                    if isinstance(tags_raw, list):
+                        for t in tags_raw:
+                            s = str(t or "").strip()
+                            if not s:
+                                continue
+                            if not s.startswith("#"):
+                                s = "#" + s
+                            if s.lower() not in {x.lower() for x in hashtags}:
+                                hashtags.append(s)
+                            if len(hashtags) >= 50:
+                                break
+                    if not hashtags:
+                        hashtags = _extract_hashtags_from_text(description)
             except Exception:
                 pass
         return {
             "id": f"src_video_{uuid.uuid4().hex[:10]}",
             "download_job_id": str(job.get("id") or ""),
+            "download_job_name": str(job.get("name") or ""),
             "platform": str(job.get("platform") or ""),
             "source_url": source_url,
             "title": title,
+            "description": description,
+            "hashtags": hashtags,
             "uploader": uploader,
             "duration": duration,
             "upload_date": upload_date,
@@ -1393,6 +1752,9 @@ class UniversalVideoDownloader:
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self._store.list_jobs()
+
+    def get_download_job(self, job_id: str) -> dict[str, Any] | None:
+        return self._store.get_job(str(job_id or "").strip())
 
     def check_url(self, url: str) -> dict[str, Any]:
         return self._yt.get_info(url)
@@ -1440,8 +1802,36 @@ class UniversalVideoDownloader:
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return {"manifest_path": str(out), "payload": payload}
 
-    def delete_downloaded_video(self, video_id: str, *, delete_file: bool = False) -> bool:
-        return self._store.delete_video_record(video_id, delete_file=delete_file)
+    def delete_downloaded_video(
+        self,
+        video_id: str,
+        *,
+        delete_file: bool = False,
+        prune_empty_dirs: bool = True,
+    ) -> bool:
+        return self._store.delete_video_record(
+            video_id,
+            delete_file=delete_file,
+            prune_empty_dirs=prune_empty_dirs,
+        )
+
+    def delete_download_job(
+        self,
+        job_id: str,
+        *,
+        delete_files: bool = True,
+        prune_empty_dirs: bool = True,
+    ) -> dict[str, int | bool]:
+        deleted_videos = self._store.delete_videos_by_job(
+            job_id,
+            delete_file=delete_files,
+            prune_empty_dirs=prune_empty_dirs,
+        )
+        deleted_job = self._store.delete_job(job_id)
+        return {
+            "deleted_job": bool(deleted_job),
+            "deleted_videos": int(deleted_videos),
+        }
 
     def remember_output_dir(self, path: str) -> None:
         cfg_path = project_root() / "config" / "universal_video_downloader.json"

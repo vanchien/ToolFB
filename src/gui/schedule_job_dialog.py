@@ -19,6 +19,7 @@ from src.utils.schedule_batch_preview import build_schedule_by_daily_slots, page
 from src.utils.schedule_job_content import (
     build_schedule_slot_hhmm,
     deserialize_job_schedule_for_ui,
+    internal_post_title_from_body,
     once_local_wall_to_utc_iso,
 )
 from src.utils.reel_thumbnail_choice import REEL_THUMBNAIL_METHOD1_FIRST_AUTO, normalize_reel_thumbnail_choice
@@ -115,6 +116,7 @@ class SchedulePostJobDialog:
         self._top.transient(parent)
         self._top.grab_set()
         self._top.geometry("680x900")
+        self._top.minsize(560, 520)
 
         outer = ttk.Frame(self._top, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -125,11 +127,16 @@ class SchedulePostJobDialog:
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
         )
-        canvas.create_window((0, 0), window=form, anchor="nw")
+        canvas_window_id = canvas.create_window((0, 0), window=form, anchor="nw")
         canvas.configure(yscrollcommand=sy.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sy.pack(side=tk.RIGHT, fill=tk.Y)
         form.columnconfigure(1, weight=1)
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(canvas_window_id, width=max(1, int(getattr(e, "width", canvas.winfo_width())))),
+            add="+",
+        )
 
         def row(r: int, label: str, w: ttk.Widget) -> int:
             ttk.Label(form, text=label).grid(row=r, column=0, sticky="nw", pady=3, padx=(0, 8))
@@ -331,14 +338,23 @@ class SchedulePostJobDialog:
         self._on_schedule_rule_changed()
         self._sync_reel_thumbnail_visibility()
 
-        ttk.Label(
+        lbl_schedule_save = ttk.Label(
             form,
             text="Lưu: kiểu lịch + ngày/giờ hoặc khung giờ → scheduled_at (UTC). Nhiều khung giờ/ngày: chỉ lần chạy đầu được lưu vào scheduled_at (không tự lặp theo từng slot).",
             foreground="gray",
             font=("Segoe UI", 8),
             wraplength=560,
-        ).grid(row=n, column=0, columnspan=2, sticky="w")
+        )
+        lbl_schedule_save.grid(row=n, column=0, columnspan=2, sticky="w")
         n += 1
+        self._top.bind(
+            "<Configure>",
+            lambda _e: (
+                self._lbl_schedule_hint.configure(wraplength=max(340, int(self._top.winfo_width()) - 120)),
+                lbl_schedule_save.configure(wraplength=max(340, int(self._top.winfo_width()) - 120)),
+            ),
+            add="+",
+        )
 
         ai_fr = ttk.LabelFrame(form, text="AI (theo job — để trống nội dung = dùng AI)", padding=8)
         ai_fr.grid(row=n, column=0, columnspan=2, sticky="ew", pady=(6, 4))
@@ -346,12 +362,17 @@ class SchedulePostJobDialog:
         n += 1
         ttk.Label(ai_fr, text="Tiêu đề nội bộ").grid(row=0, column=0, sticky="nw", pady=2, padx=(0, 8))
         self._e_title = ttk.Entry(ai_fr, width=48)
-        self._e_title.insert(0, str(self._init.get("title", "")))
+        _body_init = str(self._init.get("content", "")).strip()
+        _title_init = str(self._init.get("title", "")).strip()
+        _line0 = internal_post_title_from_body(_body_init, fallback="")
+        if not _line0:
+            _line0 = internal_post_title_from_body(_title_init, fallback=_title_init)
+        self._e_title.insert(0, _line0)
         self._e_title.grid(row=0, column=1, sticky="ew", pady=2)
         ttk.Label(ai_fr, text="Nội dung (trống = AI)").grid(row=1, column=0, sticky="nw", pady=2, padx=(0, 8))
         self._txt_body = tk.Text(ai_fr, height=5, width=48, wrap="word", font=("Segoe UI", 9))
         self._txt_body.grid(row=1, column=1, sticky="ew", pady=2)
-        self._txt_body.insert("1.0", str(self._init.get("content", "")))
+        self._txt_body.insert("1.0", _line0)
         ttk.Label(ai_fr, text="ai_topic").grid(row=2, column=0, sticky="nw", pady=2, padx=(0, 8))
         self._e_ai_topic = ttk.Entry(ai_fr, width=48)
         self._e_ai_topic.insert(0, str(self._init.get("ai_topic", "")))
@@ -699,14 +720,18 @@ class SchedulePostJobDialog:
             "auto_generate_caption": bool(self._var_auto_cap.get()),
         }
 
-        body = self._txt_body.get("1.0", tk.END).strip()
+        body_raw = self._txt_body.get("1.0", tk.END).strip()
+        title_ent = self._e_title.get().strip()
+        line_one = internal_post_title_from_body(body_raw, fallback="")
+        if not line_one:
+            line_one = internal_post_title_from_body(title_ent, fallback=title_ent)
         draft = self._e_draft.get().strip()
         row: dict[str, Any] = {
             "account_id": aid,
             "page_id": pid,
             "post_type": pt,
-            "title": self._e_title.get().strip(),
-            "content": body,
+            "title": line_one,
+            "content": line_one,
             "scheduled_at": sched_iso,
             "status": "pending",
             "created_by": str(self._init.get("created_by", "") or "gui").strip() or "gui",

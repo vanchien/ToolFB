@@ -16,7 +16,8 @@ import sys
 import threading
 import time
 import tkinter as tk
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
@@ -76,9 +77,10 @@ from src.utils.app_secrets import (
 from src.utils.app_restart import DEFERRED_GUI_BAT_NAME, relaunch_same_app_and_exit
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager
 from src.utils.pages_manager import PageRecord, PagesManager
-from src.utils.page_schedule import scheduler_tz
+from src.utils.page_schedule import parse_date_only_yyyy_mm_dd, scheduler_tz
+from src.utils.schedule_batch_preview import build_schedule_by_daily_slots, page_post_style_for_post_type
+from src.utils.schedule_job_content import build_schedule_slot_hhmm, internal_post_title_from_body
 from src.utils.schedule_posts_filters import (
-    RETRY_MODES,
     apply_job_filters,
     is_overdue,
     sort_jobs,
@@ -86,7 +88,6 @@ from src.utils.schedule_posts_filters import (
 from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
 from src.utils.schedule_posts_missing_fields import (
     MISSING_FIELD_LABELS,
-    MISSING_FIELD_PRESETS,
     filter_jobs_by_missing_fields,
     format_missing_fields_for_display,
     get_missing_fields,
@@ -95,6 +96,11 @@ from src.utils.schedule_posts_missing_fields import (
 from src.utils.browser_exe_discover import find_browser_exe_in_directory
 from src.utils.github_repo_detect import github_owner_repo_from_git
 from src.utils.paths import project_root
+from src.services.tiktok.account_manager import TikTokAccountStore
+from src.services.tiktok.job_manager import TikTokJobStore, default_job_dict
+from src.services.universal_video_downloader import ensure_downloader_layout
+from src.gui.treeview_shortcuts import install_treeview_shortcuts
+from src.gui.tiktok_manager_tab import build_tiktok_manager_tab
 from src.gui.video_editor_tab import build_video_editor_tab
 from src.utils.proxy_check import check_http_proxy
 
@@ -223,6 +229,11 @@ class _ManagerWindow:
         self._app_version_str = read_local_version(project_root())
         self._root.title(f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._compact_ui = int(self._root.winfo_screenheight() or 900) <= 820
+        self._tree_rows_main = 9 if self._compact_ui else 11
+        self._tree_rows_jobs = 8 if self._compact_ui else 10
+        self._tree_rows_small = 5 if self._compact_ui else 7
+        self._log_rows = 7 if self._compact_ui else 10
         lock_raw = os.environ.get("FB_LOCK_BROWSER_DURING_JOB", "1").strip().lower()
         self._var_lock_browser_job = tk.BooleanVar(value=lock_raw not in {"0", "false", "off", "no"})
         os.environ["FB_LOCK_BROWSER_DURING_JOB"] = "1" if self._var_lock_browser_job.get() else "0"
@@ -261,16 +272,20 @@ class _ManagerWindow:
         self._ui_watchdog_last_tick = time.monotonic()
         self._ui_watchdog_after_id: str | None = None
         self._ui_busy_label: str = ""
+        self._schedule_ve_background_fill: Callable[[], None] | None = None
+        self._tab_ve_notebook_child: tk.Misc | None = None
+        self._tab_dl_notebook_child: tk.Misc | None = None
+        self._embedded_download_panel: Any | None = None
 
-        main = ttk.Frame(self._root, padding=8)
+        main = ttk.Frame(self._root, padding=(6 if self._compact_ui else 8))
         main.pack(fill=tk.BOTH, expand=True)
 
         title = ttk.Label(
             main,
             text="Facebook Automation — Lịch (scheduler) + Account Source + Page/Group",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11 if self._compact_ui else 12, "bold"),
         )
-        title.pack(anchor="w", pady=(0, 6))
+        title.pack(anchor="w", pady=(0, 4 if self._compact_ui else 6))
 
         bar = ttk.Frame(main)
         bar.pack(fill=tk.X, pady=(0, 6))
@@ -292,6 +307,21 @@ class _ManagerWindow:
         self._btn_show_browser.pack(side=tk.LEFT, padx=(12, 4))
         self._btn_hide_browser = ttk.Button(bar, text="Ẩn browser", command=lambda: self._set_browser_visibility(False))
         self._btn_hide_browser.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Label(bar, text="Giao diện:").pack(side=tk.LEFT, padx=(0, 6))
+        self._platform_view_var = tk.StringVar(value="TikTok")
+        self._cb_platform_view = ttk.Combobox(
+            bar,
+            state="readonly",
+            width=10,
+            values=("Facebook", "TikTok"),
+            textvariable=self._platform_view_var,
+        )
+        self._cb_platform_view.pack(side=tk.LEFT, padx=(0, 6))
+        self._cb_platform_view.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._apply_platform_view(self._platform_view_var.get()),
+        )
         self._btn_compact_multi = ttk.Button(
             bar,
             text="Preset multi-page compact",
@@ -349,7 +379,7 @@ class _ManagerWindow:
             "nếu không có tick nào thì dùng dòng đang chọn (Ctrl/Shift, kéo chuột, «Chọn tất cả»). "
             "Chuột phải: «Tick ☑ các dòng đang chọn» / «Bỏ tick» (giữ vùng bôi xanh nếu click phải trên dòng đã chọn).",
             font=("Segoe UI", 9),
-            wraplength=920,
+            wraplength=640,
         ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
         acc_bar = ttk.Frame(tab_acc)
@@ -387,7 +417,7 @@ class _ManagerWindow:
 
         cols_acc = ("tick", "id", "name", "browser", "portable", "proxy", "cookie")
         self._tree_accounts = ttk.Treeview(
-            acc_tree_fr, columns=cols_acc, show="headings", height=11, selectmode="extended"
+            acc_tree_fr, columns=cols_acc, show="headings", height=self._tree_rows_main, selectmode="extended"
         )
         headings_acc = {
             "tick": "Chọn",
@@ -411,6 +441,12 @@ class _ManagerWindow:
         self._tree_accounts.bind("<ButtonPress-1>", self._on_account_tree_press_drag, add=True)
         self._tree_accounts.bind("<B1-Motion>", self._on_account_tree_motion_drag, add=True)
         self._tree_accounts.bind("<ButtonRelease-1>", self._on_account_tree_release_drag, add=True)
+        install_treeview_shortcuts(
+            self._tree_accounts,
+            owner=self._root,
+            enable_context_menu=False,
+            info_callback=lambda msg: logger.info(msg),
+        )
         sy_acc.grid(row=0, column=1, sticky="ns")
 
         tab_pg = ttk.Frame(nb, padding=4)
@@ -422,7 +458,7 @@ class _ManagerWindow:
             text="Thêm / sửa Page (URL, owner…). Lịch + AI theo từng bài: tab «3. Job lịch đăng» — «Job lịch đăng…» từ đây mở nhanh tab đó. "
             "Owner = id tài khoản; file pages.json.",
             font=("Segoe UI", 9),
-            wraplength=920,
+            wraplength=640,
         ).grid(row=0, column=0, sticky="w", pady=(0, 4))
         pg_bar = ttk.Frame(tab_pg)
         pg_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
@@ -463,7 +499,7 @@ class _ManagerWindow:
             pg_tree_fr,
             columns=cols_pg,
             show="headings",
-            height=11,
+            height=self._tree_rows_main,
             selectmode="extended",
         )
         headings_pg = {
@@ -487,6 +523,7 @@ class _ManagerWindow:
         self._tree_pages.configure(yscrollcommand=sy_pg.set)
         self._tree_pages.grid(row=0, column=0, sticky="nsew")
         self._tree_pages.bind("<Double-1>", lambda _e: self._on_edit_page())
+        install_treeview_shortcuts(self._tree_pages, owner=self._root, info_callback=lambda msg: logger.info(msg))
         sy_pg.grid(row=0, column=1, sticky="ns")
 
         tab_jobs = ttk.Frame(nb, padding=4)
@@ -499,12 +536,15 @@ class _ManagerWindow:
             "Scheduler quét SCHEDULE_POSTS_POLL_SEC (mặc định 60s). Nội dung trống → AI (ưu tiên cấu hình trên job, fallback Page). "
             "Hàng ngày: sau đăng thành công job tự pending với scheduled_at ngày kế.",
             font=("Segoe UI", 9),
-            wraplength=920,
+            wraplength=640,
         ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
         jb = ttk.Frame(tab_jobs)
         jb.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         ttk.Button(jb, text="Thêm job", command=self._on_add_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(jb, text="Thêm batch job…", command=self._on_add_batch_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Nạp job chờ đăng từ Export…", command=self._on_import_saved_export_job).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
         ttk.Button(jb, text="Sửa job", command=self._on_edit_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(jb, text="Xóa job", command=self._on_delete_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(jb, text="Đăng luôn job đã chọn", command=self._on_run_selected_jobs_now).pack(side=tk.LEFT, padx=(8, 4))
@@ -556,7 +596,9 @@ class _ManagerWindow:
             "retry",
             "missing",
         )
-        self._tree_jobs = ttk.Treeview(j_tree_fr, columns=cols_j, show="headings", height=10, selectmode="extended")
+        self._tree_jobs = ttk.Treeview(
+            j_tree_fr, columns=cols_j, show="headings", height=self._tree_rows_jobs, selectmode="extended"
+        )
         heads_j = {
             "id": "id",
             "page_id": "page",
@@ -579,6 +621,7 @@ class _ManagerWindow:
         self._tree_jobs.grid(row=0, column=0, sticky="nsew")
         self._tree_jobs.bind("<Double-1>", lambda _e: self._on_edit_schedule_job())
         self._tree_jobs.bind("<<TreeviewSelect>>", lambda _e: self._update_schedule_jobs_stats_label())
+        install_treeview_shortcuts(self._tree_jobs, owner=self._root, info_callback=lambda msg: logger.info(msg))
         sy_j.grid(row=0, column=1, sticky="ns")
         self._install_schedule_jobs_column_sort()
 
@@ -641,7 +684,7 @@ class _ManagerWindow:
             text="Lưu key theo từng provider (Gemini/OpenAI/NanoBanana). Cột «Key»: hiển thị rút gọn an toàn. "
             "«Kích hoạt» = dùng ngay cho phiên này; «Mặc định» = key khi mở lại app (env trống). "
             "Nếu biến môi trường đã có sẵn thì sẽ được ưu tiên khi khởi động.",
-            wraplength=880,
+            wraplength=620,
             font=("Segoe UI", 9),
         ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ai_pick_fr = ttk.Frame(tab_ai)
@@ -667,7 +710,7 @@ class _ManagerWindow:
         gtree_fr.rowconfigure(0, weight=1)
         gcols = ("mark", "label", "preview")
         self._tree_gemini = ttk.Treeview(
-            gtree_fr, columns=gcols, show="headings", height=7, selectmode="browse"
+            gtree_fr, columns=gcols, show="headings", height=self._tree_rows_small, selectmode="browse"
         )
         self._tree_gemini.heading("mark", text="Mặc định")
         self._tree_gemini.heading("label", text="Nhãn")
@@ -680,6 +723,7 @@ class _ManagerWindow:
         self._tree_gemini.grid(row=0, column=0, sticky="nsew")
         sgy.grid(row=0, column=1, sticky="ns")
         self._tree_gemini.bind("<Double-1>", lambda _e: self._on_activate_selected_gemini_key())
+        install_treeview_shortcuts(self._tree_gemini, owner=self._root, info_callback=lambda msg: logger.info(msg))
 
         ttk.Label(tab_ai, text="Nhãn (gợi nhớ)").grid(row=4, column=0, sticky="nw", pady=(8, 2))
         self._ent_gemini_label = ttk.Entry(tab_ai, width=48)
@@ -727,7 +771,9 @@ class _ManagerWindow:
         otree_fr.columnconfigure(0, weight=1)
         otree_fr.rowconfigure(0, weight=1)
         ocols = ("mark", "label", "preview")
-        self._tree_openai = ttk.Treeview(otree_fr, columns=ocols, show="headings", height=6, selectmode="browse")
+        self._tree_openai = ttk.Treeview(
+            otree_fr, columns=ocols, show="headings", height=self._tree_rows_small, selectmode="browse"
+        )
         self._tree_openai.heading("mark", text="Mặc định")
         self._tree_openai.heading("label", text="Nhãn")
         self._tree_openai.heading("preview", text="Key (đã che)")
@@ -739,6 +785,7 @@ class _ManagerWindow:
         self._tree_openai.grid(row=0, column=0, sticky="nsew")
         osb.grid(row=0, column=1, sticky="ns")
         self._tree_openai.bind("<Double-1>", lambda _e: self._on_activate_selected_openai_key())
+        install_treeview_shortcuts(self._tree_openai, owner=self._root, info_callback=lambda msg: logger.info(msg))
 
         ttk.Label(tab_ai, text="Nhãn OpenAI").grid(row=14, column=0, sticky="nw", pady=(8, 2))
         self._ent_openai_label = ttk.Entry(tab_ai, width=48)
@@ -779,7 +826,9 @@ class _ManagerWindow:
         nbtree_fr.columnconfigure(0, weight=1)
         nbtree_fr.rowconfigure(0, weight=1)
         nbcols = ("mark", "label", "preview")
-        self._tree_nanobanana = ttk.Treeview(nbtree_fr, columns=nbcols, show="headings", height=6, selectmode="browse")
+        self._tree_nanobanana = ttk.Treeview(
+            nbtree_fr, columns=nbcols, show="headings", height=self._tree_rows_small, selectmode="browse"
+        )
         self._tree_nanobanana.heading("mark", text="Mặc định")
         self._tree_nanobanana.heading("label", text="Nhãn")
         self._tree_nanobanana.heading("preview", text="Key (đã che)")
@@ -791,6 +840,7 @@ class _ManagerWindow:
         self._tree_nanobanana.grid(row=0, column=0, sticky="nsew")
         nsb.grid(row=0, column=1, sticky="ns")
         self._tree_nanobanana.bind("<Double-1>", lambda _e: self._on_activate_selected_nanobanana_key())
+        install_treeview_shortcuts(self._tree_nanobanana, owner=self._root, info_callback=lambda msg: logger.info(msg))
 
         ttk.Label(tab_ai, text="Nhãn NanoBanana/VEO3").grid(row=23, column=0, sticky="nw", pady=(8, 2))
         self._ent_nb_label = ttk.Entry(tab_ai, width=48)
@@ -834,6 +884,7 @@ class _ManagerWindow:
         )
 
         self._jobs_tab_index = nb.index(tab_jobs)
+        self._root.bind("<<OpenScheduleJobsTab>>", self._on_open_schedule_jobs_tab_event, add="+")
 
         tab_ve = ttk.Frame(nb, padding=4)
         nb.add(tab_ve, text="  5. Video Editor  ")
@@ -843,12 +894,16 @@ class _ManagerWindow:
         ve_host.grid(row=0, column=0, sticky="nsew")
         ve_host.columnconfigure(0, weight=1)
         ve_host.rowconfigure(0, weight=1)
-        build_video_editor_tab(ve_host, self._root)
+        self._schedule_ve_background_fill, self._shutdown_video_editor_tab = build_video_editor_tab(
+            ve_host, self._root
+        )
+        self._tab_ve_notebook_child = tab_ve
 
         tab_dl = ttk.Frame(nb, padding=4)
         nb.add(tab_dl, text="  6. Tải Video  ")
         tab_dl.columnconfigure(0, weight=1)
         tab_dl.rowconfigure(0, weight=1)
+        self._tab_dl_notebook_child = tab_dl
         try:
             from src.gui.ai_video_dialog import AIVideoDialog
 
@@ -859,12 +914,33 @@ class _ManagerWindow:
                 embedded_download_host=tab_dl,
             )
         except Exception as exc:  # noqa: BLE001
+            self._embedded_download_panel = None
             ttk.Label(tab_dl, text="Không khởi tạo được module tải video.", foreground="#b00020").grid(
                 row=0, column=0, sticky="w"
             )
-            ttk.Label(tab_dl, text=str(exc), foreground="#555", wraplength=800, justify="left").grid(
+            ttk.Label(tab_dl, text=str(exc), foreground="#555", wraplength=620, justify="left").grid(
                 row=1, column=0, sticky="w", pady=(6, 0)
             )
+
+        tab_tt = ttk.Frame(nb, padding=4)
+        nb.add(tab_tt, text="  7. TikTok Manager  ")
+        tab_tt.columnconfigure(0, weight=1)
+        tab_tt.rowconfigure(0, weight=1)
+        tt_host = ttk.Frame(tab_tt)
+        tt_host.grid(row=0, column=0, sticky="nsew")
+        tt_host.columnconfigure(0, weight=1)
+        tt_host.rowconfigure(0, weight=1)
+        build_tiktok_manager_tab(tt_host, self._root)
+
+        # --- Platform view (Facebook vs TikTok) ---
+        self._tab_facebook_accounts = tab_acc
+        self._tab_facebook_pages = tab_pg
+        self._tab_facebook_jobs = tab_jobs
+        self._tab_tiktok_manager = tab_tt
+        self._apply_platform_view(self._platform_view_var.get())
+
+        self._nb.bind("<<NotebookTabChanged>>", self._on_manager_notebook_tab_changed, add="+")
+        self._root.after_idle(self._on_manager_notebook_tab_changed)
 
         body.add(nb_host, weight=5)
 
@@ -873,14 +949,14 @@ class _ManagerWindow:
         log_bar.pack(fill=tk.X, anchor="w")
         ttk.Label(log_bar, text="Nhật ký (INFO)").pack(side=tk.LEFT, anchor="w")
         ttk.Button(log_bar, text="Clear", command=self._on_clear_log_text, width=8).pack(side=tk.RIGHT)
-        self._log_text = tk.Text(log_fr, height=10, state="disabled", wrap="word", font=("Consolas", 9))
+        self._log_text = tk.Text(log_fr, height=self._log_rows, state="disabled", wrap="word", font=("Consolas", 9))
         ly = ttk.Scrollbar(log_fr, orient=tk.VERTICAL, command=self._log_text.yview)
         self._log_text.configure(yscrollcommand=ly.set)
         self._log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ly.pack(side=tk.RIGHT, fill=tk.Y)
         body.add(log_fr, weight=2)
 
-        self._root.minsize(960, 620)
+        self._root.minsize(860 if self._compact_ui else 960, 560 if self._compact_ui else 620)
 
         self._attach_log_sink()
         self._fill_tree(self._accounts.load_all())
@@ -902,6 +978,28 @@ class _ManagerWindow:
         Chạy vòng lặp sự kiện Tk cho tới khi đóng cửa sổ.
         """
         self._root.mainloop()
+
+    def _on_manager_notebook_tab_changed(self, _event: tk.Event | None = None) -> None:
+        """Trì hoãn tác vụ nền (Video Editor / tab Tải) tới lần đầu người dùng mở đúng tab."""
+        try:
+            sel = self._nb.select()
+        except tk.TclError:
+            return
+        ve_tab = self._tab_ve_notebook_child
+        if ve_tab is not None and str(sel) == str(ve_tab):
+            fn = self._schedule_ve_background_fill
+            if fn is not None:
+                try:
+                    fn()
+                except Exception:
+                    pass
+        dl_tab = self._tab_dl_notebook_child
+        panel = self._embedded_download_panel
+        if panel is not None and dl_tab is not None and str(sel) == str(dl_tab):
+            try:
+                panel.warm_embedded_download_panel()
+            except Exception:
+                pass
 
     def _set_ui_busy(self, label: str) -> None:
         """Đánh dấu tác vụ UI hiện tại để watchdog log đúng ngữ cảnh."""
@@ -1348,11 +1446,52 @@ class _ManagerWindow:
             return
         acc = self._record_by_id(aid)
         menu = tk.Menu(self._root, tearoff=0)
+        def _copy_rows() -> None:
+            sel = list(self._tree_accounts.selection())
+            if not sel:
+                return
+            lines: list[str] = []
+            for iid in sel:
+                vals = [str(v) for v in (self._tree_accounts.item(iid, "values") or ())]
+                if vals:
+                    lines.append("\t".join(vals))
+            if not lines:
+                return
+            self._root.clipboard_clear()
+            self._root.clipboard_append("\n".join(lines))
+            logger.info("Đã copy {} dòng tài khoản.", len(lines))
+
+        def _copy_links() -> None:
+            sel = list(self._tree_accounts.selection())
+            if not sel:
+                return
+            links: list[str] = []
+            for iid in sel:
+                vals = [str(v) for v in (self._tree_accounts.item(iid, "values") or ())]
+                for v in vals:
+                    s = v.strip()
+                    if not s:
+                        continue
+                    low = s.lower()
+                    if "http://" in low or "https://" in low:
+                        links.append(s)
+            if not links:
+                logger.info("Không có link trong dòng đã chọn.")
+                return
+            uniq = list(dict.fromkeys(links))
+            self._root.clipboard_clear()
+            self._root.clipboard_append("\n".join(uniq))
+            logger.info("Đã copy {} link.", len(uniq))
+
         n_sel = len(self._tree_accounts.selection())
         tick_lbl = "Tick ☑ các dòng đang chọn" if n_sel > 1 else "Tick ☑ dòng này"
         untick_lbl = "Bỏ tick ☐ các dòng đang chọn" if n_sel > 1 else "Bỏ tick ☐ dòng này"
         menu.add_command(label=tick_lbl, command=self._on_menu_tick_selection)
         menu.add_command(label=untick_lbl, command=self._on_menu_untick_selection)
+        menu.add_command(label="Chọn hết (Ctrl+A)", command=self._on_accounts_select_all)
+        menu.add_separator()
+        menu.add_command(label="Copy dòng đã chọn", command=_copy_rows)
+        menu.add_command(label="Copy link trong dòng đã chọn", command=_copy_links)
         menu.add_separator()
         menu.add_command(label="Sửa tài khoản…", command=self._on_edit_account)
         menu.add_command(label="Lấy cookie (Playwright)…", command=self._on_capture_cookie_account)
@@ -2133,8 +2272,17 @@ class _ManagerWindow:
         top = tk.Toplevel(self._root)
         top.title("Field thiếu của job đang chọn")
         top.transient(self._root)
-        txt = tk.Text(top, width=80, height=min(24, max(8, len(jobs) + 2)))
-        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        top.geometry("760x420")
+        top.minsize(560, 320)
+        host = ttk.Frame(top, padding=8)
+        host.pack(fill=tk.BOTH, expand=True)
+        host.columnconfigure(0, weight=1)
+        host.rowconfigure(0, weight=1)
+        txt = tk.Text(host, width=80, height=min(24, max(8, len(jobs) + 2)))
+        sy = ttk.Scrollbar(host, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=sy.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        sy.grid(row=0, column=1, sticky="ns")
         for j in jobs:
             missing = get_missing_fields(j)
             jid = str(j.get("id", ""))[:12]
@@ -2142,7 +2290,7 @@ class _ManagerWindow:
             line += (", ".join(missing) if missing else "(đủ field)") + "\n"
             txt.insert(tk.END, line)
         txt.configure(state=tk.DISABLED)
-        ttk.Button(top, text="Đóng", command=top.destroy).pack(pady=(0, 8))
+        ttk.Button(host, text="Đóng", command=top.destroy).grid(row=1, column=0, sticky="e", pady=(8, 0))
 
     def _on_jobs_regenerate_missing(self) -> None:
         """Tự phát hiện field thiếu và sinh lại — tuân preset «Thiếu field» nếu user đã chọn."""
@@ -2196,6 +2344,8 @@ class _ManagerWindow:
         dlg.title("Chọn field cần tái tạo")
         dlg.transient(self._root)
         dlg.grab_set()
+        dlg.geometry("520x520")
+        dlg.minsize(420, 340)
         ttk.Label(
             dlg,
             text="Chỉ tái tạo những field được tick dưới đây và ĐANG THIẾU trên job.\n"
@@ -2203,8 +2353,19 @@ class _ManagerWindow:
             justify="left",
         ).pack(anchor="w", padx=10, pady=(10, 6))
         vars_: dict[str, tk.BooleanVar] = {}
-        fr = ttk.Frame(dlg)
-        fr.pack(fill=tk.BOTH, expand=True, padx=10)
+        body = ttk.Frame(dlg)
+        body.pack(fill=tk.BOTH, expand=True, padx=10)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        cvs = tk.Canvas(body, highlightthickness=0)
+        sy = ttk.Scrollbar(body, orient=tk.VERTICAL, command=cvs.yview)
+        fr = ttk.Frame(cvs)
+        fr.bind("<Configure>", lambda _e: cvs.configure(scrollregion=cvs.bbox("all")))
+        win = cvs.create_window((0, 0), window=fr, anchor="nw")
+        cvs.configure(yscrollcommand=sy.set)
+        cvs.grid(row=0, column=0, sticky="nsew")
+        sy.grid(row=0, column=1, sticky="ns")
+        cvs.bind("<Configure>", lambda e: cvs.itemconfigure(win, width=max(1, int(getattr(e, "width", cvs.winfo_width())))))
         for i, f in enumerate(REGENERABLE_FIELDS):
             v = tk.BooleanVar(value=False)
             vars_[f] = v
@@ -3001,12 +3162,13 @@ class _ManagerWindow:
         """
         top = tk.Toplevel(self._root)
         top.title("Màn hình trực quan đăng bài")
-        top.geometry("450x400")
-        top.minsize(440, 360)
+        top.geometry("760x520")
+        top.minsize(520, 380)
         frm = ttk.Frame(top, padding=6)
         frm.pack(fill=tk.BOTH, expand=True)
         step_var = tk.StringVar(value="Đang đọc tiến trình job…")
-        ttk.Label(frm, textvariable=step_var, font=("Segoe UI", 8), wraplength=420, justify=tk.LEFT).pack(
+        lbl_step = ttk.Label(frm, textvariable=step_var, font=("Segoe UI", 8), wraplength=720, justify=tk.LEFT)
+        lbl_step.pack(
             anchor="w", pady=(0, 4)
         )
         status_var = tk.StringVar(value="Đang chờ screenshot mới...")
@@ -3030,6 +3192,21 @@ class _ManagerWindow:
         # Lưu state lên window để tránh GC ảnh.
         top._visual_img_obj = None  # type: ignore[attr-defined]
         top._visual_last_file = ""  # type: ignore[attr-defined]
+        top._visual_max_w = 720  # type: ignore[attr-defined]
+        top._visual_max_h = 300  # type: ignore[attr-defined]
+
+        def _on_resize(_event: tk.Event | None = None) -> None:
+            try:
+                w = max(360, int(top.winfo_width()))
+                h = max(300, int(top.winfo_height()))
+                lbl_step.configure(wraplength=max(300, w - 40))
+                top._visual_max_w = max(300, w - 40)  # type: ignore[attr-defined]
+                top._visual_max_h = max(180, h - 220)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        top.bind("<Configure>", _on_resize, add="+")
+        _on_resize()
 
         def on_close() -> None:
             try:
@@ -3082,7 +3259,8 @@ class _ManagerWindow:
                             img_label.configure(text=f"Ảnh lớn >4MB, bỏ render:\n{latest.name}", image="")
                         else:
                             img = tk.PhotoImage(file=str(latest))
-                            max_w, max_h = 420, 220
+                            max_w = int(getattr(top, "_visual_max_w", 420) or 420)
+                            max_h = int(getattr(top, "_visual_max_h", 220) or 220)
                             while (img.width() > max_w or img.height() > max_h) and img.width() > 8 and img.height() > 8:
                                 img = img.subsample(2, 2)
                             top._visual_img_obj = img  # type: ignore[attr-defined]
@@ -3146,6 +3324,701 @@ class _ManagerWindow:
                 return
             self._fill_schedule_jobs_tree()
             logger.info("Đã thêm schedule job id={}", dlg.result.get("id"))
+
+    @staticmethod
+    def _load_saved_export_schedule_jobs() -> list[dict[str, Any]]:
+        p = ensure_downloader_layout()["root"] / "video_editor_schedule_jobs.json"
+        if not p.is_file():
+            return []
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            return [dict(x) for x in raw] if isinstance(raw, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _save_saved_export_schedule_jobs(rows: list[dict[str, Any]]) -> None:
+        p = ensure_downloader_layout()["root"] / "video_editor_schedule_jobs.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _on_import_saved_export_job(self) -> None:
+        rows = self._load_saved_export_schedule_jobs()
+        if not rows:
+            messagebox.showinfo(
+                "Job chờ đăng",
+                "Chưa có job chờ đăng từ Video Editor.",
+                parent=self._root,
+            )
+            return
+        top = tk.Toplevel(self._root)
+        top.title("Nạp job chờ đăng từ Export")
+        top.transient(self._root)
+        top.grab_set()
+        top.geometry("780x640")
+        top.minsize(640, 520)
+        frm = ttk.Frame(top, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+        frm.columnconfigure(1, weight=1)
+
+        job_map: dict[str, dict[str, Any]] = {}
+        preferred_saved_job_id = str(getattr(self._root, "_ve_saved_export_job_id", "") or "").strip()
+        var_show_imported = tk.BooleanVar(value=False)
+        var_allow_reimport = tk.BooleanVar(value=False)
+        var_job = tk.StringVar(value="")
+
+        fb_account_map: dict[str, str] = {}
+        for a in self._accounts.load_all():
+            aid = str(a.get("id") or "").strip()
+            an = str(a.get("name") or "").strip() or aid
+            if aid:
+                fb_account_map[f"[{aid}] {an}"] = aid
+        tt_account_map: dict[str, str] = {}
+        try:
+            for a in TikTokAccountStore().load_all():
+                aid = str(a.get("id") or "").strip()
+                an = str(a.get("name") or "").strip() or aid
+                un = str(a.get("username") or "").strip()
+                if not aid:
+                    continue
+                suffix = f" (@{un})" if un else ""
+                tt_account_map[f"[{aid}] {an}{suffix}"] = aid
+        except Exception:
+            pass
+        if not fb_account_map and not tt_account_map:
+            messagebox.showwarning(
+                "Chưa có tài khoản",
+                "Thêm tài khoản Facebook (tab 1) hoặc TikTok (TikTok Manager) trước khi nạp job.",
+                parent=self._root,
+            )
+            top.destroy()
+            return
+        var_platform = tk.StringVar(
+            value=(
+                "TikTok"
+                if not fb_account_map and tt_account_map
+                else "Facebook"
+                if fb_account_map and not tt_account_map
+                else "Facebook"
+            )
+        )
+        var_acc = tk.StringVar(value="")
+        var_page = tk.StringVar(value="")
+        var_step = tk.StringVar(value="30")
+        page_map: dict[str, str] = {}
+        try:
+            _tz_default = str(getattr(scheduler_tz(), "key", "") or "").strip() or "Asia/Ho_Chi_Minh"
+        except Exception:
+            _tz_default = "Asia/Ho_Chi_Minh"
+
+        ttk.Label(frm, text="Job chờ đăng").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        cb_job = ttk.Combobox(frm, textvariable=var_job, values=[], state="readonly")
+        cb_job.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        ttk.Label(frm, text="Nền tảng").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        cb_platform = ttk.Combobox(frm, textvariable=var_platform, values=("Facebook", "TikTok"), state="readonly", width=14)
+        cb_platform.grid(row=1, column=1, sticky="w", pady=(0, 6))
+        ttk.Label(frm, text="Tài khoản").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Checkbutton(
+            frm,
+            text="Hiện cả job đã import",
+            variable=var_show_imported,
+        ).grid(row=2, column=1, sticky="w")
+        cb_acc = ttk.Combobox(frm, textvariable=var_acc, values=[], state="readonly")
+        cb_acc.grid(row=3, column=1, sticky="ew", pady=(0, 6))
+        lbl_page = ttk.Label(frm, text="Page")
+        lbl_page.grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        cb_page = ttk.Combobox(frm, textvariable=var_page, state="readonly")
+        cb_page.grid(row=4, column=1, sticky="ew", pady=(0, 6))
+        sch_fr = ttk.LabelFrame(frm, text="Lịch đăng", padding=8)
+        sch_fr.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 4))
+        sch_fr.columnconfigure(1, weight=1)
+        _now = datetime.now()
+        var_sched_rule = tk.StringVar(value="Một lần")
+        sr = 0
+        ttk.Label(sch_fr, text="Kiểu lịch").grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=2)
+        cb_sched_rule = ttk.Combobox(
+            sch_fr,
+            textvariable=var_sched_rule,
+            values=("Đăng ngay", "Một lần", "Theo khung giờ mỗi ngày"),
+            state="readonly",
+            width=38,
+        )
+        cb_sched_rule.grid(row=sr, column=1, sticky="w", pady=2)
+        sr += 1
+        lbl_start_date = ttk.Label(sch_fr, text="Ngày bắt đầu (YYYY-MM-DD)")
+        lbl_start_date.grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=4)
+        e_start_date = ttk.Entry(sch_fr, width=14)
+        e_start_date.insert(0, _now.strftime("%Y-%m-%d"))
+        e_start_date.grid(row=sr, column=1, sticky="w", pady=4)
+        sr += 1
+        lbl_once_time = ttk.Label(sch_fr, text="Giờ/phút (cho kiểu Một lần)")
+        lbl_once_time.grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=4)
+        sched_once_fr = ttk.Frame(sch_fr)
+        sched_once_fr.grid(row=sr, column=1, sticky="w", pady=4)
+        ttk.Label(sched_once_fr, text="Giờ:").pack(side=tk.LEFT)
+        sp_hour = ttk.Spinbox(sched_once_fr, from_=0, to=23, width=4, format="%.0f")
+        sp_hour.set(str(_now.hour))
+        sp_hour.pack(side=tk.LEFT, padx=4)
+        ttk.Label(sched_once_fr, text="Phút:").pack(side=tk.LEFT)
+        sp_min = ttk.Spinbox(sched_once_fr, from_=0, to=59, width=4, format="%.0f")
+        sp_min.set(str(_now.minute))
+        sp_min.pack(side=tk.LEFT, padx=4)
+        sr += 1
+        lbl_daily_slots = ttk.Label(sch_fr, text="Khung giờ/ngày (HH:MM, phẩy)")
+        lbl_daily_slots.grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=4)
+        e_daily_slots = ttk.Entry(sch_fr, width=36)
+        e_daily_slots.insert(0, "04:30,10:15,22:30")
+        e_daily_slots.grid(row=sr, column=1, sticky="ew", pady=4)
+        sr += 1
+        lbl_delay_min = ttk.Label(sch_fr, text="Delay tối thiểu (phút)")
+        lbl_delay_min.grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=4)
+        delay_min_w = ttk.Spinbox(sch_fr, from_=0, to=180, width=6)
+        delay_min_w.insert(0, "1")
+        delay_min_w.grid(row=sr, column=1, sticky="w", pady=4)
+        sr += 1
+        lbl_delay_max = ttk.Label(sch_fr, text="Delay tối đa (phút)")
+        lbl_delay_max.grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=4)
+        delay_max_w = ttk.Spinbox(sch_fr, from_=0, to=180, width=6)
+        delay_max_w.insert(0, "5")
+        delay_max_w.grid(row=sr, column=1, sticky="w", pady=4)
+        sr += 1
+        lbl_timezone = ttk.Label(sch_fr, text="Múi giờ")
+        lbl_timezone.grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=4)
+        e_timezone = ttk.Entry(sch_fr, width=32)
+        e_timezone.insert(0, _tz_default)
+        e_timezone.grid(row=sr, column=1, sticky="ew", pady=4)
+        sr += 1
+        lbl_step_gap = ttk.Label(sch_fr, text="Cách nhau (phút, nhiều video)")
+        lbl_step_gap.grid(row=sr, column=0, sticky="nw", padx=(0, 8), pady=4)
+        ent_step_gap = ttk.Entry(sch_fr, textvariable=var_step, width=8)
+        ent_step_gap.grid(row=sr, column=1, sticky="w", pady=4)
+        sr += 1
+        _default_lbl_fg = lbl_daily_slots.cget("foreground")
+        lbl_sch_hint = ttk.Label(
+            sch_fr,
+            text=(
+                "Giống job lịch / «Thêm batch job»: Đăng ngay / Một lần / Theo khung giờ mỗi ngày. "
+                "Nhiều video: kiểu «Theo khung giờ» xếp lần lượt theo các slot; "
+                "«Đăng ngay» / «Một lần» dùng «Cách nhau (phút)»."
+            ),
+            foreground="gray",
+            font=("Segoe UI", 8),
+            wraplength=640,
+        )
+        lbl_sch_hint.grid(row=sr, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        sr += 1
+
+        def _import_sched_rule_key() -> str:
+            s = str(var_sched_rule.get() or "")
+            if "Đăng ngay" in s:
+                return "immediate"
+            if "Theo khung giờ" in s:
+                return "daily_slots"
+            return "once"
+
+        def _on_import_sched_rule_changed(*_a: Any) -> None:
+            rule = _import_sched_rule_key()
+            if rule == "immediate":
+                lbl_start_date.grid_remove()
+                e_start_date.grid_remove()
+                lbl_once_time.grid_remove()
+                sched_once_fr.grid_remove()
+                lbl_daily_slots.grid_remove()
+                e_daily_slots.grid_remove()
+                lbl_delay_min.grid_remove()
+                delay_min_w.grid_remove()
+                lbl_delay_max.grid_remove()
+                delay_max_w.grid_remove()
+                lbl_timezone.grid_remove()
+                e_timezone.grid_remove()
+                lbl_step_gap.grid()
+                ent_step_gap.grid()
+            elif rule == "once":
+                lbl_start_date.grid()
+                e_start_date.grid()
+                lbl_once_time.grid()
+                sched_once_fr.grid()
+                lbl_daily_slots.grid_remove()
+                e_daily_slots.grid_remove()
+                lbl_delay_min.grid_remove()
+                delay_min_w.grid_remove()
+                lbl_delay_max.grid_remove()
+                delay_max_w.grid_remove()
+                lbl_timezone.grid_remove()
+                e_timezone.grid_remove()
+                lbl_step_gap.grid()
+                ent_step_gap.grid()
+            else:
+                lbl_start_date.grid()
+                e_start_date.grid()
+                lbl_once_time.grid_remove()
+                sched_once_fr.grid_remove()
+                lbl_daily_slots.grid()
+                e_daily_slots.grid()
+                lbl_delay_min.grid()
+                delay_min_w.grid()
+                lbl_delay_max.grid()
+                delay_max_w.grid()
+                lbl_timezone.grid()
+                e_timezone.grid()
+                lbl_step_gap.grid_remove()
+                ent_step_gap.grid_remove()
+            try:
+                top.event_generate("<Configure>")
+            except tk.TclError:
+                pass
+
+        cb_sched_rule.bind("<<ComboboxSelected>>", _on_import_sched_rule_changed)
+        _on_import_sched_rule_changed()
+
+        ttk.Checkbutton(
+            frm,
+            text="Cho phép import lại job đã import",
+            variable=var_allow_reimport,
+        ).grid(row=6, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(
+            frm,
+            text="(Dùng khi muốn tạo lại toàn bộ lịch từ cùng một job đã import)",
+            foreground="#666",
+            font=("Segoe UI", 8),
+        ).grid(row=7, column=1, sticky="w")
+
+        var_preview = tk.StringVar(value="")
+        lbl_preview = ttk.Label(frm, textvariable=var_preview, foreground="#666", wraplength=680, justify="left")
+        lbl_preview.grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        def _import_dlg_wrap(_e: Any = None) -> None:
+            w = max(320, int(top.winfo_width()) - 80)
+            try:
+                lbl_preview.configure(wraplength=w)
+                lbl_sch_hint.configure(wraplength=max(340, w - 40))
+            except tk.TclError:
+                pass
+
+        top.bind("<Configure>", _import_dlg_wrap, add="+")
+
+        def _refresh_job_choices(*_args: Any) -> None:
+            job_map.clear()
+            vals: list[str] = []
+            include_imported = bool(var_show_imported.get())
+            for r in rows:
+                st = str(r.get("status", "")).strip().lower()
+                if not include_imported and st not in {"", "saved", "pending"}:
+                    continue
+                jid = str(r.get("id") or "").strip()
+                jn = str(r.get("job_name") or jid).strip()
+                created = str(r.get("created_at") or "").strip()
+                cnt = len(r.get("items") or [])
+                suffix = " [ĐÃ IMPORT]" if st == "imported" else ""
+                label = f"[{jid}] {jn} ({cnt} video) {created}{suffix}"
+                job_map[label] = r
+                vals.append(label)
+            cb_job.configure(values=vals)
+            if vals:
+                current = str(var_job.get() or "").strip()
+                if current not in job_map:
+                    picked = ""
+                    if preferred_saved_job_id:
+                        needle = f"[{preferred_saved_job_id}]"
+                        picked = next((v for v in vals if needle in v), "")
+                    var_job.set(picked or vals[0])
+            else:
+                var_job.set("")
+
+        def _active_account_map() -> dict[str, str]:
+            return tt_account_map if str(var_platform.get() or "").strip() == "TikTok" else fb_account_map
+
+        def _sync_account_combo(*_args: Any) -> None:
+            m = _active_account_map()
+            vals = list(m.keys())
+            cb_acc.configure(values=vals)
+            cur = str(var_acc.get() or "").strip()
+            if vals:
+                if cur not in m:
+                    var_acc.set(vals[0])
+            else:
+                var_acc.set("")
+            plat = str(var_platform.get() or "").strip()
+            if plat == "TikTok":
+                lbl_page.grid_remove()
+                cb_page.grid_remove()
+                page_map.clear()
+                var_page.set("")
+            else:
+                lbl_page.grid()
+                cb_page.grid()
+            _refresh_pages()
+
+        def _refresh_pages(*_args: Any) -> None:
+            page_map.clear()
+            if str(var_platform.get() or "").strip() == "TikTok":
+                cb_page.configure(values=[])
+                var_page.set("")
+                return
+            aid = fb_account_map.get(str(var_acc.get() or "").strip(), "")
+            vals: list[str] = []
+            for p in self._pages.load_all():
+                if str(p.get("account_id") or "").strip() != aid:
+                    continue
+                pid = str(p.get("id") or "").strip()
+                pname = str(p.get("page_name") or "").strip() or pid
+                if not pid:
+                    continue
+                lb = f"[{pid}] {pname}"
+                page_map[lb] = pid
+                vals.append(lb)
+            cb_page.configure(values=vals)
+            var_page.set(vals[0] if vals else "")
+
+        def _refresh_preview(*_args: Any) -> None:
+            rec = job_map.get(str(var_job.get() or "").strip(), {})
+            cnt = len(rec.get("items") or [])
+            nm = str(rec.get("job_name") or rec.get("id") or "").strip()
+            plat = str(var_platform.get() or "").strip()
+            if plat == "TikTok":
+                var_preview.set(
+                    f"Sẽ tạo {cnt} job TikTok (lịch) từ «{nm}». Xem và sửa ở tab TikTok Manager → Job & lịch đăng."
+                )
+            else:
+                var_preview.set(f"Sẽ tạo {cnt} job lịch Facebook từ «{nm}». Bạn có thể chỉnh sửa từng job sau khi nạp.")
+
+        def _on_platform_or_acc_change(*_a: Any) -> None:
+            _sync_account_combo()
+            _refresh_preview()
+
+        var_platform.trace_add("write", _on_platform_or_acc_change)
+        var_acc.trace_add("write", _refresh_pages)
+        var_job.trace_add("write", _refresh_preview)
+        var_show_imported.trace_add("write", _refresh_job_choices)
+        _refresh_job_choices()
+        _sync_account_combo()
+        _refresh_preview()
+
+        def _clear_schedule_import_marks() -> None:
+            for w in (lbl_daily_slots, lbl_delay_min, lbl_delay_max, lbl_timezone):
+                try:
+                    w.configure(foreground=_default_lbl_fg)
+                except tk.TclError:
+                    pass
+
+        def _parse_daily_slot_strings_import() -> list[str]:
+            raw = e_daily_slots.get().strip()
+            if not raw:
+                lbl_daily_slots.configure(foreground="red")
+                raise ValueError("Khung giờ/ngày không được để trống.")
+            out: list[str] = []
+            for token in raw.split(","):
+                s = token.strip()
+                if not s:
+                    continue
+                parts = s.split(":")
+                if len(parts) != 2:
+                    lbl_daily_slots.configure(foreground="red")
+                    raise ValueError(f"Khung giờ không hợp lệ: {s!r}. Dùng HH:MM.")
+                h, mi = int(parts[0]), int(parts[1])
+                if not (0 <= h <= 23 and 0 <= mi <= 59):
+                    lbl_daily_slots.configure(foreground="red")
+                    raise ValueError(f"Khung giờ không hợp lệ: {s!r}.")
+                out.append(f"{h:02d}:{mi:02d}")
+            return sorted(set(out))
+
+        def _resolved_tz_name_import() -> str:
+            name = (e_timezone.get() or "").strip() or "Asia/Ho_Chi_Minh"
+            try:
+                ZoneInfo(name)
+                return name
+            except Exception:
+                lbl_timezone.configure(foreground="red")
+                return "Asia/Ho_Chi_Minh"
+
+        def _iso_to_local_wall(iso_s: str, tz: ZoneInfo) -> str:
+            s2 = str(iso_s or "").strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s2)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+
+        def _build_import_plans(n_valid: int) -> tuple[list[dict[str, Any]], str] | None:
+            if n_valid < 1:
+                return None
+            _clear_schedule_import_marks()
+            rule = _import_sched_rule_key()
+            tz_sched = scheduler_tz()
+            tz_row_fb = str(getattr(tz_sched, "key", "") or "").strip() or _tz_default
+
+            if rule == "immediate":
+                try:
+                    gap = max(0, int(str(var_step.get()).strip() or "0"))
+                except ValueError:
+                    messagebox.showwarning("Lịch", "«Cách nhau (phút)» phải là số nguyên ≥ 0.", parent=top)
+                    return None
+                base = datetime.now(tz_sched).replace(second=0, microsecond=0)
+                plans: list[dict[str, Any]] = []
+                for i in range(n_valid):
+                    dt = base + timedelta(minutes=i * gap)
+                    iso = dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                    plans.append(
+                        {
+                            "scheduled_at": iso,
+                            "wall": dt.strftime("%Y-%m-%d %H:%M"),
+                            "schedule_recurrence": "",
+                            "schedule_slot": "",
+                        }
+                    )
+                return plans, tz_row_fb
+
+            if rule == "once":
+                try:
+                    gap = max(0, int(str(var_step.get()).strip() or "0"))
+                except ValueError:
+                    messagebox.showwarning("Lịch", "«Cách nhau (phút)» phải là số nguyên ≥ 0.", parent=top)
+                    return None
+                try:
+                    d_only = parse_date_only_yyyy_mm_dd(str(e_start_date.get() or "").strip())
+                except Exception:
+                    messagebox.showwarning("Sai định dạng", "Ngày bắt đầu phải là YYYY-MM-DD.", parent=top)
+                    return None
+                try:
+                    h0 = int(str(sp_hour.get()).strip())
+                    m0 = int(str(sp_min.get()).strip())
+                except ValueError:
+                    messagebox.showwarning("Sai giờ", "Giờ và phút phải là số nguyên.", parent=top)
+                    return None
+                if not (0 <= h0 <= 23 and 0 <= m0 <= 59):
+                    messagebox.showwarning("Sai giờ", "Giờ 0–23, phút 0–59.", parent=top)
+                    return None
+                cur = datetime(d_only.year, d_only.month, d_only.day, h0, m0, 0, tzinfo=tz_sched)
+                slot = build_schedule_slot_hhmm(h0, m0)
+                plans_once: list[dict[str, Any]] = []
+                for i in range(n_valid):
+                    dt = cur + timedelta(minutes=i * gap)
+                    iso = dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                    plans_once.append(
+                        {
+                            "scheduled_at": iso,
+                            "wall": dt.strftime("%Y-%m-%d %H:%M"),
+                            "schedule_recurrence": "once",
+                            "schedule_slot": slot,
+                        }
+                    )
+                return plans_once, tz_row_fb
+
+            tz_out = _resolved_tz_name_import()
+            try:
+                d_only_d = parse_date_only_yyyy_mm_dd(str(e_start_date.get() or "").strip())
+            except Exception:
+                messagebox.showwarning("Sai định dạng", "Ngày bắt đầu phải là YYYY-MM-DD.", parent=top)
+                return None
+            try:
+                slots_list = _parse_daily_slot_strings_import()
+            except ValueError as exc:
+                messagebox.showerror("Lịch", str(exc), parent=top)
+                return None
+            try:
+                dmin = int(str(delay_min_w.get() or "0").strip())
+                dmax = int(str(delay_max_w.get() or "0").strip())
+            except ValueError:
+                messagebox.showwarning("Lịch", "Delay phải là số nguyên.", parent=top)
+                return None
+            if dmin < 0 or dmax < 0 or dmin > dmax:
+                lbl_delay_min.configure(foreground="red")
+                lbl_delay_max.configure(foreground="red")
+                messagebox.showwarning("Lịch", "Delay tối thiểu ≤ delay tối đa (cùng ≥ 0).", parent=top)
+                return None
+            try:
+                tz_z = ZoneInfo(tz_out)
+            except Exception:
+                tz_z = scheduler_tz()
+                tz_out = tz_row_fb
+            try:
+                raw_plans = build_schedule_by_daily_slots(
+                    start_date=d_only_d,
+                    time_slots=slots_list,
+                    job_count=n_valid,
+                    delay_min_minutes=dmin,
+                    delay_max_minutes=dmax,
+                    timezone_name=tz_out,
+                )
+            except ValueError as exc:
+                messagebox.showerror("Lịch", str(exc), parent=top)
+                return None
+            if len(slots_list) == 1:
+                rec, slot0 = "daily", slots_list[0]
+            else:
+                rec, slot0 = "", ""
+            plans_d: list[dict[str, Any]] = []
+            ssd = d_only_d.strftime("%Y-%m-%d")
+            slots_csv = ",".join(slots_list)
+            for p in raw_plans:
+                iso = str(p.get("scheduled_at", "")).strip()
+                wall = _iso_to_local_wall(iso, tz_z)
+                slot_base = str(p.get("slot_base_local", "")).strip()
+                try:
+                    dam = int(p.get("delay_applied_min", 0))
+                except (TypeError, ValueError):
+                    dam = 0
+                plans_d.append(
+                    {
+                        "scheduled_at": iso,
+                        "wall": wall,
+                        "schedule_recurrence": rec,
+                        "schedule_slot": slot0,
+                        "schedule_daily_slots": slots_csv,
+                        "schedule_delay_min": dmin,
+                        "schedule_delay_max": dmax,
+                        "schedule_start_date": ssd,
+                        "slot_base_local": slot_base,
+                        "delay_applied_min": dam,
+                    }
+                )
+            return plans_d, tz_out
+
+        def _ok() -> None:
+            rec = job_map.get(str(var_job.get() or "").strip(), {})
+            if not rec:
+                messagebox.showwarning("Thiếu dữ liệu", "Chọn job chờ đăng.", parent=top)
+                return
+            if str(rec.get("status", "")).strip().lower() == "imported" and not bool(var_allow_reimport.get()):
+                messagebox.showwarning(
+                    "Đã import",
+                    "Job này đã import rồi. Bật «Cho phép import lại» nếu bạn muốn tạo lại lịch.",
+                    parent=top,
+                )
+                return
+            plat = str(var_platform.get() or "").strip()
+            items = [dict(x) for x in (rec.get("items") or []) if isinstance(x, dict)]
+            if not items:
+                messagebox.showwarning("Trống", "Job chờ đăng không có video.", parent=top)
+                return
+            valid_items = [it for it in items if str(it.get("video_path") or "").strip()]
+            if not valid_items:
+                messagebox.showwarning("Trống", "Không có video_path hợp lệ trong job.", parent=top)
+                return
+            built = _build_import_plans(len(valid_items))
+            if built is None:
+                return
+            plans, tz_row = built
+            created = 0
+            if plat == "TikTok":
+                aid = tt_account_map.get(str(var_acc.get() or "").strip(), "").strip()
+                if not aid:
+                    messagebox.showwarning("Thiếu dữ liệu", "Chọn tài khoản TikTok.", parent=top)
+                    return
+                job_store = TikTokJobStore()
+                for idx, it in enumerate(valid_items):
+                    vp = str(it.get("video_path") or "").strip()
+                    plan = plans[idx]
+                    raw_c = str(it.get("content") or "").strip()
+                    line = internal_post_title_from_body(raw_c, fallback="")
+                    if not line:
+                        line = internal_post_title_from_body(
+                            str(it.get("title") or Path(vp).stem).strip(), fallback=Path(vp).stem
+                        )
+                    caption = line
+                    tags = [str(x).strip() for x in (it.get("hashtags") or []) if str(x).strip()]
+                    job = default_job_dict(account_id=aid, video_path=vp, caption=caption, hashtags=tags)
+                    job["schedule_enabled"] = True
+                    job["scheduled_at"] = plan["scheduled_at"]
+                    job["schedule_time"] = plan["wall"]
+                    job["created_by"] = "video_editor_saved_job_import"
+                    job["source_project_id"] = str(rec.get("source_project_id") or "")
+                    job["source_download_job_id"] = str(rec.get("source_download_job_id") or "")
+                    job["source_download_job_label"] = str(rec.get("source_download_job_label") or "")
+                    job["source_download_video_id"] = str(it.get("source_download_video_id") or "")
+                    job_store.upsert(job)
+                    created += 1
+                rec["status"] = "imported"
+                rec["imported_at"] = datetime.now().isoformat(timespec="seconds")
+                rec["imported_to_platform"] = "tiktok"
+                rec["imported_to_account_id"] = aid
+                rec["imported_to_page_id"] = ""
+                self._save_saved_export_schedule_jobs(rows)
+                top.destroy()
+                messagebox.showinfo(
+                    "Hoàn tất",
+                    f"Đã nạp {created} job TikTok (có lịch) vào TikTok Manager.",
+                    parent=self._root,
+                )
+                return
+            aid = fb_account_map.get(str(var_acc.get() or "").strip(), "").strip()
+            pid = page_map.get(str(var_page.get() or "").strip(), "").strip()
+            if not aid or not pid:
+                messagebox.showwarning("Thiếu dữ liệu", "Chọn đủ tài khoản và page.", parent=top)
+                return
+            pps = page_post_style_for_post_type("video")
+            for idx, it in enumerate(valid_items):
+                vp = str(it.get("video_path") or "").strip()
+                plan = plans[idx]
+                raw_fb = str(it.get("content") or "").strip()
+                line_fb = internal_post_title_from_body(raw_fb, fallback="")
+                if not line_fb:
+                    line_fb = internal_post_title_from_body(
+                        str(it.get("title") or Path(vp).stem).strip(), fallback=Path(vp).stem
+                    )
+                row_fb: dict[str, Any] = {
+                    "id": f"sched_{uuid.uuid4().hex[:10]}",
+                    "page_id": pid,
+                    "account_id": aid,
+                    "post_type": "video",
+                    "page_post_style": pps,
+                    "title": line_fb,
+                    "content": line_fb,
+                    "hashtags": [str(x).strip() for x in (it.get("hashtags") or []) if str(x).strip()],
+                    "media_files": [vp],
+                    "video_path": vp,
+                    "scheduled_at": plan["scheduled_at"],
+                    "timezone": tz_row,
+                    "schedule_recurrence": str(plan.get("schedule_recurrence") or ""),
+                    "schedule_slot": str(plan.get("schedule_slot") or ""),
+                    "status": "pending",
+                    "retry_count": 0,
+                    "max_retry": 3,
+                    "created_by": "video_editor_saved_job_import",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "source_project_id": str(rec.get("source_project_id") or ""),
+                    "source_download_job_id": str(rec.get("source_download_job_id") or ""),
+                    "source_download_job_label": str(rec.get("source_download_job_label") or ""),
+                    "source_download_video_id": str(it.get("source_download_video_id") or ""),
+                }
+                if plan.get("schedule_daily_slots"):
+                    row_fb["schedule_daily_slots"] = str(plan["schedule_daily_slots"])
+                    row_fb["schedule_delay_min"] = int(plan["schedule_delay_min"])
+                    row_fb["schedule_delay_max"] = int(plan["schedule_delay_max"])
+                    row_fb["schedule_start_date"] = str(plan["schedule_start_date"])
+                sbl = str(plan.get("slot_base_local") or "").strip()
+                if sbl:
+                    row_fb["slot_base_local"] = sbl[:80]
+                if "delay_applied_min" in plan:
+                    row_fb["schedule_delay_applied_min"] = max(0, min(180, int(plan["delay_applied_min"])))
+                self._schedule_posts.upsert(row_fb)  # type: ignore[arg-type]
+                created += 1
+            rec["status"] = "imported"
+            rec["imported_at"] = datetime.now().isoformat(timespec="seconds")
+            rec["imported_to_page_id"] = pid
+            rec["imported_to_account_id"] = aid
+            rec["imported_to_platform"] = "facebook"
+            self._save_saved_export_schedule_jobs(rows)
+            top.destroy()
+            src_hint = str(rec.get("source_download_job_label") or rec.get("source_download_job_id") or "").strip()
+            if hasattr(self, "_var_jobs_filter_status"):
+                self._var_jobs_filter_status.set("pending")
+            if hasattr(self, "_var_jobs_filter_account"):
+                self._var_jobs_filter_account.set(str(var_acc.get() or "Tất cả account"))
+            if hasattr(self, "_var_jobs_filter_page"):
+                self._var_jobs_filter_page.set(str(var_page.get() or "Tất cả page"))
+            if hasattr(self, "_var_jobs_filter_retry"):
+                self._var_jobs_filter_retry.set("Retry: tất cả")
+            if hasattr(self, "_var_jobs_search"):
+                self._var_jobs_search.set(src_hint or "video_editor_saved_job_import")
+            self._fill_schedule_jobs_tree()
+            messagebox.showinfo("Hoàn tất", f"Đã nạp {created} job lịch từ job chờ đăng.", parent=self._root)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Hủy", command=top.destroy).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="Nạp vào job lịch", command=_ok).pack(side=tk.LEFT)
+        top.wait_window()
 
     def _on_edit_schedule_job(self) -> None:
         jid = self._selected_job_id()
@@ -3236,8 +4109,8 @@ class _ManagerWindow:
         top.title("Đang xử lý")
         top.transient(self._root)
         top.grab_set()
-        top.resizable(False, False)
         top.geometry("400x124")
+        top.minsize(360, 124)
         ttk.Label(top, text=title, anchor="w", justify="left", wraplength=340).pack(
             fill=tk.X, padx=14, pady=(14, 8)
         )
@@ -3362,8 +4235,76 @@ class _ManagerWindow:
                 on_done=done,
             )
 
+    def _notebook_has_tab(self, child: tk.Widget) -> bool:
+        try:
+            self._nb.tab(child)
+            return True
+        except tk.TclError:
+            return False
+
+    def _apply_platform_view(self, platform_label: str) -> None:
+        """
+        Chỉ hiển thị nhóm tab theo nền tảng để giao diện gọn hơn:
+        - Facebook: tab accounts / page / job lịch
+        - TikTok: chỉ tab TikTok Manager
+        """
+        view = (platform_label or "").strip().lower()
+        want_tiktok = view.startswith("tiktok")
+        if getattr(self, "_platform_view_is_tiktok", None) == want_tiktok:
+            return
+        self._platform_view_is_tiktok = want_tiktok
+
+        nb = self._nb
+
+        fb_accounts_text = "  1. Tài khoản (accounts.json)  "
+        fb_pages_text = "  2. Page / Group (pages.json)  "
+        fb_jobs_text = "  3. Job lịch đăng (schedule_posts.json)  "
+        tt_text = "  7. TikTok Manager  "
+
+        if want_tiktok:
+            # Ẩn tab Facebook
+            for child in (self._tab_facebook_jobs, self._tab_facebook_pages, self._tab_facebook_accounts):
+                if child is not None and self._notebook_has_tab(child):
+                    nb.forget(child)
+            # Hiện TikTok
+            if self._tab_tiktok_manager is not None and not self._notebook_has_tab(self._tab_tiktok_manager):
+                nb.add(self._tab_tiktok_manager, text=tt_text)
+            if self._tab_tiktok_manager is not None and self._notebook_has_tab(self._tab_tiktok_manager):
+                nb.select(self._tab_tiktok_manager)
+            self._jobs_tab_index = 0
+            return
+
+        # want facebook
+        # Ẩn TikTok
+        if self._tab_tiktok_manager is not None and self._notebook_has_tab(self._tab_tiktok_manager):
+            nb.forget(self._tab_tiktok_manager)
+
+        # Hiện tab Facebook (nếu bị quên do toggle trước đó)
+        if self._tab_facebook_accounts is not None and not self._notebook_has_tab(self._tab_facebook_accounts):
+            nb.add(self._tab_facebook_accounts, text=fb_accounts_text)
+        if self._tab_facebook_pages is not None and not self._notebook_has_tab(self._tab_facebook_pages):
+            nb.add(self._tab_facebook_pages, text=fb_pages_text)
+        if self._tab_facebook_jobs is not None and not self._notebook_has_tab(self._tab_facebook_jobs):
+            nb.add(self._tab_facebook_jobs, text=fb_jobs_text)
+
+        # Cập nhật index tab jobs để nút điều hướng hoạt động đúng.
+        if self._tab_facebook_jobs is not None and self._notebook_has_tab(self._tab_facebook_jobs):
+            self._jobs_tab_index = nb.index(self._tab_facebook_jobs)
+        else:
+            self._jobs_tab_index = 0
+
+        # Chuyển tới tab Page để người dùng thấy “chức năng Facebook” ngay.
+        if self._tab_facebook_pages is not None and self._notebook_has_tab(self._tab_facebook_pages):
+            nb.select(self._tab_facebook_pages)
+        elif self._tab_facebook_accounts is not None and self._notebook_has_tab(self._tab_facebook_accounts):
+            nb.select(self._tab_facebook_accounts)
+
     def _on_goto_jobs_for_page(self) -> None:
         """Chuyển sang tab Job; gợi ý tạo job cho Page đang chọn."""
+        if getattr(self, "_platform_view_is_tiktok", None):
+            # User đang xem TikTok -> tự chuyển sang Facebook để tab job tồn tại.
+            self._platform_view_var.set("Facebook")
+            self._apply_platform_view("Facebook")
         try:
             self._nb.select(self._jobs_tab_index)
         except Exception as exc:  # noqa: BLE001
@@ -3382,6 +4323,21 @@ class _ManagerWindow:
                 "Chọn một Page ở bảng tab này rồi bấm lại «Job lịch đăng…», hoặc sang tab 3 và «Thêm job».",
                 parent=self._root,
             )
+
+    def _on_open_schedule_jobs_tab_event(self, _event: tk.Event | None = None) -> None:
+        """Nhận event từ Video Editor và chuyển sang tab Job lịch đăng."""
+        if getattr(self, "_platform_view_is_tiktok", None):
+            self._platform_view_var.set("Facebook")
+            self._apply_platform_view("Facebook")
+        try:
+            self._nb.select(self._jobs_tab_index)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không chuyển tab Job lịch đăng từ event: {}", exc)
+            return
+        try:
+            self._on_import_saved_export_job()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không mở popup nạp job chờ đăng tự động: {}", exc)
 
     def _on_delete_page(self) -> None:
         pids = self._selected_page_ids()
@@ -4517,7 +5473,8 @@ class _ManagerWindow:
         top = tk.Toplevel(self._root)
         top.title("Cập nhật xong — mở lại chương trình")
         top.transient(self._root)
-        top.resizable(False, False)
+        top.geometry("680x300")
+        top.minsize(520, 240)
         try:
             top.grab_set()
         except Exception:
@@ -4537,7 +5494,13 @@ class _ManagerWindow:
             "Phím Enter = mở lại ngay. Esc = để sau."
             f"{extra}"
         )
-        ttk.Label(fr, text=msg, wraplength=480, justify=tk.LEFT).pack(anchor="w", pady=(0, 14))
+        lbl_msg = ttk.Label(fr, text=msg, wraplength=620, justify=tk.LEFT)
+        lbl_msg.pack(anchor="w", pady=(0, 14))
+        top.bind(
+            "<Configure>",
+            lambda _e: lbl_msg.configure(wraplength=max(360, int(top.winfo_width()) - 60)),
+            add="+",
+        )
         btn_row = ttk.Frame(fr)
         btn_row.pack(fill=tk.X)
 
@@ -4749,6 +5712,12 @@ class _ManagerWindow:
             except Exception:  # noqa: BLE001
                 pass
         self._manual_profile_sessions.clear()
+        try:
+            shutdown_ve = getattr(self, "_shutdown_video_editor_tab", None)
+            if callable(shutdown_ve):
+                shutdown_ve()
+        except Exception:  # noqa: BLE001
+            pass
         self._stop_ui_watchdog()
         self._detach_log_sink()
         try:

@@ -7,6 +7,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from src.services.universal_video_downloader import ensure_downloader_layout
+from src.services.video_editor.layout import ensure_video_editor_layout
 from src.utils.paths import project_root
 from src.utils.profile_cleanup import iter_profile_leaf_dirs, profiles_data_dir
 
@@ -316,6 +318,92 @@ def _cleanup_temp_json(stats: CleanupStats) -> None:
         _safe_unlink(p, stats)
 
 
+def _cleanup_video_editor_artifacts(root: Path, stats: CleanupStats) -> None:
+    """
+    Dọn file tạm/log/phụ trợ của Video Editor để giảm I/O và RAM cache:
+    - temp preview cũ
+    - log render cũ
+    - thumbnail/waveform/subtitle burn cũ (giữ lại một phần gần nhất)
+    Không xóa ``renders`` để tránh mất video thành phẩm.
+    """
+    paths = ensure_video_editor_layout()
+    _cleanup_old_files_in_dir(
+        paths["temp"],
+        max_age_days=2,
+        keep_latest=8,
+        patterns=("preview_draft_*.mp4", "*.tmp", "*.temp", "ffmpeg_fc_*.txt"),
+        stats=stats,
+    )
+    _cleanup_old_files_in_dir(
+        paths["logs"],
+        max_age_days=7,
+        keep_latest=40,
+        patterns=("render_*.log", "*.log", "*.txt"),
+        stats=stats,
+    )
+    _cleanup_old_files_in_dir(
+        paths["thumbnails"],
+        max_age_days=14,
+        keep_latest=600,
+        patterns=("*.png", "*.jpg", "*.jpeg", "*.webp"),
+        stats=stats,
+    )
+    _cleanup_old_files_in_dir(
+        paths["waveforms"],
+        max_age_days=14,
+        keep_latest=600,
+        patterns=("*.png", "*.jpg", "*.jpeg", "*.webp"),
+        stats=stats,
+    )
+    _cleanup_old_files_in_dir(
+        paths["subtitles"],
+        max_age_days=14,
+        keep_latest=200,
+        patterns=("*_burn.ass", "*_preview_burn.ass", "*.ass"),
+        stats=stats,
+    )
+
+
+def _cleanup_downloader_artifacts(root: Path, stats: CleanupStats) -> None:
+    """
+    Dọn file tạm của yt-dlp/downloader:
+    - .part/.ytdl/.tmp tồn đọng trong data/downloads
+    - cookie tạm do downloader tạo trong temp hệ thống.
+    """
+    dl_paths = ensure_downloader_layout()
+    downloads_dir = root / "data" / "downloads"
+    if downloads_dir.is_dir():
+        _cleanup_old_files_in_dir(
+            downloads_dir,
+            max_age_days=2,
+            keep_latest=0,
+            patterns=("*.part", "*.ytdl", "*.tmp", "*.temp"),
+            stats=stats,
+        )
+    # Dọn cookie tạm dùng cho yt-dlp conversion.
+    tmp = Path(tempfile.gettempdir())
+    if tmp.is_dir():
+        cutoff = time.time() - 2 * 86400
+        for p in tmp.glob("toolfb_ytdlp_cookie_*.txt"):
+            if not p.is_file():
+                continue
+            try:
+                if p.stat().st_mtime > cutoff:
+                    continue
+            except Exception:
+                continue
+            _safe_unlink(p, stats)
+    # Touch để đảm bảo file metadata downloader luôn tồn tại hợp lệ sau cleanup.
+    for key in ("jobs_file", "videos_file", "archive"):
+        p = dl_paths[key]
+        if not p.exists():
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("[]\n" if key != "archive" else "", encoding="utf-8")
+            except Exception:
+                pass
+
+
 def cleanup_runtime_junk() -> CleanupStats:
     """
     Dọn rác nhẹ lúc startup để giảm nặng đĩa/RAM I/O cache:
@@ -340,6 +428,8 @@ def cleanup_runtime_junk() -> CleanupStats:
         _cleanup_profiles_redundant_logs(root, stats)
         _cleanup_ai_video_artifacts(root, stats)
         _cleanup_screenshots(root, stats)
+        _cleanup_video_editor_artifacts(root, stats)
+        _cleanup_downloader_artifacts(root, stats)
         _cleanup_temp_json(stats)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Runtime cleanup bị lỗi (bỏ qua): {}", exc)

@@ -34,31 +34,21 @@ def ensure_video_transform_defaults(clip: dict[str, Any], project: dict[str, Any
         sc.setdefault("keep_aspect", True)
     if "canvas_mode" not in clip:
         clip["canvas_mode"] = "fit"
-    bb = clip.get("blur_background")
-    if not isinstance(bb, dict):
-        clip["blur_background"] = {"enabled": False, "blur": 20}
-    else:
-        bb.setdefault("enabled", False)
-        bb.setdefault("blur", 20)
     if "muted" not in clip:
         clip["muted"] = False
 
 
 class VideoTransformFilterBuilder:
     def build_transform_filters(self, clip: dict[str, Any], project: dict[str, Any]) -> str:
+        """
+        Thứ tự FFmpeg (trái → phải = áp dụng trên ảnh đã giải mã):
+        1) crop — tọa độ theo khung nguồn (trước khi xoay/lật).
+        2) xoay — transpose=1 (90° theo chiều kim đồng hồ), transpose=2 (90° ngược chiều kim).
+        3) lật — trên khung đã xoay (gương trái/phải/trên/dưới như người xem).
+        4) scale — thu phóng sau cùng.
+        """
         ensure_video_transform_defaults(clip, project)
         parts: list[str] = []
-        if clip.get("flip_horizontal"):
-            parts.append("hflip")
-        if clip.get("flip_vertical"):
-            parts.append("vflip")
-        rot = int(clip.get("rotation") or 0) % 360
-        if rot == 90:
-            parts.append("transpose=1")
-        elif rot == 180:
-            parts.extend(["transpose=1", "transpose=1"])
-        elif rot == 270:
-            parts.append("transpose=2")
         cr = clip.get("crop") or {}
         if cr.get("enabled"):
             cw = max(2, int(cr.get("width") or 2))
@@ -66,6 +56,17 @@ class VideoTransformFilterBuilder:
             cx = max(0, int(cr.get("x") or 0))
             cy = max(0, int(cr.get("y") or 0))
             parts.append(f"crop={cw}:{ch}:{cx}:{cy}")
+        rot = int(clip.get("rotation") or 0) % 360
+        if rot == 90:
+            parts.append("transpose=1")
+        elif rot == 180:
+            parts.extend(["transpose=1", "transpose=1"])
+        elif rot == 270:
+            parts.append("transpose=2")
+        if clip.get("flip_horizontal"):
+            parts.append("hflip")
+        if clip.get("flip_vertical"):
+            parts.append("vflip")
         sc = clip.get("scale") or {}
         if sc.get("enabled"):
             sw = max(2, int(sc.get("width") or 2))

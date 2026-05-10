@@ -28,13 +28,56 @@ def _escape_drawtext(s: str) -> str:
 
 
 def _norm_os_path(p: Path) -> str:
-    return os.path.normpath(str(p.resolve()))
+    """Chuẩn hoá đường dẫn cho FFmpeg; Windows: bơm \\\\?\\ khi dài để tránh MAX_PATH."""
+    try:
+        resolved = p.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = p.expanduser()
+    s = os.path.normpath(str(resolved))
+    if os.name != "nt":
+        return s
+    if str(os.environ.get("TOOLFB_FFMPEG_NO_LONGPATH", "0") or "0").strip().lower() in ("1", "true", "yes", "on"):
+        return s
+    if s.startswith("\\\\?\\"):
+        return s
+    if len(s) <= 220:
+        return s
+    if len(s) >= 2 and s[1] == ":":
+        return "\\\\?\\" + s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s[2:]
+    return s
 
 
 def _ass_path_filter(path: Path) -> str:
     """Escape đường dẫn Windows cho filter ass=subtitles=."""
     s = path.resolve().as_posix()
     return s.replace("\\", "/").replace(":", "\\:")
+
+
+def _normalize_video_source_trim(ss: float, se: float, du: float, speed: float) -> tuple[float, float]:
+    """
+    Sau trim, setpts=PTS/speed làm độ dài output ≈ (source_end-source_start)/speed.
+    Ta cần source_end-source_start ≈ duration_timeline × speed.
+    Nếu source_end quá xa (metadata lệch / source_end = cả file), FFmpeg vẫn giải mã hàng phút
+    dù timeline chỉ vài giây — thu hẹp theo duration.
+    """
+    try:
+        sp = float(speed)
+    except (TypeError, ValueError):
+        sp = 1.0
+    if sp <= 0:
+        sp = 1.0
+    du = max(0.0, float(du))
+    ss = max(0.0, float(ss))
+    se = float(se)
+    need = max(0.05, du * sp)
+    tol = 0.08
+    if se <= ss + 1e-6:
+        return ss, ss + need
+    if (se - ss) > need + tol:
+        return ss, ss + need
+    return ss, se
 
 
 class FFmpegCommandBuilder:
@@ -60,6 +103,8 @@ class FFmpegCommandBuilder:
         ass_path: str | None = None,
         output_duration_limit_sec: float | None = None,
         encoding_overrides: dict[str, Any] | None = None,
+        lightweight_mode_override: bool | None = None,
+        mp4_faststart: bool | None = None,
     ) -> list[str]:
         ff = _norm_os_path(Path(ffmpeg_bin))
         out = _norm_os_path(Path(output_path).expanduser())
@@ -75,6 +120,50 @@ class FFmpegCommandBuilder:
         preset = str(enc.get("preset") if enc.get("preset") is not None else exp.get("preset") or "veryfast")
         crf = int(enc.get("crf") if enc.get("crf") is not None else exp.get("crf") if exp.get("crf") is not None else 23)
         acodec = str(enc.get("audio_codec") if enc.get("audio_codec") is not None else exp.get("audio_codec") or "aac")
+        enc_threads = enc.get("threads")
+        # Mặc định ưu tiên "nhẹ + nhanh" (TOOLFB_LIGHT_EXPORT mặc định bật).
+        # Tune thêm:
+        # - TOOLFB_EXPORT_MIN_CRF, TOOLFB_EXPORT_LIGHT_PRESET (vd veryfast)
+        # - TOOLFB_EXPORT_AUDIO_BITRATE
+        # - TOOLFB_EXPORT_VBV=1 hoặc TOOLFB_EXPORT_MAXRATE_K để kẹp bitrate (chậm hơn, file gọn hơn)
+        # - TOOLFB_EXPORT_THREADS (để trống = tự chọn theo CPU, tối đa 12)
+        if lightweight_mode_override is None:
+            lightweight_mode = str(os.environ.get("TOOLFB_LIGHT_EXPORT", "1") or "").strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
+        else:
+            lightweight_mode = bool(lightweight_mode_override)
+        if lightweight_mode:
+            try:
+                min_crf = int(float(str(os.environ.get("TOOLFB_EXPORT_MIN_CRF", "28") or "28")))
+            except (TypeError, ValueError):
+                min_crf = 28
+            crf = max(crf, max(18, min_crf))
+            # Giới hạn tốc độ encode: không cho preset «chậm» hơn mức target (mặc định veryfast).
+            # Trước đây chỉ «kéo chậm» từ ultrafast → fast, nên project preset medium/slow vẫn export rất lâu.
+            preset_order = [
+                "ultrafast",
+                "superfast",
+                "veryfast",
+                "faster",
+                "fast",
+                "medium",
+                "slow",
+                "slower",
+                "veryslow",
+            ]
+            p = preset.strip().lower()
+            target_preset = str(os.environ.get("TOOLFB_EXPORT_LIGHT_PRESET", "veryfast") or "veryfast").strip().lower()
+            if target_preset not in preset_order:
+                target_preset = "veryfast"
+            if p in preset_order:
+                pi = preset_order.index(p)
+                ti = preset_order.index(target_preset)
+                # Chỉ số nhỏ hơn = encode nhanh hơn. Cần preset nhanh hơn hoặc bằng target → lấy min(pi, ti).
+                preset = preset_order[min(pi, ti)]
 
         media_by_id = {str(m.get("id")): m for m in (project.get("media") or []) if isinstance(m, dict) and m.get("id")}
 
@@ -177,6 +266,7 @@ class FFmpegCommandBuilder:
             se = float(clip.get("source_end") or 0)
             du = float(clip.get("duration") or 0)
             sp = clip_speed(clip)
+            ss, se = _normalize_video_source_trim(ss, se, du, sp)
             fi = float(clip.get("fade_in") or 0)
             fo = float(clip.get("fade_out") or 0)
 
@@ -200,21 +290,12 @@ class FFmpegCommandBuilder:
             vchain += f"[{pre_lab}]"
             fc.append(vchain)
 
-            bb = clip.get("blur_background") or {}
-            if isinstance(bb, dict) and bb.get("enabled"):
-                blur_lines = self._cvb.build_blur_background_chain(
-                    pre_lab,
-                    cv_mid,
-                    w,
-                    h,
-                    int(bb.get("blur") or 20),
-                    seg_index=si,
-                )
-                fc.extend(blur_lines)
-            else:
-                cv_vf = self._cvb.build_simple_canvas_vf(clip, w, h)
-                fc.append(f"[{pre_lab}]{cv_vf}[{cv_mid}]")
+            cv_vf = self._cvb.build_simple_canvas_vf(clip, w, h)
+            fc.append(f"[{pre_lab}]{cv_vf}[{cv_mid}]")
 
+            # concat / xfade bắt buộc khớp width, height, SAR và pixel format giữa mọi đoạn.
+            # Một số nguồn (đặc biệt vertical phone) có SAR lạ; scale+pad trước đó đôi khi vẫn để SAR khác 1:1
+            # hoặc kích thước lệch nhẹ → concat báo lỗi (Invalid argument / configure concat).
             v_up = f"[{cv_mid}]fps={fps}"
             if col_vf:
                 v_up += f",{col_vf}"
@@ -223,6 +304,10 @@ class FFmpegCommandBuilder:
             if fo > 0 and du > fo:
                 st_out = max(0.0, du - fo)
                 v_up += f",fade=t=out:st={st_out}:d={fo}"
+            v_up += (
+                f",scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p"
+            )
             v_up += f"[{vlab}]"
             fc.append(v_up)
 
@@ -301,11 +386,10 @@ class FFmpegCommandBuilder:
             ip = resolve_path(media)
             if not ip:
                 continue
-            # Ảnh tĩnh: lặp stream (-stream_loop -1) để overlay đủ suốt timeline; không thì FFmpeg chỉ có 1 frame.
+            # Ảnh tĩnh: KHÔNG dùng -stream_loop -1 (decode PNG lặp vô hạn — dễ lỗi zlib / crash 0xC0000005 sau encode dài).
+            # Giải mã một lần rồi loop trong filter_complex (xem scale_chain bên dưới).
             mtype = str(media.get("type") or "")
             in_meta: dict[str, Any] = {}
-            if mtype == "image":
-                in_meta["stream_loop"] = -1
             ii = file_input_index(ip, in_meta or None)
             ow = int(ovc.get("width") or 180)
             oh = int(ovc.get("height") or 180)
@@ -328,7 +412,14 @@ class FFmpegCommandBuilder:
                 opa = 1.0
             opa = max(0.0, min(1.0, opa))
 
-            scale_chain = f"[{ii}:v]scale={ow}:{oh}"
+            ifr = max(1, min(120, int(round(fps))))
+            if mtype == "image":
+                # size=32767: đủ buffer nếu ảnh nhiều frame (GIF); PNG logo 1 frame vẫn ổn.
+                scale_chain = (
+                    f"[{ii}:v]scale={ow}:{oh},format=rgba,loop=loop=-1:size=32767:start=0,fps={ifr}"
+                )
+            else:
+                scale_chain = f"[{ii}:v]scale={ow}:{oh}"
             if extra_vf:
                 scale_chain += f",{extra_vf}"
             if opa < 0.999:
@@ -485,6 +576,8 @@ class FFmpegCommandBuilder:
                     se_a = ss_a + du_a
                 elif se_a <= ss_a:
                     se_a = ss_a + 0.1
+                elif du_a > 0 and (se_a - ss_a) > du_a + 0.08:
+                    se_a = ss_a + max(0.05, du_a)
                 ts_a = float(acl.get("timeline_start") or 0)
                 src_len = max(1e-3, float(se_a) - float(ss_a))
                 proj_dur_tl = float(project.get("duration") or 0)
@@ -510,12 +603,32 @@ class FFmpegCommandBuilder:
                 )
                 final_audio = mix_tl
 
-        args: list[str] = [ff, "-y"]
+        # Tránh FFmpeg chờ/đọc stdin (treo trên Windows khi subprocess không nối stdin).
+        # stats_period: ghi progress ra stderr thường xuyên hơn → UI không «im lặng» khi encode lâu.
+        args: list[str] = [ff, "-nostdin", "-y", "-hide_banner"]
+        try:
+            _sp = str(os.environ.get("TOOLFB_FFMPEG_STATS_PERIOD", "0.25") or "0.25").strip()
+            if _sp and _sp not in {"0", "off", "no"}:
+                float(_sp)  # validate
+                args.extend(["-stats_period", _sp])
+        except (TypeError, ValueError):
+            args.extend(["-stats_period", "0.25"])
+        # Khi video đã được ffmpeg tự xoay theo metadata rồi filter lại transpose/hflip → có thể sai góc.
+        # Bật: TOOLFB_INPUT_NO_AUTOROTATE=1 (pixel trong filter = đúng orientation trong file; cần chỉnh xoay trong project cho file có tag xoay).
+        input_no_autorotate = str(os.environ.get("TOOLFB_INPUT_NO_AUTOROTATE", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         for typ, val, meta in inputs:
             if typ == "file":
                 if meta.get("stream_loop") is not None:
                     args.extend(["-stream_loop", str(meta["stream_loop"])])
-                args.extend(["-i", _norm_os_path(val)])
+                if input_no_autorotate:
+                    args.extend(["-noautorotate", "-i", _norm_os_path(val)])
+                else:
+                    args.extend(["-i", _norm_os_path(val)])
             else:
                 d = float(val)
                 args.extend(
@@ -530,28 +643,101 @@ class FFmpegCommandBuilder:
                 )
 
         fc_str = ";".join(fc)
-        args.extend(
-            [
-                "-filter_complex",
-                fc_str,
-                "-map",
-                f"[{final_v}]",
-                "-map",
-                f"[{final_audio}]",
-                "-c:v",
-                vcodec,
-                "-preset",
-                preset,
-                "-crf",
-                str(crf),
-                "-c:a",
-                acodec,
-                "-movflags",
-                "+faststart",
-            ]
-        )
+        use_faststart = mp4_faststart
+        if use_faststart is None:
+            use_faststart = str(os.environ.get("TOOLFB_EXPORT_MP4_FASTSTART", "1") or "1").strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
+        enc_tail: list[str] = [
+            "-filter_complex",
+            fc_str,
+            "-map",
+            f"[{final_v}]",
+            "-map",
+            f"[{final_audio}]",
+            "-c:v",
+            vcodec,
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-c:a",
+            acodec,
+            "-b:a",
+            str(os.environ.get("TOOLFB_EXPORT_AUDIO_BITRATE", "96k") or "96k"),
+        ]
+        if use_faststart:
+            enc_tail.extend(["-movflags", "+faststart"])
+        args.extend(enc_tail)
+        # VBV + CRF có thể làm encoder «vật lộn» với bitrate → mặc định TẮT để ưu tiên tốc độ.
+        # Bật lại: TOOLFB_EXPORT_VBV=1 hoặc đặt TOOLFB_EXPORT_MAXRATE_K (kilo-bit/s).
+        vbv_on = str(os.environ.get("TOOLFB_EXPORT_VBV", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+        maxrate_env = str(os.environ.get("TOOLFB_EXPORT_MAXRATE_K", "") or "").strip()
+        if lightweight_mode and (
+            vbv_on or maxrate_env
+        ) and ("264" in vcodec.lower() or "265" in vcodec.lower() or "hevc" in vcodec.lower()):
+            px = max(1, int(w) * int(h))
+            if px <= 1280 * 720:
+                default_maxrate_k = 1400
+            elif px <= 1920 * 1080:
+                default_maxrate_k = 2400
+            elif px <= 2560 * 1440:
+                default_maxrate_k = 3800
+            else:
+                default_maxrate_k = 5200
+            try:
+                maxrate_k = int(float(maxrate_env or str(default_maxrate_k)))
+            except (TypeError, ValueError):
+                maxrate_k = default_maxrate_k
+            try:
+                bufsize_k = int(
+                    float(
+                        str(os.environ.get("TOOLFB_EXPORT_BUFSIZE_K", str(max(1000, maxrate_k * 2))) or max(1000, maxrate_k * 2))
+                    )
+                )
+            except (TypeError, ValueError):
+                bufsize_k = max(1000, maxrate_k * 2)
+            if maxrate_k > 0:
+                args.extend(["-maxrate", f"{maxrate_k}k"])
+            if bufsize_k > 0:
+                args.extend(["-bufsize", f"{bufsize_k}k"])
+        # Thread: để trống env = tự chọn theo CPU (có trần để tránh spike).
+        raw_threads = str(enc_threads if enc_threads is not None else (os.environ.get("TOOLFB_EXPORT_THREADS", "")) or "").strip()
+        if not raw_threads:
+            try:
+                cpu = int(os.cpu_count() or 4)
+            except (TypeError, ValueError):
+                cpu = 4
+            max_threads = max(2, min(12, cpu))
+        else:
+            try:
+                max_threads = int(float(raw_threads))
+            except (TypeError, ValueError):
+                max_threads = 4
+        low_mem = str(os.environ.get("TOOLFB_LOW_MEMORY", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+        if low_mem and max_threads > 0:
+            max_threads = max(1, min(4, int(max_threads)))
+        if max_threads > 0:
+            args.extend(["-threads", str(max_threads)])
         if output_duration_limit_sec is not None and float(output_duration_limit_sec) > 0:
             args.extend(["-t", f"{float(output_duration_limit_sec):.4f}"])
+        else:
+            cap_out = str(os.environ.get("TOOLFB_EXPORT_CAP_OUTPUT_DUR", "1") or "1").strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
+            if cap_out:
+                try:
+                    pdur = float(project.get("duration") or 0.0)
+                except (TypeError, ValueError):
+                    pdur = 0.0
+                if pdur > 0.05:
+                    args.extend(["-t", f"{pdur + 0.08:.4f}"])
         args.append(out)
 
         return args

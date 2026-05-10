@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import uuid
 from copy import deepcopy
-from pathlib import Path
 from typing import Any
 
 from src.services.video_editor.export_preset_manager import ExportPresetManager

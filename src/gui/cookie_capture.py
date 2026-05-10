@@ -87,12 +87,19 @@ def run_fb_cookie_capture_dialog(
     tip = tk.Toplevel(parent)
     tip.title("Đăng nhập Facebook")
     tip.transient(parent)
-    tip.geometry("420x150")
-    ttk.Label(
+    tip.geometry("520x180")
+    tip.minsize(420, 150)
+    lbl_tip = ttk.Label(
         tip,
         text=f"Trình duyệt đã mở tới trang đăng nhập.\nSau khi đăng nhập xong, bấm «Lưu cookie vào file».\n{tip_extra}",
-        wraplength=400,
-    ).pack(padx=12, pady=12)
+        wraplength=480,
+    )
+    lbl_tip.pack(padx=12, pady=12)
+    tip.bind(
+        "<Configure>",
+        lambda _e: lbl_tip.configure(wraplength=max(300, int(tip.winfo_width()) - 40)),
+        add="+",
+    )
 
     def send(cmd: str) -> None:
         action_holder.append(cmd)

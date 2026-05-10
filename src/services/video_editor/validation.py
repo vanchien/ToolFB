@@ -25,10 +25,16 @@ def validate_export(
     ffmpeg_path: str | None,
     output_path: str,
     media_resolver: MediaManager | None = None,
+    require_contiguous_video_timeline: bool = False,
 ) -> list[str]:
     """
     Trả về danh sách lỗi (rỗng nếu OK).
     Thông điệp tiếng Việt.
+
+    ``require_contiguous_video_timeline=True``: chế độ kiểm tra cũ (MVP) — clip video phải nối tiếp
+    khớp ``timeline_start``/``duration``, clip đầu phải bắt đầu tại 0. Mặc định **False**: mỗi clip
+    hợp lệ theo media/source/duration là đủ để xuất; thứ tự ghép do FFmpeg builder quyết định
+    (sắp xếp theo ``timeline_start``).
     """
     errors: list[str] = []
     mr = media_resolver or MediaManager()
@@ -62,7 +68,7 @@ def validate_export(
 
     ordered = sorted(video_clips, key=lambda c: float(c.get("timeline_start") or 0))
 
-    if ordered:
+    if ordered and require_contiguous_video_timeline:
         first_ts = float(ordered[0].get("timeline_start") or 0)
         if abs(first_ts) > 1e-6:
             errors.append("timeline: Clip video đầu tiên phải có timeline_start = 0 (MVP).")

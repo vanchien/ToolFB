@@ -45,6 +45,7 @@ from src.utils.schedule_batch_preview import (
 )
 from src.utils.schedule_posts_manager import SchedulePostsManager
 from src.utils.ffmpeg_paths import portable_ffmpeg_bin_dir, resolve_ffmpeg_ffprobe_paths
+from src.gui.treeview_shortcuts import install_treeview_shortcuts
 
 _FFMPEG_INSTALL_ATTEMPTED = False
 
@@ -548,7 +549,7 @@ class ScheduleBatchJobDialog:
         self._top.transient(parent)
         self._top.grab_set()
         self._top.geometry("980x720")
-        self._top.minsize(880, 600)
+        self._top.minsize(760, 520)
 
         self._main_canvas = tk.Canvas(self._top, highlightthickness=0, borderwidth=0)
         self._main_vsb = ttk.Scrollbar(self._top, orient=tk.VERTICAL, command=self._main_canvas.yview)
@@ -1146,7 +1147,10 @@ class ScheduleBatchJobDialog:
                 )
             self._top.after(0, lambda: self._on_ffmpeg_check_done(ok, msg, detail))
         except Exception as exc:  # noqa: BLE001
-            self._top.after(0, lambda: self._on_ffmpeg_check_done(False, "Lỗi kiểm tra ffmpeg.", str(exc)))
+            self._top.after(
+                0,
+                lambda e=exc: self._on_ffmpeg_check_done(False, "Lỗi kiểm tra ffmpeg.", str(e)),
+            )
 
     def _on_ffmpeg_check_done(self, ok: bool, status_msg: str, detail: str) -> None:
         self._set_ffmpeg_check_busy(False, status_msg)
@@ -1458,6 +1462,7 @@ class ScheduleBatchJobDialog:
         self._tree.grid(row=0, column=0, sticky="nsew")
         sy.grid(row=0, column=1, sticky="ns")
         sx.grid(row=1, column=0, sticky="ew")
+        install_treeview_shortcuts(self._tree, owner=self._top, info_callback=self._set_status)
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self._apply_preview_columns_for_mode(self._mode_key())
 

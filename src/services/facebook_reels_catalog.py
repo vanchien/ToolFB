@@ -2,20 +2,22 @@
 Thu thập danh sách link ``/reel/<id>`` trên tab Reels của profile Facebook.
 
 yt-dlp không hỗ trợ URL dạng ``…/username/reels/`` — dùng Playwright cuộn trang
-và trích href / HTML. Hỗ trợ cả chế độ public và dùng profile account đã login.
+và trích href / HTML trên trang public (không dùng cookie/session đăng nhập).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from loguru import logger
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
-from src.automation.browser_factory import BrowserFactory, sync_close_persistent_context
 
 StatusFn = Callable[[str], None]
 
@@ -71,103 +73,6 @@ _JS_SCROLL_DEEP = """
 }
 """
 
-# Lưới Reels trên profile thường là hàng ngang (virtualized); cần cuộn scrollLeft, không chỉ cuộn dọc document.
-_JS_COLLECT_HORIZ_REEL_RAILS = """
-() => {
-  const rails = [];
-  const seen = new Set();
-  const pushRail = (el) => {
-    if (!el || seen.has(el)) return;
-    try {
-      const st = window.getComputedStyle(el);
-      const ox = st.overflowX;
-      const sw = el.scrollWidth || 0;
-      const cw = el.clientWidth || 0;
-      if ((ox === "auto" || ox === "scroll" || ox === "overlay" || ox === "hidden") && sw > cw + 4) {
-        seen.add(el);
-        rails.push(el);
-      }
-    } catch (_e) {}
-  };
-  for (const a of document.querySelectorAll('a[href*="/reel/"]')) {
-    let el = a.parentElement;
-    let d = 0;
-    while (el && d++ < 42) {
-      pushRail(el);
-      const st = window.getComputedStyle(el);
-      const ox = st.overflowX;
-      const sw = el.scrollWidth || 0;
-      const cw = el.clientWidth || 0;
-      if ((ox === "auto" || ox === "scroll" || ox === "overlay" || ox === "hidden") && sw > cw + 4) {
-        break;
-      }
-      el = el.parentElement;
-    }
-  }
-  for (const el of document.querySelectorAll("div")) {
-    if (seen.has(el)) continue;
-    try {
-      const st = window.getComputedStyle(el);
-      if (st.overflowX !== "auto" && st.overflowX !== "scroll") continue;
-      const sw = el.scrollWidth || 0;
-      const cw = el.clientWidth || 0;
-      if (sw <= cw + 30) continue;
-      if (!el.querySelector('a[href*="/reel/"]')) continue;
-      pushRail(el);
-    } catch (_e) {}
-  }
-  return rails;
-}
-"""
-
-_JS_SCROLL_HORIZ_REEL_RAILS = """
-() => {
-  const collect = %s;
-  const rails = collect();
-  let moved = false;
-  let maxDelta = 0;
-  for (const el of rails) {
-    try {
-      const before = el.scrollLeft || 0;
-      const maxL = Math.max(0, (el.scrollWidth || 0) - (el.clientWidth || 0));
-      const cw = el.clientWidth || 800;
-      const step = Math.max(480, Math.floor(cw * 0.94));
-      const next = Math.min(maxL, before + step);
-      el.scrollLeft = next;
-      const after = el.scrollLeft || 0;
-      const d = Math.abs(after - before);
-      if (d > 2) moved = true;
-      if (d > maxDelta) maxDelta = d;
-      if (after >= maxL - 6) {
-        el.scrollLeft = maxL;
-      }
-    } catch (_e) {}
-  }
-  return { railCount: rails.length, moved, maxDelta };
-}
-""" % (
-    _JS_COLLECT_HORIZ_REEL_RAILS.strip().replace("\n", " "),
-)
-
-_JS_SNAP_HORIZ_REEL_RAILS_END = """
-() => {
-  const collect = %s;
-  const rails = collect();
-  let snapped = 0;
-  for (const el of rails) {
-    try {
-      const maxL = Math.max(0, (el.scrollWidth || 0) - (el.clientWidth || 0));
-      const before = el.scrollLeft || 0;
-      el.scrollLeft = maxL;
-      if (Math.abs((el.scrollLeft || 0) - before) > 2 || maxL > 0) snapped += 1;
-    } catch (_e) {}
-  }
-  return { railCount: rails.length, snapped };
-}
-""" % (
-    _JS_COLLECT_HORIZ_REEL_RAILS.strip().replace("\n", " "),
-)
-
 
 def _noop_status(_: str) -> None:
     pass
@@ -188,127 +93,25 @@ def _env_scroll_pause(default: float) -> float:
         return default
 
 
-_JS_LOADING_NEAR_REEL_GRID = """
-() => {
-  const loaders = document.querySelectorAll('[data-visualcompletion="loading-state"]');
-  let n = 0;
-  outer: for (const el of loaders) {
-    let p = el;
-    for (let d = 0; d < 28 && p; d++) {
-      try {
-        if (p.querySelector && p.querySelector('a[href*="/reel/"]')) {
-          n++;
-          continue outer;
-        }
-      } catch (_e) {}
-      p = p.parentElement;
-    }
-  }
-  return n;
-}
-"""
+def _profile_lock_markers(browser_type: str) -> tuple[str, ...]:
+    bt = str(browser_type or "").strip().lower()
+    if bt == "firefox":
+        return ("parent.lock", "lock")
+    return ("SingletonLock", "SingletonCookie", "SingletonSocket", "LOCK")
 
 
-def _fb_reels_loading_placeholder_count(page: Any) -> int:
-    """Skeleton gần lưới Reels (tránh đếm toàn bộ trang FB → chờ vô hạn)."""
-    try:
-        return int(page.evaluate(_JS_LOADING_NEAR_REEL_GRID))
-    except Exception:
-        try:
-            return int(page.locator('[data-visualcompletion="loading-state"]').count())
-        except Exception:
-            return 0
+def _is_profile_locked(profile_dir: Path, browser_type: str) -> bool:
+    for name in _profile_lock_markers(browser_type):
+        if (profile_dir / name).exists():
+            return True
+    return False
 
 
-def _fb_reels_horiz_rails_end(page: Any) -> tuple[int, int]:
-    """
-    Trả về ``(rail_count, at_end_count)`` của các rail ngang chứa reel.
-    Dùng để dừng sớm khi rail đã chạm cuối và không còn reel mới.
-    """
-    js = (
-        "() => {"
-        " const collect = "
-        + _JS_COLLECT_HORIZ_REEL_RAILS.strip().replace("\n", " ")
-        + "; const rails = collect();"
-        " let end = 0;"
-        " for (const el of rails) {"
-        "   try {"
-        "     const maxL = Math.max(0, (el.scrollWidth || 0) - (el.clientWidth || 0));"
-        "     const cur = el.scrollLeft || 0;"
-        "     if (maxL <= 6 || cur >= maxL - 6) end += 1;"
-        "   } catch (_e) {}"
-        " }"
-        " return { railCount: rails.length, atEnd: end };"
-        "}"
-    )
-    try:
-        got = page.evaluate(js) or {}
-        return int(got.get("railCount") or 0), int(got.get("atEnd") or 0)
-    except Exception:
-        return 0, 0
-
-
-def _wait_fb_reels_loading_placeholders(page: Any, *, max_wait: float) -> None:
-    """Chờ ngắn: Facebook public thường giữ skeleton; không được kẹt chờ hết mỗi vòng."""
-    if max_wait <= 0:
-        return
-    deadline = time.monotonic() + max_wait
-    quiet_twice = 0
-    prev = -1
-    while time.monotonic() < deadline:
-        try:
-            n = _fb_reels_loading_placeholder_count(page)
-        except Exception:
-            return
-        if prev >= 0 and n < prev:
-            time.sleep(0.2)
-            return
-        prev = n
-        if n == 0:
-            quiet_twice += 1
-            if quiet_twice >= 2:
-                return
-            time.sleep(0.18)
-        else:
-            quiet_twice = 0
-            time.sleep(0.28)
-
-
-def _scroll_fb_profile_reel_grid(page: Any, *, snap_horiz_to_end: bool = False) -> None:
-    """Cuộn hàng Reels (ngang + đưa ô cuối vào viewport) để lazy-load thêm tile.
-
-    ``snap_horiz_to_end``: chỉ thỉnh thoảng bật — snap mỗi vòng dễ nhảy quá vùng lazy-load,
-    Facebook không kịp render thêm tile.
-    """
-    try:
-        page.evaluate(_JS_SCROLL_HORIZ_REEL_RAILS)
-    except Exception as exc:
-        logger.debug("reel grid horiz step: {}", exc)
-    if snap_horiz_to_end:
-        try:
-            page.evaluate(_JS_SNAP_HORIZ_REEL_RAILS_END)
-        except Exception as exc:
-            logger.debug("reel grid horiz snap: {}", exc)
-    try:
-        page.locator('a[href*="/reel/"]').last.scroll_into_view_if_needed(timeout=5000)
-    except Exception:
-        pass
-    try:
-        for _ in range(22):
-            page.keyboard.press("ArrowRight")
-            time.sleep(0.028)
-    except Exception:
-        pass
-    try:
-        page.mouse.wheel(2200, 0)
-    except Exception:
-        pass
-    try:
-        page.keyboard.down("Shift")
-        page.mouse.wheel(0, 1600)
-        page.keyboard.up("Shift")
-    except Exception:
-        pass
+def _clone_profile_for_scan(src: Path) -> Path:
+    tmp = Path(tempfile.mkdtemp(prefix="toolfb_fbscan_profile_"))
+    dst = tmp / "profile"
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    return dst
 
 
 def normalize_facebook_reels_tab_url(url: str) -> str:
@@ -320,6 +123,12 @@ def normalize_facebook_reels_tab_url(url: str) -> str:
     low = u.lower()
     if "facebook.com" not in low:
         return url.strip()
+    # profile.php?id=... -> profile.php?id=...&sk=reels_tab
+    if re.search(r"facebook\.com/profile\.php\?[^#]*\bid=\d+", low):
+        if "sk=reels_tab" not in low:
+            sep = "&" if "?" in u else "?"
+            return f"{u}{sep}sk=reels_tab"
+        return u
     if re.search(r"facebook\.com/[^/]+/reels", low):
         return u + "/"
     m = re.match(r"https?://(?:[\w-]+\.)?facebook\.com/([^/?#]+)/?(?:[?#].*)?$", u, re.I)
@@ -428,13 +237,14 @@ def _profile_videos_tab_url(page_url: str) -> str:
 def scan_facebook_profile_reels_page(
     *,
     page_url: str,
+    account: dict[str, Any] | None = None,
+    cookie_path: str | None = None,
     max_reels: int = 200,
     max_scroll_rounds: int = 100,
     max_scan_minutes: float = 30.0,
     scroll_until_end: bool = True,
     scroll_pause_sec: float = 1.65,
     headless: bool | None = None,
-    account_id: str = "",
     status: StatusFn | None = None,
     on_partial: Optional[Callable[[list[str]], None]] = None,
 ) -> dict[str, Any]:
@@ -456,9 +266,22 @@ def scan_facebook_profile_reels_page(
     hard_deadline = started_at + (max_scan_minutes * 60.0)
     if scroll_until_end:
         max_scroll_rounds = max(220, int(max_scroll_rounds))
+    if cookie_path:
+        st("Đang chạy chế độ account-profile, không dùng cookie JSON riêng.")
 
     ordered_ids: list[str] = []
     seen: set[str] = set()
+    ordered_urls: list[str] = []
+    seen_urls: set[str] = set()
+
+    def _add_url(u: str) -> None:
+        s = str(u or "").strip()
+        if not s or s in seen_urls:
+            return
+        if len(seen_urls) >= max_reels:
+            return
+        seen_urls.add(s)
+        ordered_urls.append(s)
 
     def _add_from_text(blob: str) -> None:
         for rid in _extract_reel_ids_from_text(blob):
@@ -468,14 +291,13 @@ def scan_facebook_profile_reels_page(
                 return
             seen.add(rid)
             ordered_ids.append(rid)
-            _emit_partial()
+            _add_url(f"https://www.facebook.com/reel/{rid}")
 
     def _emit_partial() -> None:
         if not on_partial:
             return
-        urls = [f"https://www.facebook.com/reel/{rid}" for rid in ordered_ids]
         try:
-            on_partial(urls)
+            on_partial(list(ordered_urls))
         except Exception as exc:  # noqa: BLE001
             logger.debug("on_partial: {}", exc)
 
@@ -494,314 +316,256 @@ def scan_facebook_profile_reels_page(
         )
         return any(x in b for x in marks)
 
-    def _run_scan_on_page(page: Any) -> dict[str, Any] | None:
-        st("Đang tải trang Reels (có thể 30–90s)…")
-        page.goto(url, wait_until="load", timeout=120_000)
-        time.sleep(min(2.2, scroll_pause_sec + 0.5))
-        try:
-            body_text = page.inner_text("body", timeout=3000)
-        except Exception:
-            body_text = ""
-        if _is_login_or_checkpoint(page.url, body_text):
-            return {
-                "ok": False,
-                "items": [],
-                "message": (
-                    "Facebook hiển thị đăng nhập / kiểm tra bảo mật — không quét được Reels công khai trên URL này."
-                ),
-            }
-        try:
-            hrefs = page.eval_on_selector_all("a[href]", "els => els.map(a => a.getAttribute('href') || a.href || '')")
-        except Exception:
-            hrefs = []
-        for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
-            if rid in seen:
-                continue
-            if len(seen) >= max_reels:
-                break
-            seen.add(rid)
-            ordered_ids.append(rid)
-            _emit_partial()
-        _add_from_text(page.content())
-
-        try:
-            _scroll_fb_profile_reel_grid(page, snap_horiz_to_end=True)
-            time.sleep(min(1.05, scroll_pause_sec * 0.5))
-            hrefs_w = page.eval_on_selector_all(
-                "a[href]",
-                "els => els.map(a => a.getAttribute('href') || a.href || '')",
-            )
-        except Exception:
-            hrefs_w = []
-        for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs_w]):
-            if rid in seen:
-                continue
-            if len(seen) >= max_reels:
-                break
-            seen.add(rid)
-            ordered_ids.append(rid)
-            _emit_partial()
-        _add_from_text(page.content())
-
-        stable = 0
-        prev_count = 0
-        prev_scroll_h = 0
-        idle_at_bottom = 0
-        reached_end = False
-        for i in range(max_scroll_rounds):
-            if time.monotonic() >= hard_deadline:
-                st(f"Đã chạm giới hạn thời gian quét ({max_scan_minutes:.0f} phút) — dừng.")
-                break
-            if len(ordered_ids) >= max_reels:
-                break
-            elapsed = int(max(0.0, time.monotonic() - started_at))
-            before = page.evaluate(_JS_SCROLL_SNAP)
-            if prev_scroll_h == 0:
-                prev_scroll_h = int(before.get("sh") or 0)
-            ph0 = _fb_reels_loading_placeholder_count(page)
-            st(
-                f"Đang cuộn {i + 1}/{max_scroll_rounds} — "
-                f"{len(ordered_ids)} reel — cao trang ~{before.get('sh', 0)}px — "
-                f"đang tải ~{ph0} — {elapsed}s…"
-            )
-            try:
-                _scroll_fb_profile_reel_grid(
-                    page,
-                    snap_horiz_to_end=(i % 8 == 7),
-                )
-                try:
-                    page.get_by_role("button", name=re.compile(r"(xem thêm|see more|show more)", re.I)).first.click(
-                        timeout=800
-                    )
-                except Exception:
-                    pass
-                if i % 6 == 5:
-                    page.evaluate(
-                        "() => { const e=document.scrollingElement||document.documentElement;"
-                        " e.scrollTop = e.scrollHeight; }"
-                    )
-                elif i % 4 == 3:
-                    page.keyboard.press("End")
-                    time.sleep(0.25)
-                else:
-                    page.evaluate(
-                        "() => { const e=document.scrollingElement||document.documentElement;"
-                        " e.scrollBy(0, Math.floor((window.innerHeight||800)*0.98)); }"
-                    )
-                try:
-                    page.evaluate(_JS_SCROLL_DEEP)
-                except Exception:
-                    pass
-                try:
-                    page.mouse.wheel(0, 2800)
-                except Exception:
-                    pass
-                try:
-                    page.keyboard.press("PageDown")
-                except Exception:
-                    pass
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("scroll: {}", exc)
-            time.sleep(scroll_pause_sec)
-            try:
-                page.wait_for_timeout(450)
-            except Exception:
-                time.sleep(0.45)
-            ph_n = _fb_reels_loading_placeholder_count(page)
-            ph_wait = 1.35 if len(ordered_ids) == 0 else min(2.4, scroll_pause_sec + 0.6)
-            if ph_n > 0:
-                _wait_fb_reels_loading_placeholders(page, max_wait=ph_wait)
-            try:
-                body_text = page.inner_text("body", timeout=1500)
-            except Exception:
-                body_text = ""
-            if _is_login_or_checkpoint(page.url, body_text):
-                st("Phát hiện login/checkpoint — dừng quét.")
-                return {
-                    "ok": False,
-                    "items": [],
-                    "message": (
-                        "Facebook hiển thị đăng nhập / kiểm tra bảo mật — không quét được Reels công khai trên URL này."
-                    ),
-                }
-            try:
-                hrefs = page.eval_on_selector_all(
-                    "a[href]",
-                    "els => els.map(a => a.getAttribute('href') || a.href || '')",
-                )
-            except Exception:
-                hrefs = []
-            for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
-                if rid in seen:
-                    continue
-                if len(seen) >= max_reels:
-                    break
-                seen.add(rid)
-                ordered_ids.append(rid)
-                _emit_partial()
-            _add_from_text(page.content())
-            after = page.evaluate(_JS_SCROLL_SNAP)
-            sh = int(after.get("sh") or 0)
-            ch = int(after.get("ch") or 0)
-            meaningful_doc_scroll = sh > ch + 350
-            if sh > prev_scroll_h + 50:
-                stable = 0
-                idle_at_bottom = 0
-            prev_scroll_h = sh
-            if bool(after.get("atBottom")) and meaningful_doc_scroll:
-                idle_at_bottom += 1
-            else:
-                idle_at_bottom = 0
-
-            if len(ordered_ids) == prev_count:
-                ph_still = _fb_reels_loading_placeholder_count(page)
-                if ph_still == 0:
-                    stable += 1
-                elif not scroll_until_end:
-                    stable += 1
-                if stable >= 40 and not scroll_until_end:
-                    st("Không còn reel mới sau nhiều lần cuộn — dừng.")
-                    reached_end = True
-                    break
-                if (
-                    scroll_until_end
-                    and meaningful_doc_scroll
-                    and i > 55
-                    and stable >= 36
-                    and idle_at_bottom >= 14
-                ):
-                    st("Đã ở cuối trang, không thêm reel — dừng.")
-                    reached_end = True
-                    break
-                rail_count, rail_end = _fb_reels_horiz_rails_end(page)
-                if (
-                    scroll_until_end
-                    and not meaningful_doc_scroll
-                    and i > 34
-                    and stable >= 24
-                    and ph_still == 0
-                    and rail_count > 0
-                    and rail_end >= rail_count
-                ):
-                    st("Đã cuộn tới cuối dải reel ngang và không có reel mới — dừng.")
-                    reached_end = True
-                    break
-                if (
-                    not meaningful_doc_scroll
-                    and i > 120
-                    and stable >= 85
-                    and ph_still == 0
-                ):
-                    st(
-                        "Không thêm reel sau nhiều lần cuộn (lưới ngang). "
-                        "Có thể Facebook chỉ hiển thị một phần khi chưa đăng nhập — dừng."
-                    )
-                    reached_end = True
-                    break
-            else:
-                stable = 0
-            prev_count = len(ordered_ids)
-
-            if len(ordered_ids) == 0 and i >= 28:
-                st(
-                    "Đã cuộn 29 lần mà vẫn không thấy link /reel/ — dừng. "
-                    "Thử TOOLFB_FB_REELS_HEADLESS=0 để xem trang, hoặc URL / kênh khác."
-                )
-                reached_end = True
-                break
-
-        if len(ordered_ids) < max_reels and not reached_end:
-            try:
-                vurl = _profile_videos_tab_url(url)
-                st("Đang quét bổ sung tab Videos public…")
-                page.goto(vurl, wait_until="load", timeout=90_000)
-                time.sleep(min(1.8, scroll_pause_sec + 0.2))
-                for _j in range(min(max_scroll_rounds, 140)):
-                    if len(ordered_ids) >= max_reels:
-                        break
-                    try:
-                        hrefs2 = page.eval_on_selector_all(
-                            "a[href]",
-                            "els => els.map(a => a.getAttribute('href') || a.href || '')",
-                        )
-                    except Exception:
-                        hrefs2 = []
-                    for vid in _extract_video_ids_from_hrefs([str(h) for h in hrefs2]):
-                        if vid in seen:
-                            continue
-                        seen.add(vid)
-                        ordered_ids.append(vid)
-                        _emit_partial()
-                    try:
-                        page.evaluate(_JS_SCROLL_DEEP)
-                    except Exception:
-                        pass
-                    try:
-                        page.mouse.wheel(0, 2600)
-                    except Exception:
-                        pass
-                    time.sleep(scroll_pause_sec)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("videos fallback scan: {}", exc)
-        return None
-
-    aid = str(account_id or "").strip()
     try:
-        if aid:
-            factory: BrowserFactory | None = None
+        with sync_playwright() as pw:
+            browser = None
             context = None
             try:
-                st(f"Đang mở profile đã login của tài khoản {aid}…")
-                factory = BrowserFactory(headless=hl)
-                context = factory.get_browser_context(aid, headless=hl)
-                page = context.pages[0] if context.pages else context.new_page()
+                acc = account or {}
+                profile_path = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+                browser_type = str(acc.get("browser_type") or "chromium").strip().lower()
+                browser_exe = str(acc.get("browser_exe_path") or "").strip()
+                temp_profile_root: Path | None = None
+                if profile_path:
+                    profile_dir = Path(profile_path).resolve()
+                    os.makedirs(str(profile_dir), exist_ok=True)
+                    run_profile = profile_dir
+                    if _is_profile_locked(profile_dir, browser_type):
+                        st("Profile tài khoản đang được dùng, tạo profile tạm để quét bằng session hiện có…")
+                        run_profile = _clone_profile_for_scan(profile_dir)
+                        temp_profile_root = run_profile.parent
+                    user_data_dir = str(run_profile)
+                    launch_kwargs: dict[str, Any] = {
+                        "user_data_dir": user_data_dir,
+                        "headless": hl,
+                        "viewport": {"width": 1366, "height": 900},
+                        "locale": "vi-VN",
+                    }
+                    if browser_exe and Path(browser_exe).is_file():
+                        launch_kwargs["executable_path"] = str(Path(browser_exe).resolve())
+                    if browser_type in ("firefox",):
+                        context = pw.firefox.launch_persistent_context(**launch_kwargs)
+                    else:
+                        context = pw.chromium.launch_persistent_context(**launch_kwargs)
+                    st("Đang dùng browser profile của tài khoản đã chọn.")
+                else:
+                    return {
+                        "ok": False,
+                        "items": [],
+                        "message": "Không có profile của tài khoản đã chọn. Dừng quét (không mở browser mới).",
+                    }
                 try:
-                    stealth = Stealth()
-                    stealth.apply_stealth_sync(page)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("stealth.apply_stealth_sync(account): {}", exc)
-                early = _run_scan_on_page(page)
-                if early is not None:
-                    return early
-            finally:
-                sync_close_persistent_context(context, log_label=f"fb_reels_scan:{aid}")
-                if factory is not None:
-                    factory.close()
-        else:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=hl)
-                try:
-                    context = browser.new_context(
-                        viewport={"width": 1400, "height": 960},
-                        locale="vi-VN",
-                    )
+                    existing_pages = [p for p in (context.pages or []) if not p.is_closed()]
+                    if existing_pages:
+                        page = existing_pages[0]
+                    else:
+                        return {
+                            "ok": False,
+                            "items": [],
+                            "message": "Profile không có tab khả dụng. Dừng quét (không dùng new_page).",
+                        }
                     try:
-                        page = context.new_page()
+                        stealth = Stealth()
+                        stealth.apply_stealth_sync(page)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("stealth.apply_stealth_sync: {}", exc)
+
+                    st("Đang tải trang Reels (có thể 30–90s)…")
+                    page.goto(url, wait_until="load", timeout=120_000)
+                    time.sleep(min(2.2, scroll_pause_sec + 0.5))
+                    try:
+                        body_text = page.inner_text("body", timeout=3000)
+                    except Exception:
+                        body_text = ""
+                    if _is_login_or_checkpoint(page.url, body_text):
+                        return {
+                            "ok": False,
+                            "items": [],
+                            "message": "Không thể quét tiếp nếu không dùng cookies/session.",
+                        }
+                    try:
+                        hrefs = page.eval_on_selector_all("a[href]", "els => els.map(a => a.getAttribute('href') || a.href || '')")
+                    except Exception:
+                        hrefs = []
+                    for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
+                        if rid in seen:
+                            continue
+                        if len(seen) >= max_reels:
+                            break
+                        seen.add(rid)
+                        ordered_ids.append(rid)
+                        _add_url(f"https://www.facebook.com/reel/{rid}")
+                    _add_from_text(page.content())
+                    _emit_partial()
+
+                    stable = 0
+                    prev_count = 0
+                    prev_scroll_h = 0
+                    idle_at_bottom = 0
+                    for i in range(max_scroll_rounds):
+                        if time.monotonic() >= hard_deadline:
+                            st(f"Đã chạm giới hạn thời gian quét ({max_scan_minutes:.0f} phút) — dừng.")
+                            break
+                        if len(ordered_ids) >= max_reels:
+                            break
+                        elapsed = int(max(0.0, time.monotonic() - started_at))
+                        before = page.evaluate(_JS_SCROLL_SNAP)
+                        if prev_scroll_h == 0:
+                            prev_scroll_h = int(before.get("sh") or 0)
+                        st(
+                            f"Đang cuộn {i + 1}/{max_scroll_rounds} — "
+                            f"{len(ordered_ids)} reel — cao trang ~{before.get('sh', 0)}px — {elapsed}s…"
+                        )
                         try:
-                            stealth = Stealth()
-                            stealth.apply_stealth_sync(page)
+                            # Public page đôi khi có nút tải thêm nội dung.
+                            try:
+                                page.get_by_role("button", name=re.compile(r"(xem thêm|see more|show more)", re.I)).first.click(
+                                    timeout=800
+                                )
+                            except Exception:
+                                pass
+                            if i % 6 == 5:
+                                page.evaluate(
+                                    "() => { const e=document.scrollingElement||document.documentElement;"
+                                    " e.scrollTop = e.scrollHeight; }"
+                                )
+                            elif i % 4 == 3:
+                                page.keyboard.press("End")
+                                time.sleep(0.25)
+                            else:
+                                page.evaluate(
+                                    "() => { const e=document.scrollingElement||document.documentElement;"
+                                    " e.scrollBy(0, Math.floor((window.innerHeight||800)*0.98)); }"
+                                )
+                            try:
+                                page.evaluate(_JS_SCROLL_DEEP)
+                            except Exception:
+                                pass
+                            try:
+                                page.mouse.wheel(0, 2800)
+                            except Exception:
+                                pass
+                            try:
+                                page.keyboard.press("PageDown")
+                            except Exception:
+                                pass
                         except Exception as exc:  # noqa: BLE001
-                            logger.debug("stealth.apply_stealth_sync: {}", exc)
-                        early = _run_scan_on_page(page)
-                        if early is not None:
-                            return early
-                    finally:
-                        context.close()
+                            logger.warning("scroll: {}", exc)
+                        time.sleep(scroll_pause_sec)
+                        try:
+                            page.wait_for_timeout(450)
+                        except Exception:
+                            time.sleep(0.45)
+                        try:
+                            body_text = page.inner_text("body", timeout=1500)
+                        except Exception:
+                            body_text = ""
+                        if _is_login_or_checkpoint(page.url, body_text):
+                            st("Phát hiện login/checkpoint — dừng quét.")
+                            return {
+                                "ok": False,
+                                "items": [],
+                                "message": "Không thể quét tiếp nếu không dùng cookies/session.",
+                            }
+                        try:
+                            hrefs = page.eval_on_selector_all(
+                                "a[href]",
+                                "els => els.map(a => a.getAttribute('href') || a.href || '')",
+                            )
+                        except Exception:
+                            hrefs = []
+                        for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
+                            if rid in seen:
+                                continue
+                            if len(seen) >= max_reels:
+                                break
+                            seen.add(rid)
+                            ordered_ids.append(rid)
+                            _add_url(f"https://www.facebook.com/reel/{rid}")
+                        _add_from_text(page.content())
+                        _emit_partial()
+                        after = page.evaluate(_JS_SCROLL_SNAP)
+                        sh = int(after.get("sh") or 0)
+                        if sh > prev_scroll_h + 50:
+                            stable = 0
+                            idle_at_bottom = 0
+                        prev_scroll_h = sh
+                        if bool(after.get("atBottom")):
+                            idle_at_bottom += 1
+                        else:
+                            idle_at_bottom = 0
+
+                        if len(ordered_ids) == prev_count:
+                            stable += 1
+                            if stable >= 40 and not scroll_until_end:
+                                st("Không còn reel mới sau nhiều lần cuộn — dừng.")
+                                break
+                            # Chỉ kết luận "hết dữ liệu" sau nhiều vòng, tránh dừng sớm ở khoảng 10 reel đầu.
+                            if i > 45 and stable >= 24 and idle_at_bottom >= 12:
+                                st("Đã ở cuối trang, không thêm reel — dừng.")
+                                break
+                        else:
+                            stable = 0
+                        prev_count = len(ordered_ids)
+
+                    # Fallback public-only: một số profile chỉ render ít reel ở reels_tab khi chưa login.
+                    # Thử quét tab videos public để lấy thêm id rồi normalize về /reel/<id>.
+                    if len(ordered_ids) < max_reels:
+                        try:
+                            vurl = _profile_videos_tab_url(url)
+                            st("Đang quét bổ sung tab Videos public…")
+                            page.goto(vurl, wait_until="load", timeout=90_000)
+                            time.sleep(min(1.8, scroll_pause_sec + 0.2))
+                            for j in range(min(max_scroll_rounds, 80)):
+                                if len(ordered_ids) >= max_reels:
+                                    break
+                                try:
+                                    hrefs2 = page.eval_on_selector_all(
+                                        "a[href]",
+                                        "els => els.map(a => a.getAttribute('href') || a.href || '')",
+                                    )
+                                except Exception:
+                                    hrefs2 = []
+                                for vid in _extract_video_ids_from_hrefs([str(h) for h in hrefs2]):
+                                    if vid in seen:
+                                        continue
+                                    seen.add(vid)
+                                    ordered_ids.append(vid)
+                                    _add_url(f"https://www.facebook.com/reel/{vid}")
+                                _emit_partial()
+                                try:
+                                    page.evaluate(_JS_SCROLL_DEEP)
+                                except Exception:
+                                    pass
+                                try:
+                                    page.mouse.wheel(0, 2600)
+                                except Exception:
+                                    pass
+                                time.sleep(scroll_pause_sec)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("videos fallback scan: {}", exc)
                 finally:
+                    if context:
+                        context.close()
+                    if temp_profile_root is not None:
+                        shutil.rmtree(temp_profile_root, ignore_errors=True)
+            finally:
+                if browser:
                     browser.close()
     except Exception as exc:  # noqa: BLE001
         logger.exception("scan_facebook_profile_reels_page")
         return {"ok": False, "items": [], "message": str(exc)}
 
     elapsed_sec = int(max(0.0, time.monotonic() - started_at))
-    items = [{"video_id": rid, "url": f"https://www.facebook.com/reel/{rid}"} for rid in ordered_ids]
+    items = [{"video_id": str(i + 1), "url": u} for i, u in enumerate(ordered_urls)]
     if not items:
         return {
             "ok": False,
             "items": [],
             "message": (
-                "Không trích được link reel nào. Thử: (1) TOOLFB_FB_REELS_HEADLESS=0 để xem trình duyệt, "
-                "(2) kiểm tra URL tab Reels / profile có Reels công khai."
+                "Không trích được link reel nào. Thử: (1) file cookie Playwright đã đăng nhập, "
+                "(2) bật cửa sổ trình duyệt TOOLFB_FB_REELS_HEADLESS=0 để xem lỗi, "
+                "(3) kiểm tra URL tab Reels đúng kênh."
             ),
         }
     return {
