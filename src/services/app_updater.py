@@ -92,6 +92,48 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _validate_downloaded_zip(
+    path: Path,
+    *,
+    declared_url: str,
+    final_url: str | None,
+) -> None:
+    """
+    GitHub / CDN đôi khi trả HTML (404, tên asset sai) thay vì file zip — ZipFile báo «not a zip file».
+    Kiểm tra sớm để thông báo rõ cho người dùng và người phát hành manifest.
+    """
+    if not path.is_file():
+        raise RuntimeError(f"Không có file tải về: {path}")
+    sz = path.stat().st_size
+    if sz < 64:
+        extra = f"\nSau redirect: {final_url}" if final_url and final_url != declared_url.strip() else ""
+        raise RuntimeError(
+            f"Tải về chỉ {sz} byte — lỗi mạng hoặc URL không trả file ZIP.\n"
+            f"URL trong manifest: {declared_url}{extra}\n"
+            "Kiểm tra GitHub Release có đính kèm đúng tên file (ví dụ ToolFB_release_bundle.zip)."
+        )
+    head = path.read_bytes()[:1200]
+    lead = head.lstrip()[:800]
+    low = lead.lower()
+    if low.startswith(b"<!doctype") or low.startswith(b"<html"):
+        frag = lead.decode("utf-8", errors="replace")[:420].replace("\n", " ")
+        extra = f"\nSau redirect: {final_url}" if final_url and final_url != declared_url.strip() else ""
+        raise RuntimeError(
+            "Tải về là trang HTML (thường 404 / asset không tồn tại trên Release), không phải file ZIP.\n"
+            f"URL trong manifest: {declared_url}{extra}\n"
+            "Cập nhật `download_url` trong latest.json trùng tên file trên Release «Latest».\n"
+            f"Đầu nội dung: {frag!r}"
+        )
+    if len(head) < 4 or head[:2] != b"PK":
+        frag_hex = head[:48].hex()
+        extra = f"\nSau redirect: {final_url}" if final_url and final_url != declared_url.strip() else ""
+        raise RuntimeError(
+            f"File tải về không phải ZIP (không bắt đầu bằng PK). Kích thước {sz} byte.\n"
+            f"URL trong manifest: {declared_url}{extra}\n"
+            f"Hex đầu file: {frag_hex}"
+        )
+
+
 def _windows_long_path_str(path: Path) -> str:
     """Chuỗi đường dẫn Windows dài (\\\\?\\) để vượt MAX_PATH khi cần."""
     s = str(path.resolve())
@@ -167,9 +209,17 @@ def _zip_extract_resilient(zip_path: Path, dest_dir: Path) -> tuple[int, int]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     skipped = 0
-    with zipfile.ZipFile(zip_path, "r") as zf:
+    try:
+        zf_ctx = zipfile.ZipFile(zip_path, "r")
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(
+            f"Không đọc được file như ZIP (gói hỏng hoặc không phải zip): {zip_path}\n"
+            "Xóa file trong data/updates/*.zip rồi bấm «Cập nhật ngay» lại; kiểm tra manifest / GitHub Release."
+        ) from exc
+    with zf_ctx as zf:
         for info in zf.infolist():
             name = info.filename.replace("\\", "/")
+            norm = name.lower()
             if name.endswith("/") or not name.strip():
                 continue
             if _zip_member_should_skip_extract(name):
@@ -402,8 +452,21 @@ def apply_update_package(
     tmp_zip = updates_dir / f"update_{manifest.version}.zip"
     logger.info("Updater: tải gói cập nhật từ {}", manifest.download_url)
     req = urllib.request.Request(manifest.download_url, headers={"User-Agent": "ToolFB-Updater/1.0"})
+    final_url: str | None = None
     with urllib.request.urlopen(req, timeout=900) as resp, tmp_zip.open("wb") as fh:
+        try:
+            final_url = resp.geturl()
+        except Exception:
+            final_url = None
+        if final_url:
+            logger.info("Updater: URL sau redirect: {}", final_url)
         shutil.copyfileobj(resp, fh, length=4 * 1024 * 1024)
+
+    _validate_downloaded_zip(
+        tmp_zip,
+        declared_url=manifest.download_url,
+        final_url=final_url,
+    )
 
     if manifest.sha256:
         got = _sha256_file(tmp_zip)
