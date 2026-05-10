@@ -330,7 +330,7 @@ class _ManagerWindow:
         self._btn_compact_multi.pack(side=tk.LEFT, padx=(0, 6))
         self._btn_check_updates = ttk.Button(bar, text="Kiểm tra cập nhật", command=self._on_check_updates)
         self._btn_check_updates.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_apply_update = ttk.Button(bar, text="Cập nhật ngay", command=self._on_apply_update, state=tk.DISABLED)
+        self._btn_apply_update = ttk.Button(bar, text="Cập nhật ngay", command=self._on_apply_update)
         self._btn_apply_update.pack(side=tk.LEFT, padx=(0, 6))
         self._btn_update_channel = ttk.Button(
             bar,
@@ -5441,12 +5441,12 @@ class _ManagerWindow:
                                 f"Đã tìm thấy bản mới: {mf.version}\n"
                                 f"Bản hiện tại: {local_v}\n\n"
                                 f"Ghi chú: {mf.notes or '—'}\n\n"
-                                "Đóng hộp thoại này, rồi bấm «Cập nhật ngay» trên thanh công cụ để tải và áp dụng."
+                                "Bấm «Cập nhật ngay» để tải và áp dụng một lần (không cần kiểm tra lại)."
                             ),
                             parent=self._root,
                         )
                     else:
-                        self._btn_apply_update.configure(state=tk.DISABLED)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
                         messagebox.showinfo(
                             "Cập nhật",
                             f"Bạn đang dùng bản mới nhất ({local_v}).",
@@ -5459,7 +5459,7 @@ class _ManagerWindow:
 
                 def done_err() -> None:
                     self._btn_check_updates.configure(state=tk.NORMAL)
-                    self._btn_apply_update.configure(state=tk.DISABLED)
+                    self._btn_apply_update.configure(state=tk.NORMAL)
                     self._clear_ui_busy()
                     messagebox.showerror("Cập nhật", f"Kiểm tra bản mới thất bại:\n{err_text}", parent=self._root)
 
@@ -5539,51 +5539,108 @@ class _ManagerWindow:
             pass
 
     def _on_apply_update(self) -> None:
-        """Tải và áp dụng bản mới đã check được từ manifest."""
-        mf = self._latest_update_manifest
-        if mf is None:
-            messagebox.showwarning("Cập nhật", "Chưa có thông tin bản mới. Hãy bấm «Kiểm tra cập nhật» trước.", parent=self._root)
-            return
-        if not messagebox.askyesno(
-            "Xác nhận cập nhật",
-            (
-                f"Cập nhật lên phiên bản {mf.version}?\n\n"
-                "App sẽ backup trước khi cập nhật và yêu cầu khởi động lại sau khi hoàn tất."
-            ),
-            parent=self._root,
-        ):
+        """Một nút: đọc manifest → so sánh → nếu có bản mới thì tải zip và áp dụng (không cần «Kiểm tra» trước)."""
+        manifest_url = resolve_manifest_url(project_root())
+        if not manifest_url:
+            if messagebox.askyesno(
+                "Cập nhật",
+                (
+                    "Chưa cấu hình URL manifest (latest.json).\n\n"
+                    "Mở «Cấu hình kênh cập nhật» để nhập URL GitHub hoặc manifest khác?\n\n"
+                    "(Có thể dùng biến TOOLFB_UPDATE_MANIFEST_URL; dev: manifest_file / dist/latest.json.)"
+                ),
+                parent=self._root,
+            ):
+                self._on_configure_update_channel()
             return
 
         self._set_ui_busy("apply_update")
         self._btn_check_updates.configure(state=tk.DISABLED)
         self._btn_apply_update.configure(state=tk.DISABLED)
-        self._lbl_state.configure(text="Update: đang tải & áp dụng…")
+        self._lbl_state.configure(text="Update: đang kiểm tra manifest…")
 
-        def worker() -> None:
+        def worker_check_then_apply() -> None:
             try:
-                backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
+                local_v = read_local_version(project_root())
+                mf = read_manifest_from_url(manifest_url)
+                has_new = is_newer_version(mf.version, local_v)
 
-                def done_ok() -> None:
-                    self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
-                    self._clear_ui_busy()
-                    self._btn_check_updates.configure(state=tk.NORMAL)
-                    self._btn_apply_update.configure(state=tk.DISABLED)
-                    self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
+                def on_main_decide() -> None:
+                    self._latest_update_manifest = mf if has_new else None
+                    if not has_new:
+                        self._clear_ui_busy()
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._lbl_state.configure(text="")
+                        messagebox.showinfo(
+                            "Cập nhật",
+                            f"Bạn đang dùng bản mới nhất ({local_v}). Không cần cập nhật.",
+                            parent=self._root,
+                        )
+                        return
+                    notes = (mf.notes or "—").strip()
+                    if not messagebox.askyesno(
+                        "Xác nhận cập nhật",
+                        (
+                            f"Tải và cập nhật lên phiên bản {mf.version}?\n"
+                            f"Bản hiện tại: {local_v}\n\n"
+                            f"Ghi chú: {notes}\n\n"
+                            "App sẽ backup, tải gói zip và yêu cầu khởi động lại sau khi hoàn tất."
+                        ),
+                        parent=self._root,
+                    ):
+                        self._clear_ui_busy()
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._lbl_state.configure(text="")
+                        return
 
-                self._root.after(0, done_ok)
+                    self._lbl_state.configure(text="Update: đang tải & áp dụng…")
+
+                    def worker_download() -> None:
+                        try:
+                            backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
+
+                            def done_ok() -> None:
+                                self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
+                                self._clear_ui_busy()
+                                self._btn_check_updates.configure(state=tk.NORMAL)
+                                self._btn_apply_update.configure(state=tk.NORMAL)
+                                self._show_update_success_restart_dialog(
+                                    version=str(mf.version), backup_dir=backup_dir
+                                )
+
+                            self._root.after(0, done_ok)
+                        except Exception as exc:  # noqa: BLE001
+                            err_text = str(exc)
+
+                            def done_err() -> None:
+                                self._btn_check_updates.configure(state=tk.NORMAL)
+                                self._btn_apply_update.configure(state=tk.NORMAL)
+                                self._lbl_state.configure(text="Update: lỗi")
+                                self._clear_ui_busy()
+                                messagebox.showerror(
+                                    "Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root
+                                )
+
+                            self._root.after(0, done_err)
+
+                    threading.Thread(target=worker_download, name="apply_update_download", daemon=True).start()
+
+                self._root.after(0, on_main_decide)
             except Exception as exc:  # noqa: BLE001
                 err_text = str(exc)
 
                 def done_err() -> None:
                     self._btn_check_updates.configure(state=tk.NORMAL)
-                    self._btn_apply_update.configure(state=tk.NORMAL if self._latest_update_manifest else tk.DISABLED)
-                    self._lbl_state.configure(text="Update: lỗi")
+                    self._btn_apply_update.configure(state=tk.NORMAL)
+                    self._lbl_state.configure(text="")
                     self._clear_ui_busy()
-                    messagebox.showerror("Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root)
+                    messagebox.showerror("Cập nhật", f"Không đọc được manifest / kiểm tra thất bại:\n{err_text}", parent=self._root)
 
                 self._root.after(0, done_err)
 
-        threading.Thread(target=worker, name="apply_update", daemon=True).start()
+        threading.Thread(target=worker_check_then_apply, name="apply_update", daemon=True).start()
 
     def _on_start(self) -> None:
         """
