@@ -1,6 +1,6 @@
 {
-  "version": "1.0.29",
-  "download_url": "https://github.com/vanchien/ToolFB/archive/refs/heads/main.zip",
-  "sha256": "",
-  "notes": "Zip nguồn nhánh main (GitHub archive). Khi phát hành: tăng version đồng thời ở version.json và file này."
+  "version": "1.0.30",
+  "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
+  "sha256": "d55244140e3a1da5e476d8de027ab218192697ec65831e8e9f97bd204eb690d4",
+  "notes": "Release đầy đủ: portable_clean + ToolFB_GUI.exe + Playwright (Chromium/Firefox/WebKit). Đồng bộ với dist/latest.json sau khi publish."
 }
