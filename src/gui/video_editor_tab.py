@@ -1849,6 +1849,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
     tl_fr = ttk.LabelFrame(center, text="Timeline — thứ tự clip trên video (Ctrl/Shift: chọn nhiều)", padding=4)
     center.add(tl_fr, weight=2)
+    try:
+        center.paneconfigure(prev_fr, minsize=72)
+        center.paneconfigure(tl_fr, minsize=100)
+    except tk.TclError:
+        pass
     tl_wrap = ttk.Frame(tl_fr)
     tl_wrap.pack(fill=tk.BOTH, expand=True)
     tl_wrap.columnconfigure(0, weight=1)
@@ -2514,17 +2519,30 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     # Không giữ draft/_applied của nhóm clip khác — tránh «đã áp» sai hoặc áp nhầm thông số cũ.
                     _batch_edit_draft.clear()
                     _batch_edit_draft["_applied"] = {}
-                insp_grid.columnconfigure(1, weight=1)
+                insp_grid.columnconfigure(0, minsize=136)
+                insp_grid.columnconfigure(1, weight=1, minsize=96)
+                insp_grid.columnconfigure(2, minsize=88)
+                hdr_batch = ttk.Frame(insp_grid)
+                hdr_batch.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+                hdr_batch.columnconfigure(0, weight=1)
                 ttk.Label(
-                    insp_grid,
-                    text=f"Sửa hàng loạt — {len(rows)} clip video · cùng nút «Áp dụng tất cả» với clip đơn (cuối tab)",
-                ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+                    hdr_batch,
+                    text=f"Sửa hàng loạt — {len(rows)} clip video",
+                    font=("Segoe UI", 10, "bold"),
+                ).grid(row=0, column=0, sticky="w")
+                ttk.Label(
+                    hdr_batch,
+                    text="Ô trống = giữ nguyên từng clip · «Áp dụng tất cả» ở cuối tab.",
+                    font=("Segoe UI", 8),
+                    foreground="#555",
+                ).grid(row=1, column=0, sticky="w", pady=(4, 0))
                 if loaded_prev:
                     ttk.Label(
-                        insp_grid,
-                        text="Đã nạp thông số đã chỉnh trước đó cho nhóm clip này.",
+                        hdr_batch,
+                        text="Đã nạp bản nháp trước.",
                         foreground="#1a4480",
-                    ).grid(row=0, column=3, sticky="w", padx=(8, 0), pady=(0, 6))
+                        font=("Segoe UI", 8),
+                    ).grid(row=0, column=1, rowspan=2, sticky="ne", padx=(12, 0))
 
                 def _persist_batch_draft(*, save_project_file: bool = False) -> None:
                     if not project:
@@ -2599,16 +2617,16 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     (3, "Fade vào (giây)", var_b_fi, "fade_in"),
                     (4, "Fade ra (giây)", var_b_fo, "fade_out"),
                 ):
-                    ttk.Label(insp_grid, text=lab).grid(row=r, column=0, sticky="w", pady=2)
-                    _ent = ttk.Entry(insp_grid, textvariable=var, width=14)
-                    _ent.grid(row=r, column=1, sticky="ew", pady=2)
+                    ttk.Label(insp_grid, text=lab).grid(row=r, column=0, sticky="w", pady=(0, 4))
+                    _ent = ttk.Entry(insp_grid, textvariable=var, width=13)
+                    _ent.grid(row=r, column=1, sticky="ew", pady=(0, 4), padx=(0, 6))
                     st = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888", width=11)
-                    st.grid(row=r, column=2, sticky="w", padx=(8, 0), pady=2)
+                    st.grid(row=r, column=2, sticky="w", padx=(4, 0), pady=(0, 4))
                     _bind_status_text(draft_key, var, st)
 
-                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=3, sticky="ew", pady=8)
+                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 10))
                 ttk.Label(insp_grid, text="Transform & canvas", font=("Segoe UI", 9, "bold")).grid(
-                    row=6, column=0, columnspan=3, sticky="w", pady=(0, 4)
+                    row=6, column=0, columnspan=3, sticky="w", pady=(0, 6)
                 )
 
                 def _explain_toggle(msg_on: str, msg_off: str, val: tk.BooleanVar) -> None:
@@ -2739,18 +2757,15 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
                 ov_hint_b = ttk.Label(
                     batch_media_fr,
-                    text=(
-                        "Logo & chữ (nội dung, cỡ, màu, vị trí…): dùng khung «Logo · Chữ» cố định cuối tab — "
-                        "cùng giao diện với sửa 1 clip. Track âm phụ: chỉnh ngay dưới đây."
-                    ),
+                    text="Logo & chữ: dùng khung «Logo & Chữ» cuối tab. Âm phụ: chỉnh trong khung dưới.",
                     foreground="#1a4480",
                     font=("Segoe UI", 8),
-                    wraplength=480,
+                    wraplength=560,
                     justify=tk.LEFT,
                 )
-                ov_hint_b.pack(anchor="w", pady=(0, 6))
+                ov_hint_b.pack(anchor="w", pady=(0, 8))
 
-                lf_b_audio = ttk.LabelFrame(batch_media_fr, text="Âm thanh — track phụ", padding=6)
+                lf_b_audio = ttk.LabelFrame(batch_media_fr, text="Âm thanh — track phụ", padding=(8, 6, 8, 8))
                 lf_b_audio.pack(fill=tk.X, pady=(0, 6))
                 lf_b_audio.columnconfigure(1, weight=1)
                 ttk.Label(lf_b_audio, text="File âm thanh").grid(row=0, column=0, sticky="w", pady=2)
@@ -2768,14 +2783,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
                 ttk.Label(
                     insp_grid,
-                    text=(
-                        "Để trống các ô = giữ nguyên clip. Tích «Phạm vi…» ở cuối tab trước khi bấm «Áp dụng tất cả»."
-                    ),
+                    text="Để trống = giữ nguyên. Chọn phạm vi ở cuối tab trước khi «Áp dụng tất cả».",
                     foreground="gray",
                     font=("Segoe UI", 8),
-                    wraplength=440,
+                    wraplength=520,
                     justify=tk.LEFT,
-                ).grid(row=15, column=0, columnspan=3, sticky="w", pady=(6, 4))
+                ).grid(row=15, column=0, columnspan=3, sticky="w", pady=(8, 6))
 
                 var_b_reset_mode = tk.StringVar(
                     value=str(_batch_edit_draft.get("reset_mode") or "Reset về ban đầu")
@@ -2896,7 +2909,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     lf_reset_bt = ttk.LabelFrame(
                         _br_bar,
                         text="Reset hàng loạt — đưa clip về mặc định",
-                        padding=6,
+                        padding=(10, 8, 10, 8),
                     )
                     lf_reset_bt.pack(fill=tk.X)
                     lf_reset_bt.columnconfigure(1, weight=1)
@@ -5599,11 +5612,17 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     # --- Inspector + Export ---
     right = ttk.PanedWindow(main, orient=tk.VERTICAL)
     main.add(right, weight=3)
+    try:
+        main.paneconfigure(media_fr, minsize=96)
+        main.paneconfigure(center, minsize=140)
+        main.paneconfigure(right, minsize=200)
+    except tk.TclError:
+        pass
 
     insp_fr = ttk.LabelFrame(
         right,
         text="Chỉnh sửa theo clip đã chọn",
-        padding=4,
+        padding=(6, 6, 6, 4),
     )
     right.add(insp_fr, weight=2)
     _exp_layout_state: dict[str, Any] = {"inspector_hidden": False}
@@ -5634,21 +5653,53 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
     insp_nb = ttk.Notebook(insp_fr)
     insp_nb.pack(fill=tk.BOTH, expand=True)
-    tab_insp_clip = ttk.Frame(insp_nb, padding=2)
+    tab_insp_clip = ttk.Frame(insp_nb, padding=(8, 6, 8, 4))
     insp_nb.add(tab_insp_clip, text="Chỉnh clip")
     # Thanh dưới cố định (gợi ý + Logo·Chữ + nút); phần inspector cuộn phía trên — tránh bị PanedWindow cắt mất.
     clip_tab_bottom = ttk.Frame(tab_insp_clip)
     clip_tab_scroll_host = ttk.Frame(tab_insp_clip)
     _ve_batch_reset_bar_ref["fr"] = ttk.Frame(clip_tab_bottom)
-    clip_tab_bottom.pack(side=tk.BOTTOM, fill=tk.X)
-    clip_tab_scroll_host.pack(fill=tk.BOTH, expand=True)
+    # Grid: hàng 0 (cuộn) weight=1 — tránh pack(BOTTOM trước) khiến vùng inspector clip bị co về 0 trên một số DPI / cửa sổ nhỏ.
+    tab_insp_clip.columnconfigure(0, weight=1)
+    tab_insp_clip.rowconfigure(0, weight=1, minsize=120)
+    clip_tab_scroll_host.grid(row=0, column=0, sticky="nsew")
+    clip_tab_bottom.grid(row=1, column=0, sticky="ew")
     insp_grid = _pack_scrollable_vertical(clip_tab_scroll_host)
-    quick_edit_clip_tab_fr = ttk.LabelFrame(
-        clip_tab_bottom,
-        text="Logo · Chữ — chỉnh nhanh (một nút «Áp dụng tất cả»)",
-        padding=6,
-    )
+    fr_quick_edit_host = ttk.Frame(clip_tab_bottom)
     _AUTO_LOGO_MEDIA_LBL = "Tự động (ảnh trong Media — ưu tiên file import gần nhất)"
+
+    def _section_collapsible(parent: ttk.Widget, title: str, *, start_open: bool = True) -> tuple[ttk.Frame, ttk.Frame, tk.BooleanVar]:
+        """Một block có nút ▼/▶ để thu gọn nội dung — dễ tập trung từng nhóm chỉnh."""
+        outer = ttk.Frame(parent)
+        var_open = tk.BooleanVar(value=bool(start_open))
+        head = ttk.Frame(outer)
+        head.pack(fill=tk.X)
+        inner_wrap = ttk.Frame(outer)
+        inner = ttk.Frame(inner_wrap)
+
+        def _btn_text() -> str:
+            return (f"▶  {title}" if not var_open.get() else f"▼  {title}")
+
+        def _sync() -> None:
+            if var_open.get():
+                inner_wrap.pack(fill=tk.X, pady=(2, 2))
+                inner.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=(0, 2))
+            else:
+                inner.pack_forget()
+                inner_wrap.pack_forget()
+            try:
+                btn.configure(text=_btn_text())
+            except tk.TclError:
+                pass
+
+        def _toggle() -> None:
+            var_open.set(not var_open.get())
+            _sync()
+
+        btn = ttk.Button(head, text=_btn_text(), command=_toggle)
+        btn.pack(anchor="w")
+        _sync()
+        return outer, inner, var_open
 
     def _batch_meta_store() -> dict[str, Any]:
         if not project:
@@ -5674,21 +5725,29 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     var_ve_apply_ov_text = tk.BooleanVar(value=True)
     var_ve_apply_quick_logo = tk.BooleanVar(value=True)
     var_ve_apply_quick_text = tk.BooleanVar(value=True)
-    lf_apply_scope = ttk.LabelFrame(clip_tab_bottom, text="Phạm vi khi bấm «Áp dụng tất cả»", padding=4)
+    sec_scope_outer, sec_scope_inner, _var_scope_open = _section_collapsible(
+        clip_tab_bottom,
+        "Phạm vi nút «Áp dụng tất cả»",
+        start_open=False,
+    )
+    lf_apply_scope = ttk.Frame(sec_scope_inner, padding=(0, 0, 0, 4))
+    lf_apply_scope.pack(fill=tk.X)
     _r_scope = ttk.Frame(lf_apply_scope)
     _r_scope.pack(fill=tk.X)
     ttk.Checkbutton(_r_scope, text="Chỉnh clip (tỉ lệ, cắt, lật, timeline…)", variable=var_ve_apply_clip).pack(
         anchor="w"
     )
     _r_ov = ttk.Frame(lf_apply_scope)
-    _r_ov.pack(fill=tk.X, pady=(2, 0))
-    ttk.Label(_r_ov, text="Inspector — track phủ:", font=("Segoe UI", 8)).pack(side=tk.LEFT)
-    ttk.Checkbutton(_r_ov, text="Logo ảnh", variable=var_ve_apply_ov_logo).pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Checkbutton(_r_ov, text="Âm phụ", variable=var_ve_apply_ov_audio).pack(side=tk.LEFT, padx=(6, 0))
-    ttk.Checkbutton(_r_ov, text="Chữ", variable=var_ve_apply_ov_text).pack(side=tk.LEFT, padx=(6, 0))
+    _r_ov.pack(fill=tk.X, pady=(6, 0))
+    ttk.Label(_r_ov, text="Track phủ (inspector):", font=("Segoe UI", 8), foreground="#444").pack(side=tk.LEFT)
+    ttk.Checkbutton(_r_ov, text="Logo ảnh", variable=var_ve_apply_ov_logo).pack(side=tk.LEFT, padx=(10, 0))
+    ttk.Checkbutton(_r_ov, text="Âm phụ", variable=var_ve_apply_ov_audio).pack(side=tk.LEFT, padx=(8, 0))
+    ttk.Checkbutton(_r_ov, text="Chữ", variable=var_ve_apply_ov_text).pack(side=tk.LEFT, padx=(8, 0))
     _r_q = ttk.Frame(lf_apply_scope)
-    _r_q.pack(fill=tk.X, pady=(2, 0))
-    ttk.Label(_r_q, text="Chỉnh nhanh (khung dưới):", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+    _r_q.pack(fill=tk.X, pady=(6, 0))
+    ttk.Label(_r_q, text="Chỉnh nhanh (ô Logo & Chữ phía trên):", font=("Segoe UI", 8), foreground="#444").pack(
+        side=tk.LEFT
+    )
     ttk.Checkbutton(_r_q, text="Logo (độ mờ, cỡ, vị trí…)", variable=var_ve_apply_quick_logo).pack(
         side=tk.LEFT, padx=(8, 0)
     )
@@ -5733,18 +5792,6 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             parent=root,
         )
 
-    lbl_clip_quick_hint = ttk.Label(
-        clip_tab_bottom,
-        text=(
-            "Khung trên cuộn: chỉnh từng mục như clip đơn. "
-            "Cuối tab: «Logo · Chữ» → «Phạm vi» → (khi hàng loạt) «Reset» → «Áp dụng tất cả». "
-            "Logo ảnh cụ thể ở combobox «Ảnh khi tạo mới»; «Tự động» chỉ cho chỉnh nhanh, không ép logo khi chỉ sửa clip."
-        ),
-        foreground="#555",
-        font=("Segoe UI", 8),
-        wraplength=720,
-        justify=tk.LEFT,
-    )
     btn_apply_all_bottom = ttk.Button(
         clip_tab_bottom,
         text="Áp dụng tất cả",
@@ -5766,69 +5813,76 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     var_ov_text = tk.StringVar(value="")
     _text_pos_opts = ("Giữa dưới", "Giữa trên", "Trái trên", "Phải trên", "Trái dưới", "Phải dưới")
 
-    _q_quick_inner = ttk.Frame(quick_edit_clip_tab_fr)
-    lf_q_logo = ttk.LabelFrame(_q_quick_inner, text="Logo — độ mờ, kích, vị trí, chuyển động", padding=6)
-    lf_q_logo.pack(fill=tk.X, pady=(0, 6))
-    lf_q_logo.columnconfigure(1, weight=1)
-    lf_q_logo.columnconfigure(3, weight=1)
+    sec_logo_outer, sec_logo_inner, _var_sec_logo_open = _section_collapsible(
+        fr_quick_edit_host,
+        "Logo — độ mờ, kích, vị trí, chuyển động",
+        start_open=True,
+    )
+    sec_logo_outer.pack(fill=tk.X, pady=(0, 2))
+    lf_q_logo = ttk.Frame(sec_logo_inner, padding=(0, 0, 0, 4))
+    lf_q_logo.pack(fill=tk.X)
+    lf_q_logo.columnconfigure(0, minsize=108)
+    lf_q_logo.columnconfigure(1, weight=1, uniform="qe")
+    lf_q_logo.columnconfigure(2, minsize=118)
+    lf_q_logo.columnconfigure(3, weight=1, uniform="qe")
 
     qr = 0
-    ttk.Label(lf_q_logo, text="Độ mờ").grid(row=qr, column=0, sticky="w", padx=(0, 6))
+    ttk.Label(lf_q_logo, text="Độ mờ").grid(row=qr, column=0, sticky="w", padx=(0, 8))
     ttk.Combobox(
         lf_q_logo,
         textvariable=var_q_logo_opacity,
         values=("", "1.0", "0.92", "0.8", "0.65", "0.5", "0.35"),
-        width=10,
-    ).grid(row=qr, column=1, sticky="ew", padx=(0, 10))
-    ttk.Label(lf_q_logo, text="Kích (tỉ lệ ngang)").grid(row=qr, column=2, sticky="w", padx=(0, 6))
+        width=12,
+    ).grid(row=qr, column=1, sticky="ew", padx=(0, 12))
+    ttk.Label(lf_q_logo, text="Kích (tỉ lệ ngang)").grid(row=qr, column=2, sticky="w", padx=(0, 8))
     ttk.Combobox(
         lf_q_logo,
         textvariable=var_q_logo_size_ratio,
         values=("", "0.10", "0.12", "0.15", "0.18", "0.22", "0.28"),
-        width=10,
+        width=12,
     ).grid(row=qr, column=3, sticky="ew")
     qr += 1
-    ttk.Label(lf_q_logo, text="Vị trí").grid(row=qr, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+    ttk.Label(lf_q_logo, text="Vị trí").grid(row=qr, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
     cb_q_logo_position = ttk.Combobox(
         lf_q_logo,
         textvariable=var_q_logo_position,
         values=_text_pos_opts,
-        width=14,
+        width=12,
         state="readonly",
     )
-    cb_q_logo_position.grid(row=qr, column=1, sticky="ew", padx=(0, 10), pady=(6, 0))
-    ttk.Label(lf_q_logo, text="Chuyển động").grid(row=qr, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+    cb_q_logo_position.grid(row=qr, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+    ttk.Label(lf_q_logo, text="Chuyển động").grid(row=qr, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
     ttk.Combobox(
         lf_q_logo,
         textvariable=var_q_logo_motion_mode,
         values=("", "Tắt", "Bật mượt"),
-        width=14,
+        width=12,
         state="normal",
-    ).grid(row=qr, column=3, sticky="ew", pady=(6, 0))
+    ).grid(row=qr, column=3, sticky="ew", pady=(8, 0))
     qr += 1
-    ttk.Label(lf_q_logo, text="Bước (giây)").grid(row=qr, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+    ttk.Label(lf_q_logo, text="Bước (giây)").grid(row=qr, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
     ttk.Combobox(
         lf_q_logo,
         textvariable=var_q_logo_motion_interval,
         values=("", "0.5", "1.0", "1.5", "2.0", "3.0", "5.0"),
-        width=10,
-    ).grid(row=qr, column=1, sticky="ew", padx=(0, 10), pady=(6, 0))
-    ttk.Label(lf_q_logo, text="Seed").grid(row=qr, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+        width=12,
+    ).grid(row=qr, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+    ttk.Label(lf_q_logo, text="Seed").grid(row=qr, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
     ttk.Combobox(
         lf_q_logo,
         textvariable=var_q_logo_motion_seed,
         values=("", "0", "1", "2", "7", "42", "99"),
-        width=10,
-    ).grid(row=qr, column=3, sticky="ew", pady=(6, 0))
+        width=12,
+    ).grid(row=qr, column=3, sticky="ew", pady=(8, 0))
     qr += 1
-    ttk.Label(lf_q_logo, text="Ảnh khi tạo mới").grid(row=qr, column=0, sticky="nw", padx=(0, 6), pady=(6, 0))
+    ttk.Label(lf_q_logo, text="Ảnh khi tạo mới").grid(row=qr, column=0, sticky="nw", padx=(0, 8), pady=(8, 0))
     cb_q_logo_media = ttk.Combobox(
         lf_q_logo,
         textvariable=var_q_logo_media,
         values=[_AUTO_LOGO_MEDIA_LBL],
         state="readonly",
     )
-    cb_q_logo_media.grid(row=qr, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+    cb_q_logo_media.grid(row=qr, column=1, columnspan=3, sticky="ew", pady=(8, 0))
 
     def _reload_q_logo_media_combo() -> None:
         vals = [_AUTO_LOGO_MEDIA_LBL]
@@ -5882,34 +5936,42 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
     cb_q_logo_position.bind("<<ComboboxSelected>>", _persist_quick_logo_position_pick)
 
-    lf_q_text = ttk.LabelFrame(_q_quick_inner, text="Chữ — nội dung, cỡ, màu, font, vị trí", padding=6)
+    sec_text_outer, sec_text_inner, _var_sec_text_open = _section_collapsible(
+        fr_quick_edit_host,
+        "Chữ — nội dung, cỡ, màu, font, vị trí",
+        start_open=True,
+    )
+    sec_text_outer.pack(fill=tk.X, pady=(6, 0))
+    lf_q_text = ttk.Frame(sec_text_inner, padding=(0, 0, 0, 4))
     lf_q_text.pack(fill=tk.X)
-    lf_q_text.columnconfigure(1, weight=1)
-    lf_q_text.columnconfigure(3, weight=1)
+    lf_q_text.columnconfigure(0, minsize=108)
+    lf_q_text.columnconfigure(1, weight=1, uniform="qt")
+    lf_q_text.columnconfigure(2, minsize=72)
+    lf_q_text.columnconfigure(3, weight=1, uniform="qt")
 
     qt = 0
-    ttk.Label(lf_q_text, text="Nội dung").grid(row=qt, column=0, sticky="nw", padx=(0, 6))
+    ttk.Label(lf_q_text, text="Nội dung").grid(row=qt, column=0, sticky="nw", padx=(0, 8))
     ttk.Entry(lf_q_text, textvariable=var_ov_text).grid(row=qt, column=1, columnspan=3, sticky="ew")
     qt += 1
-    ttk.Label(lf_q_text, text="Cỡ chữ").grid(row=qt, column=0, sticky="w", padx=(0, 6))
+    ttk.Label(lf_q_text, text="Cỡ chữ").grid(row=qt, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
     ttk.Combobox(
         lf_q_text,
         textvariable=var_q_text_size,
         values=("", "24", "32", "40", "44", "52", "60", "72"),
-        width=10,
-    ).grid(row=qt, column=1, sticky="ew", padx=(0, 10))
-    ttk.Label(lf_q_text, text="Màu").grid(row=qt, column=2, sticky="w", padx=(0, 6))
+        width=12,
+    ).grid(row=qt, column=1, sticky="ew", padx=(0, 12), pady=(6, 0))
+    ttk.Label(lf_q_text, text="Màu").grid(row=qt, column=2, sticky="w", padx=(0, 8), pady=(6, 0))
     ttk.Combobox(
         lf_q_text,
         textvariable=var_q_text_color,
         values=("", "white", "yellow", "black", "#00FF00", "#FFCC00", "#00BFFF", "#FF66CC"),
-        width=14,
-    ).grid(row=qt, column=3, sticky="ew")
+        width=12,
+    ).grid(row=qt, column=3, sticky="ew", pady=(6, 0))
     qt += 1
-    ttk.Label(lf_q_text, text="Font (.ttf/.otf)").grid(row=qt, column=0, sticky="w", pady=(6, 0))
+    ttk.Label(lf_q_text, text="Font (.ttf/.otf)").grid(row=qt, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
     var_q_text_font.set("Mặc định (trống)")
     fr_q_font_pick = ttk.Frame(lf_q_text)
-    fr_q_font_pick.grid(row=qt, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+    fr_q_font_pick.grid(row=qt, column=1, columnspan=3, sticky="ew", pady=(8, 0))
     cb_q_font_pick = ttk.Combobox(
         fr_q_font_pick,
         textvariable=var_q_text_font,
@@ -5940,34 +6002,31 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     )
     lbl_q_font_preview.pack(fill=tk.X, anchor="w", pady=(2, 0))
     qt += 1
-    ttk.Label(lf_q_text, text="Chữ theo logo").grid(row=qt, column=0, sticky="w", pady=(6, 0))
+    ttk.Label(lf_q_text, text="Chữ theo logo").grid(row=qt, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
     ttk.Combobox(
         lf_q_text,
         textvariable=var_q_text_follow_logo,
         values=("Theo logo", "Không theo logo"),
-        width=14,
+        width=12,
         state="readonly",
-    ).grid(row=qt, column=1, sticky="ew", padx=(0, 10), pady=(6, 0))
-    ttk.Label(lf_q_text, text="Vị trí chữ").grid(row=qt, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+    ).grid(row=qt, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+    ttk.Label(lf_q_text, text="Vị trí chữ").grid(row=qt, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
     ttk.Combobox(
         lf_q_text,
         textvariable=var_q_text_position,
         values=_text_pos_opts,
-        width=14,
+        width=12,
         state="readonly",
-    ).grid(row=qt, column=3, sticky="ew", pady=(6, 0))
+    ).grid(row=qt, column=3, sticky="ew", pady=(8, 0))
     qt += 1
     ttk.Label(
         lf_q_text,
-        text=(
-            "Gợi ý: độ mờ logo 1.0 = rõ nhất; «Theo logo» = chữ đồng bộ chuyển động với logo; "
-            "bật mượt + bước nhỏ ⇒ chuyển động mềm."
-        ),
+        text="Gợi ý: logo 1.0 = rõ nhất; «Theo logo» = chữ đi cùng chuyển động logo.",
         foreground="#666",
         font=("Segoe UI", 8),
-        wraplength=520,
+        wraplength=560,
         justify=tk.LEFT,
-    ).grid(row=qt, column=0, columnspan=4, sticky="w", pady=(8, 0))
+    ).grid(row=qt, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
     def _font_tokens(name: str) -> set[str]:
         base = str(name or "").lower().replace("-", " ").replace("_", " ")
@@ -6217,11 +6276,33 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     except Exception:
         pass
 
-    _q_quick_inner.pack(fill=tk.BOTH, expand=True)
-    quick_edit_clip_tab_fr.pack(fill=tk.X, pady=(0, 4))
-    lf_apply_scope.pack(fill=tk.X, pady=(0, 4))
-    lbl_clip_quick_hint.pack(anchor="w", pady=(2, 4))
-    btn_apply_all_bottom.pack(anchor="w", pady=(6, 0))
+    _sep_clip_logo_scope = ttk.Separator(clip_tab_bottom, orient=tk.HORIZONTAL)
+    _sep_clip_scope_hint = ttk.Separator(clip_tab_bottom, orient=tk.HORIZONTAL)
+
+    fr_quick_edit_host.pack(fill=tk.X, pady=(0, 2))
+    _sep_clip_logo_scope.pack(fill=tk.X, pady=(8, 8))
+    sec_scope_outer.pack(fill=tk.X, pady=(0, 2))
+    _sep_clip_scope_hint.pack(fill=tk.X, pady=(8, 8))
+    sec_hint_outer, sec_hint_inner, _var_hint_open = _section_collapsible(
+        clip_tab_bottom,
+        "Gợi ý nhanh",
+        start_open=False,
+    )
+    lbl_clip_quick_hint = ttk.Label(
+        sec_hint_inner,
+        text=(
+            "Cuộn khung phía trên để sửa chi tiết từng clip. "
+            "Dưới: chỉnh Logo & Chữ → chọn phạm vi → «Áp dụng tất cả». "
+            "«Ảnh khi tạo mới»: chọn file hoặc «Tự động» (ảnh trong Media)."
+        ),
+        foreground="#5c5c5c",
+        font=("Segoe UI", 8),
+        wraplength=680,
+        justify=tk.LEFT,
+    )
+    lbl_clip_quick_hint.pack(anchor="w", pady=(0, 2))
+    sec_hint_outer.pack(fill=tk.X, pady=(0, 4))
+    btn_apply_all_bottom.pack(anchor="w", pady=(4, 0))
 
     for _vq in (
         var_q_logo_opacity,
@@ -6241,7 +6322,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         _vq.trace_add("write", lambda *_a: _schedule_quick_batch_if_active("chỉnh nhanh logo/chữ"))
 
     tab_phase2 = ttk.Frame(insp_nb, padding=4)
-    insp_nb.add(tab_phase2, text="Dự án: nhạc · phụ đề")
+    insp_nb.add(tab_phase2, text="Nhạc & phụ đề")
 
     p2_fr = _pack_scrollable_vertical(tab_phase2)
 
@@ -7429,6 +7510,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
     exp_fr = ttk.LabelFrame(right, text="Xuất video (Export)", padding=4)
     right.add(exp_fr, weight=1)
+    try:
+        right.paneconfigure(insp_fr, minsize=120)
+        right.paneconfigure(exp_fr, minsize=88)
+    except tk.TclError:
+        pass
     exp_inner = _pack_scrollable_vertical(exp_fr)
     exp_top_actions = ttk.Frame(exp_inner)
     exp_top_actions.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))

@@ -963,6 +963,11 @@ class _ManagerWindow:
         self._log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ly.pack(side=tk.RIGHT, fill=tk.Y)
         body.add(log_fr, weight=2)
+        try:
+            body.paneconfigure(nb_host, minsize=380)
+            body.paneconfigure(log_fr, minsize=110)
+        except tk.TclError:
+            pass
 
         self._root.minsize(860 if self._compact_ui else 960, 560 if self._compact_ui else 620)
 

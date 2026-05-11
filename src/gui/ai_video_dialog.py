@@ -252,6 +252,7 @@ class AIVideoDialog:
 
         canvas.bind("<MouseWheel>", _on_mousewheel)
         inner.bind("<MouseWheel>", _on_mousewheel)
+        host.bind("<MouseWheel>", _on_mousewheel)
         canvas.bind("<Button-4>", lambda _e: _scroll_units(-1))
         canvas.bind("<Button-5>", lambda _e: _scroll_units(1))
         inner.bind("<Button-4>", lambda _e: _scroll_units(-1))
@@ -1175,17 +1176,17 @@ class AIVideoDialog:
                 self._tree_fb_reels.column("idx", width=44, stretch=False)
                 self._tree_fb_reels.column("url", width=max(220, w - 52), stretch=True)
             if self._tree_yt_channel is not None:
-                w = max(320, int(self._tree_yt_channel.winfo_width()))
+                w = max(260, int(self._tree_yt_channel.winfo_width()))
                 self._tree_yt_channel.column("idx", width=44, stretch=False)
                 self._tree_yt_channel.column("title", width=max(120, int(w * 0.32)), stretch=True)
                 self._tree_yt_channel.column("url", width=max(180, int(w * 0.60)), stretch=True)
             if self._tree_tt_channel is not None:
-                w = max(320, int(self._tree_tt_channel.winfo_width()))
+                w = max(260, int(self._tree_tt_channel.winfo_width()))
                 self._tree_tt_channel.column("idx", width=44, stretch=False)
                 self._tree_tt_channel.column("title", width=max(120, int(w * 0.32)), stretch=True)
                 self._tree_tt_channel.column("url", width=max(180, int(w * 0.60)), stretch=True)
             if self._tree_uv is not None:
-                w = max(640, int(self._tree_uv.winfo_width()))
+                w = max(260, int(self._tree_uv.winfo_width()))
                 self._tree_uv.column("job", width=max(100, int(w * 0.13)), stretch=True)
                 self._tree_uv.column("platform", width=max(84, int(w * 0.09)), stretch=False)
                 self._tree_uv.column("title", width=max(140, int(w * 0.20)), stretch=True)
@@ -1195,8 +1196,9 @@ class AIVideoDialog:
                 self._tree_uv.column("path", width=max(180, int(w * 0.28)), stretch=True)
 
         def _reflow_download_tab() -> None:
-            host_w = max(640, int(host.winfo_width()))
-            wrap = max(340, host_w - 120)
+            # Cho cửa sổ hẹp / DPI cao: vẫn co wrap + cột tree, tránh nhãn cắt chữ và thanh ngang vô dụng.
+            host_w = max(280, int(host.winfo_width()))
+            wrap = max(220, host_w - 48)
 
             def _apply_wrap(widget: tk.Misc) -> None:
                 if not isinstance(widget, (ttk.Label, tk.Label)):

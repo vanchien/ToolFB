@@ -497,10 +497,15 @@ def scan_facebook_profile_reels_page(
 
                         if len(ordered_ids) == prev_count:
                             stable += 1
-                            if stable >= 40 and not scroll_until_end:
+                            if stable >= 22 and not scroll_until_end:
                                 st("Không còn reel mới sau nhiều lần cuộn — dừng.")
                                 break
-                            # Chỉ kết luận "hết dữ liệu" sau nhiều vòng, tránh dừng sớm ở khoảng 10 reel đầu.
+                            # Ít reel trên trang: dừng sớm khi đã ở đáy và không tăng count (tránh chờ >40 vòng).
+                            n_found = len(ordered_ids)
+                            if n_found <= 25 and i >= 10 and stable >= 7 and idle_at_bottom >= 5:
+                                st("Đã thu đủ reel hiển thị (ít mục) — dừng quét.")
+                                break
+                            # Nhiều reel / cuộn tới hết: giữ ngưỡng cao hơn để tránh dừng nhầm giữa chừng.
                             if i > 45 and stable >= 24 and idle_at_bottom >= 12:
                                 st("Đã ở cuối trang, không thêm reel — dừng.")
                                 break

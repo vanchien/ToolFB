@@ -1234,8 +1234,8 @@ class UniversalYTDLPWrapper:
             cmd.extend(["--proxy", proxy])
         cmd.append(raw)
         timeout = int(self._yt.get("timeout_sec") or 600)
-        # Máy chậm/mạng yếu cần dư thời gian quét; tránh fail sớm khi list dài.
-        timeout_scan = min(max(180, n + 60), timeout)
+        # Trần theo n: ít entry không cần ngân sách cố định rất lớn; kênh dài vẫn có trần ~320s.
+        timeout_scan = min(timeout, max(60, min(320, n * 8 + 48)))
         try:
             p = subprocess.Popen(
                 cmd,
@@ -1339,7 +1339,7 @@ class UniversalYTDLPWrapper:
                 return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
 
             remain = max(5.0, float(timeout) - (time.monotonic() - t0))
-            reap = max(8, min(120, int(min(remain, 120.0))))
+            reap = max(5, min(45, int(min(remain, 55.0))))
             try:
                 rc = p.wait(timeout=reap)
             except subprocess.TimeoutExpired:
