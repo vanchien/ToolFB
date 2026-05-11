@@ -1,7 +1,7 @@
 {
-  "version": "1.0.33",
+  "version": "1.0.34",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "28e0333764edb3f3b432d20ea42479974fb3ff8c567b25ad6249fe27e19e463e",
-  "notes": "Metadata tải batch đúng (source_url + .info.json); yt-dlp ẩn console; tối ưu I/O batch; concurrent_fragments mặc định 1.",
-  "generated_at": "2026-05-11T12:52:54"
+  "sha256": "9e2297d686ddb4c06ec84dec015d41dee71745dcd99c67c9f5a9b620b32be0dd",
+  "notes": "Fix import video từ job tải trong Video Editor; ổn định tải yt-dlp và metadata batch.",
+  "generated_at": "2026-05-11T14:49:33"
 }
