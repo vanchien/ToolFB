@@ -37,6 +37,7 @@ _INTERNAL_TOOL_DIR = project_root() / "tools" / "Veo3Studio"
 _INTERNAL_TOOL_EXE = _INTERNAL_TOOL_DIR / "Veo3Studio.exe"
 _EXTERNAL_TOOL_DIR = Path(r"C:\Users\Hello\Desktop\Tool")
 _EXTERNAL_TOOL_EXE = _EXTERNAL_TOOL_DIR / "Veo3Studio.exe"
+UV_LIBRARY_UI_MAX_ROWS = 1200
 
 
 def ai_video_project_gate_dialog(parent: tk.Misc) -> dict[str, Any] | None:
@@ -121,9 +122,9 @@ class AIVideoDialog:
         self._uv_yt_entry_rows: list[dict[str, str]] = []
         self._tree_tt_channel: ttk.Treeview | None = None
         self._uv_tt_entry_rows: list[dict[str, str]] = []
-        self._var_uv_yt_list_max = tk.StringVar(value="500")
+        self._var_uv_yt_list_max = tk.StringVar(value="200")
         self._var_uv_yt_scan_status = tk.StringVar(value="")
-        self._var_uv_tt_list_max = tk.StringVar(value="500")
+        self._var_uv_tt_list_max = tk.StringVar(value="200")
         self._var_uv_tt_scan_status = tk.StringVar(value="")
         self._var_uv_job_name = tk.StringVar(value="")
         self._uv_last_saved_job_name: str = ""
@@ -1810,8 +1811,8 @@ class AIVideoDialog:
         try:
             lim = int(self._var_uv_yt_list_max.get().strip())
         except ValueError:
-            lim = 500
-        return max(1, min(2000, lim))
+            lim = 200
+        return max(1, min(800, lim))
 
     def _refresh_yt_channel_tree(self, rows: list[dict[str, str]]) -> None:
         self._uv_yt_entry_rows = list(rows)
@@ -2055,8 +2056,8 @@ class AIVideoDialog:
         try:
             lim = int(self._var_uv_tt_list_max.get().strip())
         except ValueError:
-            lim = 500
-        return max(1, min(2000, lim))
+            lim = 200
+        return max(1, min(800, lim))
 
     def _refresh_tt_channel_tree(self, rows: list[dict[str, str]]) -> None:
         self._uv_tt_entry_rows = list(rows)
@@ -2633,6 +2634,7 @@ class AIVideoDialog:
         self._refresh_uv_library_job_filter(rows)
         selected_job_filter = str(self._var_uv_lib_job_filter.get() or "").strip()
         shown_ok = 0
+        inserted = 0
         for i, r in enumerate(rows, start=1):
             vid = str(r.get("id") or "")
             if not vid:
@@ -2641,6 +2643,8 @@ class AIVideoDialog:
             if selected_job_filter and selected_job_filter != "Tất cả job" and display_job != selected_job_filter:
                 continue
             shown_ok += 1
+            if inserted >= UV_LIBRARY_UI_MAX_ROWS:
+                continue
             dur = r.get("duration") or 0
             try:
                 ds = f"{float(dur):.1f}s"
@@ -2660,10 +2664,13 @@ class AIVideoDialog:
                     str(r.get("video_path") or ""),
                 ),
             )
+            inserted += 1
         if selected_job_filter and selected_job_filter != "Tất cả job":
-            self._var_uv_lib_total_ok.set(f"Tổng thành công: {total_ok} video (đang lọc hiển thị: {shown_ok})")
+            tail = f", đang hiển thị: {inserted}" if shown_ok > inserted else ""
+            self._var_uv_lib_total_ok.set(f"Tổng thành công: {total_ok} video (đang lọc: {shown_ok}{tail})")
         else:
-            self._var_uv_lib_total_ok.set(f"Tổng thành công: {total_ok} video")
+            tail = f" (đang hiển thị {inserted}/{shown_ok})" if shown_ok > inserted else ""
+            self._var_uv_lib_total_ok.set(f"Tổng thành công: {total_ok} video{tail}")
 
     def _refresh_uv_library_job_filter(self, rows: list[dict[str, Any]]) -> None:
         if self._cb_uv_lib_job_filter is None:

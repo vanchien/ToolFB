@@ -384,7 +384,8 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
             "merge_output_format": "mp4",
             "timeout_sec": 600,
-            "sleep_interval_sec": 2,
+            # Mặc định ưu tiên tốc độ; máy yếu sẽ đỡ bị "lag" khi tải nhiều URL.
+            "sleep_interval_sec": 0,
             "max_videos_default": 50,
             "max_filesize_mb": 300,
             "write_info_json": True,
@@ -401,10 +402,12 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
         },
         "facebook_reels": {
             "cookie_path": "",
-            "max_collect": 300,
-            "max_scroll_rounds": 100,
-            "max_scan_minutes": 30,
+            # Mặc định "nhanh", tránh quét quá nặng trên máy khách.
+            "max_collect": 120,
+            "max_scroll_rounds": 35,
+            "max_scan_minutes": 12,
             "scroll_until_end": True,
+            "show_browser": False,
         },
     }
 
@@ -1185,6 +1188,9 @@ class UniversalYTDLPWrapper:
             archive_path.parent.mkdir(parents=True, exist_ok=True)
             cmd.extend(["--download-archive", str(archive_path)])
         ut = (url_type or "unknown").lower()
+        # Batch theo URL đơn không nên chèn sleep giữa request, sẽ rất chậm trên máy yếu.
+        if ut == "single_video":
+            sleep_sec = 0
         if ut in ("playlist", "channel", "profile"):
             cmd.append("--yes-playlist")
             cmd.extend(["--playlist-end", str(max(1, int(max_videos)))])
