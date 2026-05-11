@@ -1,6 +1,7 @@
 {
-  "version": "1.0.30",
+  "version": "1.0.32",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "d55244140e3a1da5e476d8de027ab218192697ec65831e8e9f97bd204eb690d4",
-  "notes": "Release đầy đủ: portable_clean + ToolFB_GUI.exe + Playwright (Chromium/Firefox/WebKit). Đồng bộ với dist/latest.json sau khi publish."
+  "sha256": "4165052377da22f35ff79cafe474a26276cd791180c1d516889c0eb725223714",
+  "notes": "Đóng gói đầy đủ: PyInstaller + Playwright (Chromium/Firefox/WebKit), yt-dlp.exe kèm exe_gui, portable_clean. Sửa gọi yt-dlp trên bản .exe đóng gói (không dùng ToolFB_GUI.exe -m yt_dlp).",
+  "generated_at": "2026-05-11T11:12:36"
 }
