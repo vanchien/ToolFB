@@ -1,7 +1,7 @@
 {
-  "version": "1.0.40",
+  "version": "1.0.41",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "6a77bd13c115ecbfd3c949ba5ce16e2caee597a2fc079e5294dd02ed025da657",
-  "notes": "Rà soát lại luồng quét/tải và đường dẫn đóng gói: ép UTF-8 cho yt-dlp, sửa hiển thị tiếng Việt vỡ dấu, giữ timeout quét theo wall-clock + partial an toàn; bundle đầy đủ ffmpeg/ffprobe/yt-dlp cho máy khách.",
-  "generated_at": "2026-05-11T19:47:43"
+  "sha256": "7e638edc58e1209c2fcd6ae320cf14492b6cbb17fda7be2dcb2ad637e9079951",
+  "notes": "Tải/quét nhanh hơn trên máy khách: batch YouTube/TikTok/Reel tôn trọng checkbox Ghi info JSON & Lưu thumbnail (trước đây luôn bật JSON làm chậm từng video ngắn); mặc định concurrent_fragments 8, socket-timeout 45s, tắt thumbnail mặc định; giữ UTF-8 yt-dlp.",
+  "generated_at": "2026-05-11T20:28:38"
 }
