@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
+from src.services.universal_video_downloader import YTDLP_FORMAT_HD_MERGE
 from src.utils.app_secrets import get_nanobanana_runtime_config
 from src.utils.ffmpeg_paths import resolve_ffmpeg_ffprobe_paths
 from src.utils.paths import project_root
@@ -73,7 +74,7 @@ def _default_ytdlp_config() -> dict[str, Any]:
         "use_exe": False,
         "exe_path": str(project_root() / "tools" / "yt-dlp" / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp")),
         "timeout_sec": 300,
-        "max_filesize_mb": 200,
+        "max_filesize_mb": 800,
         "output_dir": str(ensure_reverse_video_layout()["input"]),
         "proxy": "",
     }
@@ -212,7 +213,7 @@ class YTDLPDownloader:
         cmd = [
             *self._resolve_ytdlp_cmd_prefix(),
             "-f",
-            "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
+            YTDLP_FORMAT_HD_MERGE,
             "--merge-output-format",
             "mp4",
             "--no-playlist",

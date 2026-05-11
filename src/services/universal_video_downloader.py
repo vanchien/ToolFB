@@ -22,6 +22,37 @@ from typing import Any, Callable
 from src.utils.paths import project_root
 
 LogFn = Callable[[str], None]
+# ``download()``: ``event`` = start | file_complete | stderr_activity | error_line
+ProgressHook = Callable[[dict[str, Any]], None]
+
+# yt-dlp: ưu tiên tối thiểu 720p (HD); trần chiều cao 2160 (Short dọc / 4K). Fallback dần xuống thấp hơn nếu site không có HD.
+YTDLP_FORMAT_HD_MERGE = (
+    "bestvideo[height>=720][height<=2160]+bestaudio/"
+    "bestvideo[height>=720]+bestaudio/"
+    "bestvideo*+bestaudio/"
+    "best[height>=720]/best"
+)
+YTDLP_FORMAT_HD_SINGLE = (
+    "best[height>=720][height<=2160]/best[height>=720]/best[ext=mp4]/best"
+)
+
+# yt-dlp YouTube (EJS): stderr có thể lặp cảnh báo thiếu JS runtime.
+_YTDLP_JS_WARN_SNIP = "No supported JavaScript runtime"
+
+
+def ytdlp_js_runtimes_cli_args(yt_cfg: dict[str, Any]) -> list[str]:
+    """
+    Trả về ``--js-runtimes …`` cho yt-dlp khi cấu hình hoặc tự tìm node/deno/bun trên PATH.
+    Chuỗi rỗng trong ``js_runtimes`` = tự phát hiện; không tìm thấy runtime → danh sách rỗng.
+    """
+    raw = str(yt_cfg.get("js_runtimes") or "").strip()
+    if raw:
+        return ["--js-runtimes", raw]
+    for name in ("node", "deno", "bun"):
+        path = shutil.which(name)
+        if path:
+            return ["--js-runtimes", f"{name}:{path}"]
+    return []
 
 
 def _paths_seen_and_list_for_job(video_rows: list[dict[str, Any]], job_id: str) -> tuple[set[str], list[str]]:
@@ -119,6 +150,12 @@ def _extract_video_id_for_scan(url: str) -> str:
     m = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]{11})", u, re.I)
     if m:
         return m.group(1)
+    m = re.search(r"youtube\.com/live/([A-Za-z0-9_-]{11})", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"music\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})", u, re.I)
+    if m:
+        return m.group(1)
     m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", u, re.I)
     if m:
         return m.group(1)
@@ -140,6 +177,73 @@ def _extract_video_id_for_scan(url: str) -> str:
 def _norm_url_key(u: str) -> str:
     u = str(u or "").strip().split("&list=", 1)[0].strip()
     return u.rstrip("/")
+
+
+def _batch_urls_still_missing(requested: list[str], resolved_media_paths: list[str]) -> list[str]:
+    """
+    Sau tải batch một lần yt-dlp: URL nào không ghép được một file riêng.
+    Mỗi đường dẫn chỉ khớp tối đa một URL (tránh báo «lỗi» hàng loạt khi nhiều file cùng meta).
+    """
+    if not requested:
+        return []
+    if not resolved_media_paths:
+        return list(requested)
+
+    def _meta_for_fp(fp: str) -> tuple[set[str], set[str]]:
+        keys: set[str] = set()
+        ids: set[str] = set()
+        vp = Path(fp)
+        for inf in (vp.with_suffix(".info.json"), Path(str(vp) + ".info.json")):
+            if not inf.is_file():
+                continue
+            try:
+                meta = json.loads(inf.read_text(encoding="utf-8"))
+            except Exception:
+                break
+            if not isinstance(meta, dict):
+                break
+            w = str(meta.get("webpage_url") or meta.get("original_url") or "").strip()
+            if w:
+                keys.add(_norm_url_key(w))
+            mid = str(meta.get("id") or "").strip()
+            if mid:
+                ids.add(mid)
+            break
+        return keys, ids
+
+    meta_by_idx = [_meta_for_fp(fp) for fp in resolved_media_paths]
+    unused: set[int] = set(range(len(resolved_media_paths)))
+    missing: list[str] = []
+    for u in requested:
+        nk = _norm_url_key(u)
+        vid = _extract_video_id_for_scan(u)
+        chosen = -1
+        for i in sorted(unused):
+            keys, ids = meta_by_idx[i]
+            if vid and vid in ids:
+                chosen = i
+                break
+            if nk and nk in keys:
+                chosen = i
+                break
+            matched_gk = False
+            for gk in keys:
+                if nk and (nk in gk or gk in nk):
+                    matched_gk = True
+                    break
+            if matched_gk:
+                chosen = i
+                break
+        if chosen < 0 and vid:
+            for i in sorted(unused):
+                if vid in Path(resolved_media_paths[i]).name:
+                    chosen = i
+                    break
+        if chosen >= 0:
+            unused.discard(chosen)
+        else:
+            missing.append(u)
+    return missing
 
 
 def _repair_mojibake_text(text: str) -> str:
@@ -412,10 +516,11 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "bin": "yt-dlp",
             "use_exe": False,
             "exe_path": str(project_root() / "tools" / "yt-dlp" / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp")),
-            "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
-            # URL đơn/batch nhiều video: ưu tiên file mp4 đơn để tải nhanh, ít CPU merge.
-            "single_video_fast_format": "b[ext=mp4]/best[ext=mp4]/best",
-            "prefer_fast_single_video": True,
+            "format": YTDLP_FORMAT_HD_MERGE,
+            # Khi bật prefer_fast_single_video: file đơn (ít merge), vẫn ưu tiên >=720p nếu có.
+            "single_video_fast_format": YTDLP_FORMAT_HD_SINGLE,
+            # False = URL đơn cũng dùng format (merge video+audio) → chất lượng HD ổn định hơn.
+            "prefer_fast_single_video": False,
             "merge_output_format": "mp4",
             "timeout_sec": 600,
             # Giới hạn treo socket (yt-dlp); máy khách mạng chập chờn vẫn fail nhanh thay vì chờ vô hạn.
@@ -424,13 +529,22 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "playlist_scan_socket_timeout_sec": 90,
             # Mặc định ưu tiên tốc độ; máy yếu sẽ đỡ bị "lag" khi tải nhiều URL.
             "sleep_interval_sec": 0,
-            "concurrent_fragments": 8,
+            # DASH/HLS: tăng mặc định giúp máy mạng tốt tải nhanh hơn (trần 16 trong download()).
+            "concurrent_fragments": 12,
             "max_videos_default": 50,
-            "max_filesize_mb": 300,
+            # HD merge thường >300MB cho video dài; giảm lỗi «file quá lớn» khi tải 720p/1080p.
+            "max_filesize_mb": 1536,
             "write_info_json": True,
             # Thumbnail = thêm request/ghi file mỗi video; tắt mặc định để tải batch/Short nhanh hơn.
             "write_thumbnail": False,
+            # Trì hoãn tự tải yt-dlp.exe nền để không tranh băng thông/ổ với lệnh tải vừa mở app.
+            "auto_update_delay_sec": 90,
+            # Giảm log ffmpeg khi merge (ít stderr → nhẹ hơn trên Windows/AV).
+            "ffmpeg_quiet_log": True,
             "proxy": "",
+            # Rỗng = tự tìm node → deno → bun trên PATH (YouTube bản yt-dlp mới cần JS runtime).
+            # Ví dụ ép: "node" hoặc "node:C:\\Program Files\\nodejs\\node.exe"
+            "js_runtimes": "",
         },
         "download": {
             "default_output_dir": str(project_root() / "data" / "downloads"),
@@ -926,11 +1040,13 @@ class UniversalYTDLPWrapper:
                 "label": label,
                 "version": "",
             }
+        js_args = ytdlp_js_runtimes_cli_args(dict(self._yt))
         return {
             "ok": True,
             "message": "",
             "label": label,
             "version": version_line or "yt-dlp",
+            "js_runtimes_resolved": js_args[1] if len(js_args) > 1 else "",
         }
 
     def get_install_kind(self) -> str:
@@ -1079,6 +1195,7 @@ class UniversalYTDLPWrapper:
         ut = classify_url_type(url)
         cmd = [
             *self._resolve_prefix(),
+            *ytdlp_js_runtimes_cli_args(self._yt),
             "-J",
             "--skip-download",
             "--quiet",
@@ -1212,6 +1329,7 @@ class UniversalYTDLPWrapper:
         # Fast path: tránh parse JSON lớn cho playlist dài (máy yếu sẽ đỡ lag/đỡ RAM).
         cmd = [
             *self._resolve_prefix(),
+            *ytdlp_js_runtimes_cli_args(self._yt),
             "--skip-download",
             "--quiet",
             "--no-warnings",
@@ -1371,6 +1489,7 @@ class UniversalYTDLPWrapper:
             # Fallback tương thích cho bản yt-dlp cũ không hỗ trợ một số cờ scan nhanh.
             cmd_fallback = [
                 *self._resolve_prefix(),
+                *ytdlp_js_runtimes_cli_args(self._yt),
                 "-J",
                 "--skip-download",
                 "--quiet",
@@ -1454,14 +1573,21 @@ class UniversalYTDLPWrapper:
         cancel_event: threading.Event | None,
         cookie_path: str = "",
         log_lines: LogFn | None = None,
+        batch_urls: list[str] | None = None,
+        progress_hook: ProgressHook | None = None,
     ) -> dict[str, Any]:
         log_lines = log_lines or self._log
         prefix = self._resolve_prefix()
+        urls_batch = [str(x).strip() for x in (batch_urls or []) if str(x).strip()]
+        use_batch_file = len(urls_batch) >= 2
         ut = (url_type or "unknown").lower()
-        fmt = str(self._yt.get("format") or "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best")
-        fast_single = str(self._yt.get("single_video_fast_format") or "b[ext=mp4]/best[ext=mp4]/best")
-        # ``unknown`` thường là URL đơn mà heuristic chưa khớp; đừng ép merge bv+ba (rất chậm/CPU).
-        prefer_fast = bool(self._yt.get("prefer_fast_single_video", True))
+        if use_batch_file:
+            # Một tiến trình yt-dlp đọc nhiều URL: luôn coi từng dòng là video đơn (không mở playlist).
+            ut = "single_video"
+        fmt = str(self._yt.get("format") or YTDLP_FORMAT_HD_MERGE)
+        fast_single = str(self._yt.get("single_video_fast_format") or YTDLP_FORMAT_HD_SINGLE)
+        # ``unknown`` = URL đơn chưa khớp extractor; prefer_fast=True tránh merge (nhanh hơn, có thể thấp hơn).
+        prefer_fast = bool(self._yt.get("prefer_fast_single_video", False))
         if prefer_fast and ut in ("single_video", "unknown"):
             fmt = fast_single
         merge_fmt = str(self._yt.get("merge_output_format") or "mp4")
@@ -1470,18 +1596,24 @@ class UniversalYTDLPWrapper:
         if not has_ffmpeg:
             # Máy khách thiếu ffmpeg trong bundle/PATH: dùng profile không cần merge
             # để tránh chậm/lỗi do yt-dlp thử ghép AV rồi fail.
-            fmt = "b[ext=mp4]/best[ext=mp4]/best"
-            log_lines("[yt-dlp] Không thấy ffmpeg -> fallback format không cần merge (ưu tiên mp4).")
+            fmt = YTDLP_FORMAT_HD_SINGLE
+            log_lines("[yt-dlp] Không thấy ffmpeg -> fallback format không cần merge (ưu tiên HD nếu có).")
         sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
         # Batch theo URL đơn không nên chèn sleep giữa request, sẽ rất chậm trên máy yếu.
         if ut in ("single_video", "unknown"):
             sleep_sec = 0
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
-        frag_workers = max(1, min(8, int(self._yt.get("concurrent_fragments") or 1)))
+        if use_batch_file:
+            timeout = min(7200, max(timeout, timeout * max(1, (len(urls_batch) + 8) // 10)))
+        frag_workers = max(1, min(16, int(self._yt.get("concurrent_fragments") or 1)))
         sock_to = int(self._yt.get("socket_timeout_sec") or 0)
+        js_rt = ytdlp_js_runtimes_cli_args(self._yt)
+        if js_rt:
+            log_lines(f"[yt-dlp] YouTube JS runtime: {js_rt[1]}")
         cmd: list[str] = [
             *prefix,
+            *js_rt,
             "-f",
             fmt,
             "--newline",
@@ -1501,6 +1633,8 @@ class UniversalYTDLPWrapper:
             cmd.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
         if has_ffmpeg:
             cmd.extend(["--merge-output-format", merge_fmt, "--ffmpeg-location", ffmpeg_bin])
+            if bool(self._yt.get("ffmpeg_quiet_log", True)):
+                cmd.extend(["--postprocessor-args", "ffmpeg:-loglevel error -hide_banner -nostats"])
         if sleep_sec:
             cmd.extend(["--sleep-interval", str(sleep_sec), "--max-sleep-interval", str(max(sleep_sec, 5))])
         if write_info_json:
@@ -1521,141 +1655,232 @@ class UniversalYTDLPWrapper:
         cookie_arg, cookie_tmp = _to_ytdlp_cookie_file(cookie_path)
         if cookie_arg:
             cmd.extend(["--cookies", cookie_arg])
-        cmd.append(url)
+        batch_tmp: Path | None = None
+        effective_url = str(url or "").strip()
+        if use_batch_file:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix="toolfb_ytdlp_batch_", suffix=".txt", dir=str(archive_path.parent))
+            os.close(fd)
+            batch_tmp = Path(tmp_name)
+            batch_tmp.write_text("\n".join(urls_batch) + "\n", encoding="utf-8")
+            cmd.append("--ignore-errors")
+            cmd.extend(["-a", str(batch_tmp)])
+            if not effective_url:
+                effective_url = urls_batch[0]
+            log_lines(f"[yt-dlp] batch-file {len(urls_batch)} URL (1 process) → {batch_tmp.name}")
+        else:
+            if not effective_url:
+                if cookie_tmp is not None:
+                    cookie_tmp.unlink(missing_ok=True)
+                return {"success": False, "error": "Thiếu URL"}
+            cmd.append(effective_url)
+
+        batch_total = len(urls_batch) if use_batch_file else 0
+        completed_stream = 0
+
+        def _safe_progress(payload: dict[str, Any]) -> None:
+            if not progress_hook:
+                return
+            try:
+                progress_hook(payload)
+            except Exception:
+                pass
+
+        if progress_hook:
+            _safe_progress(
+                {
+                    "event": "start",
+                    "batch_total": batch_total,
+                    "url_type": ut,
+                    "max_videos": int(max_videos),
+                    "single_url": (effective_url[:400] if effective_url else ""),
+                }
+            )
 
         log_lines(f"[yt-dlp] {' '.join(cmd[:12])} ... ({len(cmd)} args)")
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **_ytdlp_subprocess_kw(),
-        )
-        filepaths: list[str] = []
-        stderr_tail: deque[str] = deque(maxlen=1200)
-
-        def _read_stderr() -> None:
-            if not proc.stderr:
-                return
-            n = 0
-            for line in proc.stderr:
-                stderr_tail.append(line)
-                n += 1
-                if n <= 30 or "ERROR" in line:
-                    log_lines(line.rstrip())
-
-        rt = threading.Thread(target=_read_stderr, daemon=True)
-        rt.start()
-
-        if proc.stdout:
-            for line in proc.stdout:
-                if cancel_event and cancel_event.is_set():
-                    proc.terminate()
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                # after_move:/path/to/file.mp4
-                if line.startswith("after_move:"):
-                    fp = line.split(":", 1)[1].strip().strip('"')
-                    # Không ép is_file ngay lúc stream stdout vì một số hệ/FS báo trễ.
-                    if fp:
-                        filepaths.append(fp)
-                elif line.lower().endswith((".mp4", ".webm", ".mkv", ".mov")):
-                    filepaths.append(line)
-
         try:
-            rc = proc.wait(timeout=timeout) if proc.poll() is None else (proc.returncode or 0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            rc = -1
-            log_lines("[yt-dlp] Timeout — đã dừng process.")
-        rt.join(timeout=2)
-        err_full = "".join(stderr_tail)
-        if cancel_event and cancel_event.is_set():
-            if cookie_tmp is not None:
-                cookie_tmp.unlink(missing_ok=True)
-            return {"success": False, "error": "Đã hủy/tạm dừng bởi người dùng.", "filepaths": filepaths, "stderr": err_full[-2000:]}
-        if rc != 0:
-            low = err_full.lower()
-            if any(x in low for x in ("private", "login required", "sign in", "drm", "members only")):
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **_ytdlp_subprocess_kw(),
+            )
+            filepaths: list[str] = []
+            stderr_tail: deque[str] = deque(maxlen=1200)
+            last_hook_ts: list[float] = [0.0]
+            last_err_hook_ts: list[float] = [0.0]
+
+            def _read_stderr() -> None:
+                if not proc.stderr:
+                    return
+                n = 0
+                js_warn_logged = False
+                for line in proc.stderr:
+                    stderr_tail.append(line)
+                    n += 1
+                    if _YTDLP_JS_WARN_SNIP in line and "javascript" in line.lower():
+                        if not js_warn_logged:
+                            js_warn_logged = True
+                            log_lines(
+                                line.rstrip()
+                                + " → Cài Node.js (PATH) hoặc yt_dlp.js_runtimes trong config; bỏ qua các dòng lặp."
+                            )
+                        continue
+                    low_ln = line.lower()
+                    if progress_hook and (
+                        "[download]" in low_ln
+                        or "[merger]" in low_ln
+                        or "destination:" in low_ln
+                        or "merging formats into" in low_ln
+                    ):
+                        now = time.monotonic()
+                        if now - last_hook_ts[0] >= 0.4:
+                            last_hook_ts[0] = now
+                            _safe_progress({"event": "stderr_activity", "line": line.strip()[:260]})
+                    if "ERROR" in line and progress_hook:
+                        nowe = time.monotonic()
+                        if nowe - last_err_hook_ts[0] >= 0.75:
+                            last_err_hook_ts[0] = nowe
+                            _safe_progress({"event": "error_line", "line": line.strip()[:420]})
+                    if n <= 30 or "ERROR" in line:
+                        log_lines(line.rstrip())
+
+            rt = threading.Thread(target=_read_stderr, daemon=True)
+            rt.start()
+
+            if proc.stdout:
+                for line in proc.stdout:
+                    if cancel_event and cancel_event.is_set():
+                        proc.terminate()
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # after_move:/path/to/file.mp4
+                    if line.startswith("after_move:"):
+                        fp = line.split(":", 1)[1].strip().strip('"')
+                        # Không ép is_file ngay lúc stream stdout vì một số hệ/FS báo trễ.
+                        if fp:
+                            filepaths.append(fp)
+                            completed_stream += 1
+                            _safe_progress(
+                                {
+                                    "event": "file_complete",
+                                    "completed": completed_stream,
+                                    "total": batch_total,
+                                    "path": fp,
+                                }
+                            )
+                    elif line.lower().endswith((".mp4", ".webm", ".mkv", ".mov")):
+                        filepaths.append(line)
+                        completed_stream += 1
+                        _safe_progress(
+                            {
+                                "event": "file_complete",
+                                "completed": completed_stream,
+                                "total": batch_total,
+                                "path": line,
+                            }
+                        )
+
+            try:
+                rc = proc.wait(timeout=timeout) if proc.poll() is None else (proc.returncode or 0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = -1
+                log_lines("[yt-dlp] Timeout — đã dừng process.")
+            rt.join(timeout=2)
+            err_full = "".join(stderr_tail)
+            if cancel_event and cancel_event.is_set():
+                if cookie_tmp is not None:
+                    cookie_tmp.unlink(missing_ok=True)
+                return {"success": False, "error": "Đã hủy/tạm dừng bởi người dùng.", "filepaths": filepaths, "stderr": err_full[-2000:]}
+            if rc != 0:
+                low = err_full.lower()
+                if any(x in low for x in ("private", "login required", "sign in", "drm", "members only")):
+                    if cookie_tmp is not None:
+                        cookie_tmp.unlink(missing_ok=True)
+                    return {
+                        "success": False,
+                        "error": "need_manual_upload",
+                        "message": "Không tải được bằng yt-dlp (private/login/DRM). Vui lòng tải tay và chọn file local.",
+                        "stderr": err_full[-2000:],
+                        "filepaths": filepaths,
+                    }
+                err_snip = err_full.strip()[-1200:] or f"yt-dlp exit {rc}"
+                err_snip = augment_facebook_unsupported_url_message(effective_url, err_snip)
+                if not (use_batch_file and filepaths):
+                    if cookie_tmp is not None:
+                        cookie_tmp.unlink(missing_ok=True)
+                    return {"success": False, "error": err_snip[:2200], "filepaths": filepaths}
+                log_lines("[yt-dlp] batch: mã thoát khác 0 nhưng đã có file — tiếp tục ghép metadata.")
+            # Chuẩn hóa danh sách đường dẫn báo về và lọc file thực sự tồn tại.
+            resolved_paths: list[str] = []
+            seen_resolved: set[str] = set()
+
+            def _consume_fps(raw_list: list[str]) -> None:
+                for fp in raw_list:
+                    raw = str(fp or "").strip().strip('"')
+                    if not raw:
+                        continue
+                    p = Path(raw).expanduser()
+                    candidates: list[Path] = [p]
+                    if not p.is_absolute():
+                        candidates.append((Path.cwd() / p).resolve())
+                    for cand in candidates:
+                        try:
+                            if cand.is_file():
+                                s = str(cand.resolve())
+                                if s not in seen_resolved:
+                                    seen_resolved.add(s)
+                                    resolved_paths.append(s)
+                                break
+                        except OSError:
+                            continue
+
+            _consume_fps(filepaths)
+
+            if not resolved_paths and rc == 0:
+                od = _output_root_dir_from_ytdlp_template(output_template)
+                if od is not None:
+                    _consume_fps(scan_output_dir_for_existing_media(root=od, url=effective_url))
+
+            if not resolved_paths:
+                low = err_full.lower()
+                if skip_existing and any(x in low for x in _YTDLP_SKIP_OR_ARCHIVE_MARKERS):
+                    if cookie_tmp is not None:
+                        cookie_tmp.unlink(missing_ok=True)
+                    return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "skipped_only": True}
+                # Có trường hợp yt-dlp tải xong nhưng không in đúng after_move/path parser.
+                # Nếu rc=0 và stderr có dấu hiệu hoàn tất download thì coi là thành công mềm.
+                if any(x in low for x in ("[download] 100%", "destination:", "merging formats into")):
+                    if cookie_tmp is not None:
+                        cookie_tmp.unlink(missing_ok=True)
+                    return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "paths_unreported": True}
+                # Một số bản yt-dlp + extractor Facebook trả rc=0 nhưng không in after_move/stderr.
+                # Trường hợp này coi như skip mềm để UI không báo lỗi giả.
+                if rc == 0:
+                    if cookie_tmp is not None:
+                        cookie_tmp.unlink(missing_ok=True)
+                    return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "skipped_only": True}
                 if cookie_tmp is not None:
                     cookie_tmp.unlink(missing_ok=True)
                 return {
                     "success": False,
-                    "error": "need_manual_upload",
-                    "message": "Không tải được bằng yt-dlp (private/login/DRM). Vui lòng tải tay và chọn file local.",
-                    "stderr": err_full[-2000:],
-                    "filepaths": filepaths,
+                    "error": "Không nhận được đường dẫn file từ yt-dlp (có thể đã skip vì trùng archive).",
+                    "stderr": err_full[-1500:],
+                    "filepaths": [],
                 }
-            err_snip = err_full.strip()[-1200:] or f"yt-dlp exit {rc}"
-            err_snip = augment_facebook_unsupported_url_message(url, err_snip)
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
-            return {"success": False, "error": err_snip[:2200], "filepaths": filepaths}
-        # Chuẩn hóa danh sách đường dẫn báo về và lọc file thực sự tồn tại.
-        resolved_paths: list[str] = []
-        seen_resolved: set[str] = set()
-
-        def _consume_fps(raw_list: list[str]) -> None:
-            for fp in raw_list:
-                raw = str(fp or "").strip().strip('"')
-                if not raw:
-                    continue
-                p = Path(raw).expanduser()
-                candidates: list[Path] = [p]
-                if not p.is_absolute():
-                    candidates.append((Path.cwd() / p).resolve())
-                for cand in candidates:
-                    try:
-                        if cand.is_file():
-                            s = str(cand.resolve())
-                            if s not in seen_resolved:
-                                seen_resolved.add(s)
-                                resolved_paths.append(s)
-                            break
-                    except OSError:
-                        continue
-
-        _consume_fps(filepaths)
-
-        if not resolved_paths and rc == 0:
-            od = _output_root_dir_from_ytdlp_template(output_template)
-            if od is not None:
-                _consume_fps(scan_output_dir_for_existing_media(root=od, url=url))
-
-        if not resolved_paths:
-            low = err_full.lower()
-            if skip_existing and any(x in low for x in _YTDLP_SKIP_OR_ARCHIVE_MARKERS):
-                if cookie_tmp is not None:
-                    cookie_tmp.unlink(missing_ok=True)
-                return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "skipped_only": True}
-            # Có trường hợp yt-dlp tải xong nhưng không in đúng after_move/path parser.
-            # Nếu rc=0 và stderr có dấu hiệu hoàn tất download thì coi là thành công mềm.
-            if any(x in low for x in ("[download] 100%", "destination:", "merging formats into")):
-                if cookie_tmp is not None:
-                    cookie_tmp.unlink(missing_ok=True)
-                return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "paths_unreported": True}
-            # Một số bản yt-dlp + extractor Facebook trả rc=0 nhưng không in after_move/stderr.
-            # Trường hợp này coi như skip mềm để UI không báo lỗi giả.
-            if rc == 0:
-                if cookie_tmp is not None:
-                    cookie_tmp.unlink(missing_ok=True)
-                return {"success": True, "filepaths": [], "stderr": err_full[-1500:], "skipped_only": True}
-            if cookie_tmp is not None:
-                cookie_tmp.unlink(missing_ok=True)
-            return {
-                "success": False,
-                "error": "Không nhận được đường dẫn file từ yt-dlp (có thể đã skip vì trùng archive).",
-                "stderr": err_full[-1500:],
-                "filepaths": [],
-            }
-        if cookie_tmp is not None:
-            cookie_tmp.unlink(missing_ok=True)
-        return {"success": True, "filepaths": resolved_paths, "stderr": err_full[-1000:]}
+            return {"success": True, "filepaths": resolved_paths, "stderr": err_full[-1000:]}
+        finally:
+            if batch_tmp is not None:
+                batch_tmp.unlink(missing_ok=True)
 
 
 class BulkDownloadManager:
@@ -1714,6 +1939,11 @@ class UniversalVideoDownloader:
 
     def _auto_refresh_ytdlp_background(self) -> None:
         def _work() -> None:
+            yt = dict(self._uvd.get("yt_dlp") or {})
+            delay = int(yt.get("auto_update_delay_sec", 90) or 0)
+            delay = max(0, min(600, delay))
+            if delay:
+                time.sleep(delay)
             ret = self._yt.maybe_auto_update_standalone_exe(min_hours_between_attempts=24)
             if ret.get("ok"):
                 self._log("[yt-dlp] Đã tự cập nhật yt-dlp.exe nền.")
@@ -1810,7 +2040,7 @@ class UniversalVideoDownloader:
             "organize_by_uploader": bool(options.get("organize_by_uploader", dl.get("organize_by_uploader", True))),
             "skip_existing": bool(options.get("skip_existing", dl.get("skip_existing", True))),
             "write_info_json": bool(options.get("write_info_json", self._uvd.get("yt_dlp", {}).get("write_info_json", True))),
-            "write_thumbnail": bool(options.get("write_thumbnail", self._uvd.get("yt_dlp", {}).get("write_thumbnail", True))),
+            "write_thumbnail": bool(options.get("write_thumbnail", self._uvd.get("yt_dlp", {}).get("write_thumbnail", False))),
             "cookie_path": str(options.get("cookie_path") or ""),
             "status": "pending",
             "downloaded_files": [],
@@ -1823,7 +2053,7 @@ class UniversalVideoDownloader:
         self._store.save_job(job)
         return job
 
-    def run_download_job(self, job_id: str) -> dict[str, Any]:
+    def run_download_job(self, job_id: str, *, on_progress: ProgressHook | None = None) -> dict[str, Any]:
         job = self._store.get_job(job_id)
         if not job:
             raise KeyError(f"Không có job: {job_id}")
@@ -1848,6 +2078,7 @@ class UniversalVideoDownloader:
             cookie_path=str(job.get("cookie_path") or ""),
             cancel_event=self._cancel,
             log_lines=self._log,
+            progress_hook=on_progress,
         )
         filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
         if ret.get("skipped_only") and not filepaths:
@@ -1909,7 +2140,9 @@ class UniversalVideoDownloader:
         self._active_job_id = None
         return job
 
-    def run_download_url_for_job(self, job_id: str, item_url: str) -> dict[str, Any]:
+    def run_download_url_for_job(
+        self, job_id: str, item_url: str, *, on_progress: ProgressHook | None = None
+    ) -> dict[str, Any]:
         """
         Tải một URL đơn và gộp kết quả vào job có sẵn (dùng cho batch: một job — nhiều video).
         Giữ ``status=running`` cho tới khi gọi ``finalize_batch_download_job``.
@@ -1947,6 +2180,7 @@ class UniversalVideoDownloader:
             cookie_path=str(job.get("cookie_path") or ""),
             cancel_event=self._cancel,
             log_lines=self._log,
+            progress_hook=on_progress,
         )
         filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
         if ret.get("skipped_only") and not filepaths:
@@ -1997,6 +2231,110 @@ class UniversalVideoDownloader:
         job["status"] = "running"
         if ret.get("paths_unreported") and not filepaths:
             pass
+        self._store.save_job(job)
+        self._active_job_id = None
+        return job
+
+    def run_download_urls_batch_for_job(
+        self, job_id: str, urls: list[str], *, on_progress: ProgressHook | None = None
+    ) -> dict[str, Any]:
+        """
+        Tải nhiều URL đơn trong **một** tiến trình yt-dlp (``-a`` batch file + ``--ignore-errors``),
+        tránh khởi động lại yt-dlp/merge từng URL — nhanh hơn rõ rệt trên máy khách so với tuần tự.
+        """
+        urls = [str(u).strip() for u in urls if str(u).strip()]
+        if not urls:
+            raise ValueError("Thiếu URL")
+        if len(urls) == 1:
+            return self.run_download_url_for_job(job_id, urls[0], on_progress=on_progress)
+        job = self._store.get_job(job_id)
+        if not job:
+            raise KeyError(f"Không có job: {job_id}")
+        if self.is_cancel_requested():
+            self._active_job_id = None
+            return job
+        self._active_job_id = job_id
+        jid_q = str(job.get("id") or "")
+        videos_rows = self._store.list_downloaded_videos()
+        seen_lower, job_paths_acc = _paths_seen_and_list_for_job(videos_rows, jid_q)
+        DownloadFolderManager.validate_output_dir(job["output_dir"])
+        tmpl = DownloadFolderManager.build_output_template(job)
+        if not str(job.get("started_at") or "").strip():
+            job["status"] = "running"
+            job["started_at"] = _now_iso()
+        job["error_message"] = ""
+        self._store.save_job(job)
+
+        ret = self._yt.download(
+            url=urls[0],
+            output_template=tmpl,
+            archive_path=self._paths["archive"],
+            url_type="single_video",
+            max_videos=len(urls),
+            skip_existing=bool(job["skip_existing"]),
+            write_info_json=bool(job["write_info_json"]),
+            write_thumbnail=bool(job["write_thumbnail"]),
+            cookie_path=str(job.get("cookie_path") or ""),
+            cancel_event=self._cancel,
+            log_lines=self._log,
+            batch_urls=urls,
+            progress_hook=on_progress,
+        )
+        filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
+        if ret.get("skipped_only") and not filepaths:
+            od = Path(str(job.get("output_dir") or "")).expanduser().resolve()
+            if od.is_dir():
+                rescue_all: list[str] = []
+                for u in urls[:80]:
+                    rescue_all.extend(scan_output_dir_for_existing_media(root=od, url=u))
+                if rescue_all:
+                    filepaths = list(dict.fromkeys(rescue_all))
+                    ret = {**ret, "skipped_only": False, "filepaths": filepaths, "success": True}
+        job = self._store.get_job(job_id) or job
+        failed_items = list(job.get("failed_items") or [])
+        if ret.get("skipped_only") and not filepaths:
+            for u in urls:
+                self._attach_existing_sources_to_job(job=job, source_url=u, videos_rows=videos_rows)
+            job["status"] = "running"
+            self._store.save_job(job)
+            self._active_job_id = None
+            return job
+        if not bool(ret.get("success")) and not filepaths:
+            err = str(ret.get("error") or "Lỗi không xác định")
+            for u in urls:
+                if err == "need_manual_upload":
+                    failed_items.append({"url": u, "error": str(ret.get("message") or err)})
+                else:
+                    failed_items.append({"url": u, "error": err[:900]})
+            job["failed_items"] = failed_items
+            job["status"] = "running"
+            self._store.save_job(job)
+            self._active_job_id = None
+            return job
+
+        records: list[dict[str, Any]] = []
+        for fp in filepaths:
+            try:
+                norm = str(Path(fp).expanduser().resolve())
+                pl = norm.lower()
+            except OSError:
+                norm = str(fp)
+                pl = norm.lower()
+            if pl in seen_lower:
+                continue
+            rec = self._build_video_record(video_path=fp, job=job, item_url="")
+            records.append(rec)
+            seen_lower.add(pl)
+            job_paths_acc.append(norm)
+        if records:
+            self._store.save_downloaded_videos(records)
+
+        missing = _batch_urls_still_missing(urls, job_paths_acc)
+        for m in missing:
+            failed_items.append({"url": m, "error": "Không tải được hoặc không khớp metadata sau batch (xem log)."})
+        job["failed_items"] = failed_items
+        job["downloaded_files"] = list(dict.fromkeys(job_paths_acc))
+        job["status"] = "running"
         self._store.save_job(job)
         self._active_job_id = None
         return job
