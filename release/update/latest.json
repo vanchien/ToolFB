@@ -1,7 +1,7 @@
 {
-  "version": "1.0.34",
+  "version": "1.0.35",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "9e2297d686ddb4c06ec84dec015d41dee71745dcd99c67c9f5a9b620b32be0dd",
-  "notes": "Fix import video từ job tải trong Video Editor; ổn định tải yt-dlp và metadata batch.",
-  "generated_at": "2026-05-11T14:49:33"
+  "sha256": "f3297735d6a261a057ed8ff6945ae08979135244b6c55d873727e831d28baca9",
+  "notes": "Tối ưu tốc độ tải/quét trên máy yếu: batch single_video không sleep, giới hạn quét mặc định nhẹ hơn, giảm lag bảng thư viện tải, và ổn định import từ job tải.",
+  "generated_at": "2026-05-11T15:36:27"
 }
