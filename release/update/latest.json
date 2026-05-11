@@ -1,7 +1,7 @@
 {
-  "version": "1.0.41",
+  "version": "1.0.43",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "7e638edc58e1209c2fcd6ae320cf14492b6cbb17fda7be2dcb2ad637e9079951",
-  "notes": "Tải/quét nhanh hơn trên máy khách: batch YouTube/TikTok/Reel tôn trọng checkbox Ghi info JSON & Lưu thumbnail (trước đây luôn bật JSON làm chậm từng video ngắn); mặc định concurrent_fragments 8, socket-timeout 45s, tắt thumbnail mặc định; giữ UTF-8 yt-dlp.",
-  "generated_at": "2026-05-11T20:28:38"
+  "sha256": "a748329b10ee99651ac8b11c2c4333eb28e8221abd5d8d5e46ad0c71f941afff",
+  "notes": "",
+  "generated_at": "2026-05-11T21:22:13"
 }
