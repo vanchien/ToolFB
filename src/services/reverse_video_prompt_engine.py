@@ -24,6 +24,12 @@ from src.utils.paths import project_root
 
 LogFn = Callable[[str], None]
 YTDLP_BUNDLE_EXE_MIN_BYTES = 400_000
+
+
+def _ytdlp_subprocess_kw() -> dict[str, Any]:
+    if os.name != "nt" or not hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {}
+    return {"creationflags": int(subprocess.CREATE_NO_WINDOW)}
 _profile_launch_locks: dict[str, threading.Lock] = {}
 _profile_launch_guard = threading.Lock()
 
@@ -148,6 +154,10 @@ class YTDLPDownloader:
                 capture_output=True,
                 text=True,
                 timeout=int(self._cfg.get("timeout_sec") or 300),
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                **_ytdlp_subprocess_kw(),
             )
             if p.returncode == 0:
                 info = self._parse_info_json(p.stdout or "")
@@ -241,6 +251,8 @@ class YTDLPDownloader:
                 timeout=25,
                 encoding="utf-8",
                 errors="replace",
+                stdin=subprocess.DEVNULL,
+                **_ytdlp_subprocess_kw(),
             )
         except (OSError, subprocess.TimeoutExpired):
             return None

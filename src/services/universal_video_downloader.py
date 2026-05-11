@@ -21,6 +21,18 @@ from src.utils.paths import project_root
 
 LogFn = Callable[[str], None]
 
+
+def _ytdlp_subprocess_kw() -> dict[str, Any]:
+    """
+    Windows: không gắn cửa sổ console cho yt-dlp.exe / python -m yt_dlp
+    (tránh nhấp nháy cửa sổ đen khi tải nhiều URL liên tiếp).
+    """
+    if os.name != "nt":
+        return {}
+    if not hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {}
+    return {"creationflags": int(subprocess.CREATE_NO_WINDOW)}
+
 YTDLP_PYPI_JSON_URL = "https://pypi.org/pypi/yt-dlp/json"
 # File yt-dlp.exe đóng gói kèm app; nhỏ hơn ngưỡng này coi như tải lỗi / placeholder.
 YTDLP_BUNDLE_EXE_MIN_BYTES = 400_000
@@ -805,6 +817,8 @@ class UniversalYTDLPWrapper:
                 timeout=25,
                 encoding="utf-8",
                 errors="replace",
+                stdin=subprocess.DEVNULL,
+                **_ytdlp_subprocess_kw(),
             )
         except subprocess.TimeoutExpired:
             return {
@@ -891,6 +905,8 @@ class UniversalYTDLPWrapper:
                 timeout=25,
                 encoding="utf-8",
                 errors="replace",
+                stdin=subprocess.DEVNULL,
+                **_ytdlp_subprocess_kw(),
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -943,7 +959,16 @@ class UniversalYTDLPWrapper:
         if proxy:
             cmd.extend(["--proxy", proxy])
         cmd.append(url)
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=min(120, int(self._yt.get("timeout_sec") or 600)))
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=min(120, int(self._yt.get("timeout_sec") or 600)),
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            **_ytdlp_subprocess_kw(),
+        )
         if p.returncode != 0:
             err = (p.stderr or p.stdout or "").strip()
             err = augment_facebook_unsupported_url_message(url, err[:1200])
@@ -1036,6 +1061,8 @@ class UniversalYTDLPWrapper:
                 timeout=min(max(120, n // 2 + 60), timeout),
                 encoding="utf-8",
                 errors="replace",
+                stdin=subprocess.DEVNULL,
+                **_ytdlp_subprocess_kw(),
             )
         except subprocess.TimeoutExpired:
             return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout}s)."}
@@ -1131,11 +1158,13 @@ class UniversalYTDLPWrapper:
         log_lines(f"[yt-dlp] {' '.join(cmd[:12])} ... ({len(cmd)} args)")
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
+            **_ytdlp_subprocess_kw(),
         )
         filepaths: list[str] = []
         stderr_chunks: list[str] = []
