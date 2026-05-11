@@ -418,13 +418,16 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "prefer_fast_single_video": True,
             "merge_output_format": "mp4",
             "timeout_sec": 600,
+            # Giới hạn treo socket (yt-dlp); máy khách mạng chập chờn vẫn fail nhanh thay vì chờ vô hạn.
+            "socket_timeout_sec": 45,
             # Mặc định ưu tiên tốc độ; máy yếu sẽ đỡ bị "lag" khi tải nhiều URL.
             "sleep_interval_sec": 0,
-            "concurrent_fragments": 4,
+            "concurrent_fragments": 8,
             "max_videos_default": 50,
             "max_filesize_mb": 300,
             "write_info_json": True,
-            "write_thumbnail": True,
+            # Thumbnail = thêm request/ghi file mỗi video; tắt mặc định để tải batch/Short nhanh hơn.
+            "write_thumbnail": False,
             "proxy": "",
         },
         "download": {
@@ -1081,6 +1084,9 @@ class UniversalYTDLPWrapper:
             "--encoding",
             "utf-8",
         ]
+        sock_to = int(self._yt.get("socket_timeout_sec") or 0)
+        if sock_to > 0:
+            cmd.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
         if ut in ("playlist", "channel", "profile"):
             cmd.append("--flat-playlist")
         proxy = str(self._yt.get("proxy") or "").strip()
@@ -1216,6 +1222,9 @@ class UniversalYTDLPWrapper:
             "--print",
             "%(id)s\t%(title)s\t%(webpage_url)s\t%(url)s\t%(uploader_id)s",
         ]
+        sock_to = int(self._yt.get("socket_timeout_sec") or 0)
+        if sock_to > 0:
+            cmd.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
         proxy = str(self._yt.get("proxy") or "").strip()
         if proxy:
             cmd.extend(["--proxy", proxy])
@@ -1368,6 +1377,9 @@ class UniversalYTDLPWrapper:
                 "--playlist-end",
                 str(n),
             ]
+            sock_to = int(self._yt.get("socket_timeout_sec") or 0)
+            if sock_to > 0:
+                cmd_fallback.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
             if proxy:
                 cmd_fallback.extend(["--proxy", proxy])
             cmd_fallback.append(raw)
@@ -1461,6 +1473,7 @@ class UniversalYTDLPWrapper:
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
         frag_workers = max(1, min(8, int(self._yt.get("concurrent_fragments") or 1)))
+        sock_to = int(self._yt.get("socket_timeout_sec") or 0)
         cmd: list[str] = [
             *prefix,
             "-f",
@@ -1478,6 +1491,8 @@ class UniversalYTDLPWrapper:
             "-o",
             output_template,
         ]
+        if sock_to > 0:
+            cmd.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
         if has_ffmpeg:
             cmd.extend(["--merge-output-format", merge_fmt, "--ffmpeg-location", ffmpeg_bin])
         if sleep_sec:
