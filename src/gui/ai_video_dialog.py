@@ -1374,6 +1374,9 @@ class AIVideoDialog:
         o["platform"] = "facebook"
         o["url_type"] = "single_video"
         o["max_videos"] = 1
+        # Batch nhiều reel: bỏ metadata/thumbnail để giảm tải RAM/ổ và tránh yt-dlp nặng.
+        o["write_info_json"] = False
+        o["write_thumbnail"] = False
         return o
 
     def _parse_fb_reel_limits(self) -> tuple[int, int, int, bool]:
@@ -1719,17 +1722,20 @@ class AIVideoDialog:
                 failed = 0
                 failed_urls: list[str] = []
                 cancelled = False
+                j0 = down.get_download_job(jid) or {}
+                n_fail_prev = len(j0.get("failed_items") or [])
                 for i, u in enumerate(urls, start=1):
                     if down.is_cancel_requested():
                         cancelled = True
                         break
-                    msg = f"Đang tải reel {i}/{n} (1 job)…"
-                    self._top.after(0, lambda m=msg: self._var_uv_operation_status.set(m))
-                    self._top.after(0, lambda ii=i, uu=u: self._append_uv_log(f"[INFO] Reel {ii}/{n}: {uu}"))
+
+                    def _pulse(ii=i, uu=u, total=n) -> None:
+                        self._var_uv_operation_status.set(f"Đang tải reel {ii}/{total} (tuần tự, 1 job)…")
+                        self._append_uv_log(f"[INFO] Reel {ii}/{total}: {uu}")
+
+                    self._top.after(0, _pulse)
                     try:
-                        n0 = len((down.get_download_job(jid) or {}).get("failed_items") or [])
-                        down.run_download_url_for_job(jid, u)
-                        jcur = down.get_download_job(jid) or {}
+                        jcur = down.run_download_url_for_job(jid, u) or {}
                         n1 = len(jcur.get("failed_items") or [])
                         n_ok_now = len(jcur.get("downloaded_files") or [])
                         self._top.after(
@@ -1738,7 +1744,7 @@ class AIVideoDialog:
                                 f"Đang tải reel {ii}/{total} — đã thành công {ok} video."
                             ),
                         )
-                        if n1 > n0:
+                        if n1 > n_fail_prev:
                             failed += 1
                             failed_urls.append(u)
                             last_err = ""
@@ -1748,6 +1754,7 @@ class AIVideoDialog:
                                     break
                             em = last_err or "yt-dlp failed"
                             self._top.after(0, lambda uu=u, ee=em: self._append_uv_log(f"[FAILED] {uu} | {ee}"))
+                        n_fail_prev = n1
                     except Exception as exc:  # noqa: BLE001
                         failed += 1
                         failed_urls.append(u)
@@ -1797,6 +1804,8 @@ class AIVideoDialog:
         o["platform"] = "youtube"
         o["url_type"] = "single_video"
         o["max_videos"] = 1
+        o["write_info_json"] = False
+        o["write_thumbnail"] = False
         return o
 
     def _parse_yt_list_max(self) -> int:
@@ -1967,17 +1976,20 @@ class AIVideoDialog:
                 failed = 0
                 failed_urls: list[str] = []
                 cancelled = False
+                j0 = down.get_download_job(jid) or {}
+                n_fail_prev = len(j0.get("failed_items") or [])
                 for i, u in enumerate(urls, start=1):
                     if down.is_cancel_requested():
                         cancelled = True
                         break
-                    msg = f"Đang tải YouTube {i}/{n} (1 job)…"
-                    self._top.after(0, lambda m=msg: self._var_uv_operation_status.set(m))
-                    self._top.after(0, lambda ii=i, uu=u: self._append_uv_log(f"[INFO] YouTube {ii}/{n}: {uu}"))
+
+                    def _pulse_yt(ii=i, uu=u, total=n) -> None:
+                        self._var_uv_operation_status.set(f"Đang tải YouTube {ii}/{total} (tuần tự, 1 job)…")
+                        self._append_uv_log(f"[INFO] YouTube {ii}/{total}: {uu}")
+
+                    self._top.after(0, _pulse_yt)
                     try:
-                        n0 = len((down.get_download_job(jid) or {}).get("failed_items") or [])
-                        down.run_download_url_for_job(jid, u)
-                        jcur = down.get_download_job(jid) or {}
+                        jcur = down.run_download_url_for_job(jid, u) or {}
                         n1 = len(jcur.get("failed_items") or [])
                         n_ok_now = len(jcur.get("downloaded_files") or [])
                         self._top.after(
@@ -1986,7 +1998,7 @@ class AIVideoDialog:
                                 f"Đang tải YouTube {ii}/{total} — đã thành công {ok} video."
                             ),
                         )
-                        if n1 > n0:
+                        if n1 > n_fail_prev:
                             failed += 1
                             failed_urls.append(u)
                             last_err = ""
@@ -1996,6 +2008,7 @@ class AIVideoDialog:
                                     break
                             em = last_err or "yt-dlp failed"
                             self._top.after(0, lambda uu=u, ee=em: self._append_uv_log(f"[FAILED] {uu} | {ee}"))
+                        n_fail_prev = n1
                     except Exception as exc:  # noqa: BLE001
                         failed += 1
                         failed_urls.append(u)
@@ -2158,6 +2171,8 @@ class AIVideoDialog:
         opts["platform"] = "tiktok"
         opts["url_type"] = "single_video"
         opts["max_videos"] = 1
+        opts["write_info_json"] = False
+        opts["write_thumbnail"] = False
         n = len(urls)
         self._uv_set_busy(True, f"Chuẩn bị tải {n} video TikTok bằng yt-dlp…")
 
@@ -2194,17 +2209,20 @@ class AIVideoDialog:
                 failed = 0
                 failed_urls: list[str] = []
                 cancelled = False
+                j0 = down.get_download_job(jid) or {}
+                n_fail_prev = len(j0.get("failed_items") or [])
                 for i, u in enumerate(urls, start=1):
                     if down.is_cancel_requested():
                         cancelled = True
                         break
-                    msg = f"Đang tải TikTok {i}/{n} (1 job)…"
-                    self._top.after(0, lambda m=msg: self._var_uv_operation_status.set(m))
-                    self._top.after(0, lambda ii=i, uu=u: self._append_uv_log(f"[INFO] TikTok {ii}/{n}: {uu}"))
+
+                    def _pulse_tt(ii=i, uu=u, total=n) -> None:
+                        self._var_uv_operation_status.set(f"Đang tải TikTok {ii}/{total} (tuần tự, 1 job)…")
+                        self._append_uv_log(f"[INFO] TikTok {ii}/{total}: {uu}")
+
+                    self._top.after(0, _pulse_tt)
                     try:
-                        n0 = len((down.get_download_job(jid) or {}).get("failed_items") or [])
-                        down.run_download_url_for_job(jid, u)
-                        jcur = down.get_download_job(jid) or {}
+                        jcur = down.run_download_url_for_job(jid, u) or {}
                         n1 = len(jcur.get("failed_items") or [])
                         n_ok_now = len(jcur.get("downloaded_files") or [])
                         self._top.after(
@@ -2213,7 +2231,7 @@ class AIVideoDialog:
                                 f"Đang tải TikTok {ii}/{total} — đã thành công {ok} video."
                             ),
                         )
-                        if n1 > n0:
+                        if n1 > n_fail_prev:
                             failed += 1
                             failed_urls.append(u)
                             last_err = ""
@@ -2223,6 +2241,7 @@ class AIVideoDialog:
                                     break
                             em = last_err or "yt-dlp failed"
                             self._top.after(0, lambda uu=u, ee=em: self._append_uv_log(f"[FAILED] {uu} | {ee}"))
+                        n_fail_prev = n1
                     except Exception as exc:  # noqa: BLE001
                         failed += 1
                         failed_urls.append(u)

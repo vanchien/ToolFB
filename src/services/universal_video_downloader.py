@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import deque
 import re
 import shutil
 import subprocess
@@ -20,6 +21,32 @@ from typing import Any, Callable
 from src.utils.paths import project_root
 
 LogFn = Callable[[str], None]
+
+
+def _paths_seen_and_list_for_job(video_rows: list[dict[str, Any]], job_id: str) -> tuple[set[str], list[str]]:
+    """Một lần đọc danh sách video: đường dẫn đã thuộc job + tập lower-case để trùng lặp."""
+    jid = str(job_id)
+    seen: set[str] = set()
+    paths: list[str] = []
+    for r in video_rows:
+        if not isinstance(r, dict):
+            continue
+        if str(r.get("download_job_id") or "") != jid:
+            continue
+        vp = str(r.get("video_path") or "").strip()
+        if not vp:
+            continue
+        try:
+            norm = str(Path(vp).expanduser().resolve())
+            key = norm.lower()
+        except OSError:
+            norm = vp
+            key = vp.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(norm)
+    return seen, paths
 
 
 def _ytdlp_subprocess_kw() -> dict[str, Any]:
@@ -694,6 +721,19 @@ class DownloadMetadataStore:
         rows.insert(0, dict(record))
         self._write_videos(rows)
 
+    def save_downloaded_videos(self, records: list[dict[str, Any]]) -> None:
+        """Ghi nhiều bản ghi trong một lần đọc/ghi file — giảm tải khi tải batch."""
+        if not records:
+            return
+        rows = self._read_videos()
+        ids = {str(r.get("id") or "").strip() for r in records if str(r.get("id") or "").strip()}
+        rows = [r for r in rows if str(r.get("id") or "").strip() not in ids]
+        for rec in reversed(records):
+            rid = str(rec.get("id") or "").strip()
+            if rid:
+                rows.insert(0, dict(rec))
+        self._write_videos(rows)
+
     def list_downloaded_videos(self) -> list[dict[str, Any]]:
         return self._read_videos()
 
@@ -1117,6 +1157,7 @@ class UniversalYTDLPWrapper:
         sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
+        frag_workers = max(1, min(8, int(self._yt.get("concurrent_fragments") or 1)))
         cmd: list[str] = [
             *prefix,
             "-f",
@@ -1125,6 +1166,8 @@ class UniversalYTDLPWrapper:
             merge_fmt,
             "--newline",
             "--no-progress",
+            "--concurrent-fragments",
+            str(frag_workers),
             "--print",
             "after_move:%(filepath)s",
             "--max-filesize",
@@ -1167,14 +1210,16 @@ class UniversalYTDLPWrapper:
             **_ytdlp_subprocess_kw(),
         )
         filepaths: list[str] = []
-        stderr_chunks: list[str] = []
+        stderr_tail: deque[str] = deque(maxlen=1200)
 
         def _read_stderr() -> None:
             if not proc.stderr:
                 return
+            n = 0
             for line in proc.stderr:
-                stderr_chunks.append(line)
-                if len(stderr_chunks) <= 30 or "ERROR" in line:
+                stderr_tail.append(line)
+                n += 1
+                if n <= 30 or "ERROR" in line:
                     log_lines(line.rstrip())
 
         rt = threading.Thread(target=_read_stderr, daemon=True)
@@ -1204,7 +1249,7 @@ class UniversalYTDLPWrapper:
             rc = -1
             log_lines("[yt-dlp] Timeout — đã dừng process.")
         rt.join(timeout=2)
-        err_full = "".join(stderr_chunks)
+        err_full = "".join(stderr_tail)
         if cancel_event and cancel_event.is_set():
             if cookie_tmp is not None:
                 cookie_tmp.unlink(missing_ok=True)
@@ -1501,33 +1546,25 @@ class UniversalVideoDownloader:
             return job
 
         records: list[dict[str, Any]] = []
-        seen_lower: set[str] = set()
-        for r in self._store.list_downloaded_videos():
-            if str(r.get("download_job_id") or "") != str(job.get("id") or ""):
-                continue
-            vp = str(r.get("video_path") or "").strip()
-            if not vp:
-                continue
-            try:
-                seen_lower.add(str(Path(vp).expanduser().resolve()).lower())
-            except OSError:
-                seen_lower.add(vp.lower())
+        jid0 = str(job.get("id") or "")
+        videos_rows0 = self._store.list_downloaded_videos()
+        seen_lower, job_paths_acc = _paths_seen_and_list_for_job(videos_rows0, jid0)
         for fp in filepaths:
             try:
-                pl = str(Path(fp).expanduser().resolve()).lower()
+                norm = str(Path(fp).expanduser().resolve())
+                pl = norm.lower()
             except OSError:
-                pl = str(fp).lower()
+                norm = str(fp)
+                pl = norm.lower()
             if pl in seen_lower:
                 continue
             rec = self._build_video_record(video_path=fp, job=job)
             records.append(rec)
-            self._store.save_downloaded_video(rec)
             seen_lower.add(pl)
-        job["downloaded_files"] = [
-            str(r.get("video_path") or "")
-            for r in self._store.list_downloaded_videos()
-            if str(r.get("download_job_id") or "") == str(job.get("id") or "") and str(r.get("video_path") or "").strip()
-        ]
+            job_paths_acc.append(norm)
+        if records:
+            self._store.save_downloaded_videos(records)
+        job["downloaded_files"] = list(dict.fromkeys(job_paths_acc))
         job["status"] = "completed"
         job["completed_at"] = _now_iso()
         if ret.get("paths_unreported") and not job["downloaded_files"]:
@@ -1553,6 +1590,9 @@ class UniversalVideoDownloader:
             self._active_job_id = None
             return job
         self._active_job_id = job_id
+        jid_q = str(job.get("id") or "")
+        videos_rows = self._store.list_downloaded_videos()
+        seen_lower, job_paths_acc = _paths_seen_and_list_for_job(videos_rows, jid_q)
         DownloadFolderManager.validate_output_dir(job["output_dir"])
         tmpl = DownloadFolderManager.build_output_template(job)
         if not str(job.get("started_at") or "").strip():
@@ -1584,7 +1624,7 @@ class UniversalVideoDownloader:
                     ret = {**ret, "skipped_only": False, "filepaths": filepaths, "success": True}
         if ret.get("skipped_only"):
             job = self._store.get_job(job_id) or job
-            self._attach_existing_sources_to_job(job=job, source_url=item_url)
+            self._attach_existing_sources_to_job(job=job, source_url=item_url, videos_rows=videos_rows)
             job["status"] = "running"
             self._store.save_job(job)
             self._active_job_id = None
@@ -1603,33 +1643,23 @@ class UniversalVideoDownloader:
             self._active_job_id = None
             return job
 
-        job = self._store.get_job(job_id) or job
-        seen_lower: set[str] = set()
-        for r in self._store.list_downloaded_videos():
-            if str(r.get("download_job_id") or "") != str(job.get("id") or ""):
-                continue
-            vp = str(r.get("video_path") or "").strip()
-            if not vp:
-                continue
-            try:
-                seen_lower.add(str(Path(vp).expanduser().resolve()).lower())
-            except OSError:
-                seen_lower.add(vp.lower())
+        records: list[dict[str, Any]] = []
         for fp in filepaths:
             try:
-                pl = str(Path(fp).expanduser().resolve()).lower()
+                norm = str(Path(fp).expanduser().resolve())
+                pl = norm.lower()
             except OSError:
-                pl = str(fp).lower()
+                norm = str(fp)
+                pl = norm.lower()
             if pl in seen_lower:
                 continue
             rec = self._build_video_record(video_path=fp, job=job)
-            self._store.save_downloaded_video(rec)
+            records.append(rec)
             seen_lower.add(pl)
-        job["downloaded_files"] = [
-            str(r.get("video_path") or "")
-            for r in self._store.list_downloaded_videos()
-            if str(r.get("download_job_id") or "") == str(job.get("id") or "") and str(r.get("video_path") or "").strip()
-        ]
+            job_paths_acc.append(norm)
+        if records:
+            self._store.save_downloaded_videos(records)
+        job["downloaded_files"] = list(dict.fromkeys(job_paths_acc))
         job["status"] = "running"
         if ret.get("paths_unreported") and not filepaths:
             pass
@@ -1637,7 +1667,13 @@ class UniversalVideoDownloader:
         self._active_job_id = None
         return job
 
-    def _attach_existing_sources_to_job(self, *, job: dict[str, Any], source_url: str) -> int:
+    def _attach_existing_sources_to_job(
+        self,
+        *,
+        job: dict[str, Any],
+        source_url: str,
+        videos_rows: list[dict[str, Any]] | None = None,
+    ) -> int:
         """
         Nếu URL bị skip (archive) nhưng video đã tồn tại từ job cũ, tạo bản ghi mới
         trỏ cùng file vào job hiện tại để Bước 4/Video Editor nhìn thấy theo job mới.
@@ -1649,7 +1685,7 @@ class UniversalVideoDownloader:
         src_vid = _extract_video_id_for_scan(source_url)
         if not src_key and not src_vid:
             return 0
-        rows = [r for r in self._store.list_downloaded_videos() if isinstance(r, dict)]
+        rows = [r for r in (videos_rows or self._store.list_downloaded_videos()) if isinstance(r, dict)]
         existing_by_path: set[str] = set()
         for r in rows:
             if str(r.get("download_job_id") or "").strip() != jid:
@@ -1658,6 +1694,7 @@ class UniversalVideoDownloader:
             if p:
                 existing_by_path.add(p.lower())
         added = 0
+        clones: list[dict[str, Any]] = []
         for r in rows:
             old_job = str(r.get("download_job_id") or "").strip()
             if not old_job or old_job == jid:
@@ -1681,10 +1718,11 @@ class UniversalVideoDownloader:
             clone["download_job_id"] = jid
             clone["download_job_name"] = str(job.get("name") or "")
             clone["created_at"] = _now_iso()
-            self._store.save_downloaded_video(clone)
+            clones.append(clone)
             existing_by_path.add(vp.lower())
             added += 1
-        if added > 0:
+        if clones:
+            self._store.save_downloaded_videos(clones)
             job["downloaded_files"] = [
                 str(r.get("video_path") or "")
                 for r in self._store.list_downloaded_videos()
