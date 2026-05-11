@@ -1132,7 +1132,7 @@ class UniversalYTDLPWrapper:
         raw = str(line or "").strip()
         if not raw:
             return None
-        parts = raw.split("\t")
+        parts = raw.split("\t", 4)
         while len(parts) < 5:
             parts.append("")
         vid = str(parts[0] or "").strip()
@@ -1215,11 +1215,25 @@ class UniversalYTDLPWrapper:
         stderr_tail: deque[str] = deque(maxlen=1200)
         t0 = time.monotonic()
         last_partial_ts = 0.0
+        _stderr_stop = threading.Event()
+
+        def _read_stderr() -> None:
+            if p.stderr is None:
+                return
+            for ln in p.stderr:
+                stderr_tail.append(ln)
+                if _stderr_stop.is_set():
+                    break
+
+        t_err = threading.Thread(target=_read_stderr, daemon=True, name="uv_scan_stderr")
+        t_err.start()
         try:
             if p.stdout is not None:
                 for ln in p.stdout:
                     if time.monotonic() - t0 > timeout_scan:
                         p.kill()
+                        _stderr_stop.set()
+                        t_err.join(timeout=1.5)
                         return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
                     rec = self._parse_flat_print_line(ln, source_url=raw, platform=platform)
                     if not rec:
@@ -1235,18 +1249,21 @@ class UniversalYTDLPWrapper:
                         except Exception:
                             pass
                         last_partial_ts = time.monotonic()
-            if p.stderr is not None:
-                for ln in p.stderr:
-                    stderr_tail.append(ln)
             rc = p.wait(timeout=max(3, timeout_scan))
+            _stderr_stop.set()
+            t_err.join(timeout=1.5)
         except subprocess.TimeoutExpired:
             p.kill()
+            _stderr_stop.set()
+            t_err.join(timeout=1.5)
             return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
         except Exception as exc:  # noqa: BLE001
             try:
                 p.kill()
             except Exception:
                 pass
+            _stderr_stop.set()
+            t_err.join(timeout=1.5)
             return {"success": False, "error": str(exc)}
         if rc != 0:
             err = ("".join(stderr_tail) or "").strip()

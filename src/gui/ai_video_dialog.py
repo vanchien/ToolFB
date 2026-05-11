@@ -1875,13 +1875,16 @@ class AIVideoDialog:
         self._uv_set_busy(True, f"Đang quét danh sách YouTube (tối đa {lim} video, yt-dlp)…")
         self._refresh_yt_channel_tree([])
         self._var_uv_yt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
+        last_ui_count = {"n": 0}
 
         def _partial(rows: list[dict[str, str]]) -> None:
             snap = list(rows)
             now = time.monotonic()
-            if now - self._uv_last_partial_ui_ts < 0.35:
+            grow = len(snap) - int(last_ui_count["n"])
+            if grow < 5 and now - self._uv_last_partial_ui_ts < 0.9:
                 return
             self._uv_last_partial_ui_ts = now
+            last_ui_count["n"] = len(snap)
 
             def _apply() -> None:
                 self._refresh_yt_channel_tree(snap)
@@ -2125,13 +2128,16 @@ class AIVideoDialog:
         self._uv_set_busy(True, f"Đang quét danh sách TikTok (tối đa {lim} video, yt-dlp)…")
         self._refresh_tt_channel_tree([])
         self._var_uv_tt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
+        last_ui_count = {"n": 0}
 
         def _partial(rows: list[dict[str, str]]) -> None:
             snap = list(rows)
             now = time.monotonic()
-            if now - self._uv_last_partial_ui_ts < 0.35:
+            grow = len(snap) - int(last_ui_count["n"])
+            if grow < 5 and now - self._uv_last_partial_ui_ts < 0.9:
                 return
             self._uv_last_partial_ui_ts = now
+            last_ui_count["n"] = len(snap)
 
             def _apply() -> None:
                 self._refresh_tt_channel_tree(snap)
