@@ -1902,14 +1902,19 @@ class AIVideoDialog:
                     rows = [e for e in entries if isinstance(e, dict) and str(e.get("url") or "").strip()]
                     self._refresh_yt_channel_tree(rows)
                     ptitle = str(res.get("playlist_title") or "").strip()
-                    self._var_uv_yt_scan_status.set(
-                        f"Đã quét {len(rows)} video."
-                        + (f" — {ptitle}" if ptitle else "")
-                    )
+                    warn = str(res.get("warning") or "").strip()
+                    partial = bool(res.get("partial"))
+                    status = f"Đã quét {len(rows)} video." + (f" — {ptitle}" if ptitle else "")
+                    if partial and warn:
+                        status += f" ({warn})"
+                    self._var_uv_yt_scan_status.set(status)
                     messagebox.showinfo(
                         "Quét YouTube",
-                        f"{len(rows)} video trong danh sách.\n"
-                        "Chọn dòng rồi «Tải video đã chọn» (có thể «Chọn hết» trước).",
+                        (
+                            f"{len(rows)} video trong danh sách.\n"
+                            + ("(Quét một phần do mạng chậm, bạn vẫn có thể tải các video đã hiện.)\n" if partial else "")
+                            + "Chọn dòng rồi «Tải video đã chọn» (có thể «Chọn hết» trước)."
+                        ),
                         parent=self._top,
                     )
                 else:
@@ -2154,10 +2159,19 @@ class AIVideoDialog:
                     entries = res.get("entries") or []
                     rows = [e for e in entries if isinstance(e, dict) and str(e.get("url") or "").strip()]
                     self._refresh_tt_channel_tree(rows)
-                    self._var_uv_tt_scan_status.set(f"Đã quét {len(rows)} video TikTok.")
+                    warn = str(res.get("warning") or "").strip()
+                    partial = bool(res.get("partial"))
+                    status = f"Đã quét {len(rows)} video TikTok."
+                    if partial and warn:
+                        status += f" ({warn})"
+                    self._var_uv_tt_scan_status.set(status)
                     messagebox.showinfo(
                         "Quét TikTok",
-                        f"{len(rows)} video trong profile.\nChọn dòng rồi «Tải TikTok đã chọn» (có thể «Chọn hết» trước).",
+                        (
+                            f"{len(rows)} video trong profile.\n"
+                            + ("(Quét một phần do mạng chậm, bạn vẫn có thể tải các video đã hiện.)\n" if partial else "")
+                            + "Chọn dòng rồi «Tải TikTok đã chọn» (có thể «Chọn hết» trước)."
+                        ),
                         parent=self._top,
                     )
                 else:

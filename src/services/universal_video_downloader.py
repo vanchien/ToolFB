@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 from collections import deque
 import re
 import shutil
@@ -1196,7 +1197,8 @@ class UniversalYTDLPWrapper:
             cmd.extend(["--proxy", proxy])
         cmd.append(raw)
         timeout = int(self._yt.get("timeout_sec") or 600)
-        timeout_scan = min(max(60, n // 3 + 40), timeout)
+        # Máy chậm/mạng yếu cần dư thời gian quét; tránh fail sớm khi list dài.
+        timeout_scan = min(max(180, n + 60), timeout)
         try:
             p = subprocess.Popen(
                 cmd,
@@ -1216,6 +1218,7 @@ class UniversalYTDLPWrapper:
         t0 = time.monotonic()
         last_partial_ts = 0.0
         _stderr_stop = threading.Event()
+        line_q: queue.Queue[str | None] = queue.Queue(maxsize=max(4096, n * 8))
 
         def _read_stderr() -> None:
             if p.stderr is None:
@@ -1225,44 +1228,105 @@ class UniversalYTDLPWrapper:
                 if _stderr_stop.is_set():
                     break
 
-        t_err = threading.Thread(target=_read_stderr, daemon=True, name="uv_scan_stderr")
-        t_err.start()
-        try:
-            if p.stdout is not None:
+        def _read_stdout() -> None:
+            """Đọc stdout trên luồng riêng để luồng chính luôn kiểm tra deadline (tránh treo trước dòng đầu)."""
+            try:
+                if p.stdout is None:
+                    line_q.put(None)
+                    return
                 for ln in p.stdout:
-                    if time.monotonic() - t0 > timeout_scan:
+                    line_q.put(ln)
+            except Exception:
+                pass
+            finally:
+                try:
+                    line_q.put(None)
+                except Exception:
+                    pass
+
+        t_err = threading.Thread(target=_read_stderr, daemon=True, name="uv_scan_stderr")
+        t_out = threading.Thread(target=_read_stdout, daemon=True, name="uv_scan_stdout")
+        t_err.start()
+        t_out.start()
+        timed_out = False
+        try:
+            while True:
+                if time.monotonic() - t0 > timeout_scan:
+                    timed_out = True
+                    try:
                         p.kill()
-                        _stderr_stop.set()
-                        t_err.join(timeout=1.5)
-                        return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
-                    rec = self._parse_flat_print_line(ln, source_url=raw, platform=platform)
-                    if not rec:
-                        continue
-                    u = rec["url"]
-                    if u in seen:
-                        continue
-                    seen.add(u)
-                    out.append(rec)
-                    if on_partial and (len(out) <= 10 or time.monotonic() - last_partial_ts > 0.4):
+                    except Exception:
+                        pass
+                    break
+                try:
+                    ln = line_q.get(timeout=0.2)
+                except queue.Empty:
+                    if p.poll() is not None:
                         try:
-                            on_partial(list(out))
-                        except Exception:
-                            pass
-                        last_partial_ts = time.monotonic()
-            rc = p.wait(timeout=max(3, timeout_scan))
+                            ln = line_q.get(timeout=4.0)
+                        except queue.Empty:
+                            ln = None
+                    else:
+                        continue
+                if ln is None:
+                    break
+                rec = self._parse_flat_print_line(ln, source_url=raw, platform=platform)
+                if not rec:
+                    continue
+                u = rec["url"]
+                if u in seen:
+                    continue
+                seen.add(u)
+                out.append(rec)
+                if on_partial and (len(out) <= 10 or time.monotonic() - last_partial_ts > 0.4):
+                    try:
+                        on_partial(list(out))
+                    except Exception:
+                        pass
+                    last_partial_ts = time.monotonic()
+
             _stderr_stop.set()
+            t_out.join(timeout=4.0)
             t_err.join(timeout=1.5)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            _stderr_stop.set()
-            t_err.join(timeout=1.5)
-            return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
+
+            if timed_out:
+                if out:
+                    return {
+                        "success": True,
+                        "entries": out,
+                        "playlist_title": "",
+                        "extractor": "",
+                        "partial": True,
+                        "warning": f"Quét chậm nên dừng sau {timeout_scan}s (đã lấy {len(out)} video).",
+                    }
+                return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
+
+            remain = max(5.0, float(timeout) - (time.monotonic() - t0))
+            reap = max(8, min(120, int(min(remain, 120.0))))
+            try:
+                rc = p.wait(timeout=reap)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                if out:
+                    return {
+                        "success": True,
+                        "entries": out,
+                        "playlist_title": "",
+                        "extractor": "",
+                        "partial": True,
+                        "warning": f"yt-dlp chưa thoát sau khi quét xong (>{reap}s); đã giữ {len(out)} video đã đọc.",
+                    }
+                return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{reap}s)."}
         except Exception as exc:  # noqa: BLE001
             try:
                 p.kill()
             except Exception:
                 pass
             _stderr_stop.set()
+            t_out.join(timeout=2.0)
             t_err.join(timeout=1.5)
             return {"success": False, "error": str(exc)}
         if rc != 0:
@@ -1286,7 +1350,7 @@ class UniversalYTDLPWrapper:
                     cmd_fallback,
                     capture_output=True,
                     text=True,
-                    timeout=min(max(120, n // 2 + 60), timeout),
+                    timeout=min(max(180, n + 120), timeout),
                     encoding="utf-8",
                     errors="replace",
                     stdin=subprocess.DEVNULL,
