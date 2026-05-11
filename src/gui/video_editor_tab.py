@@ -499,9 +499,10 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         return str(raw.get("job_id") or "").strip()
 
     def refresh_download_job_combo() -> None:
+        keep_label = str(var_dl_job.get() or "").strip()
+        keep_current_jid = dl_job_map.get(keep_label, "").strip()
         dl_job_map.clear()
         vals: list[str] = []
-        keep_current_jid = dl_job_map.get(str(var_dl_job.get() or "").strip(), "").strip()
         all_videos = dl_store.list_downloaded_videos()
         count_by_job: dict[str, int] = {}
         for r in all_videos:
