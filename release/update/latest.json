@@ -1,7 +1,7 @@
 {
-  "version": "1.0.44",
+  "version": "1.0.45",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "9518781f92e733fb9efc5b6c156334d06cf484408a68d2505de56e805ad9b2b3",
-  "notes": "Video Editor (tab Chỉnh clip): thu gọn Logo, Chữ, phạm vi Áp dụng tất cả, Gợi ý nhanh. Cập nhật GUI và tải video/catalog liên quan.",
-  "generated_at": "2026-05-11T22:24:48"
+  "sha256": "e6fa7ef9ccb6395e988f204a81dbd76451823882fdd94bf2e23c4e4a88d92f33",
+  "notes": "Tải video: yt-dlp JS runtime, tiến trình batch (k/n), sửa ghép URL-file; reverse engine dùng format HD chung.",
+  "generated_at": "2026-05-12T00:10:45"
 }
