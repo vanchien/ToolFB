@@ -1,7 +1,7 @@
 {
-  "version": "1.0.37",
+  "version": "1.0.39",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "5375d7f76a55dbb08ac9959158215c1a80c12f328315fc0a620dfb8796f60959",
-  "notes": "Tối ưu tốc độ Tải video máy khách: URL đơn/batch dùng format mp4 nhanh mặc định, concurrent_fragments mặc định 4, sửa sleep_interval áp dụng đúng; giữ đầy đủ yt-dlp + ffmpeg trong bundle.",
-  "generated_at": "2026-05-11T17:12:52"
+  "sha256": "b8e06c64d932a7b5de38ca73d50722b8db0a06ef1a570ee82c3d32cf694e3112",
+  "notes": "Tải video: URL loại unknown dùng format mp4 nhanh và không sleep (tránh merge bv+ba chậm). Bundle đầy đủ yt-dlp + ffmpeg như các bản trước.",
+  "generated_at": "2026-05-11T18:12:03"
 }
