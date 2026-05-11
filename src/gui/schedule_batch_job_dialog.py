@@ -610,6 +610,10 @@ class ScheduleBatchJobDialog:
         elif num == 5:
             self._main_canvas.yview_scroll(1, "units")
 
+    def _set_status(self, msg: str) -> None:
+        """Callback cho ``install_treeview_shortcuts``; dialog không có thanh trạng thái riêng."""
+        _ = msg
+
     def _make_scrollable_popup(
         self,
         *,

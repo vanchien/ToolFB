@@ -268,11 +268,16 @@ class AccountFormDialog:
         self._top.grab_set()
         self._top.geometry("780x720")
         self._top.minsize(680, 560)
-        self._top.columnconfigure(0, weight=1)
-        self._top.rowconfigure(0, weight=1)
+
+        btnf = ttk.Frame(self._top, padding=6)
+        self._btn_save = ttk.Button(btnf, text="Lưu", command=self._on_ok)
+        self._btn_save.pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btnf, text="Hủy", command=self._on_cancel).pack(side=tk.RIGHT)
+        # Pack thanh nút trước (BOTTOM) để không bị hàng nội dung (weight) đẩy khỏi vùng nhìn thấy.
+        btnf.pack(side=tk.BOTTOM, fill=tk.X)
 
         outer = ttk.Frame(self._top, padding=6)
-        outer.grid(row=0, column=0, sticky="nsew")
+        outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
 
@@ -281,7 +286,9 @@ class AccountFormDialog:
         self._body = ttk.Frame(canvas, padding=4)
 
         def _on_body_configure(_event: tk.Event | None = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
 
         self._body.bind("<Configure>", _on_body_configure)
 
@@ -293,6 +300,7 @@ class AccountFormDialog:
             cw = int(event.width)
             if cw > 1:
                 canvas.itemconfigure(self._canvas_window_id, width=cw)
+            _on_body_configure()
 
         canvas.bind("<Configure>", _on_canvas_configure)
         canvas.configure(yscrollcommand=scroll.set)
@@ -301,10 +309,23 @@ class AccountFormDialog:
         self._scroll_canvas = canvas
 
         def _on_canvas_mousewheel(event: tk.Event) -> None:
+            if not canvas.bbox("all"):
+                return
             if getattr(event, "delta", 0):
                 canvas.yview_scroll(int(-event.delta / 120), "units")
 
+        def _on_canvas_mousewheel_linux_up(_event: tk.Event) -> None:
+            canvas.yview_scroll(-1, "units")
+
+        def _on_canvas_mousewheel_linux_down(_event: tk.Event) -> None:
+            canvas.yview_scroll(1, "units")
+
         canvas.bind("<MouseWheel>", _on_canvas_mousewheel)
+        canvas.bind("<Button-4>", _on_canvas_mousewheel_linux_up)
+        canvas.bind("<Button-5>", _on_canvas_mousewheel_linux_down)
+        self._body.bind("<MouseWheel>", _on_canvas_mousewheel)
+        self._body.bind("<Button-4>", _on_canvas_mousewheel_linux_up)
+        self._body.bind("<Button-5>", _on_canvas_mousewheel_linux_down)
 
         init = self._initial or {}
         self._build_common(self._body, init)
@@ -335,30 +356,41 @@ class AccountFormDialog:
                 self._var_mode.set(_ACCOUNT_MODE_FILE)
 
         self._dyn_host = ttk.Frame(self._body)
-        self._dyn_host.grid(row=2, column=0, sticky="nsew", pady=4)
+        # Không dùng weight=1 trên hàng này: trong Canvas, frame con sẽ bị kéo cao theo
+        # viewport → scrollregion rộng, khoảng trống xám, nút Lưu/Hủy tưởng như «mất».
+        self._dyn_host.grid(row=2, column=0, sticky="ew", pady=4)
         self._dyn_host.columnconfigure(0, weight=1)
-        self._dyn_host.rowconfigure(0, weight=1)
-        self._body.rowconfigure(2, weight=1)
         self._build_panel_new(self._dyn_host, init)
         self._build_panel_folder(self._dyn_host, init)
         self._build_panel_cookie(self._dyn_host, init)
-
-        btnf = ttk.Frame(self._top, padding=6)
-        btnf.grid(row=1, column=0, sticky="ew")
-        self._btn_save = ttk.Button(btnf, text="Lưu", command=self._on_ok)
-        self._btn_save.pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(btnf, text="Hủy", command=self._on_cancel).pack(side=tk.RIGHT)
 
         self._top.protocol("WM_DELETE_WINDOW", self._on_cancel)
         if id_readonly:
             self._show_panel("edit")
         else:
             self._on_mode_change()
+        self._top.after_idle(self._account_dialog_scroll_top)
         self._top.wait_window()
 
     @property
     def result(self) -> dict[str, Any] | list[dict[str, Any]] | None:
         return self._result
+
+    def _account_dialog_scroll_top(self) -> None:
+        """Sau lần layout đầu, đưa viewport Canvas về đầu nội dung (tránh khoảng trống lệch)."""
+        c = self._scroll_canvas
+        try:
+            c.update_idletasks()
+            bbox = c.bbox("all")
+            if bbox:
+                c.configure(scrollregion=bbox)
+            c.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _set_status(self, msg: str) -> None:
+        """``install_treeview_shortcuts`` gọi khi copy/chọn nhanh; hộp thoại không có thanh trạng thái."""
+        _ = msg
 
     def _build_common(self, parent: ttk.Frame, init: dict[str, Any]) -> None:
         parent.columnconfigure(0, weight=1)
@@ -439,12 +471,12 @@ class AccountFormDialog:
         r += 1
 
         hint = ttk.Label(
-            parent,
+            lf,
             text="Lịch đăng (HH:MM) và trạng thái đăng bài được cấu hình ở tab «Page / Group».",
             foreground="gray",
             font=("Segoe UI", 8),
         )
-        hint.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        hint.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         self._on_use_proxy_toggle()
 
@@ -521,12 +553,11 @@ class AccountFormDialog:
             row=pr, column=1, sticky="w", pady=4
         )
         pr += 1
-        if not self._id_readonly:
-            ttk.Button(
-                self._frm_new,
-                text="Mở trình duyệt đăng nhập Facebook → lưu cookie_path",
-                command=self._on_login_capture_cookie,
-            ).grid(row=pr, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(
+            self._frm_new,
+            text="Mở trình duyệt đăng nhập Facebook → lưu cookie_path",
+            command=self._on_login_capture_cookie,
+        ).grid(row=pr, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def _on_mkdir_profile(self) -> None:
         aid = self._e_id.get().strip()
@@ -558,10 +589,16 @@ class AccountFormDialog:
         self._e_cookie.delete(0, tk.END)
         self._e_cookie.insert(0, f"data/cookies/{cand}.json")
 
+    def _portable_path_for_capture(self, aid: str) -> str:
+        """Đường dẫn profile dùng khi mở trình duyệt: form sửa (tuyệt đối/tương đối) hoặc mặc định theo id."""
+        if self._e_portable_edit is not None:
+            raw = self._e_portable_edit.get().strip()
+            if raw:
+                return str(Path(raw))
+        return self._build_default_portable(aid)
+
     def _on_login_capture_cookie(self) -> None:
-        if self._id_readonly:
-            return
-        if self._var_mode.get() != _ACCOUNT_MODE_MANUAL:
+        if not self._id_readonly and self._var_mode.get() != _ACCOUNT_MODE_MANUAL:
             messagebox.showinfo("Chế độ", "Chỉ dùng khi chọn «Thêm Mới».", parent=self._top)
             return
         try:
@@ -571,11 +608,15 @@ class AccountFormDialog:
             return
         aid = self._e_id.get().strip()
         if not aid:
-            messagebox.showwarning("Thiếu id", "Nhập hoặc bấm «Tự sinh» mã tài khoản trước.", parent=self._top)
+            messagebox.showwarning(
+                "Thiếu id",
+                "Cần mã tài khoản (id)." if self._id_readonly else "Nhập hoặc bấm «Tự sinh» mã tài khoản trước.",
+                parent=self._top,
+            )
             return
         name = self._e_name.get().strip() or aid
         br = _browser_storage_from_label(self._cb_browser_label.get())
-        portable = self._build_default_portable(aid)
+        portable = self._portable_path_for_capture(aid)
         ck_rel = self._e_cookie.get().strip() or f"data/cookies/{aid}.json"
         self._e_cookie.delete(0, tk.END)
         self._e_cookie.insert(0, ck_rel)
@@ -590,8 +631,14 @@ class AccountFormDialog:
             "use_proxy": use_px,
             "cookie_path": ck_rel,
         }
+        exe = self._e_browser_exe.get().strip() if hasattr(self, "_e_browser_exe") else ""
+        if exe:
+            acc_preview["browser_exe_path"] = exe
         root = project_root()
-        (root / portable).mkdir(parents=True, exist_ok=True)
+        pdir = Path(portable)
+        if not pdir.is_absolute():
+            pdir = root / portable
+        pdir.mkdir(parents=True, exist_ok=True)
 
         def after_save() -> None:
             self._e_cookie.delete(0, tk.END)
@@ -826,14 +873,14 @@ class AccountFormDialog:
         self._frm_folder.grid_remove()
         self._frm_cookie.grid_remove()
         if which == "new":
-            self._frm_new.grid(row=0, column=0, sticky="nsew")
+            self._frm_new.grid(row=0, column=0, sticky="ew")
         elif which == "folder":
-            self._frm_folder.grid(row=0, column=0, sticky="nsew")
+            self._frm_folder.grid(row=0, column=0, sticky="ew")
             self._top.after_idle(self._sync_folder_selected_profile_path)
         elif which == "cookie":
-            self._frm_cookie.grid(row=0, column=0, sticky="nsew")
+            self._frm_cookie.grid(row=0, column=0, sticky="ew")
         elif which == "edit":
-            self._frm_new.grid(row=0, column=0, sticky="nsew")
+            self._frm_new.grid(row=0, column=0, sticky="ew")
 
     def _on_mode_change(self) -> None:
         if self._id_readonly:
