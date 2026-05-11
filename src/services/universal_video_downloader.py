@@ -420,6 +420,8 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "timeout_sec": 600,
             # Giới hạn treo socket (yt-dlp); máy khách mạng chập chờn vẫn fail nhanh thay vì chờ vô hạn.
             "socket_timeout_sec": 45,
+            # Quét playlist/kênh (flat): timeout socket riêng, thường cần lớn hơn tải 1 file để ít lỗi giữa chừng.
+            "playlist_scan_socket_timeout_sec": 90,
             # Mặc định ưu tiên tốc độ; máy yếu sẽ đỡ bị "lag" khi tải nhiều URL.
             "sleep_interval_sec": 0,
             "concurrent_fragments": 8,
@@ -1222,9 +1224,11 @@ class UniversalYTDLPWrapper:
             "--print",
             "%(id)s\t%(title)s\t%(webpage_url)s\t%(url)s\t%(uploader_id)s",
         ]
-        sock_to = int(self._yt.get("socket_timeout_sec") or 0)
-        if sock_to > 0:
-            cmd.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
+        scan_sock = int(self._yt.get("playlist_scan_socket_timeout_sec") or 0)
+        if scan_sock <= 0:
+            scan_sock = int(self._yt.get("socket_timeout_sec") or 0)
+        if scan_sock > 0:
+            cmd.extend(["--socket-timeout", str(max(10, min(180, scan_sock)))])
         proxy = str(self._yt.get("proxy") or "").strip()
         if proxy:
             cmd.extend(["--proxy", proxy])
@@ -1311,7 +1315,7 @@ class UniversalYTDLPWrapper:
                     continue
                 seen.add(u)
                 out.append(rec)
-                if on_partial and (len(out) <= 10 or time.monotonic() - last_partial_ts > 0.4):
+                if on_partial and (len(out) <= 25 or time.monotonic() - last_partial_ts > 0.22):
                     try:
                         on_partial(list(out))
                     except Exception:
@@ -1377,9 +1381,11 @@ class UniversalYTDLPWrapper:
                 "--playlist-end",
                 str(n),
             ]
-            sock_to = int(self._yt.get("socket_timeout_sec") or 0)
-            if sock_to > 0:
-                cmd_fallback.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
+            scan_sock = int(self._yt.get("playlist_scan_socket_timeout_sec") or 0)
+            if scan_sock <= 0:
+                scan_sock = int(self._yt.get("socket_timeout_sec") or 0)
+            if scan_sock > 0:
+                cmd_fallback.extend(["--socket-timeout", str(max(10, min(180, scan_sock)))])
             if proxy:
                 cmd_fallback.extend(["--proxy", proxy])
             cmd_fallback.append(raw)

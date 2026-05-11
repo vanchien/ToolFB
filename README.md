@@ -39,3 +39,5 @@ git pull origin main
 - Máy không có `.git` hoặc đổi kênh: **Cấu hình kênh cập nhật** (hoặc biến môi trường `TOOLFB_UPDATE_MANIFEST_URL`). Mẫu: `config/update_channel.example.json`.
 
 **Người phát hành:** khi đẩy bản mới, cập nhật `version.json` trong repo, tạo/đổi GitHub Release, đính kèm `ToolFB_release_bundle.zip` và `latest.json` (đúng `version`, `download_url`, `sha256` của zip) để các máy khách nhận bản mới khi kiểm tra cập nhật.
+
+**GitHub Actions:** trong repo có workflow **Publish GitHub Release** (`.github/workflows/release.yml`). Chạy thủ công tab *Actions* → *Run workflow*: tự bump semver, build bundle (PyInstaller + Playwright browsers + yt-dlp/ffmpeg theo script `tools/`), đăng release kèm zip + `latest.json`. Workflow dùng cache pip và cache thư mục Playwright trong workspace để lần build sau nhanh hơn. Tùy chọn **push_version_commit**: bật nếu muốn bot đẩy luôn `version.json` và `release/update/latest.json` lên nhánh hiện tại sau khi release (cần nhánh cho phép push; nếu `main` bị rule chặn, giữ tắt và tự commit sau khi xem diff trên runner hoặc dùng `Publish_Update_GitHub.bat` / `tools/publish_all.py` ở máy local).

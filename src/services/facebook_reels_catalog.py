@@ -88,7 +88,7 @@ def _env_scroll_pause(default: float) -> float:
     if not raw:
         return default
     try:
-        return max(0.5, min(4.0, float(raw)))
+        return max(0.35, min(4.0, float(raw)))
     except ValueError:
         return default
 
@@ -243,7 +243,7 @@ def scan_facebook_profile_reels_page(
     max_scroll_rounds: int = 100,
     max_scan_minutes: float = 30.0,
     scroll_until_end: bool = True,
-    scroll_pause_sec: float = 1.65,
+    scroll_pause_sec: float = 0.95,
     headless: bool | None = None,
     status: StatusFn | None = None,
     on_partial: Optional[Callable[[list[str]], None]] = None,
@@ -372,7 +372,7 @@ def scan_facebook_profile_reels_page(
 
                     st("Đang tải trang Reels (có thể 30–90s)…")
                     page.goto(url, wait_until="load", timeout=120_000)
-                    time.sleep(min(2.2, scroll_pause_sec + 0.5))
+                    time.sleep(min(1.35, scroll_pause_sec + 0.35))
                     try:
                         body_text = page.inner_text("body", timeout=3000)
                     except Exception:
@@ -453,9 +453,9 @@ def scan_facebook_profile_reels_page(
                             logger.warning("scroll: {}", exc)
                         time.sleep(scroll_pause_sec)
                         try:
-                            page.wait_for_timeout(450)
+                            page.wait_for_timeout(260)
                         except Exception:
-                            time.sleep(0.45)
+                            time.sleep(0.26)
                         try:
                             body_text = page.inner_text("body", timeout=1500)
                         except Exception:
@@ -515,7 +515,7 @@ def scan_facebook_profile_reels_page(
                             vurl = _profile_videos_tab_url(url)
                             st("Đang quét bổ sung tab Videos public…")
                             page.goto(vurl, wait_until="load", timeout=90_000)
-                            time.sleep(min(1.8, scroll_pause_sec + 0.2))
+                            time.sleep(min(1.15, scroll_pause_sec + 0.15))
                             for j in range(min(max_scroll_rounds, 80)):
                                 if len(ordered_ids) >= max_reels:
                                     break

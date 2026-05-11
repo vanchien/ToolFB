@@ -1570,7 +1570,7 @@ class AIVideoDialog:
         def _partial(urls: list[str]) -> None:
             snap = list(urls)
             now = time.monotonic()
-            if now - self._uv_last_partial_ui_ts < 0.45:
+            if now - self._uv_last_partial_ui_ts < 0.28:
                 return
             self._uv_last_partial_ui_ts = now
 
@@ -1879,7 +1879,7 @@ class AIVideoDialog:
             snap = list(rows)
             now = time.monotonic()
             grow = len(snap) - int(last_ui_count["n"])
-            if grow < 5 and now - self._uv_last_partial_ui_ts < 0.9:
+            if grow < 3 and now - self._uv_last_partial_ui_ts < 0.55:
                 return
             self._uv_last_partial_ui_ts = now
             last_ui_count["n"] = len(snap)
@@ -2137,7 +2137,7 @@ class AIVideoDialog:
             snap = list(rows)
             now = time.monotonic()
             grow = len(snap) - int(last_ui_count["n"])
-            if grow < 5 and now - self._uv_last_partial_ui_ts < 0.9:
+            if grow < 3 and now - self._uv_last_partial_ui_ts < 0.55:
                 return
             self._uv_last_partial_ui_ts = now
             last_ui_count["n"] = len(snap)
