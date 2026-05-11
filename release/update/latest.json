@@ -1,7 +1,7 @@
 {
-  "version": "1.0.36",
+  "version": "1.0.37",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "0b6fce7416b5b3720dad307325ab34ee6c9cabe8ec5c716d9a5a329c9e7cf4a4",
-  "notes": "Đóng gói full thư viện: yt-dlp.exe + ffmpeg/ffprobe portable; tối ưu tải/quét máy yếu; ổn định import video từ job tải.",
-  "generated_at": "2026-05-11T16:53:39"
+  "sha256": "5375d7f76a55dbb08ac9959158215c1a80c12f328315fc0a620dfb8796f60959",
+  "notes": "Tối ưu tốc độ Tải video máy khách: URL đơn/batch dùng format mp4 nhanh mặc định, concurrent_fragments mặc định 4, sửa sleep_interval áp dụng đúng; giữ đầy đủ yt-dlp + ffmpeg trong bundle.",
+  "generated_at": "2026-05-11T17:12:52"
 }
