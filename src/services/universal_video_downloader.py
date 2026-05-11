@@ -391,10 +391,14 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "use_exe": False,
             "exe_path": str(project_root() / "tools" / "yt-dlp" / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp")),
             "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
+            # URL đơn/batch nhiều video: ưu tiên file mp4 đơn để tải nhanh, ít CPU merge.
+            "single_video_fast_format": "b[ext=mp4]/best[ext=mp4]/best",
+            "prefer_fast_single_video": True,
             "merge_output_format": "mp4",
             "timeout_sec": 600,
             # Mặc định ưu tiên tốc độ; máy yếu sẽ đỡ bị "lag" khi tải nhiều URL.
             "sleep_interval_sec": 0,
+            "concurrent_fragments": 4,
             "max_videos_default": 50,
             "max_filesize_mb": 300,
             "write_info_json": True,
@@ -1164,7 +1168,11 @@ class UniversalYTDLPWrapper:
     ) -> dict[str, Any]:
         log_lines = log_lines or self._log
         prefix = self._resolve_prefix()
+        ut = (url_type or "unknown").lower()
         fmt = str(self._yt.get("format") or "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best")
+        fast_single = str(self._yt.get("single_video_fast_format") or "b[ext=mp4]/best[ext=mp4]/best")
+        if ut == "single_video" and bool(self._yt.get("prefer_fast_single_video", True)):
+            fmt = fast_single
         merge_fmt = str(self._yt.get("merge_output_format") or "mp4")
         ffmpeg_bin = _resolve_ffmpeg_for_ytdlp()
         has_ffmpeg = bool(ffmpeg_bin)
@@ -1174,6 +1182,9 @@ class UniversalYTDLPWrapper:
             fmt = "b[ext=mp4]/best[ext=mp4]/best"
             log_lines("[yt-dlp] Không thấy ffmpeg -> fallback format không cần merge (ưu tiên mp4).")
         sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
+        # Batch theo URL đơn không nên chèn sleep giữa request, sẽ rất chậm trên máy yếu.
+        if ut == "single_video":
+            sleep_sec = 0
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
         frag_workers = max(1, min(8, int(self._yt.get("concurrent_fragments") or 1)))
@@ -1203,10 +1214,6 @@ class UniversalYTDLPWrapper:
         if skip_existing:
             archive_path.parent.mkdir(parents=True, exist_ok=True)
             cmd.extend(["--download-archive", str(archive_path)])
-        ut = (url_type or "unknown").lower()
-        # Batch theo URL đơn không nên chèn sleep giữa request, sẽ rất chậm trên máy yếu.
-        if ut == "single_video":
-            sleep_sec = 0
         if ut in ("playlist", "channel", "profile"):
             cmd.append("--yes-playlist")
             cmd.extend(["--playlist-end", str(max(1, int(max_videos)))])
