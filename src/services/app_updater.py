@@ -17,6 +17,9 @@ from loguru import logger
 
 from src.utils.app_restart import DEFERRED_GUI_BAT_NAME
 
+# Repo công khai chứa ``release/update/latest.json`` (máy không có .git vẫn dùng manifest mặc định).
+TOOLFB_PUBLIC_REPO = "vanchien/ToolFB"
+
 
 def resolve_git_executable() -> str | None:
     """

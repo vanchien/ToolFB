@@ -40,6 +40,7 @@ from src.gui.page_scan_dialog import PageScanDialog
 from src.gui.schedule_job_dialog import SchedulePostJobDialog
 from src.modules.browser_engine import BrowserEngine
 from src.services.app_updater import (
+    TOOLFB_PUBLIC_REPO,
     GitUpdateCheckResult,
     UpdateManifest,
     apply_git_pull_ff,
@@ -5228,6 +5229,14 @@ class _ManagerWindow:
                     var_repo.set(tail.strip("/"))
             except Exception:
                 pass
+        elif "raw.githubusercontent.com/" in gh_url and "/release/update/latest.json" in gh_url:
+            try:
+                mid = gh_url.split("raw.githubusercontent.com/", 1)[1]
+                parts = mid.split("/", 2)
+                if len(parts) >= 2:
+                    var_repo.set(f"{parts[0]}/{parts[1]}")
+            except Exception:
+                pass
         ent_repo = ttk.Entry(frm, textvariable=var_repo, width=36)
         ent_repo.grid(row=3, column=0, sticky="w", pady=(0, 8))
 
@@ -5240,14 +5249,21 @@ class _ManagerWindow:
         ttk.Button(frm, text="Tạo URL GitHub", command=on_fill_github).grid(row=3, column=1, padx=(8, 0), sticky="w")
 
         def on_auto_git_remote() -> None:
-            """Điền owner/repo + URL manifest từ ``git remote origin`` (GitHub)."""
+            """Điền owner/repo + URL manifest từ ``git remote origin``; nếu không có .git thì dùng repo công khai ToolFB."""
             rid = github_owner_repo_from_git(project_root())
             if not rid:
-                messagebox.showwarning(
+                var_repo.set(TOOLFB_PUBLIC_REPO)
+                try:
+                    var_manifest.set(github_latest_manifest_url(TOOLFB_PUBLIC_REPO))
+                except Exception as exc:
+                    messagebox.showerror("Kênh cập nhật", str(exc), parent=top)
+                    return
+                messagebox.showinfo(
                     "Kênh cập nhật",
                     (
-                        "Không đọc được GitHub từ git (origin).\n"
-                        "Cần chạy app trong thư mục clone có ``git remote origin`` trỏ tới github.com."
+                        "Không đọc được ``git remote origin`` (bản copy không có .git, hoặc chạy .exe).\n"
+                        "Đã điền manifest mặc định của ToolFB (nhánh main).\n\n"
+                        "Nếu bạn dùng fork GitHub — sửa ô owner/repo rồi bấm «Tạo URL GitHub»."
                     ),
                     parent=top,
                 )
@@ -5261,10 +5277,9 @@ class _ManagerWindow:
 
         hint = (
             "Manifest mặc định đọc từ nhánh main (raw GitHub: release/update/latest.json), không phụ thuộc file Release cũ.\n"
-            "Nếu chạy từ thư mục git clone (có .git): «Cập nhật ngay» ưu tiên git pull.\n"
-            "«Tự động từ Git remote»: điền URL manifest từ ``git remote origin`` (dùng khi cập nhật bằng file zip trên Release).\n"
-            "Ví dụ URL: https://github.com/vanchien/ToolFB/releases/latest/download/latest.json\n"
-            "Biến môi trường TOOLFB_UPDATE_MANIFEST_URL (nếu có) vẫn được ưu tiên cho luồng zip."
+            "«Tự động từ Git remote»: có clone thì lấy origin; không có .git thì điền sẵn repo công khai ToolFB.\n"
+            "Nếu chạy từ thư mục git clone: «Cập nhật ngay» ưu tiên git pull.\n"
+            "Biến môi trường TOOLFB_UPDATE_MANIFEST_URL (nếu có) vẫn được ưu tiên."
         )
         ttk.Label(frm, text=hint, wraplength=520, foreground="#555").grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(4, 12)

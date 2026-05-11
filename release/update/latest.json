@@ -1,5 +1,5 @@
 {
-  "version": "1.0.28",
+  "version": "1.0.29",
   "download_url": "https://github.com/vanchien/ToolFB/archive/refs/heads/main.zip",
   "sha256": "",
   "notes": "Zip nguồn nhánh main (GitHub archive). Khi phát hành: tăng version đồng thời ở version.json và file này."
