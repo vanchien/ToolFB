@@ -1374,9 +1374,8 @@ class AIVideoDialog:
         o["platform"] = "facebook"
         o["url_type"] = "single_video"
         o["max_videos"] = 1
-        # Batch nhiều reel: bỏ metadata/thumbnail để giảm tải RAM/ổ và tránh yt-dlp nặng.
-        o["write_info_json"] = False
-        o["write_thumbnail"] = False
+        # Cần .info.json để thư viện có title/uploader/duration/source_url (webpage_url) đúng từ yt-dlp.
+        o["write_info_json"] = True
         return o
 
     def _parse_fb_reel_limits(self) -> tuple[int, int, int, bool]:
@@ -1804,8 +1803,7 @@ class AIVideoDialog:
         o["platform"] = "youtube"
         o["url_type"] = "single_video"
         o["max_videos"] = 1
-        o["write_info_json"] = False
-        o["write_thumbnail"] = False
+        o["write_info_json"] = True
         return o
 
     def _parse_yt_list_max(self) -> int:
@@ -2171,8 +2169,7 @@ class AIVideoDialog:
         opts["platform"] = "tiktok"
         opts["url_type"] = "single_video"
         opts["max_videos"] = 1
-        opts["write_info_json"] = False
-        opts["write_thumbnail"] = False
+        opts["write_info_json"] = True
         n = len(urls)
         self._uv_set_busy(True, f"Chuẩn bị tải {n} video TikTok bằng yt-dlp…")
 

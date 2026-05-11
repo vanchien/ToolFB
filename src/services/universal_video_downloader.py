@@ -1653,7 +1653,7 @@ class UniversalVideoDownloader:
                 pl = norm.lower()
             if pl in seen_lower:
                 continue
-            rec = self._build_video_record(video_path=fp, job=job)
+            rec = self._build_video_record(video_path=fp, job=job, item_url=item_url)
             records.append(rec)
             seen_lower.add(pl)
             job_paths_acc.append(norm)
@@ -1757,7 +1757,13 @@ class UniversalVideoDownloader:
         self._store.save_job(job)
         return job
 
-    def _build_video_record(self, *, video_path: str, job: dict[str, Any]) -> dict[str, Any]:
+    def _build_video_record(
+        self,
+        *,
+        video_path: str,
+        job: dict[str, Any],
+        item_url: str = "",
+    ) -> dict[str, Any]:
         vp = Path(video_path).resolve()
         info_path = vp.with_suffix(".info.json")
         if not info_path.is_file():
@@ -1769,7 +1775,8 @@ class UniversalVideoDownloader:
         uploader = ""
         duration = 0.0
         upload_date = ""
-        source_url = str(job.get("url") or "")
+        # Batch nhiều URL: job["url"] là URL gốc (tab/kênh); ưu tiên URL từng video.
+        source_url = str(item_url or "").strip() or str(job.get("url") or "")
         description = ""
         hashtags: list[str] = []
         if info_path.is_file():
