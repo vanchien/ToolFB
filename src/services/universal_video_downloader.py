@@ -1074,6 +1074,35 @@ class UniversalYTDLPWrapper:
                 return f"{m.group(0)}/video/{vid}"
         return ""
 
+    @staticmethod
+    def _parse_flat_print_line(line: str, *, source_url: str, platform: str) -> dict[str, str] | None:
+        """
+        Parse output dòng từ:
+        ``--print "%(id)s\\t%(title)s\\t%(webpage_url)s\\t%(url)s\\t%(uploader_id)s"``
+        """
+        raw = str(line or "").strip()
+        if not raw:
+            return None
+        parts = raw.split("\t")
+        while len(parts) < 5:
+            parts.append("")
+        vid = str(parts[0] or "").strip()
+        title = str(parts[1] or "").strip()
+        webpage_url = str(parts[2] or "").strip()
+        url_raw = str(parts[3] or "").strip()
+        uploader_id = str(parts[4] or "").strip()
+        entry = {
+            "id": vid,
+            "title": title or vid,
+            "webpage_url": webpage_url,
+            "url": url_raw,
+            "uploader_id": uploader_id,
+        }
+        final_url = UniversalYTDLPWrapper._flat_playlist_entry_url(entry, source_url=source_url, platform=platform)
+        if not final_url:
+            return None
+        return {"title": (title or vid or final_url)[:500], "url": final_url}
+
     def list_flat_playlist_entries(self, url: str, *, max_entries: int = 500) -> dict[str, Any]:
         """
         Liệt kê entry trong kênh / playlist (``--flat-playlist``) không tải video.
@@ -1094,15 +1123,18 @@ class UniversalYTDLPWrapper:
         if platform == "tiktok" and ut != "profile":
             return {"success": False, "error": "TikTok cần URL profile (dạng https://www.tiktok.com/@user)."}
         n = max(1, min(int(max_entries or 500), 2000))
+        # Fast path: tránh parse JSON lớn cho playlist dài (máy yếu sẽ đỡ lag/đỡ RAM).
         cmd = [
             *self._resolve_prefix(),
-            "-J",
             "--skip-download",
             "--quiet",
             "--no-warnings",
             "--flat-playlist",
+            "--lazy-playlist",
             "--playlist-end",
             str(n),
+            "--print",
+            "%(id)s\t%(title)s\t%(webpage_url)s\t%(url)s\t%(uploader_id)s",
         ]
         proxy = str(self._yt.get("proxy") or "").strip()
         if proxy:
@@ -1114,7 +1146,7 @@ class UniversalYTDLPWrapper:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=min(max(120, n // 2 + 60), timeout),
+                timeout=min(max(60, n // 3 + 40), timeout),
                 encoding="utf-8",
                 errors="replace",
                 stdin=subprocess.DEVNULL,
@@ -1126,29 +1158,75 @@ class UniversalYTDLPWrapper:
             return {"success": False, "error": str(exc)}
         if p.returncode != 0:
             err = (p.stderr or p.stdout or "").strip()
-            return {"success": False, "error": err[:2200]}
-        try:
-            data = json.loads(p.stdout or "{}")
-        except Exception as exc:
-            return {"success": False, "error": f"Parse JSON lỗi: {exc}"}
-        if not isinstance(data, dict):
-            return {"success": False, "error": "Không phải object JSON"}
-        entries_raw = data.get("entries")
+            # Fallback tương thích cho bản yt-dlp cũ không hỗ trợ một số cờ scan nhanh.
+            cmd_fallback = [
+                *self._resolve_prefix(),
+                "-J",
+                "--skip-download",
+                "--quiet",
+                "--no-warnings",
+                "--flat-playlist",
+                "--playlist-end",
+                str(n),
+            ]
+            if proxy:
+                cmd_fallback.extend(["--proxy", proxy])
+            cmd_fallback.append(raw)
+            try:
+                p2 = subprocess.run(
+                    cmd_fallback,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(max(120, n // 2 + 60), timeout),
+                    encoding="utf-8",
+                    errors="replace",
+                    stdin=subprocess.DEVNULL,
+                    **_ytdlp_subprocess_kw(),
+                )
+            except Exception:
+                return {"success": False, "error": err[:2200] or "yt-dlp scan failed."}
+            if p2.returncode != 0:
+                err2 = (p2.stderr or p2.stdout or "").strip()
+                return {"success": False, "error": (err2 or err)[:2200] or "yt-dlp scan failed."}
+            try:
+                data = json.loads(p2.stdout or "{}")
+            except Exception as exc:
+                return {"success": False, "error": f"Parse JSON lỗi: {exc}"}
+            if not isinstance(data, dict):
+                return {"success": False, "error": "Không phải object JSON"}
+            entries_raw = data.get("entries")
+            out2: list[dict[str, str]] = []
+            if isinstance(entries_raw, list):
+                for e in entries_raw:
+                    if not isinstance(e, dict):
+                        continue
+                    play_url = self._flat_playlist_entry_url(e, source_url=raw, platform=platform)
+                    if not play_url:
+                        continue
+                    title = str(e.get("title") or e.get("id") or play_url)[:500]
+                    out2.append({"title": title, "url": play_url})
+            return {
+                "success": True,
+                "entries": out2,
+                "playlist_title": str(data.get("title") or data.get("playlist_title") or ""),
+                "extractor": str(data.get("extractor") or data.get("ie_key") or ""),
+            }
         out: list[dict[str, str]] = []
-        if isinstance(entries_raw, list):
-            for e in entries_raw:
-                if not isinstance(e, dict):
-                    continue
-                play_url = self._flat_playlist_entry_url(e, source_url=raw, platform=platform)
-                if not play_url:
-                    continue
-                title = str(e.get("title") or e.get("id") or play_url)[:500]
-                out.append({"title": title, "url": play_url})
+        seen: set[str] = set()
+        for ln in str(p.stdout or "").splitlines():
+            rec = self._parse_flat_print_line(ln, source_url=raw, platform=platform)
+            if not rec:
+                continue
+            u = rec["url"]
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(rec)
         return {
             "success": True,
             "entries": out,
-            "playlist_title": str(data.get("title") or data.get("playlist_title") or ""),
-            "extractor": str(data.get("extractor") or data.get("ie_key") or ""),
+            "playlist_title": "",
+            "extractor": "",
         }
 
     def download(

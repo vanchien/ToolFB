@@ -122,9 +122,9 @@ class AIVideoDialog:
         self._uv_yt_entry_rows: list[dict[str, str]] = []
         self._tree_tt_channel: ttk.Treeview | None = None
         self._uv_tt_entry_rows: list[dict[str, str]] = []
-        self._var_uv_yt_list_max = tk.StringVar(value="200")
+        self._var_uv_yt_list_max = tk.StringVar(value="100")
         self._var_uv_yt_scan_status = tk.StringVar(value="")
-        self._var_uv_tt_list_max = tk.StringVar(value="200")
+        self._var_uv_tt_list_max = tk.StringVar(value="100")
         self._var_uv_tt_scan_status = tk.StringVar(value="")
         self._var_uv_job_name = tk.StringVar(value="")
         self._uv_last_saved_job_name: str = ""
@@ -1811,8 +1811,8 @@ class AIVideoDialog:
         try:
             lim = int(self._var_uv_yt_list_max.get().strip())
         except ValueError:
-            lim = 200
-        return max(1, min(800, lim))
+            lim = 100
+        return max(1, min(400, lim))
 
     def _refresh_yt_channel_tree(self, rows: list[dict[str, str]]) -> None:
         self._uv_yt_entry_rows = list(rows)
@@ -2056,8 +2056,8 @@ class AIVideoDialog:
         try:
             lim = int(self._var_uv_tt_list_max.get().strip())
         except ValueError:
-            lim = 200
-        return max(1, min(800, lim))
+            lim = 100
+        return max(1, min(400, lim))
 
     def _refresh_tt_channel_tree(self, rows: list[dict[str, str]]) -> None:
         self._uv_tt_entry_rows = list(rows)
