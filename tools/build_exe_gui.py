@@ -95,6 +95,10 @@ def build_exe() -> Path:
     if spec.exists():
         spec.unlink()
 
+    _ens_ff = root / "tools" / "ensure_ffmpeg_portable.py"
+    if _ens_ff.is_file():
+        subprocess.run([sys.executable, str(_ens_ff)], cwd=str(root), check=False)
+
     _ens = root / "tools" / "ensure_ytdlp_standalone_exe.py"
     if _ens.is_file():
         subprocess.run([sys.executable, str(_ens)], cwd=str(root), check=False)
