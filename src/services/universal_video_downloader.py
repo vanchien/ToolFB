@@ -22,6 +22,8 @@ from src.utils.paths import project_root
 LogFn = Callable[[str], None]
 
 YTDLP_PYPI_JSON_URL = "https://pypi.org/pypi/yt-dlp/json"
+# File yt-dlp.exe đóng gói kèm app; nhỏ hơn ngưỡng này coi như tải lỗi / placeholder.
+YTDLP_BUNDLE_EXE_MIN_BYTES = 400_000
 
 _YTDLP_MEDIA_EXTENSIONS = frozenset({".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"})
 
@@ -214,6 +216,17 @@ def fetch_ytdlp_latest_version_pypi(*, timeout_sec: float = 20.0) -> dict[str, A
 
 def run_pip_upgrade_ytdlp(*, timeout_sec: int = 300) -> dict[str, Any]:
     """``python -m pip install -U yt-dlp`` với cùng interpreter đang chạy app."""
+    if getattr(sys, "frozen", False):
+        return {
+            "ok": False,
+            "message": (
+                "Bản .exe đóng gói không cài yt-dlp bằng pip vào interpreter này. "
+                "Dùng file yt-dlp.exe kèm app (thư mục tools/yt-dlp/) hoặc tải bản phát hành mới."
+            ),
+            "stdout": "",
+            "stderr": "",
+            "returncode": -1,
+        }
     cmd = [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"]
     try:
         p = subprocess.run(
@@ -867,6 +880,9 @@ class UniversalYTDLPWrapper:
         khi pip đã cài gói, kể cả khi ``import yt_dlp`` trong process lỗi (hiếm)
         hoặc PATH không có lệnh ``yt-dlp``.
         """
+        if getattr(sys, "frozen", False):
+            # PyInstaller: sys.executable là ToolFB_GUI.exe — không hiểu ``-m yt_dlp``.
+            return None
         try:
             p = subprocess.run(
                 [sys.executable, "-m", "yt_dlp", "--version"],
@@ -892,19 +908,24 @@ class UniversalYTDLPWrapper:
             return [by_path]
         if exe_path.is_file():
             return [str(exe_path.resolve())]
-        try:
-            import yt_dlp as _  # type: ignore # noqa: F401
+        bundled = project_root() / "tools" / "yt-dlp" / "yt-dlp.exe"
+        if bundled.is_file() and bundled.stat().st_size >= YTDLP_BUNDLE_EXE_MIN_BYTES:
+            return [str(bundled.resolve())]
+        if not getattr(sys, "frozen", False):
+            try:
+                import yt_dlp as _  # type: ignore # noqa: F401
 
-            return [sys.executable, "-m", "yt_dlp"]
-        except Exception:
-            pass
-        prefix = self._probe_python_m_ytdlp()
-        if prefix:
-            return prefix
+                return [sys.executable, "-m", "yt_dlp"]
+            except Exception:
+                pass
+            prefix = self._probe_python_m_ytdlp()
+            if prefix:
+                return prefix
         raise RuntimeError(
             "Không tìm thấy yt-dlp cho Python đang chạy app. "
             f"Thử: `{sys.executable} -m pip install yt-dlp` "
-            "hoặc đặt file exe vào tools/yt-dlp/yt-dlp.exe và bật use_exe trong config."
+            "hoặc đặt file yt-dlp.exe vào tools/yt-dlp/ cạnh thư mục app (bản .exe: cùng thư mục ToolFB_GUI.exe). "
+            "Có thể tải yt-dlp.exe từ https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
         )
 
     def get_info(self, url: str) -> dict[str, Any]:

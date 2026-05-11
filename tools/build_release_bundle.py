@@ -93,6 +93,10 @@ def build_release_bundle() -> tuple[Path, Path, Path]:
     dist = root / "dist"
     dist.mkdir(parents=True, exist_ok=True)
 
+    _ens = root / "tools" / "ensure_ytdlp_standalone_exe.py"
+    if _ens.is_file():
+        subprocess.run([sys.executable, str(_ens)], cwd=str(root), check=False)
+
     # 1) Build clean portable package
     _run([sys.executable, str(root / "tools" / "build_clean_portable.py")], cwd=root)
 

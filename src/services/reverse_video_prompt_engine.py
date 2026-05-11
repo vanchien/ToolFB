@@ -23,6 +23,7 @@ from src.utils.ffmpeg_paths import resolve_ffmpeg_ffprobe_paths
 from src.utils.paths import project_root
 
 LogFn = Callable[[str], None]
+YTDLP_BUNDLE_EXE_MIN_BYTES = 400_000
 _profile_launch_locks: dict[str, threading.Lock] = {}
 _profile_launch_guard = threading.Lock()
 
@@ -230,6 +231,8 @@ class YTDLPDownloader:
 
     @staticmethod
     def _probe_python_m_ytdlp() -> list[str] | None:
+        if getattr(sys, "frozen", False):
+            return None
         try:
             p = subprocess.run(
                 [sys.executable, "-m", "yt_dlp", "--version"],
@@ -255,19 +258,23 @@ class YTDLPDownloader:
             return [by_path]
         if exe_path.is_file():
             return [str(exe_path.resolve())]
-        try:
-            import yt_dlp as _  # type: ignore # noqa: F401
+        bundled = project_root() / "tools" / "yt-dlp" / "yt-dlp.exe"
+        if bundled.is_file() and bundled.stat().st_size >= YTDLP_BUNDLE_EXE_MIN_BYTES:
+            return [str(bundled.resolve())]
+        if not getattr(sys, "frozen", False):
+            try:
+                import yt_dlp as _  # type: ignore # noqa: F401
 
-            return [sys.executable, "-m", "yt_dlp"]
-        except Exception:
-            pass
-        prefix = self._probe_python_m_ytdlp()
-        if prefix:
-            return prefix
+                return [sys.executable, "-m", "yt_dlp"]
+            except Exception:
+                pass
+            prefix = self._probe_python_m_ytdlp()
+            if prefix:
+                return prefix
         raise RuntimeError(
             "Không tìm thấy yt-dlp cho Python đang chạy app. "
             f"Thử: `{sys.executable} -m pip install yt-dlp` "
-            "hoặc đặt tools/yt-dlp/yt-dlp.exe và bật use_exe trong config."
+            "hoặc đặt yt-dlp.exe vào tools/yt-dlp/ cạnh thư mục app (bản .exe: cùng thư mục ToolFB_GUI.exe)."
         )
 
     @staticmethod

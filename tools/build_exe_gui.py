@@ -95,6 +95,10 @@ def build_exe() -> Path:
     if spec.exists():
         spec.unlink()
 
+    _ens = root / "tools" / "ensure_ytdlp_standalone_exe.py"
+    if _ens.is_file():
+        subprocess.run([sys.executable, str(_ens)], cwd=str(root), check=False)
+
     # playwright_stealth loads *.js at import time from Path(__file__).parent / "js".
     # PyInstaller does not ship those data files unless we collect them (fixes portable EXE on other PCs).
     py_cmd = cmd + [
@@ -113,6 +117,12 @@ def build_exe() -> Path:
     exe_path = dist / "ToolFB_GUI.exe"
     if not exe_path.is_file():
         raise RuntimeError("Build xong nhưng không thấy ToolFB_GUI.exe")
+
+    src_ytd = root / "tools" / "yt-dlp" / "yt-dlp.exe"
+    if src_ytd.is_file():
+        y_dest = dist / "tools" / "yt-dlp" / "yt-dlp.exe"
+        y_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_ytd, y_dest)
 
     seed_default_runtime_at(dist)
     _copy_config_template_files(project_root=root, dist_dir=dist)

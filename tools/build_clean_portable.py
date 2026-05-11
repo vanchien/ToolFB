@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from runtime_layout_seed import seed_default_runtime_at
@@ -19,6 +21,10 @@ def build_clean_portable() -> tuple[Path, Path]:
     if out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    _ens = root / "tools" / "ensure_ytdlp_standalone_exe.py"
+    if _ens.is_file():
+        subprocess.run([sys.executable, str(_ens)], cwd=str(root), check=False)
 
     def _ignore(cur_dir: str, names: list[str]) -> set[str]:
         cur = Path(cur_dir).resolve()
