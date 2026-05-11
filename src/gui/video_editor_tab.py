@@ -589,6 +589,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             return
         existing = {str(m.get("path") or "") for m in (project.get("media") or []) if isinstance(m, dict)}
         added = 0
+        failed = 0
         source_video_ids: list[str] = []
         source_video_meta_by_id: dict[str, dict[str, Any]] = {}
         for r in rows:
@@ -612,7 +613,22 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             try:
                 rec = mm.import_media(str(vp), "video", copy_to_library=False)
             except Exception:
-                continue
+                # Máy yếu có thể timeout ffprobe khi import nhiều file lớn.
+                # Fallback: vẫn nạp media record tối thiểu từ dữ liệu downloader.
+                failed += 1
+                rec = {
+                    "id": f"media_{uuid.uuid4().hex[:10]}",
+                    "type": "video",
+                    "path": str(vp),
+                    "local_path": "",
+                    "original_name": vp.name,
+                    "duration": float(r.get("duration") or 0.0),
+                    "width": int(r.get("width") or 0),
+                    "height": int(r.get("height") or 0),
+                    "fps": float(r.get("fps") or 30.0),
+                    "has_audio": True,
+                    "created_at": datetime.now().replace(microsecond=0).isoformat(),
+                }
             rec["source_download_video_id"] = src_vid
             rec["source_download_job_id"] = jid
             rec["source_title"] = src_meta["title"]
@@ -634,7 +650,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         pm.save_project(project)
         refresh_media_tree()
         refresh_timeline()
-        notify(f"Đã nạp {added} video từ job tải {jid} vào project (tổng liên kết: {len(source_video_ids)}).")
+        tail = f" | fallback nhanh: {failed}" if failed else ""
+        notify(f"Đã nạp {added} video từ job tải {jid} vào project (tổng liên kết: {len(source_video_ids)}){tail}.")
 
     ttk.Button(top_job, text="2) Nạp danh sách job", command=refresh_download_job_combo).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(top_job, text="3) Import video vào Media", command=import_from_download_job).pack(side=tk.LEFT, padx=(0, 4))
