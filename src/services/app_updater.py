@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 import urllib.request
@@ -25,6 +26,181 @@ class UpdateManifest:
     download_url: str
     sha256: str
     notes: str
+
+
+@dataclass(frozen=True)
+class GitUpdateCheckResult:
+    """Kết quả ``git fetch`` + so sánh HEAD với tip trên ``origin``."""
+
+    is_git_clone: bool
+    git_on_path: bool
+    ok: bool
+    branch: str
+    local_sha_short: str
+    remote_sha_short: str
+    remote_ref: str
+    commits_behind: int
+    remote_preview: str
+    error: str | None
+
+    @property
+    def has_new_commits(self) -> bool:
+        return self.ok and self.commits_behind > 0
+
+
+def _git_run(project_root: Path, args: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def should_use_git_updates(project_root: Path) -> bool:
+    """
+    Bản clone có ``.git`` + có lệnh ``git`` → ưu tiên «Kiểm tra / Cập nhật» bằng ``git pull``
+    (phù hợp mỗi lần đẩy code lên GitHub). Bản PyInstaller không dùng được.
+    """
+    if getattr(sys, "frozen", False):
+        return False
+    if not shutil.which("git"):
+        return False
+    return (project_root / ".git").exists()
+
+
+def _git_remote_tip_ref(project_root: Path, branch: str) -> tuple[str, str] | None:
+    """
+    Returns:
+        ``(full_sha, ref_label)`` với ref kiểu ``origin/main``, hoặc ``None``.
+    """
+    p = _git_run(project_root, ["rev-parse", f"origin/{branch}"], timeout=45)
+    if p.returncode == 0 and (p.stdout or "").strip():
+        sha = (p.stdout or "").strip()
+        return sha, f"origin/{branch}"
+    sym = _git_run(project_root, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], timeout=45)
+    if sym.returncode == 0 and (sym.stdout or "").strip():
+        ref = (sym.stdout or "").strip()
+        p3 = _git_run(project_root, ["rev-parse", ref], timeout=45)
+        if p3.returncode == 0 and (p3.stdout or "").strip():
+            return (p3.stdout or "").strip(), ref
+    lr = _git_run(project_root, ["ls-remote", "--symref", "origin", "HEAD"], timeout=90)
+    if lr.returncode == 0 and (lr.stdout or "").strip():
+        first = (lr.stdout or "").strip().splitlines()[0]
+        if first.startswith("ref:"):
+            parts = first.split()
+            if len(parts) >= 2:
+                symref = parts[1].strip()
+                if symref.startswith("refs/heads/"):
+                    default_br = symref.split("/", 2)[2]
+                    p4 = _git_run(project_root, ["rev-parse", f"origin/{default_br}"], timeout=45)
+                    if p4.returncode == 0 and (p4.stdout or "").strip():
+                        return (p4.stdout or "").strip(), f"origin/{default_br}"
+    return None
+
+
+def check_git_updates(project_root: Path, *, timeout_fetch: int = 180) -> GitUpdateCheckResult:
+    """``git fetch origin`` rồi đếm commit trên remote mà local chưa có."""
+    if not (project_root / ".git").exists():
+        return GitUpdateCheckResult(
+            is_git_clone=False,
+            git_on_path=bool(shutil.which("git")),
+            ok=False,
+            branch="",
+            local_sha_short="",
+            remote_sha_short="",
+            remote_ref="",
+            commits_behind=0,
+            remote_preview="",
+            error=None,
+        )
+    if not shutil.which("git"):
+        return GitUpdateCheckResult(
+            is_git_clone=True,
+            git_on_path=False,
+            ok=False,
+            branch="",
+            local_sha_short="",
+            remote_sha_short="",
+            remote_ref="",
+            commits_behind=0,
+            remote_preview="",
+            error="Không tìm thấy lệnh git trên PATH (cài Git for Windows / git trên Linux).",
+        )
+    br_p = _git_run(project_root, ["branch", "--show-current"], timeout=30)
+    branch = (br_p.stdout or "").strip()
+    if not branch:
+        branch = "main"
+    fe = _git_run(project_root, ["fetch", "origin"], timeout=timeout_fetch)
+    if fe.returncode != 0:
+        err = ((fe.stderr or "") + (fe.stdout or "")).strip() or "git fetch thất bại"
+        return GitUpdateCheckResult(
+            is_git_clone=True,
+            git_on_path=True,
+            ok=False,
+            branch=branch,
+            local_sha_short="",
+            remote_sha_short="",
+            remote_ref="",
+            commits_behind=0,
+            remote_preview="",
+            error=err[:4000],
+        )
+    tip = _git_remote_tip_ref(project_root, branch)
+    if tip is None:
+        return GitUpdateCheckResult(
+            is_git_clone=True,
+            git_on_path=True,
+            ok=False,
+            branch=branch,
+            local_sha_short="",
+            remote_sha_short="",
+            remote_ref="",
+            commits_behind=0,
+            remote_preview="",
+            error=(
+                f"Không xác định được tip của origin cho nhánh «{branch}».\n"
+                f"Đảm bảo đã push nhánh lên GitHub hoặc đổi sang nhánh có trên remote (vd. main)."
+            ),
+        )
+    remote_full, remote_ref = tip
+    loc = _git_run(project_root, ["rev-parse", "HEAD"], timeout=30)
+    local_full = (loc.stdout or "").strip() if loc.returncode == 0 else ""
+    cnt = _git_run(project_root, ["rev-list", "--count", f"HEAD..{remote_full}"], timeout=60)
+    behind = 0
+    if cnt.returncode == 0 and (cnt.stdout or "").strip().isdigit():
+        behind = int((cnt.stdout or "").strip())
+    elif local_full and remote_full and local_full != remote_full:
+        behind = max(1, behind)
+    log1 = _git_run(project_root, ["log", "-1", "--oneline", remote_full], timeout=30)
+    preview = ((log1.stdout or "").strip())[:500]
+    return GitUpdateCheckResult(
+        is_git_clone=True,
+        git_on_path=True,
+        ok=True,
+        branch=branch,
+        local_sha_short=local_full[:12] if local_full else "",
+        remote_sha_short=remote_full[:12],
+        remote_ref=remote_ref,
+        commits_behind=behind,
+        remote_preview=preview,
+        error=None,
+    )
+
+
+def apply_git_pull_ff(project_root: Path, *, branch: str, timeout: int = 300) -> tuple[bool, str]:
+    """
+    ``git pull --ff-only origin <branch>`` — tránh merge commit; lỗi nếu có chỉnh sửa cục bộ chưa commit.
+    """
+    p = _git_run(project_root, ["pull", "--ff-only", "origin", branch], timeout=timeout)
+    out = ((p.stdout or "").strip() + "\n" + (p.stderr or "").strip()).strip()
+    if p.returncode != 0:
+        return False, out or "git pull --ff-only thất bại"
+    return True, out
 
 
 def read_local_version(project_root: Path) -> str:

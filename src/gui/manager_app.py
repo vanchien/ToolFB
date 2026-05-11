@@ -40,13 +40,17 @@ from src.gui.page_scan_dialog import PageScanDialog
 from src.gui.schedule_job_dialog import SchedulePostJobDialog
 from src.modules.browser_engine import BrowserEngine
 from src.services.app_updater import (
+    GitUpdateCheckResult,
     UpdateManifest,
+    apply_git_pull_ff,
     apply_update_package,
+    check_git_updates,
     github_latest_manifest_url,
     is_newer_version,
     read_local_version,
     read_manifest_from_url,
     resolve_manifest_url,
+    should_use_git_updates,
 )
 from src.scheduler import run_forever, run_scheduled_post_for_account
 from src.utils.app_secrets import (
@@ -266,6 +270,7 @@ class _ManagerWindow:
         self._ai_widgets_gemini: list[tk.Widget] = []
         self._ai_widgets_openai: list[tk.Widget] = []
         self._latest_update_manifest: UpdateManifest | None = None
+        self._git_update_result: GitUpdateCheckResult | None = None
         # Watchdog UI: phát hiện main-thread bị block (dễ gây "Not Responding").
         self._ui_watchdog_interval_ms = 250
         self._ui_watchdog_threshold_sec = 1.5
@@ -5253,9 +5258,11 @@ class _ManagerWindow:
         )
 
         hint = (
-            "«Tự động từ Git remote»: điền URL từ ``git remote origin`` (máy dev / bản portable có .git).\n"
+            "Nếu chạy từ thư mục git clone (có .git): «Kiểm tra cập nhật» / «Cập nhật ngay» sẽ ưu tiên "
+            "git fetch + git pull — không cần manifest trừ khi dùng bản .exe đóng gói.\n"
+            "«Tự động từ Git remote»: điền URL manifest từ ``git remote origin`` (dùng khi cập nhật bằng file zip trên Release).\n"
             "Ví dụ URL: https://github.com/vanchien/ToolFB/releases/latest/download/latest.json\n"
-            "Sau khi lưu, dùng «Kiểm tra cập nhật». Biến môi trường TOOLFB_UPDATE_MANIFEST_URL (nếu có) vẫn được ưu tiên."
+            "Biến môi trường TOOLFB_UPDATE_MANIFEST_URL (nếu có) vẫn được ưu tiên cho luồng zip."
         )
         ttk.Label(frm, text=hint, wraplength=520, foreground="#555").grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(4, 12)
@@ -5405,20 +5412,84 @@ class _ManagerWindow:
         messagebox.showinfo("Reset profile VEO3", info, parent=self._root)
 
     def _on_check_updates(self) -> None:
-        """Kiểm tra phiên bản mới từ kênh update (manifest URL)."""
-        manifest_url = resolve_manifest_url(project_root())
+        """Kiểm tra bản mới: ưu tiên git (clone) rồi mới tới manifest (zip / Release)."""
+        root = project_root()
+        if should_use_git_updates(root):
+
+            def worker_git() -> None:
+                try:
+                    info = check_git_updates(root)
+
+                    def done_git() -> None:
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._clear_ui_busy()
+                        self._git_update_result = info if info.ok else None
+                        self._latest_update_manifest = None
+                        if not info.ok:
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            messagebox.showerror(
+                                "Cập nhật (git)",
+                                info.error or "Không kiểm tra được qua git.",
+                                parent=self._root,
+                            )
+                            return
+                        if info.has_new_commits:
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            messagebox.showinfo(
+                                "Cập nhật (git)",
+                                (
+                                    f"Có {info.commits_behind} commit mới trên {info.remote_ref}.\n"
+                                    f"Local: {info.local_sha_short} → Remote: {info.remote_sha_short}\n"
+                                    f"Mới nhất: {info.remote_preview or '—'}\n\n"
+                                    "Bấm «Cập nhật ngay» để git pull (fast-forward)."
+                                ),
+                                parent=self._root,
+                            )
+                        else:
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            lv = read_local_version(root)
+                            messagebox.showinfo(
+                                "Cập nhật (git)",
+                                (
+                                    f"Đã đồng bộ với {info.remote_ref} (nhánh «{info.branch}»).\n"
+                                    f"Commit: {info.local_sha_short} — version.json: {lv}"
+                                ),
+                                parent=self._root,
+                            )
+
+                    self._root.after(0, done_git)
+                except Exception as exc:  # noqa: BLE001
+                    err_text = str(exc)
+
+                    def done_err() -> None:
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._clear_ui_busy()
+                        messagebox.showerror("Cập nhật (git)", f"Lỗi:\n{err_text}", parent=self._root)
+
+                    self._root.after(0, done_err)
+
+            self._set_ui_busy("check_updates")
+            self._btn_check_updates.configure(state=tk.DISABLED)
+            self._btn_apply_update.configure(state=tk.DISABLED)
+            threading.Thread(target=worker_git, name="check_updates_git", daemon=True).start()
+            return
+
+        manifest_url = resolve_manifest_url(root)
         if not manifest_url:
             if messagebox.askyesno(
                 "Cập nhật",
                 (
-                    "Chưa cấu hình URL manifest (latest.json).\n\n"
-                    "Mở «Cấu hình kênh cập nhật» để nhập URL GitHub hoặc manifest khác?\n\n"
-                    "(Có thể dùng biến TOOLFB_UPDATE_MANIFEST_URL; dev: manifest_file / dist/latest.json.)"
+                    "Không phát hiện thư mục git (.git) hoặc không có lệnh git — cần kênh manifest (zip).\n\n"
+                    "Mở «Cấu hình kênh cập nhật» để nhập URL GitHub Release (latest.json)?\n\n"
+                    "(Clone repo rồi chạy trong thư mục đó để cập nhật bằng git pull; "
+                    "hoặc TOOLFB_UPDATE_MANIFEST_URL / dist/latest.json khi dev.)"
                 ),
                 parent=self._root,
             ):
                 self._on_configure_update_channel()
             return
+        self._git_update_result = None
         self._set_ui_busy("check_updates")
         self._btn_check_updates.configure(state=tk.DISABLED)
         self._btn_apply_update.configure(state=tk.DISABLED)
@@ -5467,7 +5538,7 @@ class _ManagerWindow:
 
         threading.Thread(target=worker, name="check_updates", daemon=True).start()
 
-    def _show_update_success_restart_dialog(self, *, version: str, backup_dir: Path) -> None:
+    def _show_update_success_restart_dialog(self, *, version: str, backup_dir: Path | None) -> None:
         """
         Sau cập nhật thành công: nút mở lại chương trình ngay (khuyến nghị) + để sau.
         """
@@ -5488,9 +5559,14 @@ class _ManagerWindow:
                 "\n\n(Windows) Bản .exe và thư mục _internal sẽ được thay sau khi bạn bấm mở lại "
                 "(có thể thấy cửa sổ lệnh tối thiểu vài giây — bình thường)."
             )
+        backup_line = (
+            str(backup_dir)
+            if backup_dir is not None
+            else "(Cập nhật qua git — lịch sử trong .git; hoàn tác: git revert / git checkout nếu cần.)"
+        )
         msg = (
             f"Đã cập nhật lên phiên bản {version}.\n\n"
-            f"Backup trước update:\n{backup_dir}\n\n"
+            f"Backup / ghi chú:\n{backup_line}\n\n"
             "Nên bấm «Mở lại chương trình ngay» để dùng bản mới (cửa sổ hiện tại sẽ đóng và app mở lại).\n"
             "Phím Enter = mở lại ngay. Esc = để sau."
             f"{extra}"
@@ -5539,21 +5615,129 @@ class _ManagerWindow:
             pass
 
     def _on_apply_update(self) -> None:
-        """Một nút: đọc manifest → so sánh → nếu có bản mới thì tải zip và áp dụng (không cần «Kiểm tra» trước)."""
-        manifest_url = resolve_manifest_url(project_root())
+        """Git clone: pull --ff-only. Bản .exe / không .git: zip qua manifest."""
+        root = project_root()
+        if should_use_git_updates(root):
+            self._set_ui_busy("apply_update")
+            self._btn_check_updates.configure(state=tk.DISABLED)
+            self._btn_apply_update.configure(state=tk.DISABLED)
+            self._lbl_state.configure(text="Update (git): đang kiểm tra…")
+
+            def worker_git_apply() -> None:
+                try:
+                    info = check_git_updates(root)
+
+                    def on_decide() -> None:
+                        if not info.ok:
+                            self._clear_ui_busy()
+                            self._btn_check_updates.configure(state=tk.NORMAL)
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._lbl_state.configure(text="")
+                            messagebox.showerror(
+                                "Cập nhật (git)",
+                                info.error or "Không kiểm tra được qua git.",
+                                parent=self._root,
+                            )
+                            return
+                        if not info.has_new_commits:
+                            self._clear_ui_busy()
+                            self._btn_check_updates.configure(state=tk.NORMAL)
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._lbl_state.configure(text="")
+                            messagebox.showinfo(
+                                "Cập nhật (git)",
+                                (
+                                    f"Đã đồng bộ — không có commit mới trên {info.remote_ref}.\n"
+                                    f"Local {info.local_sha_short} (nhánh «{info.branch}»)."
+                                ),
+                                parent=self._root,
+                            )
+                            return
+                        preview = (info.remote_preview or "—").strip()
+                        if not messagebox.askyesno(
+                            "Xác nhận cập nhật (git)",
+                            (
+                                f"Chạy: git pull --ff-only origin {info.branch}\n"
+                                f"Có {info.commits_behind} commit mới.\n"
+                                f"Mới nhất: {preview}\n\n"
+                                "Lưu ý: có chỉnh sửa file chưa commit thì pull có thể bị từ chối — "
+                                "hãy commit hoặc stash trước."
+                            ),
+                            parent=self._root,
+                        ):
+                            self._clear_ui_busy()
+                            self._btn_check_updates.configure(state=tk.NORMAL)
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._lbl_state.configure(text="")
+                            return
+
+                        self._lbl_state.configure(text="Update (git): đang pull…")
+
+                        def worker_pull() -> None:
+                            ok, msg = apply_git_pull_ff(root, branch=info.branch)
+
+                            def done_pull() -> None:
+                                if ok:
+                                    self._git_update_result = None
+                                    self._app_version_str = read_local_version(root)
+                                    self._root.title(
+                                        f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})"
+                                    )
+                                    self._lbl_app_version.configure(text=f"Phiên bản {self._app_version_str}")
+                                    self._lbl_state.configure(text="Update (git): hoàn tất — khởi động lại")
+                                    self._clear_ui_busy()
+                                    self._btn_check_updates.configure(state=tk.NORMAL)
+                                    self._btn_apply_update.configure(state=tk.NORMAL)
+                                    self._show_update_success_restart_dialog(
+                                        version=self._app_version_str,
+                                        backup_dir=None,
+                                    )
+                                else:
+                                    self._btn_check_updates.configure(state=tk.NORMAL)
+                                    self._btn_apply_update.configure(state=tk.NORMAL)
+                                    self._lbl_state.configure(text="Update (git): lỗi")
+                                    self._clear_ui_busy()
+                                    messagebox.showerror(
+                                        "Cập nhật (git)",
+                                        msg[:8000] or "git pull thất bại.",
+                                        parent=self._root,
+                                    )
+
+                            self._root.after(0, done_pull)
+
+                        threading.Thread(target=worker_pull, name="apply_git_pull", daemon=True).start()
+
+                    self._root.after(0, on_decide)
+                except Exception as exc:  # noqa: BLE001
+                    err_text = str(exc)
+
+                    def done_err() -> None:
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._lbl_state.configure(text="")
+                        self._clear_ui_busy()
+                        messagebox.showerror("Cập nhật (git)", err_text, parent=self._root)
+
+                    self._root.after(0, done_err)
+
+            threading.Thread(target=worker_git_apply, name="apply_update_git", daemon=True).start()
+            return
+
+        manifest_url = resolve_manifest_url(root)
         if not manifest_url:
             if messagebox.askyesno(
                 "Cập nhật",
                 (
-                    "Chưa cấu hình URL manifest (latest.json).\n\n"
-                    "Mở «Cấu hình kênh cập nhật» để nhập URL GitHub hoặc manifest khác?\n\n"
-                    "(Có thể dùng biến TOOLFB_UPDATE_MANIFEST_URL; dev: manifest_file / dist/latest.json.)"
+                    "Không có .git / git — cần URL manifest (latest.json) để tải zip.\n\n"
+                    "Mở «Cấu hình kênh cập nhật»?\n\n"
+                    "(Clone repo và chạy trong thư mục đó để dùng git pull.)"
                 ),
                 parent=self._root,
             ):
                 self._on_configure_update_channel()
             return
 
+        self._git_update_result = None
         self._set_ui_busy("apply_update")
         self._btn_check_updates.configure(state=tk.DISABLED)
         self._btn_apply_update.configure(state=tk.DISABLED)
