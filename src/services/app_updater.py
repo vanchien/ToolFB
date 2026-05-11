@@ -18,6 +18,32 @@ from loguru import logger
 from src.utils.app_restart import DEFERRED_GUI_BAT_NAME
 
 
+def resolve_git_executable() -> str | None:
+    """
+    Tìm ``git`` thực thi: biến ``TOOLFB_GIT``, ``PATH``, rồi vị trí mặc định Git for Windows
+    (mở GUI từ Explorer thường không có ``git`` trong PATH).
+    """
+    env_g = os.environ.get("TOOLFB_GIT", "").strip().strip('"')
+    if env_g:
+        p = Path(env_g)
+        if p.is_file():
+            return str(p.resolve())
+    w = shutil.which("git")
+    if w:
+        return w
+    if os.name == "nt":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        for base in (pf, pfx86):
+            if not base:
+                continue
+            for sub in ("Git/cmd/git.exe", "Git/bin/git.exe"):
+                cand = Path(base) / sub
+                if cand.is_file():
+                    return str(cand.resolve())
+    return None
+
+
 @dataclass(frozen=True)
 class UpdateManifest:
     """Manifest bản cập nhật lấy từ URL công khai."""
@@ -48,9 +74,23 @@ class GitUpdateCheckResult:
         return self.ok and self.commits_behind > 0
 
 
-def _git_run(project_root: Path, args: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+def _git_run(
+    project_root: Path,
+    args: list[str],
+    *,
+    timeout: int = 120,
+    git_exe: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    exe = git_exe or resolve_git_executable()
+    if not exe:
+        return subprocess.CompletedProcess(
+            args=["git", *args],
+            returncode=127,
+            stdout="",
+            stderr="Không tìm thấy git (PATH + Git for Windows). Đặt TOOLFB_GIT=đường_dẫn\\git.exe",
+        )
     return subprocess.run(
-        ["git", *args],
+        [exe, *args],
         cwd=str(project_root),
         capture_output=True,
         text=True,
@@ -63,32 +103,32 @@ def _git_run(project_root: Path, args: list[str], *, timeout: int = 120) -> subp
 
 def should_use_git_updates(project_root: Path) -> bool:
     """
-    Bản clone có ``.git`` + có lệnh ``git`` → ưu tiên «Kiểm tra / Cập nhật» bằng ``git pull``
-    (phù hợp mỗi lần đẩy code lên GitHub). Bản PyInstaller không dùng được.
+    Bản clone có ``.git`` + có thể gọi được ``git`` → ưu tiên «Kiểm tra / Cập nhật» bằng ``git pull``.
+    Bản PyInstaller không dùng được.
     """
     if getattr(sys, "frozen", False):
         return False
-    if not shutil.which("git"):
+    if not (project_root / ".git").exists():
         return False
-    return (project_root / ".git").exists()
+    return resolve_git_executable() is not None
 
 
-def _git_remote_tip_ref(project_root: Path, branch: str) -> tuple[str, str] | None:
+def _git_remote_tip_ref(project_root: Path, branch: str, *, git_exe: str | None = None) -> tuple[str, str] | None:
     """
     Returns:
         ``(full_sha, ref_label)`` với ref kiểu ``origin/main``, hoặc ``None``.
     """
-    p = _git_run(project_root, ["rev-parse", f"origin/{branch}"], timeout=45)
+    p = _git_run(project_root, ["rev-parse", f"origin/{branch}"], timeout=45, git_exe=git_exe)
     if p.returncode == 0 and (p.stdout or "").strip():
         sha = (p.stdout or "").strip()
         return sha, f"origin/{branch}"
-    sym = _git_run(project_root, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], timeout=45)
+    sym = _git_run(project_root, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], timeout=45, git_exe=git_exe)
     if sym.returncode == 0 and (sym.stdout or "").strip():
         ref = (sym.stdout or "").strip()
-        p3 = _git_run(project_root, ["rev-parse", ref], timeout=45)
+        p3 = _git_run(project_root, ["rev-parse", ref], timeout=45, git_exe=git_exe)
         if p3.returncode == 0 and (p3.stdout or "").strip():
             return (p3.stdout or "").strip(), ref
-    lr = _git_run(project_root, ["ls-remote", "--symref", "origin", "HEAD"], timeout=90)
+    lr = _git_run(project_root, ["ls-remote", "--symref", "origin", "HEAD"], timeout=90, git_exe=git_exe)
     if lr.returncode == 0 and (lr.stdout or "").strip():
         first = (lr.stdout or "").strip().splitlines()[0]
         if first.startswith("ref:"):
@@ -97,18 +137,62 @@ def _git_remote_tip_ref(project_root: Path, branch: str) -> tuple[str, str] | No
                 symref = parts[1].strip()
                 if symref.startswith("refs/heads/"):
                     default_br = symref.split("/", 2)[2]
-                    p4 = _git_run(project_root, ["rev-parse", f"origin/{default_br}"], timeout=45)
+                    p4 = _git_run(project_root, ["rev-parse", f"origin/{default_br}"], timeout=45, git_exe=git_exe)
                     if p4.returncode == 0 and (p4.stdout or "").strip():
                         return (p4.stdout or "").strip(), f"origin/{default_br}"
     return None
 
 
+def _resolve_remote_tip_after_fetch(
+    project_root: Path, *, local_branch: str, git_exe: str | None = None
+) -> tuple[str, str] | None:
+    """
+    Chọn ref trên ``origin`` để so sánh với ``HEAD``:
+    1) ``@{upstream}`` nếu nhánh hiện tại đã gắn tracking;
+    2) ``origin/<tên nhánh local>``;
+    3) ``origin/HEAD`` (nhánh mặc định của remote).
+    """
+    up = _git_run(project_root, ["rev-parse", "--abbrev-ref", "@{u}"], timeout=30, git_exe=git_exe)
+    if up.returncode == 0 and (up.stdout or "").strip():
+        remote_ref = (up.stdout or "").strip()
+        if remote_ref != "HEAD":
+            tip = _git_run(project_root, ["rev-parse", remote_ref], timeout=30, git_exe=git_exe)
+            if tip.returncode == 0 and (tip.stdout or "").strip():
+                return (tip.stdout or "").strip(), remote_ref
+    if local_branch:
+        t2 = _git_remote_tip_ref(project_root, local_branch, git_exe=git_exe)
+        if t2 is not None:
+            return t2
+    return _git_remote_tip_ref(project_root, "main", git_exe=git_exe)
+
+
+def _commits_behind_left_right(project_root: Path, remote_ref: str, *, git_exe: str | None = None) -> int:
+    """Số commit trên ``remote_ref`` mà ``HEAD`` chưa có (``left\\tright`` → lấy ``right``)."""
+    lr = _git_run(
+        project_root,
+        ["rev-list", "--left-right", "--count", f"HEAD...{remote_ref}"],
+        timeout=90,
+        git_exe=git_exe,
+    )
+    if lr.returncode != 0 or not (lr.stdout or "").strip():
+        return -1
+    parts = (lr.stdout or "").strip().split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1])
+    if "\t" in (lr.stdout or ""):
+        seg = (lr.stdout or "").strip().split("\t", 1)
+        if len(seg) == 2 and seg[1].strip().isdigit():
+            return int(seg[1].strip())
+    return -1
+
+
 def check_git_updates(project_root: Path, *, timeout_fetch: int = 180) -> GitUpdateCheckResult:
     """``git fetch origin`` rồi đếm commit trên remote mà local chưa có."""
+    git_exe = resolve_git_executable()
     if not (project_root / ".git").exists():
         return GitUpdateCheckResult(
             is_git_clone=False,
-            git_on_path=bool(shutil.which("git")),
+            git_on_path=git_exe is not None,
             ok=False,
             branch="",
             local_sha_short="",
@@ -118,7 +202,7 @@ def check_git_updates(project_root: Path, *, timeout_fetch: int = 180) -> GitUpd
             remote_preview="",
             error=None,
         )
-    if not shutil.which("git"):
+    if not git_exe:
         return GitUpdateCheckResult(
             is_git_clone=True,
             git_on_path=False,
@@ -129,20 +213,22 @@ def check_git_updates(project_root: Path, *, timeout_fetch: int = 180) -> GitUpd
             remote_ref="",
             commits_behind=0,
             remote_preview="",
-            error="Không tìm thấy lệnh git trên PATH (cài Git for Windows / git trên Linux).",
+            error=(
+                "Không tìm thấy git.exe (PATH và thư mục mặc định Git for Windows).\n"
+                "Cài Git for Windows hoặc đặt biến môi trường TOOLFB_GIT trỏ tới git.exe "
+                r"(vd. C:\Program Files\Git\cmd\git.exe)."
+            ),
         )
-    br_p = _git_run(project_root, ["branch", "--show-current"], timeout=30)
+    br_p = _git_run(project_root, ["branch", "--show-current"], timeout=30, git_exe=git_exe)
     branch = (br_p.stdout or "").strip()
-    if not branch:
-        branch = "main"
-    fe = _git_run(project_root, ["fetch", "origin"], timeout=timeout_fetch)
+    fe = _git_run(project_root, ["fetch", "origin"], timeout=timeout_fetch, git_exe=git_exe)
     if fe.returncode != 0:
         err = ((fe.stderr or "") + (fe.stdout or "")).strip() or "git fetch thất bại"
         return GitUpdateCheckResult(
             is_git_clone=True,
             git_on_path=True,
             ok=False,
-            branch=branch,
+            branch=branch or "(detached)",
             local_sha_short="",
             remote_sha_short="",
             remote_ref="",
@@ -150,39 +236,42 @@ def check_git_updates(project_root: Path, *, timeout_fetch: int = 180) -> GitUpd
             remote_preview="",
             error=err[:4000],
         )
-    tip = _git_remote_tip_ref(project_root, branch)
+    tip = _resolve_remote_tip_after_fetch(project_root, local_branch=branch, git_exe=git_exe)
     if tip is None:
         return GitUpdateCheckResult(
             is_git_clone=True,
             git_on_path=True,
             ok=False,
-            branch=branch,
+            branch=branch or "(detached)",
             local_sha_short="",
             remote_sha_short="",
             remote_ref="",
             commits_behind=0,
             remote_preview="",
             error=(
-                f"Không xác định được tip của origin cho nhánh «{branch}».\n"
-                f"Đảm bảo đã push nhánh lên GitHub hoặc đổi sang nhánh có trên remote (vd. main)."
+                "Không xác định được nhánh mặc định trên origin.\n"
+                "Chạy: git remote -v và git branch -vv — cần origin trỏ đúng GitHub và đã fetch."
             ),
         )
     remote_full, remote_ref = tip
-    loc = _git_run(project_root, ["rev-parse", "HEAD"], timeout=30)
+    loc = _git_run(project_root, ["rev-parse", "HEAD"], timeout=30, git_exe=git_exe)
     local_full = (loc.stdout or "").strip() if loc.returncode == 0 else ""
-    cnt = _git_run(project_root, ["rev-list", "--count", f"HEAD..{remote_full}"], timeout=60)
-    behind = 0
-    if cnt.returncode == 0 and (cnt.stdout or "").strip().isdigit():
-        behind = int((cnt.stdout or "").strip())
-    elif local_full and remote_full and local_full != remote_full:
-        behind = max(1, behind)
-    log1 = _git_run(project_root, ["log", "-1", "--oneline", remote_full], timeout=30)
+    behind = _commits_behind_left_right(project_root, remote_ref, git_exe=git_exe)
+    if behind < 0:
+        cnt = _git_run(project_root, ["rev-list", "--count", f"HEAD..{remote_full}"], timeout=60, git_exe=git_exe)
+        if cnt.returncode == 0 and (cnt.stdout or "").strip().isdigit():
+            behind = int((cnt.stdout or "").strip())
+        elif local_full and remote_full and local_full != remote_full:
+            behind = 1
+        else:
+            behind = 0
+    log1 = _git_run(project_root, ["log", "-1", "--oneline", remote_full], timeout=30, git_exe=git_exe)
     preview = ((log1.stdout or "").strip())[:500]
     return GitUpdateCheckResult(
         is_git_clone=True,
         git_on_path=True,
         ok=True,
-        branch=branch,
+        branch=branch or "(detached)",
         local_sha_short=local_full[:12] if local_full else "",
         remote_sha_short=remote_full[:12],
         remote_ref=remote_ref,
@@ -192,15 +281,38 @@ def check_git_updates(project_root: Path, *, timeout_fetch: int = 180) -> GitUpd
     )
 
 
-def apply_git_pull_ff(project_root: Path, *, branch: str, timeout: int = 300) -> tuple[bool, str]:
+def apply_git_pull_ff(project_root: Path, *, result: GitUpdateCheckResult, timeout: int = 300) -> tuple[bool, str]:
     """
-    ``git pull --ff-only origin <branch>`` — tránh merge commit; lỗi nếu có chỉnh sửa cục bộ chưa commit.
+    Ưu tiên ``git pull --ff-only`` (theo upstream). Nếu lỗi: ``git pull --ff-only origin <nhánh>``
+    với nhánh suy ra từ ``remote_ref`` (vd. ``origin/main`` → ``main``).
     """
-    p = _git_run(project_root, ["pull", "--ff-only", "origin", branch], timeout=timeout)
+    git_exe = resolve_git_executable()
+    if not git_exe:
+        return False, "Không tìm thấy git.exe."
+
+    p = _git_run(project_root, ["pull", "--ff-only"], timeout=timeout, git_exe=git_exe)
     out = ((p.stdout or "").strip() + "\n" + (p.stderr or "").strip()).strip()
-    if p.returncode != 0:
-        return False, out or "git pull --ff-only thất bại"
-    return True, out
+    if p.returncode == 0:
+        return True, out
+
+    remote_name = "origin"
+    rb = "main"
+    ref = (result.remote_ref or "").strip()
+    if ref and "/" in ref:
+        remote_name, rb = ref.split("/", 1)
+    elif result.branch and result.branch != "(detached)":
+        rb = result.branch
+
+    p2 = _git_run(
+        project_root,
+        ["pull", "--ff-only", remote_name, rb],
+        timeout=timeout,
+        git_exe=git_exe,
+    )
+    out2 = ((p2.stdout or "").strip() + "\n" + (p2.stderr or "").strip()).strip()
+    if p2.returncode == 0:
+        return True, (out + "\n" + out2).strip() if out else out2
+    return False, (out + "\n---\n" + out2).strip() if out else (out2 or "git pull --ff-only thất bại")
 
 
 def read_local_version(project_root: Path) -> str:
@@ -215,6 +327,75 @@ def read_local_version(project_root: Path) -> str:
     if not isinstance(raw, dict):
         return "0.0.0-dev"
     return str(raw.get("version", "")).strip() or "0.0.0-dev"
+
+
+def parse_github_owner_repo_from_url(url: str) -> str:
+    """Từ URL GitHub (Release, repo…) → ``owner/repo``."""
+    u = (url or "").strip()
+    low = u.lower()
+    if "github.com/" not in low:
+        return ""
+    idx = low.index("github.com/") + len("github.com/")
+    rest = u[idx:].lstrip("/")
+    parts = [p for p in rest.split("/") if p]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return ""
+
+
+def resolve_github_owner_repo_for_version_check(project_root: Path) -> str:
+    """``owner/repo`` để đọc ``version.json`` raw: từ git hoặc URL manifest trong config."""
+    try:
+        from src.utils.github_repo_detect import github_owner_repo_from_git
+
+        rid = github_owner_repo_from_git(project_root)
+        if rid:
+            return rid
+    except Exception:
+        pass
+    cf = project_root / "config" / "update_channel.json"
+    if cf.is_file():
+        try:
+            raw = json.loads(cf.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        if isinstance(raw, dict):
+            u = str(raw.get("manifest_url", "")).strip()
+            pr = parse_github_owner_repo_from_url(u)
+            if pr:
+                return pr
+    return ""
+
+
+def read_remote_version_from_github_raw(
+    owner_repo: str,
+    *,
+    branches: tuple[str, ...] = ("main", "master"),
+    timeout_sec: int = 15,
+) -> tuple[str | None, str]:
+    """
+    Đọc ``version.json`` qua raw.githubusercontent.com (không cần git).
+
+    Returns:
+        ``(phiên_bản hoặc None, nhánh đã đọc được / ghi chú)``.
+    """
+    r = (owner_repo or "").strip().strip("/").replace(" ", "")
+    if not r or "/" not in r:
+        return None, ""
+    for br in branches:
+        url = f"https://raw.githubusercontent.com/{r}/{br}/version.json"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "ToolFB-Updater/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                data = resp.read()
+            raw = json.loads(data.decode("utf-8", errors="replace"))
+            if isinstance(raw, dict):
+                v = str(raw.get("version", "")).strip()
+                if v:
+                    return v, br
+        except Exception:
+            continue
+    return None, ""
 
 
 def read_manifest_from_url(manifest_url: str, *, timeout_sec: int = 20) -> UpdateManifest:

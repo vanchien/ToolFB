@@ -49,6 +49,8 @@ from src.services.app_updater import (
     is_newer_version,
     read_local_version,
     read_manifest_from_url,
+    read_remote_version_from_github_raw,
+    resolve_github_owner_repo_for_version_check,
     resolve_manifest_url,
     should_use_git_updates,
 )
@@ -5518,11 +5520,29 @@ class _ManagerWindow:
                         )
                     else:
                         self._btn_apply_update.configure(state=tk.NORMAL)
-                        messagebox.showinfo(
-                            "Cập nhật",
-                            f"Bạn đang dùng bản mới nhất ({local_v}).",
-                            parent=self._root,
-                        )
+                        root_p = project_root()
+                        rid = resolve_github_owner_repo_for_version_check(root_p)
+                        raw_v, raw_br = read_remote_version_from_github_raw(rid) if rid else (None, "")
+                        if raw_v and is_newer_version(raw_v, local_v):
+                            messagebox.showwarning(
+                                "Cập nhật — manifest chưa kịp theo GitHub",
+                                (
+                                    f"Manifest (Release) báo không có zip mới hơn bạn ({local_v}).\n"
+                                    f"Nhưng trên GitHub nhánh «{raw_br}» (raw) có version.json = {raw_v}.\n\n"
+                                    "Cách xử lý:\n"
+                                    "• Máy clone: cài Git, mở app trong thư mục có .git, hoặc đặt TOOLFB_GIT=…\\git.exe — "
+                                    "sẽ cập nhật bằng git pull.\n"
+                                    "• Bản zip/.exe: cần maintainer cập nhật file latest.json + gói zip trên Release, "
+                                    "rồi bấm «Cập nhật ngay» lại."
+                                ),
+                                parent=self._root,
+                            )
+                        else:
+                            messagebox.showinfo(
+                                "Cập nhật",
+                                f"Bạn đang dùng bản mới nhất ({local_v}).",
+                                parent=self._root,
+                            )
 
                 self._root.after(0, done_ok)
             except Exception as exc:  # noqa: BLE001
@@ -5674,7 +5694,7 @@ class _ManagerWindow:
                         self._lbl_state.configure(text="Update (git): đang pull…")
 
                         def worker_pull() -> None:
-                            ok, msg = apply_git_pull_ff(root, branch=info.branch)
+                            ok, msg = apply_git_pull_ff(root, result=info)
 
                             def done_pull() -> None:
                                 if ok:
