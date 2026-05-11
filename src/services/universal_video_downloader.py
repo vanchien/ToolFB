@@ -1352,7 +1352,9 @@ class UniversalYTDLPWrapper:
         ut = (url_type or "unknown").lower()
         fmt = str(self._yt.get("format") or "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best")
         fast_single = str(self._yt.get("single_video_fast_format") or "b[ext=mp4]/best[ext=mp4]/best")
-        if ut == "single_video" and bool(self._yt.get("prefer_fast_single_video", True)):
+        # ``unknown`` thường là URL đơn mà heuristic chưa khớp; đừng ép merge bv+ba (rất chậm/CPU).
+        prefer_fast = bool(self._yt.get("prefer_fast_single_video", True))
+        if prefer_fast and ut in ("single_video", "unknown"):
             fmt = fast_single
         merge_fmt = str(self._yt.get("merge_output_format") or "mp4")
         ffmpeg_bin = _resolve_ffmpeg_for_ytdlp()
@@ -1364,7 +1366,7 @@ class UniversalYTDLPWrapper:
             log_lines("[yt-dlp] Không thấy ffmpeg -> fallback format không cần merge (ưu tiên mp4).")
         sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
         # Batch theo URL đơn không nên chèn sleep giữa request, sẽ rất chậm trên máy yếu.
-        if ut == "single_video":
+        if ut in ("single_video", "unknown"):
             sleep_sec = 0
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
