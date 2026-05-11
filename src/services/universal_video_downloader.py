@@ -142,6 +142,26 @@ def _norm_url_key(u: str) -> str:
     return u.rstrip("/")
 
 
+def _repair_mojibake_text(text: str) -> str:
+    """
+    Sửa chuỗi tiếng Việt bị vỡ dấu khi nguồn bị decode sai (UTF-8 <-> cp1252/latin-1).
+    """
+    s = str(text or "")
+    if not s:
+        return s
+    low = s.lower()
+    if ("�" not in s) and not any(tok in low for tok in ("ã", "â", "ä", "á»", "áº")):
+        return s
+    for src_enc in ("cp1252", "latin-1"):
+        try:
+            fixed = s.encode(src_enc, errors="strict").decode("utf-8", errors="strict")
+        except Exception:
+            continue
+        if fixed and fixed != s:
+            return fixed
+    return s
+
+
 def scan_output_dir_for_existing_media(*, root: Path, url: str) -> list[str]:
     """
     Khi yt-dlp không in after_move (skip archive, merge, v.v.) nhưng file đã nằm trên đĩa.
@@ -1058,6 +1078,8 @@ class UniversalYTDLPWrapper:
             "--skip-download",
             "--quiet",
             "--no-warnings",
+            "--encoding",
+            "utf-8",
         ]
         if ut in ("playlist", "channel", "profile"):
             cmd.append("--flat-playlist")
@@ -1092,8 +1114,8 @@ class UniversalYTDLPWrapper:
         return {
             "success": True,
             "extractor": str(data.get("extractor") or data.get("ie_key") or ""),
-            "title": str(data.get("title") or data.get("playlist_title") or ""),
-            "uploader": str(data.get("uploader") or data.get("playlist_uploader") or ""),
+            "title": _repair_mojibake_text(str(data.get("title") or data.get("playlist_title") or "")),
+            "uploader": _repair_mojibake_text(str(data.get("uploader") or data.get("playlist_uploader") or "")),
             "entry_count": n if n else (1 if data.get("id") else 0),
             "url_type": ut,
         }
@@ -1137,7 +1159,7 @@ class UniversalYTDLPWrapper:
         while len(parts) < 5:
             parts.append("")
         vid = str(parts[0] or "").strip()
-        title = str(parts[1] or "").strip()
+        title = _repair_mojibake_text(str(parts[1] or "").strip())
         webpage_url = str(parts[2] or "").strip()
         url_raw = str(parts[3] or "").strip()
         uploader_id = str(parts[4] or "").strip()
@@ -1185,6 +1207,8 @@ class UniversalYTDLPWrapper:
             "--skip-download",
             "--quiet",
             "--no-warnings",
+            "--encoding",
+            "utf-8",
             "--flat-playlist",
             "--lazy-playlist",
             "--playlist-end",
@@ -1338,6 +1362,8 @@ class UniversalYTDLPWrapper:
                 "--skip-download",
                 "--quiet",
                 "--no-warnings",
+                "--encoding",
+                "utf-8",
                 "--flat-playlist",
                 "--playlist-end",
                 str(n),
@@ -1376,7 +1402,7 @@ class UniversalYTDLPWrapper:
                     play_url = self._flat_playlist_entry_url(e, source_url=raw, platform=platform)
                     if not play_url:
                         continue
-                    title = str(e.get("title") or e.get("id") or play_url)[:500]
+                    title = _repair_mojibake_text(str(e.get("title") or e.get("id") or play_url))[:500]
                     out2.append({"title": title, "url": play_url})
             return {
                 "success": True,
@@ -1441,6 +1467,8 @@ class UniversalYTDLPWrapper:
             fmt,
             "--newline",
             "--no-progress",
+            "--encoding",
+            "utf-8",
             "--concurrent-fragments",
             str(frag_workers),
             "--print",
