@@ -5260,8 +5260,8 @@ class _ManagerWindow:
         )
 
         hint = (
-            "Nếu chạy từ thư mục git clone (có .git): «Kiểm tra cập nhật» / «Cập nhật ngay» sẽ ưu tiên "
-            "git fetch + git pull — không cần manifest trừ khi dùng bản .exe đóng gói.\n"
+            "Manifest mặc định đọc từ nhánh main (raw GitHub: release/update/latest.json), không phụ thuộc file Release cũ.\n"
+            "Nếu chạy từ thư mục git clone (có .git): «Cập nhật ngay» ưu tiên git pull.\n"
             "«Tự động từ Git remote»: điền URL manifest từ ``git remote origin`` (dùng khi cập nhật bằng file zip trên Release).\n"
             "Ví dụ URL: https://github.com/vanchien/ToolFB/releases/latest/download/latest.json\n"
             "Biến môi trường TOOLFB_UPDATE_MANIFEST_URL (nếu có) vẫn được ưu tiên cho luồng zip."
@@ -5673,23 +5673,6 @@ class _ManagerWindow:
                                 parent=self._root,
                             )
                             return
-                        preview = (info.remote_preview or "—").strip()
-                        if not messagebox.askyesno(
-                            "Xác nhận cập nhật (git)",
-                            (
-                                f"Chạy: git pull --ff-only origin {info.branch}\n"
-                                f"Có {info.commits_behind} commit mới.\n"
-                                f"Mới nhất: {preview}\n\n"
-                                "Lưu ý: có chỉnh sửa file chưa commit thì pull có thể bị từ chối — "
-                                "hãy commit hoặc stash trước."
-                            ),
-                            parent=self._root,
-                        ):
-                            self._clear_ui_busy()
-                            self._btn_check_updates.configure(state=tk.NORMAL)
-                            self._btn_apply_update.configure(state=tk.NORMAL)
-                            self._lbl_state.configure(text="")
-                            return
 
                         self._lbl_state.configure(text="Update (git): đang pull…")
 
@@ -5781,22 +5764,6 @@ class _ManagerWindow:
                             f"Bạn đang dùng bản mới nhất ({local_v}). Không cần cập nhật.",
                             parent=self._root,
                         )
-                        return
-                    notes = (mf.notes or "—").strip()
-                    if not messagebox.askyesno(
-                        "Xác nhận cập nhật",
-                        (
-                            f"Tải và cập nhật lên phiên bản {mf.version}?\n"
-                            f"Bản hiện tại: {local_v}\n\n"
-                            f"Ghi chú: {notes}\n\n"
-                            "App sẽ backup, tải gói zip và yêu cầu khởi động lại sau khi hoàn tất."
-                        ),
-                        parent=self._root,
-                    ):
-                        self._clear_ui_busy()
-                        self._btn_check_updates.configure(state=tk.NORMAL)
-                        self._btn_apply_update.configure(state=tk.NORMAL)
-                        self._lbl_state.configure(text="")
                         return
 
                     self._lbl_state.configure(text="Update: đang tải & áp dụng…")

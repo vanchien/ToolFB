@@ -939,18 +939,54 @@ def _copytree_resilient(src: Path, dst: Path) -> None:
                 logger.warning("Updater tools: không copy được {} -> {}: {}", s, t, exc)
 
 
+def github_repo_raw_manifest_url(owner_slash_repo: str, *, branch: str = "main") -> str:
+    """
+    URL manifest trong repo (luôn theo commit trên nhánh), không phụ thuộc GitHub Release asset.
+
+    File trong repo: ``release/update/latest.json`` (đồng bộ ``version`` với ``version.json``).
+    """
+    r = (owner_slash_repo or "").strip().strip("/").replace(" ", "")
+    if not r or "/" not in r:
+        raise ValueError("Repo phải dạng owner/repo (ví dụ vanchien/ToolFB).")
+    a, b, *rest = r.split("/", 2)
+    if not a or not b or rest:
+        raise ValueError("Repo phải dạng owner/repo (một dấu / giữa owner và tên repo).")
+    br = (branch or "main").strip() or "main"
+    return f"https://raw.githubusercontent.com/{a}/{b}/{br}/release/update/latest.json"
+
+
+def prefer_repo_raw_manifest_url(manifest_url: str) -> str:
+    """
+    Nếu manifest trỏ tới GitHub Release ``…/releases/latest/download/*.json`` (dễ cũ),
+    chuyển sang manifest raw trên nhánh ``main`` trong cùng repo.
+    """
+    u = (manifest_url or "").strip()
+    if not u:
+        return u
+    low = u.lower()
+    if "raw.githubusercontent.com" in low and "release/update/latest.json" in low:
+        return u
+    rid = parse_github_owner_repo_from_url(u)
+    if not rid:
+        return u
+    if "/releases/latest/download/" in low and low.rstrip("/").endswith(".json"):
+        return github_repo_raw_manifest_url(rid)
+    return u
+
+
 def resolve_manifest_url(project_root: Path) -> str:
     """
     URL manifest update:
     - env ``TOOLFB_UPDATE_MANIFEST_URL``
     - hoặc ``config/update_channel.json``:
-      - ``manifest_url`` (http/https)
+      - ``manifest_url`` (http/https) — URL kiểu Release ``latest/download`` được chuyển sang raw trên ``main``
       - ``manifest_file`` (đường dẫn tương đối tới project, dùng khi dev không có CDN)
     - fallback: ``dist/latest.json`` nếu file tồn tại (dev local sau khi build)
+    - cuối: ``raw.githubusercontent.com/.../main/release/update/latest.json`` từ ``git remote origin``
     """
     env_url = os.environ.get("TOOLFB_UPDATE_MANIFEST_URL", "").strip()
     if env_url:
-        return env_url
+        return prefer_repo_raw_manifest_url(env_url)
     cf = project_root / "config" / "update_channel.json"
     if cf.is_file():
         try:
@@ -960,7 +996,7 @@ def resolve_manifest_url(project_root: Path) -> str:
         if isinstance(raw, dict):
             u = str(raw.get("manifest_url", "")).strip()
             if u:
-                return u
+                return prefer_repo_raw_manifest_url(u)
             mf_local = str(raw.get("manifest_file", "")).strip()
             if mf_local:
                 p = Path(mf_local)
@@ -971,13 +1007,13 @@ def resolve_manifest_url(project_root: Path) -> str:
     dev_latest = (project_root / "dist" / "latest.json").resolve()
     if dev_latest.is_file():
         return dev_latest.as_uri()
-    # Clone git thường chưa có update_channel.json: thử dò owner/repo từ ``git remote origin``.
+    # Clone git thường chưa có update_channel.json: manifest raw trên nhánh main.
     try:
         from src.utils.github_repo_detect import github_owner_repo_from_git
 
         r = github_owner_repo_from_git(project_root)
         if r:
-            return github_latest_manifest_url(r)
+            return github_repo_raw_manifest_url(r)
     except Exception:
         pass
     return ""
@@ -985,21 +1021,8 @@ def resolve_manifest_url(project_root: Path) -> str:
 
 def github_latest_manifest_url(owner_slash_repo: str) -> str:
     """
-    Sinh URL manifest ``latest.json`` kiểu GitHub Releases (nhánh *latest/download*).
+    Sinh URL manifest cập nhật (file ``release/update/latest.json`` trên nhánh ``main``).
 
-    Args:
-        owner_slash_repo: Chuỗi ``owner/repo`` (ví dụ ``vanchien/ToolFB``).
-
-    Returns:
-        URL ``https://github.com/<owner>/<repo>/releases/latest/download/latest.json``.
-
-    Raises:
-        ValueError: Repo rỗng hoặc không đúng dạng ``owner/repo``.
+    Giữ tên hàm để tương thích GUI; không còn trỏ tới Release ``latest/download`` (dễ lệch version).
     """
-    r = (owner_slash_repo or "").strip().strip("/").replace(" ", "")
-    if not r or "/" not in r:
-        raise ValueError("Repo phải dạng owner/repo (ví dụ vanchien/ToolFB).")
-    a, b, *rest = r.split("/", 2)
-    if not a or not b or rest:
-        raise ValueError("Repo phải dạng owner/repo (một dấu / giữa owner và tên repo).")
-    return f"https://github.com/{a}/{b}/releases/latest/download/latest.json"
+    return github_repo_raw_manifest_url(owner_slash_repo, branch="main")
