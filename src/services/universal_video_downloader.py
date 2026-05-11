@@ -60,6 +60,15 @@ def _ytdlp_subprocess_kw() -> dict[str, Any]:
         return {}
     return {"creationflags": int(subprocess.CREATE_NO_WINDOW)}
 
+
+def _resolve_ffmpeg_for_ytdlp() -> str:
+    """Ưu tiên ffmpeg cạnh app, rồi PATH."""
+    local = project_root() / "tools" / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if local.is_file():
+        return str(local.resolve())
+    via_path = shutil.which("ffmpeg")
+    return str(via_path or "").strip()
+
 YTDLP_PYPI_JSON_URL = "https://pypi.org/pypi/yt-dlp/json"
 # File yt-dlp.exe đóng gói kèm app; nhỏ hơn ngưỡng này coi như tải lỗi / placeholder.
 YTDLP_BUNDLE_EXE_MIN_BYTES = 400_000
@@ -1157,6 +1166,13 @@ class UniversalYTDLPWrapper:
         prefix = self._resolve_prefix()
         fmt = str(self._yt.get("format") or "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best")
         merge_fmt = str(self._yt.get("merge_output_format") or "mp4")
+        ffmpeg_bin = _resolve_ffmpeg_for_ytdlp()
+        has_ffmpeg = bool(ffmpeg_bin)
+        if not has_ffmpeg:
+            # Máy khách thiếu ffmpeg trong bundle/PATH: dùng profile không cần merge
+            # để tránh chậm/lỗi do yt-dlp thử ghép AV rồi fail.
+            fmt = "b[ext=mp4]/best[ext=mp4]/best"
+            log_lines("[yt-dlp] Không thấy ffmpeg -> fallback format không cần merge (ưu tiên mp4).")
         sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
@@ -1165,8 +1181,6 @@ class UniversalYTDLPWrapper:
             *prefix,
             "-f",
             fmt,
-            "--merge-output-format",
-            merge_fmt,
             "--newline",
             "--no-progress",
             "--concurrent-fragments",
@@ -1178,6 +1192,8 @@ class UniversalYTDLPWrapper:
             "-o",
             output_template,
         ]
+        if has_ffmpeg:
+            cmd.extend(["--merge-output-format", merge_fmt, "--ffmpeg-location", ffmpeg_bin])
         if sleep_sec:
             cmd.extend(["--sleep-interval", str(sleep_sec), "--max-sleep-interval", str(max(sleep_sec, 5))])
         if write_info_json:
