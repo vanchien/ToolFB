@@ -72,6 +72,7 @@ def _resolve_ffmpeg_for_ytdlp() -> str:
 YTDLP_PYPI_JSON_URL = "https://pypi.org/pypi/yt-dlp/json"
 # File yt-dlp.exe đóng gói kèm app; nhỏ hơn ngưỡng này coi như tải lỗi / placeholder.
 YTDLP_BUNDLE_EXE_MIN_BYTES = 400_000
+YTDLP_WIN_EXE_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 
 _YTDLP_MEDIA_EXTENSIONS = frozenset({".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"})
 
@@ -944,6 +945,54 @@ class UniversalYTDLPWrapper:
         return p
 
     @staticmethod
+    def _auto_update_state_file() -> Path:
+        return ensure_downloader_layout()["root"] / "ytdlp_auto_update.json"
+
+    @classmethod
+    def maybe_auto_update_standalone_exe(cls, *, min_hours_between_attempts: int = 24) -> dict[str, Any]:
+        """Best-effort: tự cập nhật yt-dlp.exe mỗi ~24h (Windows)."""
+        if os.name != "nt":
+            return {"ok": False, "reason": "not_windows"}
+        target = project_root() / "tools" / "yt-dlp" / "yt-dlp.exe"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state_path = cls._auto_update_state_file()
+        now_ts = time.time()
+        state: dict[str, Any] = {}
+        if state_path.is_file():
+            try:
+                raw = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    state = raw
+            except Exception:
+                state = {}
+        last_attempt = float(state.get("last_attempt_ts") or 0.0)
+        if now_ts - last_attempt < max(1, int(min_hours_between_attempts)) * 3600:
+            return {"ok": False, "reason": "recently_attempted"}
+        state["last_attempt_ts"] = now_ts
+        try:
+            state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        tmp = target.with_suffix(".tmp")
+        req = urllib.request.Request(YTDLP_WIN_EXE_URL, headers={"User-Agent": "ToolFB-runtime-ytdlp-auto-update"})
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as fh:
+                shutil.copyfileobj(resp, fh, length=256 * 1024)
+            if not tmp.is_file() or tmp.stat().st_size < YTDLP_BUNDLE_EXE_MIN_BYTES:
+                tmp.unlink(missing_ok=True)
+                return {"ok": False, "reason": "download_too_small"}
+            tmp.replace(target)
+            state["last_success_ts"] = time.time()
+            try:
+                state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            return {"ok": True, "path": str(target)}
+        except Exception as exc:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            return {"ok": False, "reason": str(exc)}
+
+    @staticmethod
     def _probe_python_m_ytdlp() -> list[str] | None:
         """
         Cùng interpreter đang chạy app: ``python -m yt_dlp`` thường chạy được
@@ -1103,7 +1152,13 @@ class UniversalYTDLPWrapper:
             return None
         return {"title": (title or vid or final_url)[:500], "url": final_url}
 
-    def list_flat_playlist_entries(self, url: str, *, max_entries: int = 500) -> dict[str, Any]:
+    def list_flat_playlist_entries(
+        self,
+        url: str,
+        *,
+        max_entries: int = 500,
+        on_partial: Callable[[list[dict[str, str]]], None] | None = None,
+    ) -> dict[str, Any]:
         """
         Liệt kê entry trong kênh / playlist (``--flat-playlist``) không tải video.
         Hỗ trợ YouTube (channel/playlist) và TikTok (profile).
@@ -1141,23 +1196,60 @@ class UniversalYTDLPWrapper:
             cmd.extend(["--proxy", proxy])
         cmd.append(raw)
         timeout = int(self._yt.get("timeout_sec") or 600)
+        timeout_scan = min(max(60, n // 3 + 40), timeout)
         try:
-            p = subprocess.run(
+            p = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=min(max(60, n // 3 + 40), timeout),
                 encoding="utf-8",
                 errors="replace",
-                stdin=subprocess.DEVNULL,
                 **_ytdlp_subprocess_kw(),
             )
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout}s)."}
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "error": str(exc)}
-        if p.returncode != 0:
-            err = (p.stderr or p.stdout or "").strip()
+        out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        stderr_tail: deque[str] = deque(maxlen=1200)
+        t0 = time.monotonic()
+        last_partial_ts = 0.0
+        try:
+            if p.stdout is not None:
+                for ln in p.stdout:
+                    if time.monotonic() - t0 > timeout_scan:
+                        p.kill()
+                        return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
+                    rec = self._parse_flat_print_line(ln, source_url=raw, platform=platform)
+                    if not rec:
+                        continue
+                    u = rec["url"]
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    out.append(rec)
+                    if on_partial and (len(out) <= 10 or time.monotonic() - last_partial_ts > 0.4):
+                        try:
+                            on_partial(list(out))
+                        except Exception:
+                            pass
+                        last_partial_ts = time.monotonic()
+            if p.stderr is not None:
+                for ln in p.stderr:
+                    stderr_tail.append(ln)
+            rc = p.wait(timeout=max(3, timeout_scan))
+        except subprocess.TimeoutExpired:
+            p.kill()
+            return {"success": False, "error": f"Hết thời gian khi quét danh sách (>{timeout_scan}s)."}
+        except Exception as exc:  # noqa: BLE001
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return {"success": False, "error": str(exc)}
+        if rc != 0:
+            err = ("".join(stderr_tail) or "").strip()
             # Fallback tương thích cho bản yt-dlp cũ không hỗ trợ một số cờ scan nhanh.
             cmd_fallback = [
                 *self._resolve_prefix(),
@@ -1211,17 +1303,11 @@ class UniversalYTDLPWrapper:
                 "playlist_title": str(data.get("title") or data.get("playlist_title") or ""),
                 "extractor": str(data.get("extractor") or data.get("ie_key") or ""),
             }
-        out: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for ln in str(p.stdout or "").splitlines():
-            rec = self._parse_flat_print_line(ln, source_url=raw, platform=platform)
-            if not rec:
-                continue
-            u = rec["url"]
-            if u in seen:
-                continue
-            seen.add(u)
-            out.append(rec)
+        if on_partial and out:
+            try:
+                on_partial(list(out))
+            except Exception:
+                pass
         return {
             "success": True,
             "entries": out,
@@ -1492,6 +1578,15 @@ class UniversalVideoDownloader:
         self._yt = UniversalYTDLPWrapper(yt_cfg=dict(self._uvd.get("yt_dlp") or {}), log=self._log)
         self._cancel = threading.Event()
         self._active_job_id: str | None = None
+        self._auto_refresh_ytdlp_background()
+
+    def _auto_refresh_ytdlp_background(self) -> None:
+        def _work() -> None:
+            ret = self._yt.maybe_auto_update_standalone_exe(min_hours_between_attempts=24)
+            if ret.get("ok"):
+                self._log("[yt-dlp] Đã tự cập nhật yt-dlp.exe nền.")
+
+        threading.Thread(target=_work, daemon=True, name="uv_auto_update_ytdlp").start()
 
     def check_ytdlp(self) -> bool:
         return self._yt.check_available()
@@ -1961,9 +2056,15 @@ class UniversalVideoDownloader:
     def check_url(self, url: str) -> dict[str, Any]:
         return self._yt.get_info(url)
 
-    def list_flat_playlist_entries(self, url: str, *, max_entries: int = 500) -> dict[str, Any]:
+    def list_flat_playlist_entries(
+        self,
+        url: str,
+        *,
+        max_entries: int = 500,
+        on_partial: Callable[[list[dict[str, str]]], None] | None = None,
+    ) -> dict[str, Any]:
         """Ủy quyền tới ``UniversalYTDLPWrapper`` (quét flat-playlist cho kênh/playlist YouTube)."""
-        return self._yt.list_flat_playlist_entries(url, max_entries=max_entries)
+        return self._yt.list_flat_playlist_entries(url, max_entries=max_entries, on_partial=on_partial)
 
     def send_to_reverse_prompt_engine(self, video_id: str) -> dict[str, Any]:
         v = self._store.get_video(video_id)

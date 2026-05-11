@@ -1876,8 +1876,21 @@ class AIVideoDialog:
         self._refresh_yt_channel_tree([])
         self._var_uv_yt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
 
+        def _partial(rows: list[dict[str, str]]) -> None:
+            snap = list(rows)
+            now = time.monotonic()
+            if now - self._uv_last_partial_ui_ts < 0.35:
+                return
+            self._uv_last_partial_ui_ts = now
+
+            def _apply() -> None:
+                self._refresh_yt_channel_tree(snap)
+                self._var_uv_yt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video.")
+
+            self._top.after(0, _apply)
+
         def _work() -> None:
-            res = down.list_flat_playlist_entries(raw, max_entries=lim)
+            res = down.list_flat_playlist_entries(raw, max_entries=lim, on_partial=_partial)
 
             def _ui() -> None:
                 self._uv_set_busy(False)
@@ -2113,8 +2126,21 @@ class AIVideoDialog:
         self._refresh_tt_channel_tree([])
         self._var_uv_tt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
 
+        def _partial(rows: list[dict[str, str]]) -> None:
+            snap = list(rows)
+            now = time.monotonic()
+            if now - self._uv_last_partial_ui_ts < 0.35:
+                return
+            self._uv_last_partial_ui_ts = now
+
+            def _apply() -> None:
+                self._refresh_tt_channel_tree(snap)
+                self._var_uv_tt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video TikTok.")
+
+            self._top.after(0, _apply)
+
         def _work() -> None:
-            res = down.list_flat_playlist_entries(raw, max_entries=lim)
+            res = down.list_flat_playlist_entries(raw, max_entries=lim, on_partial=_partial)
 
             def _ui() -> None:
                 self._uv_set_busy(False)
