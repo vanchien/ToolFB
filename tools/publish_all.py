@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -113,6 +114,13 @@ def main() -> int:
     if args.prerelease:
         publish_gh_cmd.append("--prerelease")
     _run(publish_gh_cmd, cwd=root)
+
+    dist_latest = root / "dist" / "latest.json"
+    repo_manifest = root / "release" / "update" / "latest.json"
+    if dist_latest.is_file():
+        repo_manifest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dist_latest, repo_manifest)
+        print(f"REPO_MANIFEST_SYNCED={repo_manifest}")
 
     manifest_url = github_latest_asset_url(repo, "latest.json")
     print(f"MANIFEST_URL={manifest_url}")

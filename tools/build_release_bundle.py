@@ -132,6 +132,7 @@ def build_release_bundle() -> tuple[Path, Path, Path]:
         "- Co Start_ToolFB_GUI.bat de mo nhanh\n"
         "- BAT BUOC: copy ca thu muc exe_gui (gom ToolFB_GUI.exe + _internal/...), khong chi copy file .exe le\n"
         "- Ban build day du da dong goi Chromium + Firefox + WebKit (Playwright) trong _internal/ms-playwright — may dich khong can `playwright install`\n"
+        "- yt-dlp: file tools/yt-dlp/yt-dlp.exe (Windows) duoc tai khi build va chép canh ToolFB_GUI.exe — may dich khong can pip cai yt-dlp\n"
         "- Kich thuoc zip lon (hang tram MB) do trinh duyet; build nhanh: dat TOOLFB_SKIP_BROWSER_BUNDLE=1 khi goi tools/build_exe_gui.py\n"
         "- Veo3Studio: cache trong node_modules/.cache (Prisma/npm) duoc xoa truoc khi zip de giam dung luong + tranh path qua dai khi cap nhat; Prisma tai lai khi can.\n\n"
         "Goi y:\n"
