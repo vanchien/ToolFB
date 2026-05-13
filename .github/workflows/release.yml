@@ -73,11 +73,17 @@ jobs:
           path: .cache/ms-playwright
           key: playwright-${{ runner.os }}-py312-pw-${{ steps.playwright-ver.outputs.version }}-${{ hashFiles('requirements.txt') }}
 
-      # cli/gh-actions da khong con; hosted runner co the co gh nhung action nay dam bao PATH + auth.
-      - name: Setup GitHub CLI
-        uses: actions4gh/setup-gh@v1
-        with:
-          token: ${{ github.token }}
+      - name: Verify GitHub CLI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            Write-Error "GitHub CLI (gh) khong co tren runner."
+            exit 1
+          }
+          gh --version
+          gh auth status
 
       - name: Build and create GitHub Release
         env:

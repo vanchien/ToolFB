@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -79,7 +80,15 @@ def main() -> int:
         default="config/update_channel.json",
         help="Relative path for manifest_url JSON (ignored with --no-write-update-channel).",
     )
+    parser.add_argument(
+        "--skip-browser-bundle",
+        action="store_true",
+        help="Dat TOOLFB_SKIP_BROWSER_BUNDLE: build nhe, khong dong goi Chromium/FF/WebKit vao zip.",
+    )
     args = parser.parse_args()
+
+    if args.skip_browser_bundle:
+        os.environ["TOOLFB_SKIP_BROWSER_BUNDLE"] = "1"
 
     root = _project_root()
     ensure_gh_authenticated(root)
