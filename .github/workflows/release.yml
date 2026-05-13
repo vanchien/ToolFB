@@ -73,8 +73,11 @@ jobs:
           path: .cache/ms-playwright
           key: playwright-${{ runner.os }}-py312-pw-${{ steps.playwright-ver.outputs.version }}-${{ hashFiles('requirements.txt') }}
 
+      # cli/gh-actions da khong con; hosted runner co the co gh nhung action nay dam bao PATH + auth.
       - name: Setup GitHub CLI
-        uses: cli/gh-actions/setup-gh@v2
+        uses: actions4gh/setup-gh@v1
+        with:
+          token: ${{ github.token }}
 
       - name: Build and create GitHub Release
         env:
