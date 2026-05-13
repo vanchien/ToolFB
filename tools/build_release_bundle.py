@@ -70,19 +70,27 @@ def _write_latest_manifest(*, root: Path, zip_path: Path, dist: Path) -> Path:
     Env hỗ trợ:
     - ``TOOLFB_RELEASE_DOWNLOAD_URL``: URL zip cố định.
     - ``TOOLFB_RELEASE_NOTES``: ghi chú release.
+    - ``TOOLFB_PATCH_DOWNLOAD_URL`` / ``TOOLFB_PATCH_SHA256``: ZIP vá (delta), máy client
+      tải trước; updater merge từng file, chỉ ghi đè file có trong ZIP (xem ``build_delta_patch_zip.py``).
     """
     version = _read_local_version(root)
     sha256 = _sha256_file(zip_path)
     root_url = os.environ.get("TOOLFB_RELEASE_DOWNLOAD_URL", "").strip()
     download_url = root_url or str(Path(zip_path).name)
     notes = os.environ.get("TOOLFB_RELEASE_NOTES", "").strip()
-    payload = {
+    patch_url = os.environ.get("TOOLFB_PATCH_DOWNLOAD_URL", "").strip()
+    patch_sha = os.environ.get("TOOLFB_PATCH_SHA256", "").strip().lower()
+    payload: dict[str, str] = {
         "version": version,
         "download_url": download_url,
         "sha256": sha256,
         "notes": notes,
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
     }
+    if patch_url:
+        payload["patch_download_url"] = patch_url
+        if patch_sha:
+            payload["patch_sha256"] = patch_sha
     out = dist / "latest.json"
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return out
@@ -148,7 +156,22 @@ def build_release_bundle() -> tuple[Path, Path, Path]:
     zip_base = dist / "ToolFB_release_bundle"
     zip_path = Path(shutil.make_archive(str(zip_base), "zip", root_dir=bundle_dir.parent, base_dir=bundle_dir.name))
     latest_path = _write_latest_manifest(root=root, zip_path=zip_path, dist=dist)
+    _sync_repo_latest_manifest(root=root, latest_path=latest_path)
     return bundle_dir, zip_path, latest_path
+
+
+def _sync_repo_latest_manifest(*, root: Path, latest_path: Path) -> None:
+    """
+    Sao chép ``dist/latest.json`` → ``release/update/latest.json`` để push lên GitHub
+    là máy client đọc raw manifest ngay sau build (không cần copy tay).
+    """
+    dest = root / "release" / "update" / "latest.json"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(latest_path, dest)
+        print(f"REPO_MANIFEST_SYNCED={dest}", flush=True)
+    except OSError as exc:
+        print(f"WARN: không copy manifest vào repo: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

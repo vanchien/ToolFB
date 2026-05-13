@@ -34,6 +34,8 @@ def ensure_video_transform_defaults(clip: dict[str, Any], project: dict[str, Any
         sc.setdefault("keep_aspect", True)
     if "canvas_mode" not in clip:
         clip["canvas_mode"] = "fit"
+    if "zoom" not in clip:
+        clip["zoom"] = 1.0
     if "muted" not in clip:
         clip["muted"] = False
 

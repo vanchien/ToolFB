@@ -9,6 +9,7 @@ import gc
 import hashlib
 import json
 import os
+import sys
 import queue
 import re
 import shutil
@@ -62,7 +63,11 @@ from src.services.video_editor.stock_audio_library import (
     stock_topic_filter_labels,
 )
 from src.services.universal_video_downloader import DownloadMetadataStore, ensure_downloader_layout
-from src.utils.ffmpeg_paths import resolve_ffmpeg_executable, resolve_ffplay_executable
+from src.utils.ffmpeg_paths import (
+    ffplay_resolve_skips_ensure_heavy_work,
+    resolve_ffmpeg_executable,
+    resolve_ffplay_executable,
+)
 from src.utils.schedule_job_content import internal_post_title_from_body
 
 # Preset W×H cho Crop / Scale (nhãn, (rộng, cao) hoặc None = nhập tay)
@@ -81,6 +86,8 @@ RES_WH_PRESETS: tuple[tuple[str, tuple[int, int] | None], ...] = (
 VE_BATCH_AUTO_PREVIEW_MAX_CLIPS = 120
 # Từ ngưỡng này hiển thị tiến trình trên thanh trạng thái khi «Áp dụng thay đổi» / áp nhanh tỉ lệ.
 VE_BATCH_SHOW_PROGRESS_MIN_CLIPS = 50
+# Debounce ô lọc tên timeline / nhận diện chỉnh sửa (ms) — giảm rebuild tree khi gõ.
+_VE_TIMELINE_FILTER_DEBOUNCE_MS = 220
 
 
 def _match_res_wh_label(width: int, height: int) -> str:
@@ -103,7 +110,24 @@ def _pack_scrollable_vertical(parent: ttk.Widget) -> ttk.Frame:
     vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
     canvas.configure(yscrollcommand=vsb.set)
     inner = ttk.Frame(canvas)
+    inner.columnconfigure(0, weight=1)
     win = canvas.create_window((0, 0), window=inner, anchor="nw")
+    _canvas_width_cbs: list[Callable[[int], None]] = []
+
+    def _register_canvas_width_cb(cb: Callable[[int], None]) -> None:
+        """Gọi lại mỗi khi canvas đổi rộng (để cập nhật wraplength nhãn dài)."""
+        _canvas_width_cbs.append(cb)
+        try:
+            cw = int(canvas.winfo_width())
+        except tk.TclError:
+            return
+        if cw > 2:
+            try:
+                cb(cw)
+            except tk.TclError:
+                pass
+
+    setattr(inner, "_ve_on_canvas_width", _register_canvas_width_cb)
 
     def _sync_region(_e: Any = None) -> None:
         canvas.update_idletasks()
@@ -116,6 +140,13 @@ def _pack_scrollable_vertical(parent: ttk.Widget) -> ttk.Frame:
             w = int(e.width)
             if w > 1:
                 canvas.itemconfigure(win, width=w)
+                for cb in list(_canvas_width_cbs):
+                    try:
+                        cb(w)
+                    except tk.TclError:
+                        pass
+                inner.update_idletasks()
+                _sync_region()
         except (tk.TclError, ValueError):
             pass
 
@@ -145,6 +176,34 @@ def _pack_scrollable_vertical(parent: ttk.Widget) -> ttk.Frame:
     outer.columnconfigure(0, weight=1)
     outer.rowconfigure(0, weight=1)
     return inner
+
+
+def _ve_tree_sort_toggle(state: dict[str, Any], col: str) -> None:
+    """Đổi cột / đảo chiều sort khi bấm lại cùng cột."""
+    cur = str(state.get("col") or "")
+    if cur == col:
+        state["asc"] = not bool(state.get("asc", True))
+    else:
+        state["col"] = col
+        state["asc"] = True
+
+
+def _ve_apply_tree_heading_marks(
+    tv: ttk.Treeview,
+    columns: tuple[str, ...],
+    base_labels: dict[str, str],
+    sort_col: str,
+    asc: bool,
+) -> None:
+    """Hiển thị mũi tên ↑/↓ trên cột đang sort."""
+    for c in columns:
+        base = str(base_labels.get(c, c))
+        if c == sort_col:
+            base += " ↑" if asc else " ↓"
+        try:
+            tv.heading(c, text=base)
+        except tk.TclError:
+            pass
 
 
 def _normalize_post_caption_title(title: str, *, description: str = "") -> str:
@@ -221,6 +280,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     selected_clip_id: str | None = None
 
     _apply_batch_video_ref: dict[str, Any] = {"fn": None}
+    _apply_transform_subset_ref: dict[str, Any] = {"fn": None}
     _ve_batch_reset_bar_ref: dict[str, Any] = {"fr": None}
     _q_logo_media_combo_refresh: dict[str, Any] = {"fn": None}
     _batch_edit_draft: dict[str, Any] = {}
@@ -908,6 +968,29 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             tr.insert("", tk.END, iid=f"s{i}", values=(Path(fp).name, "stock", "—", "—"))
         var_stock_count.set(f"{len(stock_paths_mem)}/{len(stock_paths_all)} file")
 
+    def _play_stock_audio_system_default(path: str) -> None:
+        """
+        Mở file âm thanh bằng ứng dụng mặc định khi không có ffplay (preview stock / kho có sẵn).
+        """
+        p = Path(path)
+        if not p.is_file():
+            messagebox.showwarning("Stock audio", "Không thấy file trên đĩa.")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(p))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(["xdg-open", str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            messagebox.showerror("Stock audio", str(e))
+            return
+        notify(
+            "Không có ffplay — đã mở bằng trình phát mặc định. "
+            "«Dừng nghe» chỉ dừng tiến trình ffplay; với trình hệ thống hãy đóng cửa sổ phát đó."
+        )
+
     def _play_selected_stock_preview() -> None:
         tr = media_trees["stock"]
         sel = tr.selection()
@@ -927,21 +1010,45 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         fp = stock_paths_mem[idx]
         if str(stock_preview_proc_ref.get("last_fp") or "") == fp:
             return
-        ffplay = resolve_ffplay_executable()
-        if not ffplay:
-            notify("Không tìm thấy ffplay để preview audio.")
-            return
         _stop_stock_preview()
-        try:
-            proc = subprocess.Popen(
-                [ffplay, "-nodisp", "-autoexit", "-loglevel", "error", fp],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            stock_preview_proc_ref["proc"] = proc
+        expected_iid = str(iid)
+
+        def _finish_stock_ffplay(ffplay: str | None) -> None:
+            if str(stock_preview_proc_ref.get("last_fp") or "") == fp:
+                return
+            sel2 = tr.selection()
+            if not sel2 or str(sel2[0]) != expected_iid:
+                return
+            try:
+                idx2 = int(str(sel2[0])[1:])
+            except ValueError:
+                return
+            if idx2 < 0 or idx2 >= len(stock_paths_mem) or stock_paths_mem[idx2] != fp:
+                return
+            if ffplay:
+                try:
+                    proc = subprocess.Popen(
+                        [ffplay, "-nodisp", "-autoexit", "-loglevel", "error", fp],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    stock_preview_proc_ref["proc"] = proc
+                    stock_preview_proc_ref["last_fp"] = fp
+                except Exception as e:
+                    messagebox.showerror("Stock audio", str(e))
+                return
+            _play_stock_audio_system_default(fp)
+            stock_preview_proc_ref["proc"] = None
             stock_preview_proc_ref["last_fp"] = fp
-        except Exception as e:
-            messagebox.showerror("Stock audio", str(e))
+
+        if ffplay_resolve_skips_ensure_heavy_work():
+            _finish_stock_ffplay(resolve_ffplay_executable())
+            return
+        _resolve_ffplay_async(
+            busy_message="Đang chuẩn bị ffplay (tìm / copy / tải portable) — lần đầu có thể vài chục giây…",
+            on_ready=_finish_stock_ffplay,
+            notify_busy=True,
+        )
 
     def _on_stock_tree_select(_event: Any = None) -> None:
         aid = stock_preview_proc_ref.get("after_id")
@@ -1172,6 +1279,50 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             ffplay_managed_proc_ref["p"] = None
             raise
 
+    _ffplay_resolve_gen_ref: dict[str, int] = {"v": 0}
+
+    def _resolve_ffplay_async(
+        *,
+        busy_message: str,
+        on_ready: Callable[[str | None], None],
+        notify_busy: bool = True,
+    ) -> None:
+        """
+        Gọi ``resolve_ffplay_executable()`` trên thread nền — tránh treo UI khi copy/tải ffplay portable.
+
+        Mỗi lần gọi tăng generation; callback ``on_ready`` chỉ chạy nếu vẫn là yêu cầu mới nhất.
+        """
+        _ffplay_resolve_gen_ref["v"] = int(_ffplay_resolve_gen_ref.get("v") or 0) + 1
+        my_gen = int(_ffplay_resolve_gen_ref["v"])
+
+        def _worker() -> None:
+            fp: str | None
+            try:
+                fp = resolve_ffplay_executable()
+            except Exception as exc:
+                logger.exception("resolve_ffplay_executable (nền): {}", exc)
+                fp = None
+
+            def _apply() -> None:
+                if int(_ffplay_resolve_gen_ref.get("v") or 0) != my_gen:
+                    return
+                try:
+                    on_ready(fp)
+                except Exception:
+                    logger.exception("on_ready ffplay async")
+
+            try:
+                root.after(0, _apply)
+            except Exception:
+                pass
+
+        if notify_busy:
+            try:
+                notify(busy_message)
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
     def open_path_with_default_player(path: str) -> None:
         p = path.strip()
         if not p or not Path(p).is_file():
@@ -1208,18 +1359,28 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             if preview_busy_ref.get("busy"):
                 notify("Preview đang render nền — đợi xong rồi bấm lại.")
                 return
-            ffplay = resolve_ffplay_executable()
-            if not ffplay:
-                notify("Không tìm thấy ffplay — dùng «Mở bằng app mặc định».")
-                open_path_with_default_player(p)
-                return
-            try:
-                _popen_ffplay_managed(
-                    [ffplay, *_ffplay_window_args(window_title="ToolFB - ffplay preview nháp"), "-autoexit", p]
+
+            def _open_draft_ff_done(ffplay: str | None) -> None:
+                if not ffplay:
+                    notify("Không tìm thấy ffplay — dùng «Mở bằng app mặc định».")
+                    open_path_with_default_player(p)
+                    return
+                try:
+                    _popen_ffplay_managed(
+                        [ffplay, *_ffplay_window_args(window_title="ToolFB - ffplay preview nháp"), "-autoexit", p]
+                    )
+                    notify(f"Đã mở ffplay (preview nháp / composite): {Path(p).name}")
+                except Exception as e:
+                    messagebox.showerror("ffplay", str(e))
+
+            if ffplay_resolve_skips_ensure_heavy_work():
+                _open_draft_ff_done(resolve_ffplay_executable())
+            else:
+                _resolve_ffplay_async(
+                    busy_message="Đang chuẩn bị ffplay (copy/tải portable nếu cần)…",
+                    on_ready=_open_draft_ff_done,
+                    notify_busy=True,
                 )
-                notify(f"Đã mở ffplay (preview nháp / composite): {Path(p).name}")
-            except Exception as e:
-                messagebox.showerror("ffplay", str(e))
             return
         if preview_busy_ref.get("busy"):
             notify("Đang render preview nháp — đợi xong rồi bấm lại.")
@@ -1288,18 +1449,28 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 return
             if preview_busy_ref.get("busy"):
                 notify("Preview đang render nền — mở bản preview gần nhất bằng ffplay.")
-        ffplay = resolve_ffplay_executable()
-        if not ffplay:
-            notify("Không tìm thấy ffplay — dùng «Mở file preview».")
-            open_path_with_default_player(p)
-            return
-        try:
-            _popen_ffplay_managed(
-                [ffplay, *trim_pre, *_ffplay_window_args(window_title="ToolFB - ffplay (nguồn timeline)"), "-autoexit", p]
+
+        def _open_src_ff_done(ffplay: str | None) -> None:
+            if not ffplay:
+                notify("Không tìm thấy ffplay — dùng «Mở file preview».")
+                open_path_with_default_player(p)
+                return
+            try:
+                _popen_ffplay_managed(
+                    [ffplay, *trim_pre, *_ffplay_window_args(window_title="ToolFB - ffplay (nguồn timeline)"), "-autoexit", p]
+                )
+                notify(f"Đã mở ffplay: {Path(p).name}")
+            except Exception as e:
+                messagebox.showerror("ffplay", str(e))
+
+        if ffplay_resolve_skips_ensure_heavy_work():
+            _open_src_ff_done(resolve_ffplay_executable())
+        else:
+            _resolve_ffplay_async(
+                busy_message="Đang chuẩn bị ffplay (copy/tải portable nếu cần)…",
+                on_ready=_open_src_ff_done,
+                notify_busy=True,
             )
-            notify(f"Đã mở ffplay: {Path(p).name}")
-        except Exception as e:
-            messagebox.showerror("ffplay", str(e))
 
     def _primary_timeline_clip_id_for_preview() -> str:
         """Clip ưu tiên: dòng đang chọn đúng — không dùng focus lệch; không lấy phần tử đầu tuple selection (thường là clip đầu cây)."""
@@ -1336,18 +1507,28 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         if not media_path or not Path(media_path).is_file():
             notify("Không tìm thấy file media đã chọn.")
             return
-        ffplay = resolve_ffplay_executable()
-        if not ffplay:
-            notify("Không tìm thấy ffplay — dùng trình phát mặc định.")
-            open_path_with_default_player(media_path)
-            return
-        try:
-            _popen_ffplay_managed(
-                [ffplay, *_ffplay_window_args(window_title="ToolFB - ffplay media"), "-autoexit", str(media_path)]
+
+        def _open_media_ff_done(ffplay: str | None) -> None:
+            if not ffplay:
+                notify("Không tìm thấy ffplay — dùng trình phát mặc định.")
+                open_path_with_default_player(media_path)
+                return
+            try:
+                _popen_ffplay_managed(
+                    [ffplay, *_ffplay_window_args(window_title="ToolFB - ffplay media"), "-autoexit", str(media_path)]
+                )
+                notify(f"Đã mở ffplay: {Path(media_path).name}")
+            except Exception as e:
+                messagebox.showerror("ffplay", str(e))
+
+        if ffplay_resolve_skips_ensure_heavy_work():
+            _open_media_ff_done(resolve_ffplay_executable())
+        else:
+            _resolve_ffplay_async(
+                busy_message="Đang chuẩn bị ffplay (copy/tải portable nếu cần)…",
+                on_ready=_open_media_ff_done,
+                notify_busy=True,
             )
-            notify(f"Đã mở ffplay: {Path(media_path).name}")
-        except Exception as e:
-            messagebox.showerror("ffplay", str(e))
 
     def run_preview_draft() -> None:
         """Xuất nháp timeline (giới hạn thời lượng) để xem trước export đầy đủ."""
@@ -1863,12 +2044,20 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     tl_tab_detail = ttk.Frame(tl_nb, padding=2)
     tl_tab_grouped = ttk.Frame(tl_nb, padding=2)
     tl_tab_detail.columnconfigure(0, weight=1)
-    tl_tab_detail.rowconfigure(0, weight=1)
+    tl_tab_detail.rowconfigure(0, weight=0)
+    tl_tab_detail.rowconfigure(1, weight=1)
     tl_tab_grouped.columnconfigure(0, weight=1)
-    tl_tab_grouped.rowconfigure(0, weight=1)
+    tl_tab_grouped.rowconfigure(0, weight=0)
+    tl_tab_grouped.rowconfigure(1, weight=1)
     tl_nb.add(tl_tab_detail, text="Chi tiết clip")
     tl_nb.add(tl_tab_grouped, text="Gộp theo video")
     var_tl_video_only = tk.BooleanVar(value=True)
+    _tl_sort: dict[str, Any] = {"col": "start", "asc": True}
+    _tlg_sort: dict[str, Any] = {"col": "start", "asc": True}
+    _edit_sum_sort: dict[str, Any] = {"col": "ts", "asc": True}
+    var_tl_name_filter = tk.StringVar(value="")
+    var_tlg_name_filter = tk.StringVar(value="")
+    var_edit_sum_name_filter = tk.StringVar(value="")
     cols_tl = ("track", "clip_id", "start", "dur", "src0", "src1", "kind", "col_logo", "col_audio", "col_text")
     tree_tl = ttk.Treeview(tl_tab_detail, columns=cols_tl, show="headings", height=10, selectmode="extended")
     heads = {
@@ -1895,16 +2084,24 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         "col_audio": 64,
         "col_text": 44,
     }
+    heads_tl_base = dict(heads)
     for c in cols_tl:
-        tree_tl.heading(c, text=heads[c])
         tree_tl.column(c, width=widths_tl[c], stretch=c in ("clip_id", "kind"))
+        tree_tl.heading(c, text=heads_tl_base[c])
     tree_tl.tag_configure("all_done", foreground="#0b4f2f", background="#d8f3dc")
     tree_tl.tag_configure("partial_done", foreground="#7a4b00", background="#fff3cd")
     tree_tl.tag_configure("not_done", foreground="#495057", background="#f1f3f5")
     st = ttk.Scrollbar(tl_tab_detail, orient=tk.VERTICAL, command=tree_tl.yview)
     tree_tl.configure(yscrollcommand=st.set)
-    tree_tl.grid(row=0, column=0, sticky="nsew")
-    st.grid(row=0, column=1, sticky="ns")
+    filt_tl_fr = ttk.Frame(tl_tab_detail)
+    filt_tl_fr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+    ttk.Label(filt_tl_fr, text="Lọc:").pack(side=tk.LEFT)
+    ttk.Entry(filt_tl_fr, textvariable=var_tl_name_filter, width=22).pack(side=tk.LEFT, padx=(4, 2))
+    ttk.Label(filt_tl_fr, text="(mã clip, lớp, loại…)", font=("Segoe UI", 8), foreground="#666").pack(side=tk.LEFT)
+    btn_tl_filt_clear = ttk.Button(filt_tl_fr, text="Xóa", command=lambda: None)
+    btn_tl_filt_clear.pack(side=tk.LEFT, padx=(6, 0))
+    tree_tl.grid(row=1, column=0, sticky="nsew")
+    st.grid(row=1, column=1, sticky="ns")
     cols_tlg = ("idx", "video_name", "start", "dur", "audio", "logo", "text")
     tree_tl_grouped = ttk.Treeview(tl_tab_grouped, columns=cols_tlg, show="headings", height=10, selectmode="extended")
     heads_tlg = {
@@ -1917,13 +2114,20 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         "text": "Chữ",
     }
     widths_tlg = {"idx": 34, "video_name": 220, "start": 96, "dur": 86, "audio": 80, "logo": 72, "text": 62}
+    heads_tlg_base = dict(heads_tlg)
     for c in cols_tlg:
-        tree_tl_grouped.heading(c, text=heads_tlg[c])
         tree_tl_grouped.column(c, width=widths_tlg[c], stretch=True if c == "video_name" else False)
+        tree_tl_grouped.heading(c, text=heads_tlg_base[c])
     stg = ttk.Scrollbar(tl_tab_grouped, orient=tk.VERTICAL, command=tree_tl_grouped.yview)
     tree_tl_grouped.configure(yscrollcommand=stg.set)
-    tree_tl_grouped.grid(row=0, column=0, sticky="nsew")
-    stg.grid(row=0, column=1, sticky="ns")
+    filt_tlg_fr = ttk.Frame(tl_tab_grouped)
+    filt_tlg_fr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+    ttk.Label(filt_tlg_fr, text="Lọc video:").pack(side=tk.LEFT)
+    ttk.Entry(filt_tlg_fr, textvariable=var_tlg_name_filter, width=26).pack(side=tk.LEFT, padx=(4, 2))
+    btn_tlg_filt_clear = ttk.Button(filt_tlg_fr, text="Xóa", command=lambda: None)
+    btn_tlg_filt_clear.pack(side=tk.LEFT, padx=(6, 0))
+    tree_tl_grouped.grid(row=1, column=0, sticky="nsew")
+    stg.grid(row=1, column=1, sticky="ns")
     grouped_video_to_clip: dict[str, str] = {}
 
     ttk.Label(
@@ -1941,7 +2145,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         tl_actions,
         text="Gọn: chỉ hiện 1 hàng / video (ẩn logo, audio, chữ)",
         variable=var_tl_video_only,
-        command=lambda: refresh_timeline(),
+        command=lambda: (_cancel_tl_tlg_filter_debounce(), refresh_timeline()),
     ).pack(side=tk.LEFT, padx=(0, 10))
     trim_bar = ttk.Frame(tl_fr)
     trim_bar.pack(fill=tk.X, pady=(0, 4))
@@ -1959,8 +2163,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     )
     edit_sum_fr.pack(fill=tk.BOTH, expand=False, pady=(2, 4))
     edit_sum_fr.columnconfigure(0, weight=1)
+    edit_sum_fr.rowconfigure(2, weight=1)
     legend_fr = ttk.Frame(edit_sum_fr)
-    legend_fr.grid(row=0, column=0, sticky="w", pady=(0, 4))
+    legend_fr.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
     tk.Label(legend_fr, text="   ", bg="#d8f3dc").pack(side=tk.LEFT)
     ttk.Label(legend_fr, text="Đủ logo + âm thanh + chữ").pack(side=tk.LEFT, padx=(4, 10))
     tk.Label(legend_fr, text="   ", bg="#fff3cd").pack(side=tk.LEFT)
@@ -1978,13 +2183,21 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         "status": "Tình trạng",
     }
     widths_edit = {"idx": 36, "video": 210, "logo": 62, "audio": 82, "text": 52, "status": 300}
+    heads_edit_base = dict(heads_edit)
     for c in cols_edit:
-        tree_edit_sum.heading(c, text=heads_edit[c])
         tree_edit_sum.column(c, width=widths_edit[c], stretch=True if c in ("video", "status") else False)
+        tree_edit_sum.heading(c, text=heads_edit_base[c])
     sy_edit = ttk.Scrollbar(edit_sum_fr, orient=tk.VERTICAL, command=tree_edit_sum.yview)
     tree_edit_sum.configure(yscrollcommand=sy_edit.set)
-    tree_edit_sum.grid(row=1, column=0, sticky="nsew")
-    sy_edit.grid(row=1, column=1, sticky="ns")
+    filt_sum_fr = ttk.Frame(edit_sum_fr)
+    filt_sum_fr.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+    ttk.Label(filt_sum_fr, text="Lọc:").pack(side=tk.LEFT)
+    ttk.Entry(filt_sum_fr, textvariable=var_edit_sum_name_filter, width=28).pack(side=tk.LEFT, padx=(4, 2))
+    ttk.Label(filt_sum_fr, text="(tên video, tình trạng…)", font=("Segoe UI", 8), foreground="#666").pack(side=tk.LEFT)
+    btn_edit_sum_filt_clear = ttk.Button(filt_sum_fr, text="Xóa", command=lambda: None)
+    btn_edit_sum_filt_clear.pack(side=tk.LEFT, padx=(6, 0))
+    tree_edit_sum.grid(row=2, column=0, sticky="nsew")
+    sy_edit.grid(row=2, column=1, sticky="ns")
     tree_edit_sum.tag_configure("all_done", foreground="#0b4f2f", background="#d8f3dc")
     tree_edit_sum.tag_configure("partial_done", foreground="#7a4b00", background="#fff3cd")
     tree_edit_sum.tag_configure("not_done", foreground="#495057", background="#f1f3f5")
@@ -2133,6 +2346,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     def refresh_video_edit_summary() -> None:
         tree_edit_sum.delete(*tree_edit_sum.get_children())
         if not project:
+            _ve_apply_tree_heading_marks(tree_edit_sum, cols_edit, heads_edit_base, "__none__", True)
             return
         tracks = [t for t in (project.get("tracks") or []) if isinstance(t, dict)]
         media_by_id: dict[str, dict[str, Any]] = {}
@@ -2174,8 +2388,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             dur = float(bg.get("duration") or project.get("duration") or 0.0)
             audio_ranges.append((ts, ts + max(0.0, dur)))
 
-        video_rows.sort(key=lambda x: x[1])
-        for i, (cid, ts, te, name) in enumerate(video_rows, start=1):
+        specs: list[dict[str, Any]] = []
+        for cid, ts, te, name in video_rows:
             has_logo = any(_is_overlap(ts, te, a0, a1) for a0, a1 in overlay_ranges)
             has_audio = any(_is_overlap(ts, te, a0, a1) for a0, a1 in audio_ranges)
             has_text = any(_is_overlap(ts, te, a0, a1) for a0, a1 in text_ranges)
@@ -2189,19 +2403,65 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             status = "Đã thêm " + ", ".join(tags) if tags else "Chưa thêm logo/âm thanh/chữ"
             done_count = int(has_logo) + int(has_audio) + int(has_text)
             row_tag = "all_done" if done_count == 3 else "partial_done" if done_count > 0 else "not_done"
+            specs.append(
+                {
+                    "cid": str(cid or ""),
+                    "ts": float(ts),
+                    "te": float(te),
+                    "name": str(name),
+                    "has_logo": bool(has_logo),
+                    "has_audio": bool(has_audio),
+                    "has_text": bool(has_text),
+                    "status": status,
+                    "row_tag": row_tag,
+                }
+            )
+
+        needle = str(var_edit_sum_name_filter.get() or "").strip().lower()
+        if needle:
+            kept: list[dict[str, Any]] = []
+            for s in specs:
+                blob = f"{s['cid']} {s['name']} {s['status']}".lower()
+                if needle in blob:
+                    kept.append(s)
+            specs = kept
+
+        scol = str(_edit_sum_sort.get("col") or "ts")
+        asc = bool(_edit_sum_sort.get("asc", True))
+
+        def _sum_sort_key(s: dict[str, Any]) -> Any:
+            if scol == "ts":
+                return float(s["ts"])
+            if scol == "video":
+                return s["name"].lower()
+            if scol == "logo":
+                return 1 if s["has_logo"] else 0
+            if scol == "audio":
+                return 1 if s["has_audio"] else 0
+            if scol == "text":
+                return 1 if s["has_text"] else 0
+            if scol == "status":
+                return s["status"].lower()
+            return float(s["ts"])
+
+        specs.sort(key=_sum_sort_key, reverse=not asc)
+        arrow_col = "idx" if scol == "ts" else scol
+        _ve_apply_tree_heading_marks(tree_edit_sum, cols_edit, heads_edit_base, arrow_col, asc)
+
+        for i, s in enumerate(specs, start=1):
             tree_edit_sum.insert(
                 "",
                 tk.END,
-                iid=f"sum_{cid or i}",
+                iid=f"sum_{s['cid'] or i}",
                 values=(
                     i,
-                    name,
-                    "Có" if has_logo else "Chưa",
-                    "Có" if has_audio else "Chưa",
-                    "Có" if has_text else "Chưa",
-                    status,
+                    s["name"],
+                    "Có" if s["has_logo"] else "Chưa",
+                    "Có" if s["has_audio"] else "Chưa",
+                    "Có" if s["has_text"] else "Chưa",
+                    s["status"],
                 ),
-                tags=(row_tag,),
+                tags=(s["row_tag"],),
             )
 
     def refresh_media_tree() -> None:
@@ -2261,6 +2521,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         grouped_video_to_clip.clear()
         refresh_video_edit_summary()
         if not project:
+            _ve_apply_tree_heading_marks(tree_tl, cols_tl, heads_tl_base, "__none__", True)
+            _ve_apply_tree_heading_marks(tree_tl_grouped, cols_tlg, heads_tlg_base, "__none__", True)
             return
         media_by_id: dict[str, dict[str, Any]] = {}
         for m in project.get("media") or []:
@@ -2305,6 +2567,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             dur = float(bg.get("duration") or project.get("duration") or 0.0)
             audio_ranges.append((ts, ts + max(0.0, dur)))
         video_only = bool(var_tl_video_only.get())
+        needle_tl = str(var_tl_name_filter.get() or "").strip().lower()
+        detail_specs: list[dict[str, Any]] = []
         for cid, tname, ts, du, ss, se, kind in tl_rows:
             show_row = (not video_only) or (tname == "video" and kind == "video")
             if not show_row:
@@ -2323,43 +2587,140 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             else:
                 lv, av, tv = "—", "—", "—"
                 row_tags = ()
+            if needle_tl:
+                blob = f"{cid} {tname} {kind}".lower()
+                if needle_tl not in blob:
+                    continue
+            detail_specs.append(
+                {
+                    "cid": cid,
+                    "tname": tname,
+                    "ts": ts,
+                    "du": du,
+                    "ss": ss,
+                    "se": se,
+                    "kind": kind,
+                    "lv": lv,
+                    "av": av,
+                    "tv": tv,
+                    "row_tags": row_tags,
+                }
+            )
+
+        dcol = str(_tl_sort.get("col") or "start")
+        dasc = bool(_tl_sort.get("asc", True))
+
+        def _detail_sort_key(d: dict[str, Any]) -> Any:
+            if dcol == "track":
+                return str(d["tname"]).lower()
+            if dcol == "clip_id":
+                return str(d["cid"]).lower()
+            if dcol == "start":
+                return float(d["ts"])
+            if dcol == "dur":
+                return float(d["du"])
+            if dcol == "src0":
+                if d["ss"] == "":
+                    return float("-1e30")
+                return float(d["ss"])
+            if dcol == "src1":
+                if d["se"] == "":
+                    return float("-1e30")
+                return float(d["se"])
+            if dcol == "kind":
+                return str(d["kind"]).lower()
+            if dcol == "col_logo":
+                return str(d["lv"]).lower()
+            if dcol == "col_audio":
+                return str(d["av"]).lower()
+            if dcol == "col_text":
+                return str(d["tv"]).lower()
+            return float(d["ts"])
+
+        detail_specs.sort(key=_detail_sort_key, reverse=not dasc)
+        _ve_apply_tree_heading_marks(tree_tl, cols_tl, heads_tl_base, dcol, dasc)
+
+        for d in detail_specs:
+            cid = str(d["cid"])
             tree_tl.insert(
                 "",
                 tk.END,
                 iid=cid,
                 values=(
-                    tname,
+                    d["tname"],
                     cid[:12] + "…",
-                    f"{ts:.2f}",
-                    f"{du:.2f}",
-                    f"{ss:.2f}" if ss != "" else "",
-                    f"{se:.2f}" if se != "" else "",
-                    kind,
-                    lv,
-                    av,
-                    tv,
+                    f"{float(d['ts']):.2f}",
+                    f"{float(d['du']):.2f}",
+                    f"{float(d['ss']):.2f}" if d["ss"] != "" else "",
+                    f"{float(d['se']):.2f}" if d["se"] != "" else "",
+                    d["kind"],
+                    d["lv"],
+                    d["av"],
+                    d["tv"],
                 ),
-                tags=row_tags,
+                tags=d["row_tags"],
             )
-        grouped_rows.sort(key=lambda x: x[1])
-        for i, (cid, ts, te, vname) in enumerate(grouped_rows, start=1):
+
+        needle_g = str(var_tlg_name_filter.get() or "").strip().lower()
+        grouped_specs: list[dict[str, Any]] = []
+        for cid, ts, te, vname in grouped_rows:
+            if needle_g and needle_g not in str(vname).lower() and needle_g not in str(cid).lower():
+                continue
             has_audio = any(_is_overlap(ts, te, b0, b1) for b0, b1 in audio_ranges)
             has_logo = any(_is_overlap(ts, te, b0, b1) for b0, b1 in overlay_ranges)
             has_text = any(_is_overlap(ts, te, b0, b1) for b0, b1 in text_ranges)
+            grouped_specs.append(
+                {
+                    "cid": cid,
+                    "ts": float(ts),
+                    "te": float(te),
+                    "vname": str(vname),
+                    "has_audio": has_audio,
+                    "has_logo": has_logo,
+                    "has_text": has_text,
+                }
+            )
+
+        gcol = str(_tlg_sort.get("col") or "start")
+        gasc = bool(_tlg_sort.get("asc", True))
+
+        def _grouped_sort_key(s: dict[str, Any]) -> Any:
+            if gcol == "idx":
+                return float(s["ts"])
+            if gcol == "video_name":
+                return str(s["vname"]).lower()
+            if gcol == "start":
+                return float(s["ts"])
+            if gcol == "dur":
+                return max(0.0, float(s["te"]) - float(s["ts"]))
+            if gcol == "audio":
+                return 1 if s["has_audio"] else 0
+            if gcol == "logo":
+                return 1 if s["has_logo"] else 0
+            if gcol == "text":
+                return 1 if s["has_text"] else 0
+            return float(s["ts"])
+
+        grouped_specs.sort(key=_grouped_sort_key, reverse=not gasc)
+        _ve_apply_tree_heading_marks(tree_tl_grouped, cols_tlg, heads_tlg_base, gcol, gasc)
+
+        for i, s in enumerate(grouped_specs, start=1):
             gid = f"g_{i}"
-            grouped_video_to_clip[gid] = cid
+            grouped_video_to_clip[gid] = s["cid"]
+            ts = float(s["ts"])
+            te = float(s["te"])
             tree_tl_grouped.insert(
                 "",
                 tk.END,
                 iid=gid,
                 values=(
                     i,
-                    vname,
+                    s["vname"],
                     f"{ts:.2f}",
                     f"{max(0.0, te - ts):.2f}",
-                    "Có" if has_audio else "Chưa",
-                    "Có" if has_logo else "Chưa",
-                    "Có" if has_text else "Chưa",
+                    "Có" if s["has_audio"] else "Chưa",
+                    "Có" if s["has_logo"] else "Chưa",
+                    "Có" if s["has_text"] else "Chưa",
                 ),
             )
 
@@ -2402,6 +2763,121 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
         if bool(var_media_only_timeline.get()):
             refresh_media_tree()
+
+    _tl_filter_debounce_after: dict[str, Any] = {"id": None}
+    _edit_sum_filter_debounce_after: dict[str, Any] = {"id": None}
+    _ve_ft_sup: dict[str, str] = {"k": ""}
+
+    def _cancel_tl_tlg_filter_debounce() -> None:
+        aid = _tl_filter_debounce_after.get("id")
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+        _tl_filter_debounce_after["id"] = None
+
+    def _fire_debounced_refresh_timeline() -> None:
+        _tl_filter_debounce_after["id"] = None
+        refresh_timeline()
+
+    def _schedule_debounced_refresh_timeline() -> None:
+        _cancel_tl_tlg_filter_debounce()
+        _tl_filter_debounce_after["id"] = root.after(
+            _VE_TIMELINE_FILTER_DEBOUNCE_MS, _fire_debounced_refresh_timeline
+        )
+
+    def _cancel_edit_sum_filter_debounce() -> None:
+        aid = _edit_sum_filter_debounce_after.get("id")
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+        _edit_sum_filter_debounce_after["id"] = None
+
+    def _fire_debounced_refresh_edit_sum() -> None:
+        _edit_sum_filter_debounce_after["id"] = None
+        refresh_video_edit_summary()
+
+    def _schedule_debounced_refresh_edit_sum() -> None:
+        _cancel_edit_sum_filter_debounce()
+        _edit_sum_filter_debounce_after["id"] = root.after(
+            _VE_TIMELINE_FILTER_DEBOUNCE_MS, _fire_debounced_refresh_edit_sum
+        )
+
+    def _clear_tl_name_filter_cmd() -> None:
+        _cancel_tl_tlg_filter_debounce()
+        _ve_ft_sup["k"] = "tl"
+        try:
+            var_tl_name_filter.set("")
+        finally:
+            _ve_ft_sup["k"] = ""
+        refresh_timeline()
+
+    def _clear_tlg_name_filter_cmd() -> None:
+        _cancel_tl_tlg_filter_debounce()
+        _ve_ft_sup["k"] = "tlg"
+        try:
+            var_tlg_name_filter.set("")
+        finally:
+            _ve_ft_sup["k"] = ""
+        refresh_timeline()
+
+    def _clear_edit_sum_name_filter_cmd() -> None:
+        _cancel_edit_sum_filter_debounce()
+        _ve_ft_sup["k"] = "sum"
+        try:
+            var_edit_sum_name_filter.set("")
+        finally:
+            _ve_ft_sup["k"] = ""
+        refresh_video_edit_summary()
+
+    def _on_tl_heading_click(col: str) -> None:
+        _cancel_tl_tlg_filter_debounce()
+        _ve_tree_sort_toggle(_tl_sort, col)
+        refresh_timeline()
+
+    def _on_tlg_heading_click(col: str) -> None:
+        _cancel_tl_tlg_filter_debounce()
+        _ve_tree_sort_toggle(_tlg_sort, col)
+        refresh_timeline()
+
+    def _on_edit_sum_heading_click(col: str) -> None:
+        _cancel_edit_sum_filter_debounce()
+        real = "ts" if col == "idx" else col
+        _ve_tree_sort_toggle(_edit_sum_sort, real)
+        refresh_video_edit_summary()
+
+    for _c in cols_tl:
+        tree_tl.heading(_c, command=lambda cc=_c: _on_tl_heading_click(cc))
+    for _c in cols_tlg:
+        tree_tl_grouped.heading(_c, command=lambda cc=_c: _on_tlg_heading_click(cc))
+    for _c in cols_edit:
+        tree_edit_sum.heading(_c, command=lambda cc=_c: _on_edit_sum_heading_click(cc))
+
+    def _on_tl_filter_trace(*_a: Any) -> None:
+        if _ve_ft_sup.get("k") == "tl":
+            return
+        _schedule_debounced_refresh_timeline()
+
+    def _on_tlg_filter_trace(*_a: Any) -> None:
+        if _ve_ft_sup.get("k") == "tlg":
+            return
+        _schedule_debounced_refresh_timeline()
+
+    def _on_edit_sum_filter_trace(*_a: Any) -> None:
+        if _ve_ft_sup.get("k") == "sum":
+            return
+        _schedule_debounced_refresh_edit_sum()
+
+    var_tl_name_filter.trace_add("write", _on_tl_filter_trace)
+    var_tlg_name_filter.trace_add("write", _on_tlg_filter_trace)
+    var_edit_sum_name_filter.trace_add("write", _on_edit_sum_filter_trace)
+
+    btn_tl_filt_clear.configure(command=_clear_tl_name_filter_cmd)
+    btn_tlg_filt_clear.configure(command=_clear_tlg_name_filter_cmd)
+    btn_edit_sum_filt_clear.configure(command=_clear_edit_sum_name_filter_cmd)
 
     def _clip_ids_from_edit_sum_selection() -> list[str]:
         """Các clip_id từ bảng «Nhận diện chỉnh sửa» (iid dạng sum_<clip_id>)."""
@@ -2450,6 +2926,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     def refresh_inspector() -> None:
         # Bỏ ref cũ trước khi dựng lại UI — tránh nút «Áp dụng tất cả» gọi hàm áp của lần chọn trước.
         _apply_batch_video_ref["fn"] = None
+        _apply_transform_subset_ref["fn"] = None
         _br = _ve_batch_reset_bar_ref.get("fr")
         if _br is not None:
             try:
@@ -2519,23 +2996,30 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     # Không giữ draft/_applied của nhóm clip khác — tránh «đã áp» sai hoặc áp nhầm thông số cũ.
                     _batch_edit_draft.clear()
                     _batch_edit_draft["_applied"] = {}
-                insp_grid.columnconfigure(0, minsize=136)
-                insp_grid.columnconfigure(1, weight=1, minsize=96)
-                insp_grid.columnconfigure(2, minsize=88)
+                insp_grid.columnconfigure(0, weight=1, minsize=72)
+                insp_grid.columnconfigure(1, weight=1, minsize=72)
+                insp_grid.columnconfigure(2, minsize=68)
                 hdr_batch = ttk.Frame(insp_grid)
                 hdr_batch.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
                 hdr_batch.columnconfigure(0, weight=1)
-                ttk.Label(
+                hdr_batch.columnconfigure(0, weight=1)
+                _bat_h0 = ttk.Label(
                     hdr_batch,
                     text=f"Sửa hàng loạt — {len(rows)} clip video",
                     font=("Segoe UI", 10, "bold"),
-                ).grid(row=0, column=0, sticky="w")
-                ttk.Label(
+                    justify=tk.LEFT,
+                )
+                _bat_h0.grid(row=0, column=0, sticky="ew")
+                _bind_label_wrap_to_frame(_bat_h0, hdr_batch, inset=8)
+                _bat_h2 = ttk.Label(
                     hdr_batch,
                     text="Ô trống = giữ nguyên từng clip · «Áp dụng tất cả» ở cuối tab.",
                     font=("Segoe UI", 8),
                     foreground="#555",
-                ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+                    justify=tk.LEFT,
+                )
+                _bat_h2.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+                _bind_label_wrap_to_frame(_bat_h2, hdr_batch, inset=8)
                 if loaded_prev:
                     ttk.Label(
                         hdr_batch,
@@ -2565,6 +3049,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 var_b_fo = tk.StringVar(value=str(_batch_edit_draft.get("fade_out") or ""))
                 var_b_rot = tk.StringVar(value=str(_batch_edit_draft.get("rotation") or ""))
                 var_b_canvas = tk.StringVar(value=str(_batch_edit_draft.get("canvas_mode") or ""))
+                var_b_zoom = tk.StringVar(value=str(_batch_edit_draft.get("zoom") or ""))
                 var_b_flip_h = tk.BooleanVar(value=bool(_batch_edit_draft.get("flip_h", False)))
                 var_b_flip_v = tk.BooleanVar(value=bool(_batch_edit_draft.get("flip_v", False)))
                 var_b_mute = tk.BooleanVar(value=bool(_batch_edit_draft.get("mute", False)))
@@ -2617,7 +3102,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     (3, "Fade vào (giây)", var_b_fi, "fade_in"),
                     (4, "Fade ra (giây)", var_b_fo, "fade_out"),
                 ):
-                    ttk.Label(insp_grid, text=lab).grid(row=r, column=0, sticky="w", pady=(0, 4))
+                    _lb_r = ttk.Label(insp_grid, text=lab, justify=tk.LEFT)
+                    _lb_r.grid(row=r, column=0, sticky="ew", pady=(0, 4))
+                    _bind_label_wrap_to_frame(_lb_r, insp_grid, inset=18)
                     _ent = ttk.Entry(insp_grid, textvariable=var, width=13)
                     _ent.grid(row=r, column=1, sticky="ew", pady=(0, 4), padx=(0, 6))
                     st = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888", width=11)
@@ -2625,15 +3112,16 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     _bind_status_text(draft_key, var, st)
 
                 ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 10))
-                ttk.Label(insp_grid, text="Transform & canvas", font=("Segoe UI", 9, "bold")).grid(
-                    row=6, column=0, columnspan=3, sticky="w", pady=(0, 6)
-                )
+                _lb_tf_hdr = ttk.Label(insp_grid, text="Transform & canvas", font=("Segoe UI", 9, "bold"), justify=tk.LEFT)
+                _lb_tf_hdr.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+                _bind_label_wrap_to_frame(_lb_tf_hdr, insp_grid, inset=8)
 
                 def _explain_toggle(msg_on: str, msg_off: str, val: tk.BooleanVar) -> None:
                     notify(msg_on if bool(val.get()) else msg_off)
 
                 rf = ttk.Frame(insp_grid)
-                rf.grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 0))
+                rf.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+                rf.columnconfigure(0, weight=1)
                 ttk.Checkbutton(
                     rf,
                     text="Đặt flip",
@@ -2669,7 +3157,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 ).pack(side=tk.LEFT, padx=(8, 0))
 
                 rm = ttk.Frame(insp_grid)
-                rm.grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 0))
+                rm.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+                rm.columnconfigure(0, weight=1)
                 ttk.Checkbutton(
                     rm,
                     text="Áp dụng tùy chọn âm gốc",
@@ -2694,7 +3183,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 st_mute.grid(row=8, column=2, sticky="w", padx=(8, 0), pady=(2, 0))
                 _bind_status_bool("set_mute", var_b_set_mute, st_mute)
 
-                ttk.Label(insp_grid, text="Xoay (để trống / 0 / 90 / 180 / 270)").grid(row=9, column=0, sticky="w", pady=2)
+                _lb_rot = ttk.Label(insp_grid, text="Xoay (để trống / 0 / 90 / 180 / 270)", justify=tk.LEFT)
+                _lb_rot.grid(row=9, column=0, sticky="ew", pady=2)
+                _bind_label_wrap_to_frame(_lb_rot, insp_grid, inset=18)
                 ttk.Combobox(
                     insp_grid,
                     textvariable=var_b_rot,
@@ -2705,7 +3196,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 st_rot = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
                 st_rot.grid(row=9, column=2, sticky="w", padx=(8, 0), pady=2)
                 _bind_status_text("rotation", var_b_rot, st_rot)
-                ttk.Label(insp_grid, text="Vào khung (Fit/Fill/Stretch)").grid(row=10, column=0, sticky="w", pady=2)
+                _lb_cv = ttk.Label(insp_grid, text="Vào khung (Fit/Fill/Stretch)", justify=tk.LEFT)
+                _lb_cv.grid(row=10, column=0, sticky="ew", pady=2)
+                _bind_label_wrap_to_frame(_lb_cv, insp_grid, inset=18)
                 ttk.Combobox(
                     insp_grid,
                     textvariable=var_b_canvas,
@@ -2716,11 +3209,19 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 st_canvas = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
                 st_canvas.grid(row=10, column=2, sticky="w", padx=(8, 0), pady=2)
                 _bind_status_text("canvas_mode", var_b_canvas, st_canvas)
+                _lb_zm = ttk.Label(insp_grid, text="Zoom (1 = vừa khung; để trống = giữ)", justify=tk.LEFT)
+                _lb_zm.grid(row=11, column=0, sticky="ew", pady=2)
+                _bind_label_wrap_to_frame(_lb_zm, insp_grid, inset=18)
+                ttk.Entry(insp_grid, textvariable=var_b_zoom, width=12).grid(row=11, column=1, sticky="ew", pady=2)
+                st_zoom = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
+                st_zoom.grid(row=11, column=2, sticky="w", padx=(8, 0), pady=2)
+                _bind_status_text("zoom", var_b_zoom, st_zoom)
 
                 media_audios = [m for m in (project.get("media") or []) if isinstance(m, dict) and str(m.get("type") or "") == "audio"]
                 audio_opts = [""] + [f"{str(m.get('id'))}|{str(m.get('name') or 'audio')}" for m in media_audios]
                 var_b_audio = tk.StringVar(value=str(_batch_edit_draft.get("audio_media") or ""))
                 var_b_audio_vol = tk.StringVar(value=str(_batch_edit_draft.get("audio_vol") or "1.0"))
+                var_b_audio_sp = tk.StringVar(value=str(_batch_edit_draft.get("audio_sp") or "1.0"))
 
                 _lm_d = str(_batch_edit_draft.get("logo_media") or "").strip()
                 try:
@@ -2750,25 +3251,30 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     except (NameError, tk.TclError):
                         pass
 
-                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=11, column=0, columnspan=3, sticky="ew", pady=6)
+                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=12, column=0, columnspan=3, sticky="ew", pady=6)
 
                 batch_media_fr = ttk.Frame(insp_grid)
-                batch_media_fr.grid(row=12, column=0, columnspan=3, sticky="ew")
+                batch_media_fr.grid(row=13, column=0, columnspan=3, sticky="ew")
+                batch_media_fr.columnconfigure(0, weight=1)
 
                 ov_hint_b = ttk.Label(
                     batch_media_fr,
                     text="Logo & chữ: dùng khung «Logo & Chữ» cuối tab. Âm phụ: chỉnh trong khung dưới.",
                     foreground="#1a4480",
                     font=("Segoe UI", 8),
-                    wraplength=560,
                     justify=tk.LEFT,
                 )
-                ov_hint_b.pack(anchor="w", pady=(0, 8))
+                ov_hint_b.pack(anchor="w", fill=tk.X, pady=(0, 8))
+                _bind_label_wrap_to_frame(ov_hint_b, batch_media_fr, inset=8)
 
                 lf_b_audio = ttk.LabelFrame(batch_media_fr, text="Âm thanh — track phụ", padding=(8, 6, 8, 8))
-                lf_b_audio.pack(fill=tk.X, pady=(0, 6))
+                lf_b_audio.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+                lf_b_audio.columnconfigure(0, weight=0)
                 lf_b_audio.columnconfigure(1, weight=1)
-                ttk.Label(lf_b_audio, text="File âm thanh").grid(row=0, column=0, sticky="w", pady=2)
+                lf_b_audio.columnconfigure(2, weight=0)
+                _lb_af = ttk.Label(lf_b_audio, text="File âm thanh", justify=tk.LEFT)
+                _lb_af.grid(row=0, column=0, sticky="ew", pady=2)
+                _bind_label_wrap_to_frame(_lb_af, lf_b_audio, inset=12)
                 ttk.Combobox(lf_b_audio, textvariable=var_b_audio, values=audio_opts, state="readonly").grid(
                     row=0, column=1, sticky="ew", padx=(8, 8), pady=2
                 )
@@ -2780,15 +3286,21 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 st_audio_vol = ttk.Label(lf_b_audio, text="Chưa chỉnh", foreground="#888888")
                 st_audio_vol.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(4, 2))
                 _bind_status_text("audio_vol", var_b_audio_vol, st_audio_vol)
+                ttk.Label(lf_b_audio, text="Tốc độ track phụ").grid(row=2, column=0, sticky="w", pady=(4, 2))
+                ttk.Entry(lf_b_audio, textvariable=var_b_audio_sp, width=14).grid(row=2, column=1, sticky="w", pady=(4, 2))
+                st_audio_sp = ttk.Label(lf_b_audio, text="Chưa chỉnh", foreground="#888888")
+                st_audio_sp.grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(4, 2))
+                _bind_status_text("audio_sp", var_b_audio_sp, st_audio_sp)
 
-                ttk.Label(
+                _bat_scope = ttk.Label(
                     insp_grid,
                     text="Để trống = giữ nguyên. Chọn phạm vi ở cuối tab trước khi «Áp dụng tất cả».",
                     foreground="gray",
                     font=("Segoe UI", 8),
-                    wraplength=520,
                     justify=tk.LEFT,
-                ).grid(row=15, column=0, columnspan=3, sticky="w", pady=(8, 6))
+                )
+                _bat_scope.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(8, 6))
+                _bind_label_wrap_to_frame(_bat_scope, insp_grid, inset=8)
 
                 var_b_reset_mode = tk.StringVar(
                     value=str(_batch_edit_draft.get("reset_mode") or "Reset về ban đầu")
@@ -2845,6 +3357,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             "keep_aspect": True,
                         },
                         "canvas_mode": "fit",
+                        "zoom": 1.0,
                     }
                     patch_basic = {
                         "speed": 1.0,
@@ -2876,6 +3389,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             "keep_aspect": True,
                         },
                         "canvas_mode": "fit",
+                        "zoom": 1.0,
                     }
                     if reset_mode == "Reset cơ bản (âm/tốc độ/fade/xoay)":
                         patch_default = patch_basic
@@ -2940,7 +3454,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         justify=tk.LEFT,
                     ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
                     try:
-                        _br_bar.pack(fill=tk.X, pady=(4, 6), before=btn_apply_all_bottom)
+                        _br_bar.pack(fill=tk.X, pady=(4, 6), before=fr_quick_edit_host)
                     except tk.TclError:
                         _br_bar.pack(fill=tk.X, pady=(4, 6))
 
@@ -3021,6 +3535,21 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             messagebox.showerror("Hàng loạt", "Canvas mode chỉ nhận fit/fill/stretch.")
                             return
                         patch["canvas_mode"] = canvas_s
+                    zoom_s = var_b_zoom.get().strip()
+                    if zoom_s:
+                        if applied.get("zoom") == _sig(zoom_s):
+                            zoom_s = ""
+                    if zoom_s:
+                        try:
+                            zz = float(zoom_s)
+                            if zz < 0.1 or zz > 8.0:
+                                messagebox.showerror("Hàng loạt", "Zoom hợp lệ trong khoảng 0.1 — 8 (1 = vừa khung).", parent=root)
+                                return
+                            patch["zoom"] = zz
+                        except ValueError:
+                            messagebox.showerror("Hàng loạt", "Giá trị Zoom không hợp lệ.", parent=root)
+                            return
+
                     def _batch_explicit_logo_mid() -> str:
                         raw = str(var_q_logo_media.get() or "").strip()
                         if not raw or raw == _AUTO_LOGO_MEDIA_LBL:
@@ -3058,16 +3587,27 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     text_val = str(var_ov_text.get() or "").strip()
                     add_text = bool(text_val)
                     if add_audio:
-                        audio_sig = "|".join([str(audio_mid), str(var_b_audio_vol.get().strip() or "1.0")])
+                        audio_sig = "|".join(
+                            [
+                                str(audio_mid),
+                                str(var_b_audio_vol.get().strip() or "1.0"),
+                                str(var_b_audio_sp.get().strip() or "1.0"),
+                            ]
+                        )
                         if applied.get("audio") == audio_sig:
                             add_audio = False
                     # Không bỏ qua chữ chỉ vì applied trùng — clip mới / đổi vị trí vẫn cần đồng bộ như logo.
                     audio_vol = 1.0
+                    batch_audio_sp = 1.0
                     if add_audio:
                         try:
                             audio_vol = max(0.0, float(var_b_audio_vol.get().strip() or "1.0"))
+                            batch_audio_sp = float(str(var_b_audio_sp.get()).strip() or "1.0")
                         except ValueError:
-                            messagebox.showerror("Hàng loạt", "Âm lượng audio không hợp lệ.")
+                            messagebox.showerror("Hàng loạt", "Âm lượng / tốc độ track phụ không hợp lệ.")
+                            return
+                        if batch_audio_sp <= 0:
+                            messagebox.showerror("Hàng loạt", "Tốc độ track phụ phải > 0.")
                             return
 
                     q_logo_has_input = any(
@@ -3124,17 +3664,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
                     loc_b = aoc_b = toc_b = "replace"
                     if add_logo or add_audio or add_text:
-                        c_logo_b, c_audio_b, c_text_b = _conflicts_for_video_rows(
-                            current_rows,
-                            want_logo=add_logo,
-                            want_audio=add_audio,
-                            want_text=add_text,
-                        )
-                        if c_logo_b or c_audio_b or c_text_b:
+                        ov_l, ov_a, ov_t = _conflicts_for_video_rows(current_rows)
+                        if (add_logo and ov_l) or (add_audio and ov_a) or (add_text and ov_t):
                             modes_b = _prompt_apply_conflict_modes(
-                                ask_logo=c_logo_b and add_logo,
-                                ask_audio=c_audio_b and add_audio,
-                                ask_text=c_text_b and add_text,
+                                ask_logo=ov_l,
+                                ask_audio=ov_a,
+                                ask_text=ov_t,
                                 batch_count=len(current_rows),
                             )
                             if modes_b is None:
@@ -3163,6 +3698,15 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         if prog_step and (j == n_batch or j % prog_step == 0):
                             _ve_batch_status_progress(j, n_batch, "áp dụng clip")
 
+                    if effective_patch and "speed" in effective_patch:
+                        try:
+                            sp_batch = float(effective_patch["speed"])
+                        except (TypeError, ValueError):
+                            sp_batch = 1.0
+                        if sp_batch > 0:
+                            for cid_b, _c_b in current_rows:
+                                _sync_overlapping_timeline_audio_speed_to_video(cid_b, sp_batch)
+
                     if add_logo or add_audio or add_text:
                         lg_ops_b, au_ops_b, tx_ops_b = apply_logo_audio_text_to_video_rows(
                             current_rows,
@@ -3172,10 +3716,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             logo_corner=logo_corner_b,
                             audio_mid=str(audio_mid or "").strip() if add_audio else "",
                             audio_volume=audio_vol,
+                            audio_speed=batch_audio_sp if add_audio else None,
                             text_content=text_val if add_text else "",
-                            logo_on_conflict=loc_b,
-                            audio_on_conflict=aoc_b,
-                            text_on_conflict=toc_b,
+                            logo_on_conflict=loc_b if add_logo else "skip",
+                            audio_on_conflict=aoc_b if add_audio else "skip",
+                            text_on_conflict=toc_b if add_text else "skip",
                         )
 
                     if defer_tm:
@@ -3213,7 +3758,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     # Lưu trạng thái đã áp để lần bấm sau chỉ chạy phần chưa chạy.
                     if sc_clip_b:
                         for k in patch.keys():
-                            if k in ("volume", "speed", "fade_in", "fade_out", "rotation", "canvas_mode"):
+                            if k in ("volume", "speed", "fade_in", "fade_out", "rotation", "canvas_mode", "zoom"):
                                 applied[k] = _sig(_batch_edit_draft.get(k))
                             elif k in ("flip_horizontal", "flip_vertical"):
                                 applied["flip"] = f"{int(bool(var_b_flip_h.get()))}:{int(bool(var_b_flip_v.get()))}"
@@ -3228,7 +3773,13 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             ]
                         )
                     if add_audio:
-                        applied["audio"] = "|".join([str(audio_mid), str(var_b_audio_vol.get().strip() or "1.0")])
+                        applied["audio"] = "|".join(
+                            [
+                                str(audio_mid),
+                                str(var_b_audio_vol.get().strip() or "1.0"),
+                                str(var_b_audio_sp.get().strip() or "1.0"),
+                            ]
+                        )
                     if add_text:
                         applied["text"] = _sig(text_val)
                     _persist_batch_draft(save_project_file=False)
@@ -3302,18 +3853,21 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
         insp_grid.columnconfigure(1, weight=1)
         if ctype == "video":
+            insp_grid.columnconfigure(0, weight=1)
             sv_cid = str(selected_clip_id or "").strip()
-            ttk.Label(
+            _vh_intro = ttk.Label(
                 insp_grid,
                 text=(
-                    "Một clip video: các ô dưới là bản nháp — bấm «Áp dụng tất cả» ở cuối tab để ghi xuống timeline "
-                    "(cùng nút với sửa nhiều clip)."
+                    "Một clip video: timeline / cắt nguồn / tốc độ / fade… là bản nháp — bấm «Áp dụng tất cả» "
+                    "ở cuối tab để ghi (theo «Phạm vi»). Transform & canvas (lật, khung, zoom, tắt âm gốc) cũng bật "
+                    "trong «Phạm vi» — không đụng timeline hay cắt nguồn khi chỉ chọn các mục đó."
                 ),
                 foreground="#1a4480",
                 font=("Segoe UI", 8),
-                wraplength=440,
                 justify=tk.LEFT,
-            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            )
+            _vh_intro.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            _bind_label_wrap_to_frame(_vh_intro, insp_grid, inset=8)
 
             vr = 1
             ttk.Label(insp_grid, text="Bắt đầu trên timeline (giây)").grid(row=vr, column=0, sticky="nw", pady=2)
@@ -3390,11 +3944,125 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             ).grid(row=vr, column=1, sticky="w")
             vr += 1
 
+            zm0 = cl.get("zoom", 1.0)
+            if zm0 in ("", None):
+                zm0 = 1.0
+            ttk.Label(insp_grid, text="Zoom (1 = vừa khung; >1 phóng to, <1 thu nhỏ)").grid(row=vr, column=0, sticky="w")
+            var_sv_zoom = tk.StringVar(value=str(zm0))
+            ttk.Entry(insp_grid, textvariable=var_sv_zoom, width=18).grid(row=vr, column=1, sticky="w")
+            vr += 1
+
             var_sv_mute = tk.BooleanVar(value=bool(cl.get("muted")))
             ttk.Checkbutton(insp_grid, text="Tắt âm tiếng gốc clip", variable=var_sv_mute).grid(
                 row=vr, column=0, columnspan=2, sticky="w"
             )
             vr += 1
+
+            def _ve_validate_rotation() -> int:
+                try:
+                    rot_i = int(str(var_sv_rot.get()).strip())
+                except ValueError as exc:
+                    raise ValueError("Góc xoay không hợp lệ.") from exc
+                if rot_i not in (0, 90, 180, 270):
+                    raise ValueError("Xoay chỉ 0 / 90 / 180 / 270.")
+                return rot_i
+
+            def _ve_validate_canvas_zoom() -> tuple[str, float]:
+                cm = str(var_sv_canvas.get() or "fit").strip().lower()
+                if cm not in ("fit", "fill", "stretch"):
+                    raise ValueError("Canvas: chọn fit, fill hoặc stretch.")
+                try:
+                    zm = float(str(var_sv_zoom.get()).strip())
+                except ValueError as exc:
+                    raise ValueError("Giá trị Zoom không hợp lệ.") from exc
+                if zm < 0.1 or zm > 8.0:
+                    raise ValueError("Zoom hợp lệ trong khoảng 0.1 — 8 (1 = vừa khung).")
+                return cm, zm
+
+            def _ve_apply_transform_canvas_subset(
+                *,
+                flip_rot: bool,
+                layout: bool,
+                mute_u: bool,
+                defer_finalize: bool = False,
+            ) -> list[str] | None:
+                """
+                Ghi lật/xoay, khung & zoom, tắt âm gốc — không đổi timeline / trim / tốc độ.
+
+                Khi ``defer_finalize=True``: chỉ cập nhật project trong RAM, trả về nhãn đã áp;
+                không ``save_project`` / không ``notify`` / không làm mới timeline & inspector (dùng khi gộp «Áp dụng tất cả»).
+
+                Returns:
+                    ``None`` nếu lỗi (đã hiện ``messagebox``). Danh sách nhãn (có thể rỗng) khi thành công.
+                """
+                if not project:
+                    return [] if defer_finalize else None
+                cid = sv_cid
+                if not cid:
+                    return [] if defer_finalize else None
+                fc_tf = _find_clip(cid)
+                if not fc_tf or not fc_tf[1] or str(fc_tf[1].get("type")) != "video":
+                    messagebox.showerror("Transform & canvas", "Không tìm thấy clip video.", parent=root)
+                    return None
+                rot_i = 0
+                try:
+                    if flip_rot:
+                        rot_i = _ve_validate_rotation()
+                    if layout:
+                        cm, zm = _ve_validate_canvas_zoom()
+                except ValueError as ve:
+                    messagebox.showerror("Transform & canvas", str(ve), parent=root)
+                    return None
+                try:
+                    if flip_rot:
+                        tm.update_clip(
+                            project,
+                            cid,
+                            {
+                                "flip_horizontal": bool(var_sv_fh.get()),
+                                "flip_vertical": bool(var_sv_fv.get()),
+                                "rotation": rot_i,
+                            },
+                            persist=False,
+                            recompute_duration=False,
+                        )
+                    if layout:
+                        tm.update_clip(
+                            project,
+                            cid,
+                            {"zoom": zm},
+                            persist=False,
+                            recompute_duration=False,
+                        )
+                        tm.set_canvas_mode(project, cid, cm, persist=False, recompute_duration=False)
+                    if mute_u:
+                        tm.mute_clip(
+                            project,
+                            cid,
+                            bool(var_sv_mute.get()),
+                            persist=False,
+                            recompute_duration=False,
+                        )
+                except Exception as ex:
+                    messagebox.showerror("Transform & canvas", str(ex), parent=root)
+                    return None
+                bits: list[str] = []
+                if flip_rot:
+                    bits.append("lật & xoay")
+                if layout:
+                    bits.append("khung & zoom")
+                if mute_u:
+                    bits.append("âm gốc clip")
+                if defer_finalize:
+                    return bits
+                pm.save_project(project)
+                notify("Đã áp dụng: " + " · ".join(bits))
+                refresh_timeline()
+                refresh_inspector()
+                _auto_preview_after_apply("transform & canvas")
+                return bits
+
+            _apply_transform_subset_ref["fn"] = _ve_apply_transform_canvas_subset
 
             pw = int(project.get("width") or 1080)
             ph = int(project.get("height") or 1920)
@@ -3458,7 +4126,39 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 return lv, av, tv
 
             d_logo_ov, d_audio_ov, d_text_ov = _defaults_logo_audio_text_ov()
-            # Đồng bộ khung «Logo · Chữ» (var_q_*) với clip đang mở — cùng nguồn với nút «Áp dụng tất cả».
+            _ts0 = float(cl.get("timeline_start") or 0)
+            _te0 = _ts0 + max(0.0, float(cl.get("duration") or 0))
+            d_ov_vol = "1.0"
+            _vsp0 = cl.get("speed", 1.0)
+            if _vsp0 in ("", None):
+                _vsp0 = 1.0
+            d_ov_sp = str(_vsp0)
+            try:
+                if float(d_ov_sp) <= 0:
+                    d_ov_sp = "1.0"
+            except (TypeError, ValueError):
+                d_ov_sp = "1.0"
+            for _ac in _find_track_clips_local("audio"):
+                if not isinstance(_ac, dict) or str(_ac.get("type") or "") != "audio":
+                    continue
+                _as = float(_ac.get("timeline_start") or 0.0)
+                _ae = _as + max(0.0, float(_ac.get("duration") or 0.0))
+                if not _ve_iv_overlap(_ts0, _te0, _as, _ae):
+                    continue
+                try:
+                    d_ov_vol = str(float(_ac.get("volume") or 1.0))
+                except (TypeError, ValueError):
+                    d_ov_vol = "1.0"
+                _aspeed = _ac.get("speed", None)
+                if _aspeed not in (None, ""):
+                    d_ov_sp = str(_aspeed)
+                try:
+                    if float(d_ov_sp) <= 0:
+                        d_ov_sp = "1.0"
+                except (TypeError, ValueError):
+                    d_ov_sp = "1.0"
+                break
+
             try:
                 ts_q = float(cl.get("timeline_start") or 0)
                 te_q = ts_q + max(0.0, float(cl.get("duration") or 0))
@@ -3558,12 +4258,113 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             vr += 1
 
             var_ov_audio = tk.StringVar(value=d_audio_ov)
-            var_ov_audio_vol = tk.StringVar(value="1.0")
+            var_ov_audio_vol = tk.StringVar(value=d_ov_vol)
+            var_ov_audio_sp = tk.StringVar(value=d_ov_sp)
             var_ov_text.set(d_text_ov)
 
             def _pick_ov_id(raw: str) -> str:
                 s = str(raw or "").strip()
                 return s.split("|", 1)[0].strip() if "|" in s else s
+
+            def _ve_float_eq(a: Any, b: Any, *, eps: float = 1e-4) -> bool:
+                try:
+                    return abs(float(a) - float(b)) < eps
+                except (TypeError, ValueError):
+                    return a == b
+
+            def _ve_inspector_clip_diff_patch(
+                cur_clip: dict[str, Any],
+                *,
+                ts: float,
+                ss: float,
+                se: float,
+                du: float,
+                sp: float,
+                vol: float,
+                fi: float,
+                fo: float,
+                fh: bool,
+                fv: bool,
+                rot_i: int,
+                zm: float,
+                cm: str,
+                muted: bool,
+            ) -> tuple[dict[str, Any], bool, bool, list[str]]:
+                """
+                So sánh UI với clip đang lưu trong project.
+
+                Returns:
+                    (patch cho ``update_clip``, đổi canvas_mode, đổi muted, nhãn ngắn cho thông báo)
+                """
+                labels: list[str] = []
+                patch: dict[str, Any] = {}
+                if not _ve_float_eq(ts, cur_clip.get("timeline_start") or 0):
+                    patch["timeline_start"] = ts
+                    labels.append("vị trí timeline")
+                if not _ve_float_eq(ss, cur_clip.get("source_start") or 0):
+                    patch["source_start"] = ss
+                    labels.append("điểm cắt đầu")
+                if not _ve_float_eq(se, cur_clip.get("source_end") or 0):
+                    patch["source_end"] = se
+                    labels.append("điểm cắt cuối")
+                if not _ve_float_eq(du, cur_clip.get("duration") or 0):
+                    patch["duration"] = du
+                    labels.append("độ dài clip")
+                if not _ve_float_eq(sp, cur_clip.get("speed") or 1.0):
+                    patch["speed"] = sp
+                    labels.append("tốc độ")
+                if not _ve_float_eq(vol, cur_clip.get("volume") or 1.0):
+                    patch["volume"] = vol
+                    labels.append("âm lượng")
+                if not _ve_float_eq(fi, cur_clip.get("fade_in") or 0):
+                    patch["fade_in"] = fi
+                    labels.append("fade vào")
+                if not _ve_float_eq(fo, cur_clip.get("fade_out") or 0):
+                    patch["fade_out"] = fo
+                    labels.append("fade ra")
+                if fh != bool(cur_clip.get("flip_horizontal")):
+                    patch["flip_horizontal"] = fh
+                    labels.append("lật ngang")
+                if fv != bool(cur_clip.get("flip_vertical")):
+                    patch["flip_vertical"] = fv
+                    labels.append("lật dọc")
+                if int(cur_clip.get("rotation") or 0) != rot_i:
+                    patch["rotation"] = rot_i
+                    labels.append("xoay")
+                if not _ve_float_eq(zm, cur_clip.get("zoom") or 1.0):
+                    patch["zoom"] = zm
+                    labels.append("zoom")
+                cm_cur = str(cur_clip.get("canvas_mode") or "fit").strip().lower()
+                canvas_changed = cm != cm_cur
+                if canvas_changed:
+                    labels.append("vào khung")
+                mute_changed = muted != bool(cur_clip.get("muted"))
+                if mute_changed:
+                    labels.append("tắt âm gốc")
+                return patch, canvas_changed, mute_changed, labels
+
+            def _ve_transform_branches_dirty(
+                cur_clip: dict[str, Any],
+                *,
+                fh: bool,
+                fv: bool,
+                rot_i: int,
+                cm: str,
+                zm: float,
+                muted: bool,
+            ) -> tuple[bool, bool, bool]:
+                """
+                So sánh UI với clip trong project: nhánh nào còn lệch thì True (lật/xoay, khung&zoom, mute).
+                """
+                flip_d = (
+                    fh != bool(cur_clip.get("flip_horizontal"))
+                    or fv != bool(cur_clip.get("flip_vertical"))
+                    or int(cur_clip.get("rotation") or 0) != rot_i
+                )
+                cm_cur = str(cur_clip.get("canvas_mode") or "fit").strip().lower()
+                layout_d = cm != cm_cur or not _ve_float_eq(zm, cur_clip.get("zoom") or 1.0)
+                mute_d = muted != bool(cur_clip.get("muted"))
+                return flip_d, layout_d, mute_d
 
             def apply_single_video_inspector() -> None:
                 if not project:
@@ -3583,14 +4384,58 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 sc_ql = bool(var_ve_apply_quick_logo.get())
                 sc_qt = bool(var_ve_apply_quick_text.get())
                 sc_quick = sc_ql or sc_qt
-                if not (sc_clip or sc_ov or sc_quick):
+                sc_tf_full = bool(var_ve_apply_tf_full.get())
+                sc_tf_flip = bool(var_ve_apply_tf_flip.get())
+                sc_tf_layout = bool(var_ve_apply_tf_layout.get())
+                sc_tf_mute = bool(var_ve_apply_tf_mute.get())
+                sc_tf_any = sc_tf_full or sc_tf_flip or sc_tf_layout or sc_tf_mute
+                if not (sc_clip or sc_ov or sc_quick or sc_tf_any):
                     messagebox.showinfo(
                         "Áp dụng tất cả",
                         "Chọn ít nhất một mục trong «Phạm vi khi bấm Áp dụng tất cả» (cuối tab).",
                         parent=root,
                     )
                     return
+                fn_tf_call = _apply_transform_subset_ref.get("fn")
+                if sc_tf_any and fn_tf_call is None:
+                    messagebox.showwarning(
+                        "Áp dụng tất cả",
+                        "Đang bật «Transform & canvas» trong «Phạm vi» nhưng cần inspector clip video đang mở — "
+                        "chọn clip video trên timeline hoặc bỏ các mục Transform.",
+                        parent=root,
+                    )
+                    return
                 w_dim = h_dim = 0
+                clip_scope_msg: str | None = None
+                rot_i = 0
+                cm = "fit"
+                zm = 1.0
+                fh = fv = muted = False
+                ts = ss = se = du = sp = vol = fi = fo = 0.0
+                if sc_clip or sc_tf_any:
+                    try:
+                        rot_i = int(str(var_sv_rot.get()).strip())
+                    except ValueError:
+                        messagebox.showerror("Clip", "Góc xoay không hợp lệ.", parent=root)
+                        return
+                    if rot_i not in (0, 90, 180, 270):
+                        messagebox.showerror("Clip", "Xoay chỉ 0 / 90 / 180 / 270.", parent=root)
+                        return
+                    cm = str(var_sv_canvas.get() or "fit").strip().lower()
+                    if cm not in ("fit", "fill", "stretch"):
+                        messagebox.showerror("Clip", "Canvas: chọn fit, fill hoặc stretch.", parent=root)
+                        return
+                    try:
+                        zm = float(str(var_sv_zoom.get()).strip())
+                    except ValueError:
+                        messagebox.showerror("Clip", "Giá trị Zoom không hợp lệ.", parent=root)
+                        return
+                    if zm < 0.1 or zm > 8.0:
+                        messagebox.showerror("Clip", "Zoom hợp lệ trong khoảng 0.1 — 8 (1 = vừa khung).", parent=root)
+                        return
+                    fh = bool(var_sv_fh.get())
+                    fv = bool(var_sv_fv.get())
+                    muted = bool(var_sv_mute.get())
                 if sc_clip:
                     try:
                         ts = float(str(var_sv_ts.get()).strip())
@@ -3611,75 +4456,138 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     if sp <= 0:
                         messagebox.showerror("Clip", "Tốc độ phải > 0.", parent=root)
                         return
+                    cur = fc0[1]
+                    only_diff = bool(var_ve_clip_only_diff_vs_file.get())
+                    if only_diff:
+                        patch, canvas_changed, mute_changed, diff_labels = _ve_inspector_clip_diff_patch(
+                            cur,
+                            ts=ts,
+                            ss=ss,
+                            se=se,
+                            du=du,
+                            sp=sp,
+                            vol=vol,
+                            fi=fi,
+                            fo=fo,
+                            fh=fh,
+                            fv=fv,
+                            rot_i=rot_i,
+                            zm=zm,
+                            cm=cm,
+                            muted=muted,
+                        )
+                    else:
+                        patch = {
+                            "timeline_start": ts,
+                            "source_start": ss,
+                            "source_end": se,
+                            "duration": du,
+                            "speed": sp,
+                            "volume": vol,
+                            "fade_in": fi,
+                            "fade_out": fo,
+                            "flip_horizontal": fh,
+                            "flip_vertical": fv,
+                            "rotation": rot_i,
+                            "zoom": zm,
+                        }
+                        cm_cur = str(cur.get("canvas_mode") or "fit").strip().lower()
+                        canvas_changed = cm != cm_cur
+                        mute_changed = muted != bool(cur.get("muted"))
+                        diff_labels = ["ghi đủ từ inspector (không lọc trùng file)"]
+                    w_dim = max(2, int(project.get("width") or 1080))
+                    h_dim = max(2, int(project.get("height") or 1920))
+                    _layout_refresh_keys = {
+                        "flip_horizontal",
+                        "flip_vertical",
+                        "rotation",
+                        "zoom",
+                        "timeline_start",
+                        "source_start",
+                        "source_end",
+                        "duration",
+                        "speed",
+                    }
+                    need_crop_scale = canvas_changed or bool(_layout_refresh_keys & patch.keys())
                     try:
-                        rot_i = int(str(var_sv_rot.get()).strip())
-                    except ValueError:
-                        messagebox.showerror("Clip", "Góc xoay không hợp lệ.", parent=root)
-                        return
-                    if rot_i not in (0, 90, 180, 270):
-                        messagebox.showerror("Clip", "Xoay chỉ 0 / 90 / 180 / 270.", parent=root)
-                        return
-                    cm = str(var_sv_canvas.get() or "fit").strip().lower()
-                    if cm not in ("fit", "fill", "stretch"):
-                        messagebox.showerror("Clip", "Canvas: chọn fit, fill hoặc stretch.", parent=root)
-                        return
-                    try:
-                        w_dim = max(2, int(project.get("width") or 1080))
-                        h_dim = max(2, int(project.get("height") or 1920))
-                        tm.update_clip(
-                            project,
-                            cid,
-                            {
-                                "timeline_start": ts,
-                                "source_start": ss,
-                                "source_end": se,
-                                "duration": du,
-                                "speed": sp,
-                                "volume": vol,
-                                "fade_in": fi,
-                                "fade_out": fo,
-                                "flip_horizontal": bool(var_sv_fh.get()),
-                                "flip_vertical": bool(var_sv_fv.get()),
-                                "rotation": rot_i,
-                            },
-                            persist=False,
-                            recompute_duration=False,
-                        )
-                        tm.set_canvas_mode(project, cid, cm, persist=False, recompute_duration=False)
-                        tm.mute_clip(project, cid, bool(var_sv_mute.get()), persist=False, recompute_duration=False)
-                        tm.crop_clip(
-                            project,
-                            cid,
-                            {
-                                "enabled": False,
-                                "x": 0,
-                                "y": 0,
-                                "width": w_dim,
-                                "height": h_dim,
-                            },
-                            persist=False,
-                            recompute_duration=False,
-                        )
-                        tm.update_clip(
-                            project,
-                            cid,
-                            {
-                                "scale": {
-                                    "enabled": True,
-                                    "width": w_dim,
-                                    "height": h_dim,
-                                    "keep_aspect": True,
-                                }
-                            },
-                            persist=False,
-                            recompute_duration=True,
-                        )
+                        if not patch and not canvas_changed and not mute_changed:
+                            clip_scope_msg = f"clip {w_dim}×{h_dim} (không đổi so với đã lưu)"
+                        else:
+                            if patch:
+                                tm.update_clip(project, cid, patch, persist=False, recompute_duration=False)
+                            if canvas_changed:
+                                tm.set_canvas_mode(project, cid, cm, persist=False, recompute_duration=False)
+                            if mute_changed:
+                                tm.mute_clip(project, cid, muted, persist=False, recompute_duration=False)
+                            if need_crop_scale:
+                                tm.crop_clip(
+                                    project,
+                                    cid,
+                                    {
+                                        "enabled": False,
+                                        "x": 0,
+                                        "y": 0,
+                                        "width": w_dim,
+                                        "height": h_dim,
+                                    },
+                                    persist=False,
+                                    recompute_duration=False,
+                                )
+                                tm.update_clip(
+                                    project,
+                                    cid,
+                                    {
+                                        "scale": {
+                                            "enabled": True,
+                                            "width": w_dim,
+                                            "height": h_dim,
+                                            "keep_aspect": True,
+                                        }
+                                    },
+                                    persist=False,
+                                    recompute_duration=True,
+                                )
+                            elif patch:
+                                tm.update_clip(project, cid, {}, persist=False, recompute_duration=True)
+                            if "speed" in patch:
+                                _sync_overlapping_timeline_audio_speed_to_video(cid, float(patch["speed"]))
+                            clip_scope_msg = f"clip {w_dim}×{h_dim}: {', '.join(diff_labels)}"
                     except Exception as ex:
                         messagebox.showerror("Clip", str(ex), parent=root)
                         return
                 else:
                     w_dim = max(2, int(project.get("width") or 1080))
                     h_dim = max(2, int(project.get("height") or 1920))
+
+                tf_defer_bits: list[str] = []
+                tf_skip_note: str | None = None
+                if sc_tf_any and fn_tf_call is not None:
+                    fc_tf_l = _find_clip(cid)
+                    cur_tf_l = fc_tf_l[1] if fc_tf_l and fc_tf_l[1] else {}
+                    tf_diff = bool(var_ve_tf_only_diff_vs_file.get())
+                    d_fr, d_lay, d_mu = _ve_transform_branches_dirty(
+                        cur_tf_l, fh=fh, fv=fv, rot_i=rot_i, cm=cm, zm=zm, muted=muted
+                    )
+                    if sc_tf_full:
+                        want_fr = True if not tf_diff else d_fr
+                        want_lay = True if not tf_diff else d_lay
+                        want_mu = True if not tf_diff else d_mu
+                    else:
+                        want_fr = bool(sc_tf_flip) and (not tf_diff or d_fr)
+                        want_lay = bool(sc_tf_layout) and (not tf_diff or d_lay)
+                        want_mu = bool(sc_tf_mute) and (not tf_diff or d_mu)
+                    if not (want_fr or want_lay or want_mu):
+                        tf_skip_note = "transform (đã khớp file — bỏ qua)"
+                    else:
+                        res_tf = fn_tf_call(
+                            flip_rot=want_fr,
+                            layout=want_lay,
+                            mute_u=want_mu,
+                            defer_finalize=True,
+                        )
+                        if res_tf is None:
+                            return
+                        tf_defer_bits = list(res_tf)
 
                 lg = au = txc = 0
                 if sc_ov:
@@ -3690,9 +4598,16 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         lr = (
                             float(str(var_q_logo_size_ratio.get() or "").strip() or "0.15") if sc_l else 0.15
                         )
-                        avl = float(str(var_ov_audio_vol.get()).strip() or "1.0") if sc_a else 1.0
+                        avl = 1.0
+                        av_sp_apply: float | None = None
+                        if sc_a:
+                            avl = float(str(var_ov_audio_vol.get()).strip() or "1.0")
+                            av_sp_apply = float(str(var_ov_audio_sp.get()).strip() or "1.0")
                     except ValueError:
-                        messagebox.showerror("Clip", "Opacity logo / tỉ lệ / âm lượng track không hợp lệ.", parent=root)
+                        messagebox.showerror("Clip", "Opacity logo / tỉ lệ / âm lượng track / tốc độ âm không hợp lệ.", parent=root)
+                        return
+                    if sc_a and av_sp_apply is not None and av_sp_apply <= 0:
+                        messagebox.showerror("Clip", "Tốc độ âm track phụ phải > 0.", parent=root)
                         return
 
                     def _logo_mid_inspector_explicit_only() -> str:
@@ -3716,14 +4631,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     _want_t = bool(_tx_ins)
                     loc_m = aoc_m = toc_m = "replace"
                     if _want_l or _want_a or _want_t:
-                        cf_l, cf_a, cf_t = _conflicts_for_video_rows(
-                            rows_one, want_logo=_want_l, want_audio=_want_a, want_text=_want_t
-                        )
-                        if cf_l or cf_a or cf_t:
+                        cf_l, cf_a, cf_t = _conflicts_for_video_rows(rows_one)
+                        if (_want_l and cf_l) or (_want_a and cf_a) or (_want_t and cf_t):
                             modes_ins = _prompt_apply_conflict_modes(
-                                ask_logo=cf_l and _want_l,
-                                ask_audio=cf_a and _want_a,
-                                ask_text=cf_t and _want_t,
+                                ask_logo=cf_l,
+                                ask_audio=cf_a,
+                                ask_text=cf_t,
                                 batch_count=1,
                             )
                             if modes_ins is None:
@@ -3737,10 +4650,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             logo_corner=str(var_q_logo_position.get() or "").strip(),
                             audio_mid=_am_ins,
                             audio_volume=avl,
+                            audio_speed=av_sp_apply if sc_a else None,
                             text_content=_tx_ins,
-                            logo_on_conflict=loc_m,
-                            audio_on_conflict=aoc_m,
-                            text_on_conflict=toc_m,
+                            logo_on_conflict=loc_m if _want_l else "skip",
+                            audio_on_conflict=aoc_m if _want_a else "skip",
+                            text_on_conflict=toc_m if _want_t else "skip",
                         )
                 prev_tl_sel2 = list(tree_tl.selection())
                 q_lo = q_tx = 0
@@ -3766,8 +4680,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             pass
                 pm.save_project(project)
                 parts: list[str] = []
-                if sc_clip:
-                    parts.append(f"clip khung dự án ({w_dim}×{h_dim})")
+                if clip_scope_msg is not None:
+                    parts.append(clip_scope_msg)
+                if tf_defer_bits:
+                    parts.append("transform: " + " · ".join(tf_defer_bits))
+                if tf_skip_note:
+                    parts.append(tf_skip_note)
                 if sc_ov and (lg or au or txc):
                     parts.append(f"inspector L/A/T = {lg}/{au}/{txc}")
                 if sc_quick and (q_lo or q_tx):
@@ -3803,12 +4721,29 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             )
             ttk.Label(lf_ov_audio, text="Âm lượng").grid(row=1, column=0, sticky="w", pady=(6, 0))
             ttk.Entry(lf_ov_audio, textvariable=var_ov_audio_vol, width=12).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+            ttk.Label(lf_ov_audio, text="Tốc độ track phụ (1 = bình thường)").grid(row=2, column=0, sticky="nw", pady=(6, 0))
+            fr_ov_sp = ttk.Frame(lf_ov_audio)
+            fr_ov_sp.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+            ttk.Entry(fr_ov_sp, textvariable=var_ov_audio_sp, width=10).pack(side=tk.LEFT)
+            ttk.Button(
+                fr_ov_sp,
+                text="Khớp video",
+                command=lambda: var_ov_audio_sp.set(str(var_sv_sp.get()).strip() or "1.0"),
+            ).pack(side=tk.LEFT, padx=(6, 0))
+            ttk.Label(
+                lf_ov_audio,
+                text="Khi «Áp clip», tốc độ track phụ tự khớp tốc độ video; chỉnh ô này rồi bật phạm vi «track phụ» để ghi đè.",
+                font=("Segoe UI", 8),
+                foreground="gray",
+                wraplength=420,
+                justify=tk.LEFT,
+            ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
             r_ov += 1
             ttk.Label(
                 ov_lf,
                 text=(
-                    "«Áp dụng tất cả» ghi theo ô «Phạm vi» (cuối tab): có thể chỉ âm/chữ, chỉ clip, hoặc từng phần. "
-                    "Logo inspector chỉ áp khi đã chọn file ảnh cụ thể (không dùng «Tự động» ở đây)."
+                    "«Áp dụng tất cả» ghi theo ô «Phạm vi» (cuối tab): clip đầy đủ, transform & canvas (không timeline), "
+                    "track phủ, chỉnh nhanh. Logo inspector chỉ áp khi đã chọn file ảnh cụ thể (không dùng «Tự động» ở đây)."
                 ),
                 foreground="gray",
                 font=("Segoe UI", 8),
@@ -4666,6 +5601,45 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     def _ve_iv_overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
         return min(a1, b1) > max(a0, b0)
 
+    def _sync_overlapping_timeline_audio_speed_to_video(video_cid: str, video_speed: float) -> int:
+        """
+        Cập nhật ``speed`` của mọi clip audio trên timeline chồng khung thời gian với clip video.
+        Dùng sau khi đổi tốc độ video để nhạc phụ khớp nhịp phát.
+        """
+        if not project:
+            return 0
+        try:
+            sp = float(video_speed)
+        except (TypeError, ValueError):
+            sp = 1.0
+        if sp <= 0:
+            sp = 1.0
+        fc = _find_clip(str(video_cid))
+        if not fc or not fc[1]:
+            return 0
+        vc = fc[1]
+        if str(vc.get("type") or "") != "video":
+            return 0
+        ts = float(vc.get("timeline_start") or 0.0)
+        te = ts + max(0.0, float(vc.get("duration") or 0.0))
+        n = 0
+        for ac in _find_track_clips_local("audio"):
+            if not isinstance(ac, dict) or str(ac.get("type") or "") != "audio":
+                continue
+            ats = float(ac.get("timeline_start") or 0.0)
+            ate = ats + max(0.0, float(ac.get("duration") or 0.0))
+            if not _ve_iv_overlap(ts, te, ats, ate):
+                continue
+            aid = str(ac.get("id") or "").strip()
+            if not aid:
+                continue
+            try:
+                tm.update_clip(project, aid, {"speed": sp}, persist=False, recompute_duration=False)
+                n += 1
+            except Exception:
+                pass
+        return n
+
     def _logo_corner_xy_from_label(pos_pick: str, pw: int, ph: int, side: int, margin: int = 24) -> tuple[int, int]:
         side = max(1, int(side))
         if pos_pick == "Giữa trên":
@@ -4735,21 +5709,25 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     def _conflicts_for_video_rows(
         rows: list[tuple[str, dict[str, Any]]],
         *,
-        want_logo: bool,
-        want_audio: bool,
-        want_text: bool,
+        check_logo: bool = True,
+        check_audio: bool = True,
+        check_text: bool = True,
     ) -> tuple[bool, bool, bool]:
-        """True = ít nhất một clip đã có overlay đó khi ta định áp thêm."""
+        """
+        True = trên timeline đã có overlay (logo ảnh / âm phụ / chữ) chồng khung thời gian clip video.
+
+        ``check_*``: chỉ quét loại tương ứng (ví dụ hàng loạt chỉ kiểm logo khi thực sự định áp logo).
+        """
         any_logo = any_audio = any_text = False
         for _cid, c in rows:
             ts = float(c.get("timeline_start") or 0)
             du = max(0.1, float(c.get("duration") or 0))
             te = ts + du
-            if want_logo and _span_has_logo_overlay(ts, te):
+            if check_logo and _span_has_logo_overlay(ts, te):
                 any_logo = True
-            if want_audio and _span_has_audio_overlay(ts, te):
+            if check_audio and _span_has_audio_overlay(ts, te):
                 any_audio = True
-            if want_text and _span_has_text_overlay(ts, te):
+            if check_text and _span_has_text_overlay(ts, te):
                 any_text = True
         return any_logo, any_audio, any_text
 
@@ -4803,7 +5781,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         dlg.grab_set()
         bx = max(420, int(root.winfo_rootx()) + 40)
         by = max(40, int(root.winfo_rooty()) + 60)
-        dlg.geometry(f"560x320+{bx}+{by}")
+        dlg.geometry(f"560x380+{bx}+{by}")
         intro = (
             "Timeline đã có ít nhất một trong: logo ảnh, track âm phụ, hoặc chữ — trùng khung thời gian với clip đang áp."
             + (f" ({batch_count} clip)" if batch_count > 1 else "")
@@ -4861,6 +5839,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         logo_corner: str = "",
         audio_mid: str = "",
         audio_volume: float = 1.0,
+        audio_speed: float | None = None,
         text_content: str = "",
         logo_on_conflict: str = "replace",
         audio_on_conflict: str = "replace",
@@ -4869,6 +5848,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         """
         Gán logo (overlay ảnh), track âm thanh và clip chữ lên các clip video — cùng logic «sửa hàng loạt».
         logo_on_conflict / audio_on_conflict / text_on_conflict: replace | skip | add.
+        ``audio_speed``: tốc độ phát track phụ (atempo); ``None`` = lấy theo ``speed`` của từng clip video tương ứng.
         Trả về (số thao tác logo, audio, chữ) đã thực hiện (tạo mới hoặc cập nhật).
         """
         if not project or not rows:
@@ -4924,6 +5904,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             du = max(0.1, float(c.get("duration") or 0))
             # Trùng độ dài clip video — giới hạn 8s cũ khiến chữ biến mất sớm trên video dài, dễ hiểu như «chưa áp».
             tdur = du
+            try:
+                a_sp_row = float(audio_speed) if audio_speed is not None else float(c.get("speed") or 1.0)
+            except (TypeError, ValueError):
+                a_sp_row = 1.0
+            if a_sp_row <= 0:
+                a_sp_row = 1.0
             if add_logo:
                 logo_hits: list[dict[str, Any]] = []
                 for _oc in _find_track_clips_local("overlay"):
@@ -5013,6 +5999,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     ac0["duration"] = du
                     ac0["loop"] = True
                     ac0["volume"] = a_vol
+                    ac0["speed"] = a_sp_row
                     for _extra in audio_hits[1:]:
                         _eid = str((_extra or {}).get("id") or "").strip()
                         if _eid:
@@ -5039,6 +6026,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         ac["duration"] = du
                         ac["loop"] = True
                         ac["volume"] = a_vol
+                        ac["speed"] = a_sp_row
                         audio_ops += 1
                 elif not audio_hits:
                     _new_audio.clear()
@@ -5061,6 +6049,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         ac["duration"] = du
                         ac["loop"] = True
                         ac["volume"] = a_vol
+                        ac["speed"] = a_sp_row
                         audio_ops += 1
             if add_text:
                 text_hits: list[dict[str, Any]] = []
@@ -5244,6 +6233,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         for j, (_cid, c) in enumerate(rows, start=1):
             ts = float(c.get("timeline_start") or 0.0)
             du = max(0.1, float(c.get("duration") or 0.0))
+            try:
+                sp_row = float(c.get("speed") or 1.0)
+            except (TypeError, ValueError):
+                sp_row = 1.0
+            if sp_row <= 0:
+                sp_row = 1.0
             audio_hits: list[dict[str, Any]] = []
             for _ac in _find_track_clips_local("audio"):
                 if not isinstance(_ac, dict) or str(_ac.get("type") or "") != "audio":
@@ -5264,6 +6259,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 ac0["duration"] = du
                 ac0["loop"] = True
                 ac0["volume"] = max(0.0, float(audio_vol))
+                ac0["speed"] = sp_row
                 for _extra in audio_hits[1:]:
                     _eid = str((_extra or {}).get("id") or "").strip()
                     if _eid:
@@ -5290,6 +6286,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     ac["duration"] = du
                     ac["loop"] = True
                     ac["volume"] = max(0.0, float(audio_vol))
+                    ac["speed"] = sp_row
                     audio_added += 1
             if prog_step and (j == n_rows or j % prog_step == 0):
                 _ve_batch_status_progress(j, n_rows, "thêm âm thanh")
@@ -5655,17 +6652,28 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     insp_nb.pack(fill=tk.BOTH, expand=True)
     tab_insp_clip = ttk.Frame(insp_nb, padding=(8, 6, 8, 4))
     insp_nb.add(tab_insp_clip, text="Chỉnh clip")
-    # Thanh dưới cố định (gợi ý + Logo·Chữ + nút); phần inspector cuộn phía trên — tránh bị PanedWindow cắt mất.
+    # Hàng 0: chỉnh clip (cuộn). Hàng 1: Logo/Phạm vi/Gợi ý trong canvas cuộn + thanh footer cố định «Áp dụng tất cả»
+    # (tránh PanedWindow / cửa sổ thấp cắt mất nút khi nội dung dưới quá cao).
     clip_tab_bottom = ttk.Frame(tab_insp_clip)
     clip_tab_scroll_host = ttk.Frame(tab_insp_clip)
-    _ve_batch_reset_bar_ref["fr"] = ttk.Frame(clip_tab_bottom)
-    # Grid: hàng 0 (cuộn) weight=1 — tránh pack(BOTTOM trước) khiến vùng inspector clip bị co về 0 trên một số DPI / cửa sổ nhỏ.
     tab_insp_clip.columnconfigure(0, weight=1)
     tab_insp_clip.rowconfigure(0, weight=1, minsize=120)
+    tab_insp_clip.rowconfigure(1, weight=0, minsize=140)
     clip_tab_scroll_host.grid(row=0, column=0, sticky="nsew")
-    clip_tab_bottom.grid(row=1, column=0, sticky="ew")
+    clip_tab_bottom.grid(row=1, column=0, sticky="nsew")
+    clip_tab_bottom.columnconfigure(0, weight=1)
+    clip_tab_bottom.rowconfigure(0, weight=1, minsize=56)
+    clip_tab_bottom.rowconfigure(1, weight=0)
+    clip_bottom_scroll_host = ttk.Frame(clip_tab_bottom)
+    clip_bottom_scroll_host.grid(row=0, column=0, sticky="nsew")
+    clip_bottom_scroll_host.columnconfigure(0, weight=1)
+    clip_bottom_scroll_host.rowconfigure(0, weight=1)
+    insp_bottom_inner = _pack_scrollable_vertical(clip_bottom_scroll_host)
+    clip_footer = ttk.Frame(clip_tab_bottom)
+    clip_footer.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+    _ve_batch_reset_bar_ref["fr"] = ttk.Frame(insp_bottom_inner)
     insp_grid = _pack_scrollable_vertical(clip_tab_scroll_host)
-    fr_quick_edit_host = ttk.Frame(clip_tab_bottom)
+    fr_quick_edit_host = ttk.Frame(insp_bottom_inner)
     _AUTO_LOGO_MEDIA_LBL = "Tự động (ảnh trong Media — ưu tiên file import gần nhất)"
 
     def _section_collapsible(parent: ttk.Widget, title: str, *, start_open: bool = True) -> tuple[ttk.Frame, ttk.Frame, tk.BooleanVar]:
@@ -5701,6 +6709,122 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         _sync()
         return outer, inner, var_open
 
+    def _bind_label_wrap_to_frame(lbl: ttk.Label, frame: ttk.Widget, *, inset: int = 12) -> None:
+        """Cập nhật ``wraplength`` theo chiều rộng thực (frame + canvas cuộn nếu có)."""
+
+        def _lbl_alive(w: ttk.Widget) -> bool:
+            """Tránh TclError khi refresh inspector đã destroy widget nhưng <Configure> vẫn bắn."""
+            try:
+                return int(w.winfo_exists()) != 0
+            except tk.TclError:
+                return False
+
+        def _apply(cw: int | None = None) -> None:
+            if not _lbl_alive(lbl):
+                return
+            try:
+                fw = int(frame.winfo_width())
+            except tk.TclError:
+                fw = 0
+            try:
+                base = fw if fw > 24 else int(cw or 0)
+            except (TypeError, ValueError):
+                base = fw
+            if base > inset + 32:
+                try:
+                    lbl.configure(wraplength=max(48, int(base) - inset))
+                except tk.TclError:
+                    pass
+
+        def _local(_e: Any = None) -> None:
+            _apply(None)
+
+        frame.bind("<Configure>", lambda _e: _local(), add="+")
+        cur: Any = frame
+        while cur is not None:
+            reg = getattr(cur, "_ve_on_canvas_width", None)
+            if callable(reg):
+
+                def _cb(cw: int, _lbl=lbl, _fr=frame, _ins=inset) -> None:
+                    if not _lbl_alive(_lbl):
+                        return
+                    try:
+                        fw = int(_fr.winfo_width())
+                    except tk.TclError:
+                        fw = 0
+                    usable = max(fw, int(cw) - 8) if int(cw) > 16 else fw
+                    if usable > _ins + 28:
+                        try:
+                            _lbl.configure(wraplength=max(48, int(usable) - _ins))
+                        except tk.TclError:
+                            pass
+
+                reg(_cb)
+                break
+            cur = getattr(cur, "master", None)
+        try:
+            frame.after_idle(lambda: _apply(None))
+        except tk.TclError:
+            pass
+
+    def _scope_checkbox_wrapped(parent: ttk.Widget, *, text: str, variable: tk.BooleanVar) -> ttk.Frame:
+        """Checkbox kèm nhãn xuống dòng — tránh ttk.Checkbutton cắt chữ dài trên Windows."""
+        row = ttk.Frame(parent)
+        row.columnconfigure(1, weight=1)
+        ttk.Checkbutton(row, variable=variable).grid(row=0, column=0, sticky="nw", pady=2)
+        lab = ttk.Label(row, text=text, justify=tk.LEFT, cursor="hand2")
+
+        def _tog(_e: Any = None) -> None:
+            try:
+                variable.set(not bool(variable.get()))
+            except tk.TclError:
+                pass
+
+        lab.bind("<Button-1>", _tog)
+
+        def _lab_alive() -> bool:
+            try:
+                return int(lab.winfo_exists()) != 0
+            except tk.TclError:
+                return False
+
+        def _apply(cw: int | None = None) -> None:
+            if not _lab_alive():
+                return
+            try:
+                rw = int(row.winfo_width())
+            except tk.TclError:
+                rw = 0
+            try:
+                cw_i = int(cw) if cw is not None else 0
+            except (TypeError, ValueError):
+                cw_i = 0
+            base = max(rw, cw_i - 8) if cw_i > 16 else rw
+            pad = 36
+            if base > pad + 32:
+                try:
+                    lab.configure(wraplength=max(48, int(base) - pad))
+                except tk.TclError:
+                    pass
+
+        def _local(_e: Any = None) -> None:
+            _apply(None)
+
+        lab.grid(row=0, column=1, sticky="ew", pady=2)
+        row.bind("<Configure>", lambda _e: _local(), add="+")
+        cur: Any = row
+        while cur is not None:
+            reg = getattr(cur, "_ve_on_canvas_width", None)
+            if callable(reg):
+                reg(lambda w: _apply(w))
+                break
+            cur = getattr(cur, "master", None)
+        try:
+            row.after_idle(lambda: _apply(None))
+        except tk.TclError:
+            pass
+        return row
+
     def _batch_meta_store() -> dict[str, Any]:
         if not project:
             return {}
@@ -5720,38 +6844,144 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         return
 
     var_ve_apply_clip = tk.BooleanVar(value=True)
+    var_ve_apply_tf_full = tk.BooleanVar(value=False)
+    var_ve_apply_tf_flip = tk.BooleanVar(value=False)
+    var_ve_apply_tf_layout = tk.BooleanVar(value=False)
+    var_ve_apply_tf_mute = tk.BooleanVar(value=False)
+    var_ve_clip_only_diff_vs_file = tk.BooleanVar(value=True)
+    var_ve_tf_only_diff_vs_file = tk.BooleanVar(value=True)
     var_ve_apply_ov_logo = tk.BooleanVar(value=True)
     var_ve_apply_ov_audio = tk.BooleanVar(value=True)
     var_ve_apply_ov_text = tk.BooleanVar(value=True)
     var_ve_apply_quick_logo = tk.BooleanVar(value=True)
     var_ve_apply_quick_text = tk.BooleanVar(value=True)
     sec_scope_outer, sec_scope_inner, _var_scope_open = _section_collapsible(
-        clip_tab_bottom,
+        insp_bottom_inner,
         "Phạm vi nút «Áp dụng tất cả»",
         start_open=False,
     )
     lf_apply_scope = ttk.Frame(sec_scope_inner, padding=(0, 0, 0, 4))
-    lf_apply_scope.pack(fill=tk.X)
-    _r_scope = ttk.Frame(lf_apply_scope)
-    _r_scope.pack(fill=tk.X)
-    ttk.Checkbutton(_r_scope, text="Chỉnh clip (tỉ lệ, cắt, lật, timeline…)", variable=var_ve_apply_clip).pack(
-        anchor="w"
+    lf_apply_scope.pack(fill=tk.X, expand=True)
+    lf_apply_scope.columnconfigure(0, weight=1)
+
+    lf_clip = ttk.LabelFrame(lf_apply_scope, text="Clip video & timeline", padding=(6, 4, 6, 6))
+    lf_clip.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    lf_clip.columnconfigure(0, weight=1)
+    _scope_checkbox_wrapped(
+        lf_clip,
+        text="Chỉnh clip đầy đủ (timeline, cắt nguồn, tốc độ, fade, lật trong inspector clip…)",
+        variable=var_ve_apply_clip,
+    ).grid(row=0, column=0, sticky="ew")
+    _scope_checkbox_wrapped(
+        lf_clip,
+        text="Chỉ ghi các trường clip khác file đã lưu — bỏ qua nhóm đã khớp (chỉ đẩy thông số mới)",
+        variable=var_ve_clip_only_diff_vs_file,
+    ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+    _lbl_clip_hint1 = ttk.Label(
+        lf_clip,
+        text="Bỏ tích dòng trên nếu muốn ghi đủ mọi trường từ inspector (ép đồng bộ, kể cả trùng file).",
+        font=("Segoe UI", 8),
+        foreground="gray",
+        justify=tk.LEFT,
     )
-    _r_ov = ttk.Frame(lf_apply_scope)
-    _r_ov.pack(fill=tk.X, pady=(6, 0))
-    ttk.Label(_r_ov, text="Track phủ (inspector):", font=("Segoe UI", 8), foreground="#444").pack(side=tk.LEFT)
-    ttk.Checkbutton(_r_ov, text="Logo ảnh", variable=var_ve_apply_ov_logo).pack(side=tk.LEFT, padx=(10, 0))
-    ttk.Checkbutton(_r_ov, text="Âm phụ", variable=var_ve_apply_ov_audio).pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Checkbutton(_r_ov, text="Chữ", variable=var_ve_apply_ov_text).pack(side=tk.LEFT, padx=(8, 0))
-    _r_q = ttk.Frame(lf_apply_scope)
-    _r_q.pack(fill=tk.X, pady=(6, 0))
-    ttk.Label(_r_q, text="Chỉnh nhanh (ô Logo & Chữ phía trên):", font=("Segoe UI", 8), foreground="#444").pack(
-        side=tk.LEFT
+    _lbl_clip_hint1.grid(row=2, column=0, sticky="ew", pady=(0, 2))
+    _bind_label_wrap_to_frame(_lbl_clip_hint1, lf_clip, inset=10)
+    _scope_checkbox_wrapped(
+        lf_clip,
+        text="Transform (các ô dưới): chỉ áp nhánh còn lệch file — bỏ qua nhánh đã khớp",
+        variable=var_ve_tf_only_diff_vs_file,
+    ).grid(row=3, column=0, sticky="ew", pady=(4, 0))
+    _lbl_tf_intro = ttk.Label(
+        lf_clip,
+        text="Transform & canvas — không đụng timeline / cắt nguồn / tốc độ:",
+        font=("Segoe UI", 8),
+        foreground="#444",
+        justify=tk.LEFT,
     )
-    ttk.Checkbutton(_r_q, text="Logo (độ mờ, cỡ, vị trí…)", variable=var_ve_apply_quick_logo).pack(
-        side=tk.LEFT, padx=(8, 0)
+    _lbl_tf_intro.grid(row=4, column=0, sticky="ew", pady=(8, 2))
+    _bind_label_wrap_to_frame(_lbl_tf_intro, lf_clip, inset=10)
+    _f_tf_pad5 = ttk.Frame(lf_clip)
+    _f_tf_pad5.grid(row=5, column=0, sticky="ew", padx=(12, 0))
+    _f_tf_pad5.columnconfigure(0, weight=1)
+    _scope_checkbox_wrapped(
+        _f_tf_pad5,
+        text="Đủ: lật + khung & zoom + âm gốc clip",
+        variable=var_ve_apply_tf_full,
+    ).grid(row=0, column=0, sticky="ew")
+    _f_tf_pad6 = ttk.Frame(lf_clip)
+    _f_tf_pad6.grid(row=6, column=0, sticky="w", padx=(12, 0))
+    ttk.Checkbutton(_f_tf_pad6, text="Chỉ lật / xoay", variable=var_ve_apply_tf_flip).pack(side=tk.LEFT)
+    _f_tf_pad7 = ttk.Frame(lf_clip)
+    _f_tf_pad7.grid(row=7, column=0, sticky="ew", padx=(12, 0))
+    _f_tf_pad7.columnconfigure(0, weight=1)
+    _scope_checkbox_wrapped(
+        _f_tf_pad7,
+        text="Chỉ khung & zoom (fit/fill/stretch + zoom)",
+        variable=var_ve_apply_tf_layout,
+    ).grid(row=0, column=0, sticky="ew")
+    _f_tf_pad8 = ttk.Frame(lf_clip)
+    _f_tf_pad8.grid(row=8, column=0, sticky="ew", padx=(12, 0))
+    _f_tf_pad8.columnconfigure(0, weight=1)
+    _scope_checkbox_wrapped(
+        _f_tf_pad8,
+        text="Chỉ tắt / bật âm gốc clip",
+        variable=var_ve_apply_tf_mute,
+    ).grid(row=0, column=0, sticky="ew")
+    _lbl_clip_hint2 = ttk.Label(
+        lf_clip,
+        text="«Đủ» = một lần áp cả ba nhóm dưới. Không chọn «Đủ» thì có thể tích nhiều ô để gộp.",
+        font=("Segoe UI", 8),
+        foreground="gray",
+        justify=tk.LEFT,
     )
-    ttk.Checkbutton(_r_q, text="Chữ (cỡ, màu, font…)", variable=var_ve_apply_quick_text).pack(side=tk.LEFT, padx=(6, 0))
+    _lbl_clip_hint2.grid(row=9, column=0, sticky="ew", pady=(4, 0))
+    _bind_label_wrap_to_frame(_lbl_clip_hint2, lf_clip, inset=10)
+
+    lf_logo = ttk.LabelFrame(lf_apply_scope, text="Logo", padding=(6, 4, 6, 6))
+    lf_logo.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+    lf_logo.columnconfigure(0, weight=1)
+    _scope_checkbox_wrapped(
+        lf_logo,
+        text="Inspector — ảnh logo track phủ (khối «Logo» cuối tab, đồng bộ clip)",
+        variable=var_ve_apply_ov_logo,
+    ).grid(row=0, column=0, sticky="ew")
+    _scope_checkbox_wrapped(
+        lf_logo,
+        text="Chỉnh nhanh — ô Logo & ảnh phía trên tab (độ mờ, cỡ, vị trí…)",
+        variable=var_ve_apply_quick_logo,
+    ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+    lf_audio = ttk.LabelFrame(lf_apply_scope, text="Âm thanh", padding=(6, 4, 6, 6))
+    lf_audio.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+    lf_audio.columnconfigure(0, weight=1)
+    _scope_checkbox_wrapped(
+        lf_audio,
+        text="Inspector — track âm phụ (file âm, âm lượng, tốc độ track phụ)",
+        variable=var_ve_apply_ov_audio,
+    ).grid(row=0, column=0, sticky="ew")
+    _lbl_audio_hint = ttk.Label(
+        lf_audio,
+        text="Âm gốc của clip video nằm ở nhóm «Transform & canvas» hoặc trong «Chỉnh clip đầy đủ».",
+        font=("Segoe UI", 8),
+        foreground="gray",
+        justify=tk.LEFT,
+    )
+    _lbl_audio_hint.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+    _bind_label_wrap_to_frame(_lbl_audio_hint, lf_audio, inset=10)
+
+    lf_text = ttk.LabelFrame(lf_apply_scope, text="Chữ", padding=(6, 4, 6, 6))
+    lf_text.grid(row=3, column=0, sticky="ew", pady=(0, 0))
+    lf_text.columnconfigure(0, weight=1)
+    _scope_checkbox_wrapped(
+        lf_text,
+        text="Inspector — nội dung chữ track phủ (khối «Chữ» cuối tab, đồng bộ clip)",
+        variable=var_ve_apply_ov_text,
+    ).grid(row=0, column=0, sticky="ew")
+    _scope_checkbox_wrapped(
+        lf_text,
+        text="Chỉnh nhanh — ô Chữ phía trên tab (cỡ, màu, font…)",
+        variable=var_ve_apply_quick_text,
+    ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
     def _apply_all_from_bottom() -> None:
         fn = _apply_batch_video_ref.get("fn")
@@ -5765,8 +6995,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             if not (wql or wqt):
                 messagebox.showinfo(
                     "Áp dụng tất cả",
-                    "Bật ít nhất một ô «Chỉnh nhanh» trong «Phạm vi khi bấm Áp dụng tất cả», "
-                    "hoặc mở tab inspector clip để áp chỉnh clip / âm-chữ inspector.",
+                    "Bật ít nhất một mục trong «Phạm vi nút Áp dụng tất cả» (ví dụ Logo hoặc Chữ — chỉnh nhanh), "
+                    "hoặc mở inspector clip video để áp clip / inspector.",
                     parent=root,
                 )
                 return
@@ -5793,7 +7023,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         )
 
     btn_apply_all_bottom = ttk.Button(
-        clip_tab_bottom,
+        clip_footer,
         text="Áp dụng tất cả",
         command=_apply_all_from_bottom,
     )
@@ -6276,15 +7506,15 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     except Exception:
         pass
 
-    _sep_clip_logo_scope = ttk.Separator(clip_tab_bottom, orient=tk.HORIZONTAL)
-    _sep_clip_scope_hint = ttk.Separator(clip_tab_bottom, orient=tk.HORIZONTAL)
+    _sep_clip_logo_scope = ttk.Separator(insp_bottom_inner, orient=tk.HORIZONTAL)
+    _sep_clip_scope_hint = ttk.Separator(insp_bottom_inner, orient=tk.HORIZONTAL)
 
     fr_quick_edit_host.pack(fill=tk.X, pady=(0, 2))
     _sep_clip_logo_scope.pack(fill=tk.X, pady=(8, 8))
     sec_scope_outer.pack(fill=tk.X, pady=(0, 2))
     _sep_clip_scope_hint.pack(fill=tk.X, pady=(8, 8))
     sec_hint_outer, sec_hint_inner, _var_hint_open = _section_collapsible(
-        clip_tab_bottom,
+        insp_bottom_inner,
         "Gợi ý nhanh",
         start_open=False,
     )
@@ -6292,7 +7522,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         sec_hint_inner,
         text=(
             "Cuộn khung phía trên để sửa chi tiết từng clip. "
-            "Dưới: chỉnh Logo & Chữ → chọn phạm vi → «Áp dụng tất cả». "
+            "Cuộn vùng dưới (Logo / Phạm vi — Clip · Logo · Âm · Chữ / gợi ý) nếu không thấy hết. "
+            "Nút «Áp dụng tất cả» luôn ở thanh dưới cùng của tab. "
             "«Ảnh khi tạo mới»: chọn file hoặc «Tự động» (ảnh trong Media)."
         ),
         foreground="#5c5c5c",
@@ -6302,7 +7533,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     )
     lbl_clip_quick_hint.pack(anchor="w", pady=(0, 2))
     sec_hint_outer.pack(fill=tk.X, pady=(0, 4))
-    btn_apply_all_bottom.pack(anchor="w", pady=(4, 0))
+    ttk.Separator(clip_footer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 4))
+    btn_apply_all_bottom.pack(fill=tk.X, pady=(0, 2), ipady=4)
 
     for _vq in (
         var_q_logo_opacity,

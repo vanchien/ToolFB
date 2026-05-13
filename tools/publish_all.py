@@ -15,6 +15,17 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _tool_python_exe(root: Path) -> str:
+    """Ưu tiên ``.venv`` (Playwright) thay vì ``python`` hệ thống."""
+    win = root / ".venv" / "Scripts" / "python.exe"
+    if win.is_file():
+        return str(win.resolve())
+    nix = root / ".venv" / "bin" / "python"
+    if nix.is_file():
+        return str(nix.resolve())
+    return sys.executable
+
+
 def _github_raw_manifest_main(repo: str) -> str:
     """URL ``release/update/latest.json`` trên ``main`` (ghi ``update_channel.json`` — khớp updater ưu tiên raw)."""
     r = (repo or "").strip().strip("/").replace(" ", "")
@@ -83,7 +94,9 @@ def main() -> int:
         )
         return 1
 
-    py = sys.executable
+    py = _tool_python_exe(root)
+    if py != sys.executable:
+        print(f"INFO: dung Python trong venv de build: {py}", flush=True)
 
     dl = str(args.download_url).strip()
     if not dl:

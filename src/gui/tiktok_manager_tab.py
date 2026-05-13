@@ -36,6 +36,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     ai_store = AIVideoStore()
 
     parent.columnconfigure(0, weight=1)
+    parent.rowconfigure(0, weight=0)
     parent.rowconfigure(1, weight=1)
 
     ttk.Label(
@@ -45,10 +46,10 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
         "Lên lịch đăng: cùng «Bắt đầu lịch» và chu kỳ quét như tab Job lịch Facebook (schedule_posts) — không thêm scheduler riêng.",
         wraplength=920,
         font=("Segoe UI", 9),
-    ).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 8))
+    ).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
 
     nb = ttk.Notebook(parent)
-    nb.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+    nb.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
     tab_acc = ttk.Frame(nb, padding=4)
     tab_job = ttk.Frame(nb, padding=4)
     nb.add(tab_acc, text="  1. Tài khoản  ")
@@ -56,9 +57,9 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     tab_acc.columnconfigure(0, weight=1)
     tab_acc.rowconfigure(0, weight=1)
     tab_job.columnconfigure(0, weight=1)
+    tab_job.rowconfigure(0, weight=0)
     tab_job.rowconfigure(1, weight=2)
-    tab_job.rowconfigure(2, weight=2)
-    tab_job.rowconfigure(3, weight=1)
+    tab_job.rowconfigure(2, weight=1)
 
     acc_fr = ttk.LabelFrame(tab_acc, text="Quản lý tài khoản TikTok", padding=6)
     acc_fr.grid(row=0, column=0, sticky="nsew")
@@ -133,14 +134,17 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
             )
 
     cols_acc = ("name", "username", "profile_path", "proxy", "status")
-    tree_acc = ttk.Treeview(acc_fr, columns=cols_acc, show="headings", height=8, selectmode="extended")
-    for c, t, w in zip(
-        cols_acc,
-        ("Tên", "Username", "Profile path", "Proxy", "Status"),
-        (140, 100, 280, 70, 80),
-    ):
-        tree_acc.heading(c, text=t)
-        tree_acc.column(c, width=w, stretch=c == "profile_path")
+    tree_acc = ttk.Treeview(acc_fr, columns=cols_acc, show="headings", height=10, selectmode="extended")
+    _acc_col_cfg: list[tuple[str, str, int, int, bool]] = [
+        ("name", "Tên", 140, 80, True),
+        ("username", "Username", 120, 72, True),
+        ("profile_path", "Profile path", 260, 120, True),
+        ("proxy", "Proxy", 72, 56, False),
+        ("status", "Status", 88, 64, True),
+    ]
+    for c, title, w, mw, st in _acc_col_cfg:
+        tree_acc.heading(c, text=title)
+        tree_acc.column(c, width=w, minwidth=mw, stretch=st, anchor="w")
     sy1 = ttk.Scrollbar(acc_fr, orient=tk.VERTICAL, command=tree_acc.yview)
     tree_acc.configure(yscrollcommand=sy1.set)
     tree_acc.grid(row=1, column=0, sticky="nsew")
@@ -204,11 +208,20 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     list_fr.rowconfigure(0, weight=1)
 
     cols_j = ("id", "account_id", "video_path", "scheduled_at", "status", "step", "error")
-    tree_job = ttk.Treeview(list_fr, columns=cols_j, show="headings", height=8, selectmode="extended")
+    tree_job = ttk.Treeview(list_fr, columns=cols_j, show="headings", height=10, selectmode="extended")
     heads = ("id", "account", "video", "hẹn (UTC)", "status", "step", "lỗi")
-    for c, t, w in zip(cols_j, heads, (100, 90, 160, 130, 80, 90, 160)):
+    _job_col_cfg: list[tuple[str, str, int, int, bool]] = [
+        ("id", heads[0], 100, 72, False),
+        ("account_id", heads[1], 100, 72, True),
+        ("video_path", heads[2], 180, 100, True),
+        ("scheduled_at", heads[3], 130, 96, True),
+        ("status", heads[4], 80, 64, True),
+        ("step", heads[5], 88, 64, True),
+        ("error", heads[6], 160, 80, True),
+    ]
+    for c, t, w, mw, st in _job_col_cfg:
         tree_job.heading(c, text=t)
-        tree_job.column(c, width=w, stretch=c in ("video_path", "error"))
+        tree_job.column(c, width=w, minwidth=mw, stretch=st, anchor="w")
     sy2 = ttk.Scrollbar(list_fr, orient=tk.VERTICAL, command=tree_job.yview)
     tree_job.configure(yscrollcommand=sy2.set)
     tree_job.grid(row=0, column=0, sticky="nsew")

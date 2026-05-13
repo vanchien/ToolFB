@@ -1,7 +1,6 @@
 # Build release bundle, attach zip + latest.json, bump version.
 # Chay: tab Actions -> "Publish GitHub Release" -> Run workflow.
-# May nguoi dung: manifest_url = .../releases/latest/download/latest.json
-
+# May nguoi dung: manifest_url raw = .../main/release/update/latest.json (publish_all ghi config).
 name: Publish GitHub Release
 
 on:
@@ -19,8 +18,16 @@ on:
         description: Release notes (optional)
         type: string
         default: ""
+      version_override:
+        description: "Ghi de phien ban (vd. 1.0.46). De trong = chi dung bump."
+        type: string
+        default: ""
       push_version_commit:
         description: "Sau release: git push version.json + release/update/latest.json (canh bao: branch protection co the chan)"
+        type: boolean
+        default: false
+      skip_browser_bundle:
+        description: "Build nhe: --skip-browser-bundle (khong dong goi Chromium/FF/WebKit vao zip)"
         type: boolean
         default: false
 
@@ -74,15 +81,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = "${{ inputs.notes }}"
+          $ver = "${{ inputs.version_override }}"
           $publishArgs = @(
             "tools/publish_all.py",
             "--repo", "${{ github.repository }}",
             "--bump", "${{ inputs.bump }}",
             "--no-write-update-channel"
           )
+          if ($ver.Trim().Length -gt 0) {
+            $publishArgs += "--version"
+            $publishArgs += $ver.Trim()
+          }
           if ($notes.Trim().Length -gt 0) {
             $publishArgs += "--notes"
             $publishArgs += $notes
+          }
+          if ("${{ inputs.skip_browser_bundle }}" -eq "true") {
+            $publishArgs += "--skip-browser-bundle"
           }
           python @publishArgs
 
@@ -105,10 +120,13 @@ jobs:
         if: success()
         shell: pwsh
         run: |
-          $m = "https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
+          $repo = "${{ github.repository }}"
+          $raw = "https://raw.githubusercontent.com/$repo/main/release/update/latest.json"
+          $rel = "https://github.com/$repo/releases/latest/download/latest.json"
           @"
           ### Auto-update (manifest_url)
-          - ``$m``
+          - **Khuyen dung (raw, tranh 404 khi chua dinh kem Release):** ``$raw``
+          - **Tuy chon (Release asset):** ``$rel`` — can co ``latest.json`` trong Release moi nhat.
           - Ghi vao ``config/update_channel.json`` roi commit de ban build co kenh cap nhat.
           - Tuy chon workflow: bat ``push_version_commit`` de day ``version.json`` + ``release/update/latest.json`` len nhanh sau build (can branch ghi duoc, khong bi rule chan push).
           "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8

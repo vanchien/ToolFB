@@ -48,6 +48,7 @@ from src.services.app_updater import (
     check_git_updates,
     github_latest_manifest_url,
     is_newer_version,
+    prefer_repo_raw_manifest_url,
     read_local_version,
     read_manifest_from_url,
     read_remote_version_from_github_raw,
@@ -297,73 +298,94 @@ class _ManagerWindow:
 
         bar = ttk.Frame(main)
         bar.pack(fill=tk.X, pady=(0, 6))
-        self._btn_start = ttk.Button(bar, text="Bắt đầu lịch", command=self._on_start)
-        self._btn_start.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_stop = ttk.Button(bar, text="Dừng lịch", command=self._on_stop, state=tk.DISABLED)
-        self._btn_stop.pack(side=tk.LEFT, padx=(0, 6))
+        bar.columnconfigure(0, weight=1)
+        bar.columnconfigure(1, weight=0)
+
+        bar_rows = ttk.Frame(bar)
+        bar_rows.grid(row=0, column=0, sticky="ew")
+        bar_status = ttk.Frame(bar)
+        bar_status.grid(row=0, column=1, sticky="ne", padx=(8, 0))
+
+        row0 = ttk.Frame(bar_rows)
+        row0.pack(fill=tk.X, anchor="w")
+        row1 = ttk.Frame(bar_rows)
+        row1.pack(fill=tk.X, anchor="w", pady=(4, 0))
+
+        # --- Hàng 1: lịch + làm mới + browser + chế độ giao diện (luôn thấy khi thu cửa sổ) ---
+        self._btn_start = ttk.Button(row0, text="Bắt đầu lịch", command=self._on_start)
+        self._btn_start.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_stop = ttk.Button(row0, text="Dừng lịch", command=self._on_stop, state=tk.DISABLED)
+        self._btn_stop.pack(side=tk.LEFT, padx=(0, 4))
         self._btn_refresh = ttk.Button(
-            bar, text="Làm mới tất cả (accounts + pages + job lịch)", command=self._refresh_all
+            row0,
+            text="Làm mới tất cả",
+            command=self._refresh_all,
         )
-        self._btn_refresh.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_migrate = ttk.Button(
-            bar,
-            text="Migrate dữ liệu cũ → mới",
-            command=self._on_migrate_user_data,
-        )
-        self._btn_migrate.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_show_browser = ttk.Button(bar, text="Hiện browser", command=lambda: self._set_browser_visibility(True))
-        self._btn_show_browser.pack(side=tk.LEFT, padx=(12, 4))
-        self._btn_hide_browser = ttk.Button(bar, text="Ẩn browser", command=lambda: self._set_browser_visibility(False))
-        self._btn_hide_browser.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Label(bar, text="Giao diện:").pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_show_browser = ttk.Button(row0, text="Hiện browser", command=lambda: self._set_browser_visibility(True))
+        self._btn_show_browser.pack(side=tk.LEFT, padx=(8, 4))
+        self._btn_hide_browser = ttk.Button(row0, text="Ẩn browser", command=lambda: self._set_browser_visibility(False))
+        self._btn_hide_browser.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(row0, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Label(row0, text="Giao diện:").pack(side=tk.LEFT, padx=(0, 4))
         self._platform_view_var = tk.StringVar(value="TikTok")
         self._cb_platform_view = ttk.Combobox(
-            bar,
+            row0,
             state="readonly",
             width=10,
             values=("Facebook", "TikTok"),
             textvariable=self._platform_view_var,
         )
-        self._cb_platform_view.pack(side=tk.LEFT, padx=(0, 6))
+        self._cb_platform_view.pack(side=tk.LEFT, padx=(0, 4))
         self._cb_platform_view.bind(
             "<<ComboboxSelected>>",
             lambda _e: self._apply_platform_view(self._platform_view_var.get()),
         )
+
+        # --- Hàng 2: dữ liệu / preset / cập nhật / công cụ (tách khỏi hàng lịch để kéo ngang không chồng nút) ---
+        self._btn_migrate = ttk.Button(
+            row1,
+            text="Migrate dữ liệu",
+            command=self._on_migrate_user_data,
+        )
+        self._btn_migrate.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         self._btn_compact_multi = ttk.Button(
-            bar,
-            text="Preset multi-page compact",
+            row1,
+            text="Preset multi-page",
             command=self._apply_multi_page_compact_preset,
         )
-        self._btn_compact_multi.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_check_updates = ttk.Button(bar, text="Kiểm tra cập nhật", command=self._on_check_updates)
-        self._btn_check_updates.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_apply_update = ttk.Button(bar, text="Cập nhật ngay", command=self._on_apply_update)
-        self._btn_apply_update.pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_compact_multi.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_check_updates = ttk.Button(row1, text="Chỉ kiểm tra", command=self._on_check_updates)
+        self._btn_check_updates.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_apply_update = ttk.Button(row1, text="Cập nhật", command=self._on_apply_update)
+        self._apply_update_pack_after = self._btn_check_updates
         self._btn_update_channel = ttk.Button(
-            bar,
-            text="Cấu hình kênh cập nhật",
+            row1,
+            text="Kênh cập nhật",
             command=self._on_configure_update_channel,
         )
-        self._btn_update_channel.pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_update_channel.pack(side=tk.LEFT, padx=(0, 4))
         self._btn_reset_veo3_profile = ttk.Button(
-            bar,
-            text="Reset profile VEO3",
+            row1,
+            text="Reset VEO3",
             command=self._on_reset_veo3_profiles,
         )
-        self._btn_reset_veo3_profile.pack(side=tk.LEFT, padx=(0, 6))
-        self._btn_ai_video = ttk.Button(bar, text="AI Video Gemini/Veo", command=self._on_open_ai_video_dialog)
-        self._btn_ai_video.pack(side=tk.LEFT, padx=(0, 6))
-        self._lbl_browser_mode = ttk.Label(bar, text="")
+        self._btn_reset_veo3_profile.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_ai_video = ttk.Button(row1, text="AI Video (Gemini/Veo)", command=self._on_open_ai_video_dialog)
+        self._btn_ai_video.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self._lbl_browser_mode = ttk.Label(row1, text="", wraplength=260, justify=tk.LEFT)
         self._lbl_browser_mode.pack(side=tk.LEFT, padx=(0, 8))
-        self._lbl_state = ttk.Label(bar, text="Lịch: đang tắt")
-        self._lbl_state.pack(side=tk.RIGHT)
+
+        self._lbl_state = ttk.Label(bar_status, text="Lịch: đang tắt")
+        self._lbl_state.pack(anchor="e")
         self._lbl_app_version = ttk.Label(
-            bar,
+            bar_status,
             text=f"Phiên bản {self._app_version_str}",
             foreground="gray",
         )
-        self._lbl_app_version.pack(side=tk.RIGHT, padx=(0, 12))
+        self._lbl_app_version.pack(anchor="e", pady=(4, 0))
         self._set_browser_visibility(self._show_browser, update_env=False)
 
         body = ttk.PanedWindow(main, orient=tk.VERTICAL)
@@ -937,7 +959,9 @@ class _ManagerWindow:
         tt_host = ttk.Frame(tab_tt)
         tt_host.grid(row=0, column=0, sticky="nsew")
         tt_host.columnconfigure(0, weight=1)
-        tt_host.rowconfigure(0, weight=1)
+        # TikTok Manager: hàng 0 = nhãn mô tả (chiều cao tự nhiên), hàng 1 = Notebook — phải co giãn ở hàng 1.
+        tt_host.rowconfigure(0, weight=0)
+        tt_host.rowconfigure(1, weight=1)
         build_tiktok_manager_tab(tt_host, self._root)
 
         # --- Platform view (Facebook vs TikTok) ---
@@ -982,6 +1006,7 @@ class _ManagerWindow:
         self._apply_ai_provider_view()
         self._sync_ai_tab_scrollregion()
         self._start_ui_watchdog()
+        self._root.after(900, self._schedule_probe_update_button_visibility)
         logger.info(
             "Đã mở giao diện quản lý — tab Tài khoản / Page / Job lịch / Cài đặt AI; «Bắt đầu lịch» chạy scheduler nền."
         )
@@ -1876,29 +1901,54 @@ class _ManagerWindow:
         if not script.is_file():
             messagebox.showerror("Migrate", f"Không tìm thấy script:\n{script}", parent=self._root)
             return
-        try:
-            cp = subprocess.run(
-                [sys.executable, str(script), "--from", old_dir, "--to", new_dir],
-                capture_output=True,
-                text=True,
-                timeout=180,
-                check=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Migrate", f"Chạy migrate thất bại:\n{exc}", parent=self._root)
-            return
-        if cp.returncode != 0:
-            msg = (cp.stderr or cp.stdout or "Unknown error").strip()
-            messagebox.showerror("Migrate lỗi", msg[:2000], parent=self._root)
-            return
-        self._refresh_all()
-        out = (cp.stdout or "").strip()
-        preview = "\n".join(out.splitlines()[:12])
-        messagebox.showinfo(
-            "Migrate thành công",
-            f"Đã migrate dữ liệu từ:\n{old_dir}\n\nSang:\n{new_dir}\n\n{preview}",
-            parent=self._root,
-        )
+        old_d, new_d = str(old_dir), str(new_dir)
+        script_s = str(script)
+        self._set_ui_busy("migrate_user_data")
+        self._root.configure(cursor="watch")
+
+        def _migrate_worker() -> None:
+            result: dict[str, Any] = {"cp": None, "exc": None}
+            try:
+                result["cp"] = subprocess.run(
+                    [sys.executable, script_s, "--from", old_d, "--to", new_d],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result["exc"] = exc
+
+            def _migrate_done() -> None:
+                self._clear_ui_busy()
+                self._root.configure(cursor="")
+                if result["exc"] is not None:
+                    messagebox.showerror(
+                        "Migrate",
+                        f"Chạy migrate thất bại:\n{result['exc']}",
+                        parent=self._root,
+                    )
+                    return
+                cp = result["cp"]
+                if cp is None:
+                    messagebox.showerror("Migrate", "Không có kết quả subprocess.", parent=self._root)
+                    return
+                if cp.returncode != 0:
+                    msg = (cp.stderr or cp.stdout or "Unknown error").strip()
+                    messagebox.showerror("Migrate lỗi", msg[:2000], parent=self._root)
+                    return
+                self._refresh_all()
+                out = (cp.stdout or "").strip()
+                preview = "\n".join(out.splitlines()[:12])
+                messagebox.showinfo(
+                    "Migrate thành công",
+                    f"Đã migrate dữ liệu từ:\n{old_d}\n\nSang:\n{new_d}\n\n{preview}",
+                    parent=self._root,
+                )
+
+            self._root.after(0, _migrate_done)
+
+        threading.Thread(target=_migrate_worker, name="migrate_user_data", daemon=True).start()
 
     def _fill_schedule_jobs_tree(self) -> None:
         """Đọc dữ liệu gốc vào ``self._all_jobs`` rồi áp filter/sort và render."""
@@ -4594,49 +4644,54 @@ class _ManagerWindow:
                 state["ctx"] = None
                 state["factory"] = None
 
+        self._set_ui_busy("open_profile_browser")
         self._root.configure(cursor="watch")
-        self._root.update_idletasks()
         th = threading.Thread(target=_open_worker, name="open_profile_playwright", daemon=True)
         th.start()
-        t_deadline = time.monotonic() + 120.0
-        while time.monotonic() <= t_deadline:
+        t0 = time.monotonic()
+        timeout_sec = 120.0
+
+        def _poll_open_profile() -> None:
             if state["ready"].is_set():
-                break
+                self._root.configure(cursor="")
+                self._clear_ui_busy()
+                self._manual_profile_sessions.append({"account_id": aid, "thread": th, "shutdown": shutdown_evt})
+                messagebox.showinfo(
+                    "Đã mở profile",
+                    f"Đã mở profile browser cho tài khoản {aid}.\nBạn có thể thao tác/login trực tiếp trên cửa sổ này.",
+                    parent=self._root,
+                )
+                return
             if state.get("err") is not None:
-                break
-            if not th.is_alive() and not state["ready"].is_set():
-                break
-            th.join(timeout=0.08)
-            try:
-                self._root.update_idletasks()
-                self._root.update()
-            except tk.TclError:
-                break
-        self._root.configure(cursor="")
-        if not state["ready"].is_set():
-            shutdown_evt.set()
-            th.join(timeout=15.0)
-            if state.get("err"):
+                self._root.configure(cursor="")
+                self._clear_ui_busy()
+                shutdown_evt.set()
+                th.join(timeout=15.0)
                 messagebox.showerror("Mở profile thất bại", str(state["err"]), parent=self._root)
-            elif not th.is_alive():
+                return
+            if not th.is_alive() and not state["ready"].is_set():
+                self._root.configure(cursor="")
+                self._clear_ui_busy()
                 messagebox.showerror(
                     "Mở profile thất bại",
                     "Luồng mở trình duyệt đã kết thúc sớm.",
                     parent=self._root,
                 )
-            else:
+                return
+            if time.monotonic() - t0 >= timeout_sec:
+                self._root.configure(cursor="")
+                self._clear_ui_busy()
+                shutdown_evt.set()
+                th.join(timeout=15.0)
                 messagebox.showerror(
                     "Mở profile",
                     "Hết thời gian chờ (120s) — luồng mở trình duyệt chưa xong.",
                     parent=self._root,
                 )
-            return
-        self._manual_profile_sessions.append({"account_id": aid, "thread": th, "shutdown": shutdown_evt})
-        messagebox.showinfo(
-            "Đã mở profile",
-            f"Đã mở profile browser cho tài khoản {aid}.\nBạn có thể thao tác/login trực tiếp trên cửa sổ này.",
-            parent=self._root,
-        )
+                return
+            self._root.after(100, _poll_open_profile)
+
+        self._root.after(100, _poll_open_profile)
 
     def _on_close_open_profiles(self) -> None:
         """
@@ -4709,13 +4764,15 @@ class _ManagerWindow:
                 parent=self._root,
             )
             return
+        ids_copy = list(ids)
+        self._set_ui_busy("verify_profile")
         self._root.configure(cursor="watch")
-        self._root.update_idletasks()
-        lines: list[str] = []
-        n_ok = 0
-        n_fail = 0
-        try:
-            for aid in ids:
+
+        def _verify_worker() -> None:
+            lines: list[str] = []
+            n_ok = 0
+            n_fail = 0
+            for aid in ids_copy:
                 try:
                     ok, msg = BrowserEngine.verify_profile_ready(self._accounts, aid, headless=True)
                     if ok:
@@ -4730,18 +4787,24 @@ class _ManagerWindow:
                 except Exception as exc:  # noqa: BLE001
                     n_fail += 1
                     lines.append(f"• {aid}: LỖI — {exc}")
-        finally:
-            self._root.configure(cursor="")
-        body = "\n".join(lines[:80])
-        if len(lines) > 80:
-            body += f"\n… (+{len(lines) - 80} tài khoản)"
-        title = f"Verify Profile ({len(ids)} tài khoản — OK {n_ok}, lỗi {n_fail})"
-        if n_fail == 0:
-            messagebox.showinfo(title, body, parent=self._root)
-        elif n_ok == 0:
-            messagebox.showerror(title, body, parent=self._root)
-        else:
-            messagebox.showwarning(title, body, parent=self._root)
+
+            def _verify_done() -> None:
+                self._clear_ui_busy()
+                self._root.configure(cursor="")
+                body = "\n".join(lines[:80])
+                if len(lines) > 80:
+                    body += f"\n… (+{len(lines) - 80} tài khoản)"
+                title = f"Verify Profile ({len(ids_copy)} tài khoản — OK {n_ok}, lỗi {n_fail})"
+                if n_fail == 0:
+                    messagebox.showinfo(title, body, parent=self._root)
+                elif n_ok == 0:
+                    messagebox.showerror(title, body, parent=self._root)
+                else:
+                    messagebox.showwarning(title, body, parent=self._root)
+
+            self._root.after(0, _verify_done)
+
+        threading.Thread(target=_verify_worker, name="verify_profile", daemon=True).start()
 
     def _on_check_proxy(self) -> None:
         ids = self._profile_ids_for_bulk()
@@ -4752,55 +4815,70 @@ class _ManagerWindow:
                 parent=self._root,
             )
             return
-        lines: list[str] = []
-        n_live = 0
-        n_die = 0
-        n_skip = 0
-        for aid in ids:
-            rec = self._record_by_id(aid)
-            if rec is None:
-                n_die += 1
-                lines.append(f"• {aid}: LỖI — không tìm thấy bản ghi")
-                continue
-            if not _coerce_use_proxy(rec.get("use_proxy", True)):
-                n_skip += 1
-                lines.append(f"• {aid}: (bỏ qua — tắt «Dùng proxy»)")
-                continue
-            px = rec.get("proxy") or {}
-            try:
-                port = int(px.get("port", 0))
-            except (TypeError, ValueError):
-                n_die += 1
-                lines.append(f"• {aid}: LỖI — port proxy không hợp lệ")
-                continue
-            ok, msg = check_http_proxy(
-                str(px.get("host", "")),
-                port,
-                user=str(px.get("user", "")),
-                password=str(px.get("pass", "")),
-            )
-            if ok:
-                n_live += 1
-                ip = (msg or "").replace("\n", " ")
-                if len(ip) > 80:
-                    ip = ip[:77] + "…"
-                lines.append(f"• {aid}: LIVE — {ip}")
-            else:
-                n_die += 1
-                err = (msg or "").replace("\n", " ")
-                if len(err) > 120:
-                    err = err[:117] + "…"
-                lines.append(f"• {aid}: DIE / lỗi — {err}")
-        body = "\n".join(lines[:80])
-        if len(lines) > 80:
-            body += f"\n… (+{len(lines) - 80} tài khoản)"
-        title = f"Kiểm tra proxy ({len(ids)} dòng — LIVE {n_live}, DIE/lỗi {n_die}, bỏ qua {n_skip})"
-        if n_die == 0:
-            messagebox.showinfo(title, body, parent=self._root)
-        elif n_live == 0:
-            messagebox.showerror(title, body, parent=self._root)
-        else:
-            messagebox.showwarning(title, body, parent=self._root)
+        ids_copy = list(ids)
+        self._set_ui_busy("check_proxy")
+        self._root.configure(cursor="watch")
+
+        def _proxy_worker() -> None:
+            lines: list[str] = []
+            n_live = 0
+            n_die = 0
+            n_skip = 0
+            for aid in ids_copy:
+                rec = self._record_by_id(aid)
+                if rec is None:
+                    n_die += 1
+                    lines.append(f"• {aid}: LỖI — không tìm thấy bản ghi")
+                    continue
+                if not _coerce_use_proxy(rec.get("use_proxy", True)):
+                    n_skip += 1
+                    lines.append(f"• {aid}: (bỏ qua — tắt «Dùng proxy»)")
+                    continue
+                px = rec.get("proxy") or {}
+                try:
+                    port = int(px.get("port", 0))
+                except (TypeError, ValueError):
+                    n_die += 1
+                    lines.append(f"• {aid}: LỖI — port proxy không hợp lệ")
+                    continue
+                ok, msg = check_http_proxy(
+                    str(px.get("host", "")),
+                    port,
+                    user=str(px.get("user", "")),
+                    password=str(px.get("pass", "")),
+                )
+                if ok:
+                    n_live += 1
+                    ip = (msg or "").replace("\n", " ")
+                    if len(ip) > 80:
+                        ip = ip[:77] + "…"
+                    lines.append(f"• {aid}: LIVE — {ip}")
+                else:
+                    n_die += 1
+                    err = (msg or "").replace("\n", " ")
+                    if len(err) > 120:
+                        err = err[:117] + "…"
+                    lines.append(f"• {aid}: DIE / lỗi — {err}")
+
+            def _proxy_done() -> None:
+                self._clear_ui_busy()
+                self._root.configure(cursor="")
+                body = "\n".join(lines[:80])
+                if len(lines) > 80:
+                    body += f"\n… (+{len(lines) - 80} tài khoản)"
+                title = (
+                    f"Kiểm tra proxy ({len(ids_copy)} dòng — LIVE {n_live}, DIE/lỗi {n_die}, bỏ qua {n_skip})"
+                )
+                if n_die == 0:
+                    messagebox.showinfo(title, body, parent=self._root)
+                elif n_live == 0:
+                    messagebox.showerror(title, body, parent=self._root)
+                else:
+                    messagebox.showwarning(title, body, parent=self._root)
+
+            self._root.after(0, _proxy_done)
+
+        threading.Thread(target=_proxy_worker, name="check_proxy", daemon=True).start()
 
     def _warn_if_scheduler_running_after_config_change(self) -> None:
         """
@@ -5215,7 +5293,10 @@ class _ManagerWindow:
 
         ttk.Label(
             frm,
-            text="URL manifest (file latest.json trên máy chủ, ví dụ GitHub Release):",
+            text=(
+                "URL manifest (khuyên dùng raw GitHub: …/main/release/update/latest.json — "
+                "không cần tạo Release chỉ để có latest.json):"
+            ),
             wraplength=520,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
         var_manifest = tk.StringVar(value=str(data.get("manifest_url", "")).strip())
@@ -5283,7 +5364,7 @@ class _ManagerWindow:
         hint = (
             "Manifest mặc định đọc từ nhánh main (raw GitHub: release/update/latest.json), không phụ thuộc file Release cũ.\n"
             "«Tự động từ Git remote»: có clone thì lấy origin; không có .git thì điền sẵn repo công khai ToolFB.\n"
-            "Nếu chạy từ thư mục git clone: «Cập nhật ngay» ưu tiên git pull.\n"
+            "Nếu chạy từ thư mục git clone: nút «Cập nhật» ưu tiên git pull.\n"
             "Biến môi trường TOOLFB_UPDATE_MANIFEST_URL (nếu có) vẫn được ưu tiên."
         )
         ttk.Label(frm, text=hint, wraplength=520, foreground="#555").grid(
@@ -5299,6 +5380,8 @@ class _ManagerWindow:
                     parent=top,
                 )
                 return
+            if url:
+                url = prefer_repo_raw_manifest_url(url)
             out = dict(data)
             if url:
                 out["manifest_url"] = url
@@ -5312,9 +5395,12 @@ class _ManagerWindow:
                 return
             messagebox.showinfo(
                 "Kênh cập nhật",
-                "Đã lưu config/update_channel.json.\nBấm «Kiểm tra cập nhật» để kiểm tra bản mới.",
+                "Đã lưu config/update_channel.json.\n"
+                "Vài giây sau app sẽ kiểm tra nền — nếu có bản mới sẽ hiện nút «Cập nhật».\n"
+                "Hoặc bấm «Chỉ kiểm tra» để kiểm tra và cập nhật ngay.",
                 parent=self._root,
             )
+            self._root.after(400, self._schedule_probe_update_button_visibility)
             top.destroy()
 
         def on_cancel() -> None:
@@ -5341,100 +5427,257 @@ class _ManagerWindow:
         ):
             return
         root = project_root()
-        base = root / "data" / "nanobanana"
-        main_profile = base / "browser_profile"
-        recovery_profile = base / "browser_profile_recovery"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_root = root / "data" / "backups" / f"veo3_profile_reset_{ts}"
-        backup_root.mkdir(parents=True, exist_ok=True)
+        self._set_ui_busy("reset_veo3_profile")
+        self._root.configure(cursor="watch")
 
-        def _release_veo3_profile_locks() -> None:
-            """
-            Cố gắng giải phóng tiến trình đang giữ file profile VEO3 (Windows).
-            Chỉ kill process có command line chứa path profile để tránh ảnh hưởng browser khác.
-            """
-            if os.name != "nt":
-                return
-            targets = [str(main_profile).lower(), str(recovery_profile).lower()]
-            escaped_targets = ["'" + t.replace("'", "''") + "'" for t in targets]
-            ps_script = (
-                "$targets = @("
-                + ",".join(escaped_targets)
-                + ");"
-                "$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine };"
-                "foreach ($p in $procs) {"
-                "  $cl = ($p.CommandLine + '').ToLowerInvariant();"
-                "  $hit = $false;"
-                "  foreach ($t in $targets) { if ($cl.Contains($t)) { $hit = $true; break } }"
-                "  if ($hit -and $p.ProcessId -ne $PID) {"
-                "    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {}"
-                "  }"
-                "}"
-            )
-            try:
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
+        def _reset_veo3_worker() -> None:
+            base = root / "data" / "nanobanana"
+            main_profile = base / "browser_profile"
+            recovery_profile = base / "browser_profile_recovery"
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_root = root / "data" / "backups" / f"veo3_profile_reset_{ts}"
+            moved: list[str] = []
+            errors: list[str] = []
+
+            def _release_veo3_profile_locks() -> None:
+                """
+                Cố gắng giải phóng tiến trình đang giữ file profile VEO3 (Windows).
+                Chỉ kill process có command line chứa path profile để tránh ảnh hưởng browser khác.
+                """
+                if os.name != "nt":
+                    return
+                targets = [str(main_profile).lower(), str(recovery_profile).lower()]
+                escaped_targets = ["'" + t.replace("'", "''") + "'" for t in targets]
+                ps_script = (
+                    "$targets = @("
+                    + ",".join(escaped_targets)
+                    + ");"
+                    "$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine };"
+                    "foreach ($p in $procs) {"
+                    "  $cl = ($p.CommandLine + '').ToLowerInvariant();"
+                    "  $hit = $false;"
+                    "  foreach ($t in $targets) { if ($cl.Contains($t)) { $hit = $true; break } }"
+                    "  if ($hit -and $p.ProcessId -ne $PID) {"
+                    "    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {}"
+                    "  }"
+                    "}"
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Reset VEO3: bỏ qua lỗi khi giải phóng lock profile: {}", exc)
-
-        moved: list[str] = []
-        errors: list[str] = []
-        for src, backup_name in (
-            (main_profile, "browser_profile"),
-            (recovery_profile, "browser_profile_recovery"),
-        ):
-            try:
-                if not src.exists():
-                    continue
-                dst = backup_root / backup_name
-                if dst.exists():
-                    shutil.rmtree(dst, ignore_errors=True)
                 try:
-                    shutil.move(str(src), str(dst))
-                except Exception as first_exc:  # noqa: BLE001
-                    # Nếu profile đang bị lock (WinError 32), thử giải phóng process và move lại 1 lần.
-                    msg = str(first_exc)
-                    locked = "WinError 32" in msg or "being used by another process" in msg.lower()
-                    if not locked:
-                        raise
-                    _release_veo3_profile_locks()
-                    time.sleep(0.8)
-                    shutil.move(str(src), str(dst))
-                moved.append(str(dst))
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=20,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Reset VEO3: bỏ qua lỗi khi giải phóng lock profile: {}", exc)
+
+            try:
+                backup_root.mkdir(parents=True, exist_ok=True)
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{src}: {exc}")
+                errors.append(f"Tạo thư mục backup: {exc}")
 
-        # Tạo profile mới trống để lần chạy sau có thể login lại.
+            if not errors:
+                for src, backup_name in (
+                    (main_profile, "browser_profile"),
+                    (recovery_profile, "browser_profile_recovery"),
+                ):
+                    try:
+                        if not src.exists():
+                            continue
+                        dst = backup_root / backup_name
+                        if dst.exists():
+                            shutil.rmtree(dst, ignore_errors=True)
+                        try:
+                            shutil.move(str(src), str(dst))
+                        except Exception as first_exc:  # noqa: BLE001
+                            msg = str(first_exc)
+                            locked = "WinError 32" in msg or "being used by another process" in msg.lower()
+                            if not locked:
+                                raise
+                            _release_veo3_profile_locks()
+                            time.sleep(0.8)
+                            shutil.move(str(src), str(dst))
+                        moved.append(str(dst))
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{src}: {exc}")
+
+                try:
+                    main_profile.mkdir(parents=True, exist_ok=True)
+                    recovery_profile.mkdir(parents=True, exist_ok=True)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"Tạo profile mới: {exc}")
+
+            def _reset_done() -> None:
+                self._clear_ui_busy()
+                self._root.configure(cursor="")
+                if errors:
+                    messagebox.showerror(
+                        "Reset profile VEO3",
+                        (
+                            "Reset có lỗi:\n- "
+                            + "\n- ".join(errors)
+                            + "\n\nGợi ý: đóng tất cả cửa sổ Chrome/Edge đang dùng profile VEO3 rồi thử lại."
+                        ),
+                        parent=self._root,
+                    )
+                    return
+                info = "Đã reset profile VEO3 thành công."
+                if moved:
+                    info += "\n\nBackup cũ:\n- " + "\n- ".join(moved)
+                info += "\n\nLưu ý: hãy đăng nhập lại Google khi chạy VEO3 lần tới."
+                messagebox.showinfo("Reset profile VEO3", info, parent=self._root)
+
+            self._root.after(0, _reset_done)
+
+        threading.Thread(target=_reset_veo3_worker, name="reset_veo3_profile", daemon=True).start()
+
+    def _show_apply_update_button(self) -> None:
+        """Hiện nút «Cập nhật» (đặt bên phải «Chỉ kiểm tra») khi có bản mới trên remote."""
         try:
-            main_profile.mkdir(parents=True, exist_ok=True)
-            recovery_profile.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"Tạo profile mới: {exc}")
+            if self._btn_apply_update.winfo_manager():
+                return
+            self._btn_apply_update.pack(side=tk.LEFT, padx=(0, 4), after=self._apply_update_pack_after)
+        except tk.TclError:
+            pass
 
-        if errors:
-            messagebox.showerror(
-                "Reset profile VEO3",
-                (
-                    "Reset có lỗi:\n- "
-                    + "\n- ".join(errors)
-                    + "\n\nGợi ý: đóng tất cả cửa sổ Chrome/Edge đang dùng profile VEO3 rồi thử lại."
-                ),
-                parent=self._root,
-            )
-            return
-        info = "Đã reset profile VEO3 thành công."
-        if moved:
-            info += "\n\nBackup cũ:\n- " + "\n- ".join(moved)
-        info += "\n\nLưu ý: hãy đăng nhập lại Google khi chạy VEO3 lần tới."
-        messagebox.showinfo("Reset profile VEO3", info, parent=self._root)
+    def _hide_apply_update_button(self) -> None:
+        """Ẩn nút «Cập nhật» khi không có bản mới hoặc sau khi cập nhật xong."""
+        try:
+            if self._btn_apply_update.winfo_manager():
+                self._btn_apply_update.pack_forget()
+            self._btn_apply_update.configure(state=tk.NORMAL)
+        except tk.TclError:
+            pass
+
+    def _schedule_probe_update_button_visibility(self) -> None:
+        """
+        Sau khi mở GUI: kiểm tra nền (git hoặc manifest) có bản mới không — chỉ để hiện nút «Cập nhật»,
+        không tự tải (tránh bất ngờ khi mở app).
+        """
+
+        def worker() -> None:
+            has_new = False
+            try:
+                root_p = project_root()
+                if should_use_git_updates(root_p):
+                    info = check_git_updates(root_p, timeout_fetch=120)
+                    has_new = bool(info.ok and info.has_new_commits)
+                else:
+                    mu = resolve_manifest_url(root_p)
+                    if mu:
+                        lv = read_local_version(root_p)
+                        mf = read_manifest_from_url(mu, timeout_sec=18)
+                        has_new = is_newer_version(mf.version, lv)
+            except Exception:
+                has_new = False
+
+            def on_main() -> None:
+                if has_new:
+                    self._show_apply_update_button()
+                else:
+                    self._hide_apply_update_button()
+
+            try:
+                self._root.after(0, on_main)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, name="probe_update_btn", daemon=True).start()
+
+    def _git_run_pull_thread(self, root: Path, info: GitUpdateCheckResult) -> None:
+        """
+        Chạy ``git pull --ff-only`` trên thread nền; gọi từ main thread khi đã bật busy và tắt nút.
+
+        ``self._lbl_state`` nên đã ghi «đang pull» trước khi gọi (tránh gọi Tk từ worker).
+        """
+
+        def worker_pull() -> None:
+            try:
+                ok, msg = apply_git_pull_ff(root, result=info)
+
+                def done_pull() -> None:
+                    if ok:
+                        self._git_update_result = None
+                        self._app_version_str = read_local_version(root)
+                        self._root.title(
+                            f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})"
+                        )
+                        self._lbl_app_version.configure(text=f"Phiên bản {self._app_version_str}")
+                        self._lbl_state.configure(text="Update (git): hoàn tất — khởi động lại")
+                        self._clear_ui_busy()
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._show_update_success_restart_dialog(
+                            version=self._app_version_str,
+                            backup_dir=None,
+                        )
+                    else:
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._lbl_state.configure(text="Update (git): lỗi")
+                        self._clear_ui_busy()
+                        messagebox.showerror(
+                            "Cập nhật (git)",
+                            msg[:8000] or "git pull thất bại.",
+                            parent=self._root,
+                        )
+
+                self._root.after(0, done_pull)
+            except Exception as exc:
+                err_text = str(exc)
+
+                def done_err() -> None:
+                    self._btn_check_updates.configure(state=tk.NORMAL)
+                    self._btn_apply_update.configure(state=tk.NORMAL)
+                    self._lbl_state.configure(text="Update (git): lỗi")
+                    self._clear_ui_busy()
+                    messagebox.showerror("Cập nhật (git)", err_text, parent=self._root)
+
+                self._root.after(0, done_err)
+
+        threading.Thread(target=worker_pull, name="apply_git_pull", daemon=True).start()
+
+    def _run_manifest_download_apply_thread(self, mf: UpdateManifest) -> None:
+        """
+        Tải + áp dụng gói manifest trên thread nền; gọi từ main thread khi đã busy.
+
+        Cập nhật nhãn trạng thái «đang tải…» trước khi bắt đầu tải.
+        """
+        has_patch = bool((mf.patch_download_url or "").strip())
+        self._lbl_state.configure(
+            text="Update: đang tải bản vá (nhẹ)…" if has_patch else "Update: đang tải & áp dụng…"
+        )
+
+        def worker_download() -> None:
+            try:
+                backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
+
+                def done_ok() -> None:
+                    self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
+                    self._clear_ui_busy()
+                    self._btn_check_updates.configure(state=tk.NORMAL)
+                    self._btn_apply_update.configure(state=tk.NORMAL)
+                    self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
+
+                self._root.after(0, done_ok)
+            except Exception as exc:  # noqa: BLE001
+                err_text = str(exc)
+
+                def done_err() -> None:
+                    self._btn_check_updates.configure(state=tk.NORMAL)
+                    self._btn_apply_update.configure(state=tk.NORMAL)
+                    self._lbl_state.configure(text="Update: lỗi")
+                    self._clear_ui_busy()
+                    messagebox.showerror("Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root)
+
+                self._root.after(0, done_err)
+
+        threading.Thread(target=worker_download, name="apply_update_download", daemon=True).start()
 
     def _on_check_updates(self) -> None:
-        """Kiểm tra bản mới: ưu tiên git (clone) rồi mới tới manifest (zip / Release)."""
+        """«Chỉ kiểm tra»: git fetch / đọc manifest; nếu có bản mới thì hiện nút «Cập nhật» và tải/áp dụng luôn."""
         root = project_root()
         if should_use_git_updates(root):
 
@@ -5443,12 +5686,13 @@ class _ManagerWindow:
                     info = check_git_updates(root)
 
                     def done_git() -> None:
-                        self._btn_check_updates.configure(state=tk.NORMAL)
-                        self._clear_ui_busy()
                         self._git_update_result = info if info.ok else None
                         self._latest_update_manifest = None
                         if not info.ok:
+                            self._hide_apply_update_button()
+                            self._btn_check_updates.configure(state=tk.NORMAL)
                             self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._clear_ui_busy()
                             messagebox.showerror(
                                 "Cập nhật (git)",
                                 info.error or "Không kiểm tra được qua git.",
@@ -5456,34 +5700,33 @@ class _ManagerWindow:
                             )
                             return
                         if info.has_new_commits:
-                            self._btn_apply_update.configure(state=tk.NORMAL)
-                            messagebox.showinfo(
-                                "Cập nhật (git)",
-                                (
-                                    f"Có {info.commits_behind} commit mới trên {info.remote_ref}.\n"
-                                    f"Local: {info.local_sha_short} → Remote: {info.remote_sha_short}\n"
-                                    f"Mới nhất: {info.remote_preview or '—'}\n\n"
-                                    "Bấm «Cập nhật ngay» để git pull (fast-forward)."
-                                ),
-                                parent=self._root,
-                            )
-                        else:
-                            self._btn_apply_update.configure(state=tk.NORMAL)
-                            lv = read_local_version(root)
-                            messagebox.showinfo(
-                                "Cập nhật (git)",
-                                (
-                                    f"Đã đồng bộ với {info.remote_ref} (nhánh «{info.branch}»).\n"
-                                    f"Commit: {info.local_sha_short} — version.json: {lv}"
-                                ),
-                                parent=self._root,
-                            )
+                            self._show_apply_update_button()
+                            self._set_ui_busy("apply_update")
+                            self._btn_check_updates.configure(state=tk.DISABLED)
+                            self._btn_apply_update.configure(state=tk.DISABLED)
+                            self._lbl_state.configure(text="Update (git): đang pull…")
+                            self._git_run_pull_thread(root, info)
+                            return
+                        self._hide_apply_update_button()
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._clear_ui_busy()
+                        lv = read_local_version(root)
+                        messagebox.showinfo(
+                            "Cập nhật (git)",
+                            (
+                                f"Đã đồng bộ với {info.remote_ref} (nhánh «{info.branch}»).\n"
+                                f"Commit: {info.local_sha_short} — version.json: {lv}"
+                            ),
+                            parent=self._root,
+                        )
 
                     self._root.after(0, done_git)
                 except Exception as exc:  # noqa: BLE001
                     err_text = str(exc)
 
                     def done_err() -> None:
+                        self._hide_apply_update_button()
                         self._btn_check_updates.configure(state=tk.NORMAL)
                         self._btn_apply_update.configure(state=tk.NORMAL)
                         self._clear_ui_busy()
@@ -5499,6 +5742,7 @@ class _ManagerWindow:
 
         manifest_url = resolve_manifest_url(root)
         if not manifest_url:
+            self._hide_apply_update_button()
             if messagebox.askyesno(
                 "Cập nhật",
                 (
@@ -5523,52 +5767,48 @@ class _ManagerWindow:
                 has_new = is_newer_version(mf.version, local_v)
 
                 def done_ok() -> None:
-                    self._btn_check_updates.configure(state=tk.NORMAL)
-                    self._clear_ui_busy()
                     self._latest_update_manifest = mf if has_new else None
                     if has_new:
-                        self._btn_apply_update.configure(state=tk.NORMAL)
-                        messagebox.showinfo(
-                            "Cập nhật",
+                        self._show_apply_update_button()
+                        self._set_ui_busy("apply_update")
+                        self._btn_check_updates.configure(state=tk.DISABLED)
+                        self._btn_apply_update.configure(state=tk.DISABLED)
+                        self._run_manifest_download_apply_thread(mf)
+                        return
+                    self._hide_apply_update_button()
+                    self._btn_check_updates.configure(state=tk.NORMAL)
+                    self._btn_apply_update.configure(state=tk.NORMAL)
+                    self._clear_ui_busy()
+                    root_p = project_root()
+                    rid = resolve_github_owner_repo_for_version_check(root_p)
+                    raw_v, raw_br = read_remote_version_from_github_raw(rid) if rid else (None, "")
+                    if raw_v and is_newer_version(raw_v, local_v):
+                        messagebox.showwarning(
+                            "Cập nhật — manifest chưa kịp theo GitHub",
                             (
-                                f"Đã tìm thấy bản mới: {mf.version}\n"
-                                f"Bản hiện tại: {local_v}\n\n"
-                                f"Ghi chú: {mf.notes or '—'}\n\n"
-                                "Bấm «Cập nhật ngay» để tải và áp dụng một lần (không cần kiểm tra lại)."
+                                f"Manifest (Release) báo không có zip mới hơn bạn ({local_v}).\n"
+                                f"Nhưng trên GitHub nhánh «{raw_br}» (raw) có version.json = {raw_v}.\n\n"
+                                "Cách xử lý:\n"
+                                "• Máy clone: cài Git, mở app trong thư mục có .git, hoặc đặt TOOLFB_GIT=…\\git.exe — "
+                                "sẽ cập nhật bằng git pull.\n"
+                                "• Bản zip/.exe: cần maintainer cập nhật file latest.json + gói zip trên Release, "
+                                "rồi bấm «Cập nhật» lại."
                             ),
                             parent=self._root,
                         )
                     else:
-                        self._btn_apply_update.configure(state=tk.NORMAL)
-                        root_p = project_root()
-                        rid = resolve_github_owner_repo_for_version_check(root_p)
-                        raw_v, raw_br = read_remote_version_from_github_raw(rid) if rid else (None, "")
-                        if raw_v and is_newer_version(raw_v, local_v):
-                            messagebox.showwarning(
-                                "Cập nhật — manifest chưa kịp theo GitHub",
-                                (
-                                    f"Manifest (Release) báo không có zip mới hơn bạn ({local_v}).\n"
-                                    f"Nhưng trên GitHub nhánh «{raw_br}» (raw) có version.json = {raw_v}.\n\n"
-                                    "Cách xử lý:\n"
-                                    "• Máy clone: cài Git, mở app trong thư mục có .git, hoặc đặt TOOLFB_GIT=…\\git.exe — "
-                                    "sẽ cập nhật bằng git pull.\n"
-                                    "• Bản zip/.exe: cần maintainer cập nhật file latest.json + gói zip trên Release, "
-                                    "rồi bấm «Cập nhật ngay» lại."
-                                ),
-                                parent=self._root,
-                            )
-                        else:
-                            messagebox.showinfo(
-                                "Cập nhật",
-                                f"Bạn đang dùng bản mới nhất ({local_v}).",
-                                parent=self._root,
-                            )
+                        messagebox.showinfo(
+                            "Cập nhật",
+                            f"Bạn đang dùng bản mới nhất ({local_v}).",
+                            parent=self._root,
+                        )
 
                 self._root.after(0, done_ok)
             except Exception as exc:  # noqa: BLE001
                 err_text = str(exc)
 
                 def done_err() -> None:
+                    self._hide_apply_update_button()
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
                     self._clear_ui_busy()
@@ -5582,6 +5822,7 @@ class _ManagerWindow:
         """
         Sau cập nhật thành công: nút mở lại chương trình ngay (khuyến nghị) + để sau.
         """
+        self._hide_apply_update_button()
         top = tk.Toplevel(self._root)
         top.title("Cập nhật xong — mở lại chương trình")
         top.transient(self._root)
@@ -5655,7 +5896,7 @@ class _ManagerWindow:
             pass
 
     def _on_apply_update(self) -> None:
-        """Git clone: pull --ff-only. Bản .exe / không .git: zip qua manifest."""
+        """«Cập nhật»: git pull hoặc tải zip manifest; nút chỉ hiện khi đã phát hiện bản mới (hoặc trong lúc chạy)."""
         root = project_root()
         if should_use_git_updates(root):
             self._set_ui_busy("apply_update")
@@ -5666,9 +5907,10 @@ class _ManagerWindow:
             def worker_git_apply() -> None:
                 try:
                     info = check_git_updates(root)
+                    if not info.ok:
 
-                    def on_decide() -> None:
-                        if not info.ok:
+                        def on_bad() -> None:
+                            self._hide_apply_update_button()
                             self._clear_ui_busy()
                             self._btn_check_updates.configure(state=tk.NORMAL)
                             self._btn_apply_update.configure(state=tk.NORMAL)
@@ -5678,8 +5920,13 @@ class _ManagerWindow:
                                 info.error or "Không kiểm tra được qua git.",
                                 parent=self._root,
                             )
-                            return
-                        if not info.has_new_commits:
+
+                        self._root.after(0, on_bad)
+                        return
+                    if not info.has_new_commits:
+
+                        def on_uptodate() -> None:
+                            self._hide_apply_update_button()
                             self._clear_ui_busy()
                             self._btn_check_updates.configure(state=tk.NORMAL)
                             self._btn_apply_update.configure(state=tk.NORMAL)
@@ -5692,49 +5939,54 @@ class _ManagerWindow:
                                 ),
                                 parent=self._root,
                             )
-                            return
 
+                        self._root.after(0, on_uptodate)
+                        return
+
+                    ui_evt = threading.Event()
+
+                    def on_ui_pulling() -> None:
+                        self._show_apply_update_button()
                         self._lbl_state.configure(text="Update (git): đang pull…")
+                        ui_evt.set()
 
-                        def worker_pull() -> None:
-                            ok, msg = apply_git_pull_ff(root, result=info)
+                    self._root.after(0, on_ui_pulling)
+                    ui_evt.wait(timeout=60)
+                    ok, msg = apply_git_pull_ff(root, result=info)
 
-                            def done_pull() -> None:
-                                if ok:
-                                    self._git_update_result = None
-                                    self._app_version_str = read_local_version(root)
-                                    self._root.title(
-                                        f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})"
-                                    )
-                                    self._lbl_app_version.configure(text=f"Phiên bản {self._app_version_str}")
-                                    self._lbl_state.configure(text="Update (git): hoàn tất — khởi động lại")
-                                    self._clear_ui_busy()
-                                    self._btn_check_updates.configure(state=tk.NORMAL)
-                                    self._btn_apply_update.configure(state=tk.NORMAL)
-                                    self._show_update_success_restart_dialog(
-                                        version=self._app_version_str,
-                                        backup_dir=None,
-                                    )
-                                else:
-                                    self._btn_check_updates.configure(state=tk.NORMAL)
-                                    self._btn_apply_update.configure(state=tk.NORMAL)
-                                    self._lbl_state.configure(text="Update (git): lỗi")
-                                    self._clear_ui_busy()
-                                    messagebox.showerror(
-                                        "Cập nhật (git)",
-                                        msg[:8000] or "git pull thất bại.",
-                                        parent=self._root,
-                                    )
+                    def done_pull() -> None:
+                        if ok:
+                            self._git_update_result = None
+                            self._app_version_str = read_local_version(root)
+                            self._root.title(
+                                f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})"
+                            )
+                            self._lbl_app_version.configure(text=f"Phiên bản {self._app_version_str}")
+                            self._lbl_state.configure(text="Update (git): hoàn tất — khởi động lại")
+                            self._clear_ui_busy()
+                            self._btn_check_updates.configure(state=tk.NORMAL)
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._show_update_success_restart_dialog(
+                                version=self._app_version_str,
+                                backup_dir=None,
+                            )
+                        else:
+                            self._btn_check_updates.configure(state=tk.NORMAL)
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._lbl_state.configure(text="Update (git): lỗi")
+                            self._clear_ui_busy()
+                            messagebox.showerror(
+                                "Cập nhật (git)",
+                                msg[:8000] or "git pull thất bại.",
+                                parent=self._root,
+                            )
 
-                            self._root.after(0, done_pull)
-
-                        threading.Thread(target=worker_pull, name="apply_git_pull", daemon=True).start()
-
-                    self._root.after(0, on_decide)
+                    self._root.after(0, done_pull)
                 except Exception as exc:  # noqa: BLE001
                     err_text = str(exc)
 
                     def done_err() -> None:
+                        self._hide_apply_update_button()
                         self._btn_check_updates.configure(state=tk.NORMAL)
                         self._btn_apply_update.configure(state=tk.NORMAL)
                         self._lbl_state.configure(text="")
@@ -5748,6 +6000,7 @@ class _ManagerWindow:
 
         manifest_url = resolve_manifest_url(root)
         if not manifest_url:
+            self._hide_apply_update_button()
             if messagebox.askyesno(
                 "Cập nhật",
                 (
@@ -5766,15 +6019,17 @@ class _ManagerWindow:
         self._btn_apply_update.configure(state=tk.DISABLED)
         self._lbl_state.configure(text="Update: đang kiểm tra manifest…")
 
-        def worker_check_then_apply() -> None:
+        def worker_manifest_apply() -> None:
             try:
                 local_v = read_local_version(project_root())
                 mf = read_manifest_from_url(manifest_url)
                 has_new = is_newer_version(mf.version, local_v)
 
-                def on_main_decide() -> None:
-                    self._latest_update_manifest = mf if has_new else None
-                    if not has_new:
+                if not has_new:
+
+                    def on_no() -> None:
+                        self._hide_apply_update_button()
+                        self._latest_update_manifest = None
                         self._clear_ui_busy()
                         self._btn_check_updates.configure(state=tk.NORMAL)
                         self._btn_apply_update.configure(state=tk.NORMAL)
@@ -5784,54 +6039,46 @@ class _ManagerWindow:
                             f"Bạn đang dùng bản mới nhất ({local_v}). Không cần cập nhật.",
                             parent=self._root,
                         )
-                        return
 
-                    self._lbl_state.configure(text="Update: đang tải & áp dụng…")
+                    self._root.after(0, on_no)
+                    return
 
-                    def worker_download() -> None:
-                        try:
-                            backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
+                ui_evt = threading.Event()
 
-                            def done_ok() -> None:
-                                self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
-                                self._clear_ui_busy()
-                                self._btn_check_updates.configure(state=tk.NORMAL)
-                                self._btn_apply_update.configure(state=tk.NORMAL)
-                                self._show_update_success_restart_dialog(
-                                    version=str(mf.version), backup_dir=backup_dir
-                                )
+                def on_ui_start() -> None:
+                    self._show_apply_update_button()
+                    self._latest_update_manifest = mf
+                    has_patch = bool((mf.patch_download_url or "").strip())
+                    self._lbl_state.configure(
+                        text="Update: đang tải bản vá (nhẹ)…" if has_patch else "Update: đang tải & áp dụng…"
+                    )
+                    ui_evt.set()
 
-                            self._root.after(0, done_ok)
-                        except Exception as exc:  # noqa: BLE001
-                            err_text = str(exc)
+                self._root.after(0, on_ui_start)
+                ui_evt.wait(timeout=60)
+                backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
 
-                            def done_err() -> None:
-                                self._btn_check_updates.configure(state=tk.NORMAL)
-                                self._btn_apply_update.configure(state=tk.NORMAL)
-                                self._lbl_state.configure(text="Update: lỗi")
-                                self._clear_ui_busy()
-                                messagebox.showerror(
-                                    "Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root
-                                )
+                def on_done() -> None:
+                    self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
+                    self._clear_ui_busy()
+                    self._btn_check_updates.configure(state=tk.NORMAL)
+                    self._btn_apply_update.configure(state=tk.NORMAL)
+                    self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
 
-                            self._root.after(0, done_err)
-
-                    threading.Thread(target=worker_download, name="apply_update_download", daemon=True).start()
-
-                self._root.after(0, on_main_decide)
+                self._root.after(0, on_done)
             except Exception as exc:  # noqa: BLE001
                 err_text = str(exc)
 
-                def done_err() -> None:
+                def on_err() -> None:
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
-                    self._lbl_state.configure(text="")
+                    self._lbl_state.configure(text="Update: lỗi")
                     self._clear_ui_busy()
-                    messagebox.showerror("Cập nhật", f"Không đọc được manifest / kiểm tra thất bại:\n{err_text}", parent=self._root)
+                    messagebox.showerror("Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root)
 
-                self._root.after(0, done_err)
+                self._root.after(0, on_err)
 
-        threading.Thread(target=worker_check_then_apply, name="apply_update", daemon=True).start()
+        threading.Thread(target=worker_manifest_apply, name="apply_update_manifest", daemon=True).start()
 
     def _on_start(self) -> None:
         """

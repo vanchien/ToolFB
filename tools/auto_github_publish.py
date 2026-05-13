@@ -114,6 +114,19 @@ def main() -> int:
             extra = ["--repo", args.repo.strip(), *extra]
 
     root = _root()
+    if not args.no_push and not (root / ".git").is_dir():
+        print(
+            "LOI: Thu muc ToolFB khong co .git (ban copy le hoac chua clone).\n"
+            "Cach lam:\n"
+            "  1) git clone https://github.com/vanchien/ToolFB.git  (hoac repo cua ban)\n"
+            "  2) Copy toan bo thay doi vao thu muc clone, hoac lam viec truc tiep trong clone\n"
+            "  3) Chay lai: python tools/auto_github_publish.py\n"
+            "Neu chi can dang Release (da co dist\\ToolFB_release_bundle.zip), khong can push code:\n"
+            "  python tools\\publish_all.py --repo vanchien/ToolFB --no-write-update-channel\n",
+            file=sys.stderr,
+        )
+        return 2
+
     if not args.no_push:
         git_bin = _resolve_git_executable()
         if not git_bin:

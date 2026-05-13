@@ -291,7 +291,11 @@ class FFmpegCommandBuilder:
             fc.append(vchain)
 
             cv_vf = self._cvb.build_simple_canvas_vf(clip, w, h)
-            fc.append(f"[{pre_lab}]{cv_vf}[{cv_mid}]")
+            zoom_vf = self._cvb.build_canvas_zoom_vf(clip, w, h).strip()
+            if zoom_vf:
+                fc.append(f"[{pre_lab}]{cv_vf},{zoom_vf}[{cv_mid}]")
+            else:
+                fc.append(f"[{pre_lab}]{cv_vf}[{cv_mid}]")
 
             # concat / xfade bắt buộc khớp width, height, SAR và pixel format giữa mọi đoạn.
             # Một số nguồn (đặc biệt vertical phone) có SAR lạ; scale+pad trước đó đôi khi vẫn để SAR khác 1:1
@@ -580,15 +584,26 @@ class FFmpegCommandBuilder:
                     se_a = ss_a + max(0.05, du_a)
                 ts_a = float(acl.get("timeline_start") or 0)
                 src_len = max(1e-3, float(se_a) - float(ss_a))
+                try:
+                    sp_a = float(acl.get("speed") or 1.0)
+                except (TypeError, ValueError):
+                    sp_a = 1.0
+                if sp_a <= 1e-6:
+                    sp_a = 1.0
+                _, af_tl_spd = SpeedManager().build_speed_filter(sp_a)
                 proj_dur_tl = float(project.get("duration") or 0)
                 out_dur = float(du_a)
                 if proj_dur_tl > 0:
                     out_dur = max(out_dur, max(0.0, proj_dur_tl - ts_a))
-                use_aloop = bool(acl.get("loop", True)) and out_dur > src_len + 0.02
+                wall_after_tempo = src_len / sp_a
+                use_aloop = bool(acl.get("loop", True)) and out_dur > wall_after_tempo + 0.02
                 vol_fade_a = self._afb.build_volume_fade_filters(acl, out_dur if use_aloop else du_a)
                 delay_ms_a = max(0, int(round(ts_a * 1000)))
                 alab_tl = f"tlau{ai}"
-                chain_tl = f"[{aidx}:a]atrim=start={ss_a}:end={se_a},asetpts=PTS-STARTPTS,aresample=48000"
+                chain_tl = f"[{aidx}:a]atrim=start={ss_a}:end={se_a},asetpts=PTS-STARTPTS"
+                if af_tl_spd:
+                    chain_tl += f",{af_tl_spd}"
+                chain_tl += ",aresample=48000"
                 if use_aloop:
                     chain_tl += f",aloop=loop=-1:size=0,atrim=0:{out_dur:.6f},asetpts=PTS-STARTPTS"
                 if vol_fade_a:

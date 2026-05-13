@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -68,7 +70,9 @@ def main() -> int:
             "Example:\n"
             "  python tools/publish_release_manifest.py --download-url "
             "https://github.com/OWNER/REPO/releases/latest/download/ToolFB_release_bundle.zip "
-            "--notes \"Fix profile + updater\""
+            "--notes \"Fix profile + updater\"\n\n"
+            "ZIP vá (nhẹ, chỉ file đổi): dùng tools/build_delta_patch_zip.py rồi đăng asset;\n"
+            "truyền --patch-download-url và --patch-sha256 (hoặc env TOOLFB_PATCH_*)."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -76,6 +80,16 @@ def main() -> int:
     parser.add_argument("--notes", default="", help="Short release notes for latest.json")
     parser.add_argument("--bump", choices=("patch", "minor", "major"), default="patch", help="Semver bump level")
     parser.add_argument("--version", default="", help="Set explicit version (e.g. 1.4.0), overrides --bump")
+    parser.add_argument(
+        "--patch-download-url",
+        default="",
+        help="URL public ZIP vá (delta); updater tải trước, fallback download-url nếu lỗi.",
+    )
+    parser.add_argument(
+        "--patch-sha256",
+        default="",
+        help="SHA256 của file ZIP vá (tuỳ chọn; để trống thì updater không verify patch).",
+    )
     args = parser.parse_args()
 
     root = _project_root()
@@ -95,6 +109,10 @@ def main() -> int:
         os.environ["TOOLFB_RELEASE_DOWNLOAD_URL"] = args.download_url.strip()
     if args.notes.strip():
         os.environ["TOOLFB_RELEASE_NOTES"] = args.notes.strip()
+    if str(args.patch_download_url).strip():
+        os.environ["TOOLFB_PATCH_DOWNLOAD_URL"] = str(args.patch_download_url).strip()
+    if str(args.patch_sha256).strip():
+        os.environ["TOOLFB_PATCH_SHA256"] = str(args.patch_sha256).strip()
 
     folder, archive, latest = build_release_bundle()
     print(f"RELEASE_BUNDLE_FOLDER={folder}")

@@ -1,19 +1,99 @@
 """
-Đường dẫn ffmpeg/ffprobe dùng chung (PATH hoặc tools/ffmpeg/bin portable).
-Tránh trùng logic giữa GUI lịch đăng, AI Video thumbnail, v.v.
+Đường dẫn ffmpeg/ffprobe/ffplay dùng chung (PATH hoặc tools/ffmpeg/bin portable).
+Tránh trùng logic giữa GUI lịch đăng, AI Video thumbnail, Video Editor, v.v.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import urllib.request
+import zipfile
 from pathlib import Path
 
+from loguru import logger
+
 from src.utils.paths import project_root
+
+# Chỉ tự tải zip ffplay một lần mỗi process (sao chép từ máy có thể lặp lại an toàn).
+_ffplay_auto_fetch_attempted: bool = False
 
 
 def portable_ffmpeg_bin_dir() -> Path:
     return project_root() / "tools" / "ffmpeg" / "bin"
+
+
+def _ffplay_exe_name() -> str:
+    return "ffplay.exe" if os.name == "nt" else "ffplay"
+
+
+def _ffplay_portable_path() -> Path:
+    return portable_ffmpeg_bin_dir() / _ffplay_exe_name()
+
+
+def _iter_ffplay_source_candidates() -> list[Path]:
+    """
+    Các vị trí có thể có ffplay: PATH, cùng thư mục ffmpeg/ffprobe, thư mục cài phổ biến (Windows).
+    """
+    exe = _ffplay_exe_name()
+    out: list[Path] = []
+    w = shutil.which("ffplay")
+    if w:
+        out.append(Path(w).resolve())
+    ff, ffp = resolve_ffmpeg_ffprobe_paths()
+    for base in (ff, ffp):
+        if not base:
+            continue
+        try:
+            sib = Path(base).resolve().parent / exe
+            if sib.is_file():
+                out.append(sib)
+        except OSError:
+            continue
+    if os.name == "nt":
+        for key in ("ProgramFiles", "ProgramFiles(x86)"):
+            root = os.environ.get(key, "").strip()
+            if root:
+                p = Path(root) / "ffmpeg" / "bin" / exe
+                if p.is_file():
+                    out.append(p.resolve())
+    return out
+
+
+def _try_copy_ffplay_into_portable() -> bool:
+    """
+    Sao chép ffplay đã có trên máy vào ``tools/ffmpeg/bin`` (trùng đích thì bỏ qua).
+
+    Returns:
+        ``True`` nếu sau khi copy (hoặc đã có sẵn) file portable tồn tại.
+    """
+    local = _ffplay_portable_path()
+    if local.is_file():
+        return True
+    try:
+        bin_dir = portable_ffmpeg_bin_dir()
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Không tạo được thư mục {}: {}", portable_ffmpeg_bin_dir(), exc)
+        return False
+
+    seen: set[str] = set()
+    for src in _iter_ffplay_source_candidates():
+        if not src.is_file():
+            continue
+        key = str(src).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if src.resolve() == local.resolve():
+                return True
+            shutil.copy2(src, local)
+            logger.info("Đã copy ffplay vào {} từ {}", local, src)
+            return True
+        except OSError as exc:
+            logger.debug("Không copy ffplay từ {}: {}", src, exc)
+    return local.is_file()
 
 
 def resolve_ffmpeg_ffprobe_paths() -> tuple[str | None, str | None]:
@@ -37,11 +117,144 @@ def resolve_ffmpeg_executable() -> str | None:
     return ff
 
 
+def ensure_ffplay_portable() -> bool:
+    """
+    Đảm bảo có ffplay trong ``tools/ffmpeg/bin``:
+
+    1. Đã có sẵn trong bin → xong.
+    2. Tìm trên máy (PATH, cạnh ffmpeg/ffprobe, Program Files\\ffmpeg\\bin) → **copy** vào bin.
+    3. (Windows) Vẫn thiếu → tải zip **full** Gyan, chỉ trích ffplay.
+
+    Tắt tải mạng (vẫn copy nếu tìm thấy): ``TOOLFB_NO_AUTO_FFPLAY=1``.
+
+    Returns:
+        ``True`` nếu sau khi gọi đã dùng được ffplay (portable hoặc PATH).
+    """
+    global _ffplay_auto_fetch_attempted
+    if os.environ.get("TOOLFB_NO_AUTO_FFPLAY", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return bool(shutil.which("ffplay")) or _ffplay_portable_path().is_file()
+
+    local = _ffplay_portable_path()
+    if local.is_file():
+        return True
+
+    if _try_copy_ffplay_into_portable():
+        return True
+
+    if shutil.which("ffplay"):
+        return True
+
+    exe = _ffplay_exe_name()
+    if os.name != "nt":
+        logger.debug("Tự tải ffplay zip: chỉ hỗ trợ Windows (nt).")
+        return False
+
+    if _ffplay_auto_fetch_attempted:
+        return local.is_file()
+    _ffplay_auto_fetch_attempted = True
+
+    root = project_root() / "tools" / "ffmpeg"
+    download_dir = root / "downloads"
+    extract_dir = root / "extracted_ffplay"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    bin_dir = portable_ffmpeg_bin_dir()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    url = os.environ.get(
+        "TOOLFB_FFPLAY_FULL_ZIP_URL",
+        "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.zip",
+    ).strip()
+    zip_path = download_dir / "ffmpeg-release-full-ffplay.zip"
+    try:
+        logger.info("Không tìm thấy ffplay để copy — đang tải zip full Gyan → {} …", bin_dir)
+        urllib.request.urlretrieve(url, str(zip_path))
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            members = zf.namelist()
+            play_member = next((m for m in members if m.lower().endswith("/bin/ffplay.exe")), "")
+            if play_member:
+                with zf.open(play_member) as src, local.open("wb") as dst:
+                    dst.write(src.read())
+            else:
+                zf.extractall(extract_dir)
+                found = None
+                for p in extract_dir.rglob("ffplay.exe"):
+                    if p.is_file():
+                        found = p
+                        break
+                if not found:
+                    logger.warning("Zip full không chứa ffplay.exe — kiểm tra URL / layout Gyan.")
+                    return False
+                shutil.copy2(found, local)
+        keep = os.environ.get("FFMPEG_KEEP_INSTALL_CACHE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if not keep:
+            try:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                if zip_path.is_file():
+                    zip_path.unlink()
+            except Exception:
+                pass
+        if local.is_file():
+            logger.info("Đã đặt ffplay tại: {}", local)
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không tải/giải nén được ffplay portable: {}", exc)
+    return bool(local.is_file())
+
+
+def ffplay_resolve_skips_ensure_heavy_work() -> bool:
+    """
+    ``True`` nếu ``resolve_ffplay_executable()`` có thể trả lời mà **không** gọi
+    ``ensure_ffplay_portable()`` (tránh copy/tải zip đồng bộ — thường gây treo UI).
+
+    Heuristic: PATH, file portable đã có, hoặc ffplay cạnh ffmpeg/ffprobe đã phát hiện.
+    """
+    if shutil.which("ffplay"):
+        return True
+    exe = _ffplay_exe_name()
+    p = portable_ffmpeg_bin_dir() / exe
+    if p.is_file():
+        return True
+    ff, ffp = resolve_ffmpeg_ffprobe_paths()
+    for base in (ff, ffp):
+        if not base:
+            continue
+        try:
+            sibling = Path(base).resolve().parent / exe
+            if sibling.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def resolve_ffplay_executable() -> str | None:
-    """ffplay (PATH hoặc cạnh ffmpeg trong tools/ffmpeg/bin)."""
+    """
+    ffplay: PATH → portable ``tools/ffmpeg/bin`` → cùng thư mục với ``ffmpeg``/``ffprobe`` đã phát hiện
+    → ``ensure_ffplay_portable()`` (copy từ máy hoặc tải zip trên Windows).
+
+    Một số máy chỉ có ``ffmpeg`` trên PATH nhưng ``ffplay`` nằm cùng folder (bản Gyan đầy đủ).
+    """
     fp = shutil.which("ffplay")
     if fp:
         return fp
-    exe = "ffplay.exe" if os.name == "nt" else "ffplay"
+    exe = _ffplay_exe_name()
     p = portable_ffmpeg_bin_dir() / exe
-    return str(p) if p.is_file() else None
+    if p.is_file():
+        return str(p)
+    ff, ffp = resolve_ffmpeg_ffprobe_paths()
+    for base in (ff, ffp):
+        if not base:
+            continue
+        try:
+            sibling = Path(base).resolve().parent / exe
+            if sibling.is_file():
+                return str(sibling)
+        except OSError:
+            continue
+    if ensure_ffplay_portable() and p.is_file():
+        return str(p)
+    return None

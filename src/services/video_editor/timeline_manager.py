@@ -130,6 +130,7 @@ class TimelineManager:
                     "keep_aspect": True,
                 },
                 "canvas_mode": "fit",
+                "zoom": 1.0,
             }
             if clips:
                 last_end = 0.0
@@ -168,6 +169,7 @@ class TimelineManager:
                 "source_start": 0.0,
                 "source_end": duration,
                 "volume": 1.0,
+                "speed": 1.0,
                 "fade_in": 0.0,
                 "fade_out": 0.0,
                 "loop": True,
