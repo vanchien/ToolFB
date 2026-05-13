@@ -31,6 +31,9 @@ htmlcov/
 Thumbs.db
 Desktop.ini
 
+# Temp / scrape output (local only)
+releases_tmp.json
+
 # Project runtime — không đẩy lên GitHub (profiles, cookies, download cache, DB…)
 data/
 logs/
