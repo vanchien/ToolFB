@@ -1,7 +1,7 @@
 {
-  "version": "1.0.45",
+  "version": "1.0.47",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "e6fa7ef9ccb6395e988f204a81dbd76451823882fdd94bf2e23c4e4a88d92f33",
-  "notes": "Tải video: yt-dlp JS runtime, tiến trình batch (k/n), sửa ghép URL-file; reverse engine dùng format HD chung.",
-  "generated_at": "2026-05-12T00:10:45"
+  "sha256": "faf6633e5119ff97ab03e19052caa82cc1c7a38d4bb01bf5ff5f3f5241c7b160",
+  "notes": "Sửa TclError wrap nhãn sau refresh inspector; ổn định GUI video editor.",
+  "generated_at": "2026-05-13T02:03:17"
 }
