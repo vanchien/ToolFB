@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import uuid
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -401,14 +403,8 @@ def read_remote_version_from_github_raw(
     return None, ""
 
 
-def read_manifest_from_url(manifest_url: str, *, timeout_sec: int = 20) -> UpdateManifest:
-    """Tải manifest JSON từ URL."""
-    req = urllib.request.Request(manifest_url, headers={"User-Agent": "ToolFB-Updater/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        data = resp.read()
-    raw = json.loads(data.decode("utf-8", errors="replace"))
-    if not isinstance(raw, dict):
-        raise ValueError("Manifest cập nhật không hợp lệ (không phải object).")
+def _manifest_dict_to_model(raw: dict[str, Any]) -> UpdateManifest:
+    """Chuyển dict JSON manifest → ``UpdateManifest`` (kiểm tra tối thiểu)."""
     version = str(raw.get("version", "")).strip()
     download_url = str(raw.get("download_url", "")).strip()
     sha256 = str(raw.get("sha256", "")).strip().lower()
@@ -416,6 +412,84 @@ def read_manifest_from_url(manifest_url: str, *, timeout_sec: int = 20) -> Updat
     if not version or not download_url:
         raise ValueError("Manifest thiếu version hoặc download_url.")
     return UpdateManifest(version=version, download_url=download_url, sha256=sha256, notes=notes)
+
+
+def _manifest_fetch_urls(primary: str) -> list[str]:
+    """
+    Thứ tự URL thử khi tải manifest (tránh CDN/proxy trả bản cũ; dự phòng khi một nguồn lỗi).
+
+    - ``file:`` chỉ một URL.
+    - HTTP(S): thêm bản raw GitHub + asset ``releases/latest/download/latest.json`` cùng repo nếu parse được owner/repo.
+    """
+    u = (primary or "").strip()
+    if not u:
+        return []
+    if u.lower().startswith("file:"):
+        return [u]
+    out: list[str] = []
+
+    def add(x: str) -> None:
+        s = (x or "").strip()
+        if s and s not in out:
+            out.append(s)
+
+    add(u)
+    rid = parse_github_owner_repo_from_url(u)
+    if rid:
+        add(github_repo_raw_manifest_url(rid))
+        add(f"https://github.com/{rid}/releases/latest/download/latest.json")
+    return out
+
+
+def _http_manifest_request(url: str, *, bust_cache: bool) -> urllib.request.Request:
+    """Request GET manifest: header no-cache + (tuỳ chọn) query bust cho raw GitHub."""
+    get_url = url
+    low = url.lower()
+    if bust_cache and "raw.githubusercontent.com" in low and "://" in low:
+        sep = "&" if "?" in url else "?"
+        get_url = f"{url}{sep}_toolfb_ts={int(time.time())}"
+    return urllib.request.Request(
+        get_url,
+        headers={
+            "User-Agent": "ToolFB-Updater/1.0",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+def read_manifest_from_url(manifest_url: str, *, timeout_sec: int = 20) -> UpdateManifest:
+    """
+    Tải manifest JSON từ URL (hoặc ``file:``).
+
+    Thử lần lượt các URL ứng viên; với mỗi URL HTTP(S) thử không bust rồi bust cache (raw GitHub hay bị cache cũ).
+    """
+    bases = _manifest_fetch_urls(manifest_url)
+    if not bases:
+        raise ValueError("Thiếu URL manifest.")
+    last_exc: BaseException | None = None
+    for base in bases:
+        for bust in (False, True) if not base.lower().startswith("file:") else (False,):
+            try:
+                req = _http_manifest_request(base, bust_cache=bust)
+                with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                    data = resp.read()
+                raw = json.loads(data.decode("utf-8", errors="replace"))
+                if not isinstance(raw, dict):
+                    raise ValueError("Manifest cập nhật không hợp lệ (không phải object).")
+                return _manifest_dict_to_model(raw)
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                if exc.code in {403, 404}:
+                    continue
+                raise
+            except (ValueError, json.JSONDecodeError, OSError, TimeoutError) as exc:
+                last_exc = exc
+                continue
+    msg = "Không tải được manifest từ bất kỳ URL nào đã thử."
+    if last_exc is not None:
+        raise RuntimeError(f"{msg}\nURL gốc: {manifest_url}\nLỗi cuối: {last_exc}") from last_exc
+    raise RuntimeError(f"{msg}\nURL gốc: {manifest_url}")
 
 
 def is_newer_version(remote_version: str, local_version: str) -> bool:
@@ -984,8 +1058,10 @@ def resolve_manifest_url(project_root: Path) -> str:
     - hoặc ``config/update_channel.json``:
       - ``manifest_url`` (http/https) — URL kiểu Release ``latest/download`` được chuyển sang raw trên ``main``
       - ``manifest_file`` (đường dẫn tương đối tới project, dùng khi dev không có CDN)
-    - fallback: ``dist/latest.json`` nếu file tồn tại (dev local sau khi build)
-    - cuối: ``raw.githubusercontent.com/.../main/release/update/latest.json`` từ ``git remote origin``
+    - ``dist/latest.json`` chỉ khi: có ``.git`` (môi trường dev) hoặc ``TOOLFB_USE_DIST_MANIFEST=1`` —
+      tránh bản portable chép nhầm ``dist`` cũ làm «Không có bản mới».
+    - ``raw.githubusercontent.com/.../main/release/update/latest.json`` từ ``git remote origin``
+    - cuối: manifest raw repo công khai ``TOOLFB_PUBLIC_REPO`` (máy cài zip không có ``.git`` / chưa cấu hình).
     """
     env_url = os.environ.get("TOOLFB_UPDATE_MANIFEST_URL", "").strip()
     if env_url:
@@ -1007,8 +1083,9 @@ def resolve_manifest_url(project_root: Path) -> str:
                     p = (project_root / p).resolve()
                 if p.is_file():
                     return p.as_uri()
+    use_dist = os.environ.get("TOOLFB_USE_DIST_MANIFEST", "").strip().lower() in ("1", "true", "yes")
     dev_latest = (project_root / "dist" / "latest.json").resolve()
-    if dev_latest.is_file():
+    if dev_latest.is_file() and (use_dist or (project_root / ".git").exists()):
         return dev_latest.as_uri()
     # Clone git thường chưa có update_channel.json: manifest raw trên nhánh main.
     try:
@@ -1019,7 +1096,7 @@ def resolve_manifest_url(project_root: Path) -> str:
             return github_repo_raw_manifest_url(r)
     except Exception:
         pass
-    return ""
+    return github_repo_raw_manifest_url(TOOLFB_PUBLIC_REPO)
 
 
 def github_latest_manifest_url(owner_slash_repo: str) -> str:

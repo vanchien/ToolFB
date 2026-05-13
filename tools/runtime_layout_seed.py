@@ -36,3 +36,15 @@ def seed_default_runtime_at(dest_root: Path) -> None:
     app_secrets = dest_root / "config" / "app_secrets.json"
     if app_secrets.exists():
         app_secrets.unlink()
+
+    # Kênh cập nhật mặc định (máy chỉ có zip / chưa từng cấu hình — tránh resolve_manifest_url rỗng).
+    uc = dest_root / "config" / "update_channel.json"
+    if not uc.is_file():
+        _write_json(
+            uc,
+            {
+                "manifest_url": (
+                    "https://raw.githubusercontent.com/vanchien/ToolFB/main/release/update/latest.json"
+                )
+            },
+        )
