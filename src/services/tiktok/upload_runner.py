@@ -8,7 +8,7 @@ from typing import Any, Callable
 from loguru import logger
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-from src.services.tiktok.layout import ensure_tiktok_layout
+from src.services.tiktok.layout import ensure_tiktok_layout, resolve_tiktok_profile_dir
 
 LogFn = Callable[[str], None]
 JobPatchFn = Callable[[dict[str, Any]], None]
@@ -62,8 +62,8 @@ def _playwright_proxy(account: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def open_tiktok_browser(account: dict[str, Any], *, playwright: Any) -> BrowserContext:
-    profile = Path(str(account.get("profile_path", "")).strip())
-    profile.mkdir(parents=True, exist_ok=True)
+    # Dùng profile nội bộ theo account_id (data/tiktok/profiles), tránh dùng profile OS người dùng.
+    profile = resolve_tiktok_profile_dir(account)
     exe_raw = str(account.get("browser_exe_path", "")).strip()
     exe = Path(exe_raw) if exe_raw else None
 
@@ -114,8 +114,7 @@ def check_tiktok_login(page: Page) -> bool:
 def validate_tiktok_job(job: dict[str, Any], account: dict[str, Any]) -> None:
     if not str(account.get("id", "")).strip():
         raise ValueError("Thiếu account id.")
-    if not str(account.get("profile_path", "")).strip():
-        raise ValueError("Thiếu profile_path cho tài khoản TikTok.")
+    _ = resolve_tiktok_profile_dir(account)
     vp = Path(str(job.get("video_path", "")).strip())
     if not vp.is_file():
         raise ValueError(f"Không tìm thấy file video: {vp}")
@@ -411,8 +410,7 @@ def run_tiktok_upload_job_sync(
 
 def run_tiktok_login_check_sync(account: dict[str, Any], *, log: LogFn) -> tuple[bool, str]:
     """Mở profile, vào TikTok, kiểm tra đã login (không đổi trạng thái job)."""
-    if not str(account.get("profile_path", "")).strip():
-        return False, "Thiếu profile_path."
+    _ = resolve_tiktok_profile_dir(account)
     ctx: BrowserContext | None = None
     try:
         with sync_playwright() as p:

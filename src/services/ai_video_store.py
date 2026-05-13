@@ -16,6 +16,7 @@ from loguru import logger
 from src.services.ai_video_config import load_ai_video_config
 from src.utils.media_dedupe import dedupe_output_file_paths
 from src.utils.paths import project_root
+from src.utils.safe_delete import safe_delete_path
 
 
 def _now_iso() -> str:
@@ -249,14 +250,9 @@ def delete_ai_video_project_file(project_id: str) -> bool:
     pid = str(project_id or "").strip()
     if not pid:
         return False
-    path = ai_video_projects_dir() / f"{pid}.json"
-    try:
-        if path.is_file():
-            path.unlink()
-            return True
-    except Exception:
-        pass
-    return False
+    base = ai_video_projects_dir().resolve()
+    path = (base / f"{pid}.json").resolve()
+    return safe_delete_path(path, allowed_roots=[base], kind="file", missing_ok=False)
 
 
 def delete_ai_video_project_output_dir(project_id: str) -> bool:
@@ -264,14 +260,14 @@ def delete_ai_video_project_output_dir(project_id: str) -> bool:
     pid = str(project_id or "").strip()
     if not pid:
         return False
-    path = ensure_ai_video_layout()["outputs"] / pid
+    base = ensure_ai_video_layout()["outputs"].resolve()
+    path = (base / pid).resolve()
     try:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=False)
-            return True
-    except Exception:
-        pass
-    return False
+        path.relative_to(base)
+    except ValueError:
+        # Chặn path escape (ví dụ project_id chứa ../).
+        return False
+    return safe_delete_path(path, allowed_roots=[base], kind="dir", missing_ok=False)
 
 
 class AIVideoStore:

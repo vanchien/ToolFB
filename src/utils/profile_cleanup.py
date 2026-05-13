@@ -11,11 +11,11 @@ Không xóa cookie tùy tên khác tên thư mục profile (tránh nhầm file d
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from loguru import logger
+from src.utils.safe_delete import safe_delete_path
 
 _BROWSER_SUBDIRS = frozenset(
     name.lower() for name in ("chromium", "chrome", "firefox", "webkit", "edge", "msedge")
@@ -110,11 +110,14 @@ def _try_delete_orphan_cookie_for_stem(
         deleted_log.append(str(candidate))
         return
     try:
-        candidate.unlink()
-        deleted_log.append(str(candidate))
-        logger.info("Đã xóa cookie mồ côi (theo profile đã xóa): {}", candidate)
-    except OSError as exc:
-        logger.warning("Không xóa được cookie {}: {}", candidate, exc)
+        ok = safe_delete_path(candidate, allowed_roots=[ck_root], kind="file", missing_ok=False)
+        if ok:
+            deleted_log.append(str(candidate))
+            logger.info("Đã xóa cookie mồ côi (theo profile đã xóa): {}", candidate)
+        else:
+            logger.warning("Không xóa được cookie {}.", candidate)
+    except OSError:
+        logger.warning("Không xóa được cookie {}.", candidate)
 
 
 def iter_profile_leaf_dirs(profiles_root: Path) -> list[Path]:
@@ -199,12 +202,12 @@ def cleanup_orphan_profile_directories(
                 deleted_log=deleted,
             )
             continue
-        try:
-            shutil.rmtree(folder, ignore_errors=False)
+        ok = safe_delete_path(folder, allowed_roots=[profiles_root], kind="dir", missing_ok=False)
+        if ok:
             deleted.append(str(folder))
             logger.info("Đã xóa profile mồ côi: {}", folder)
-        except OSError as exc:
-            logger.warning("Không xóa được profile {}: {}", folder, exc)
+        else:
+            logger.warning("Không xóa được profile {}.", folder)
             continue
         _try_delete_orphan_cookie_for_stem(
             project_root=proot,

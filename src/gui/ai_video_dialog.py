@@ -22,6 +22,7 @@ from src.services.facebook_reels_catalog import (
 )
 from src.services.universal_video_downloader import (
     UniversalVideoDownloader,
+    _extract_hashtags_from_text,
     classify_url_type,
     detect_platform,
     ensure_downloader_layout,
@@ -1217,18 +1218,28 @@ class AIVideoDialog:
             foreground="#1f4d8f",
             font=("Segoe UI", 9, "bold"),
         ).grid(row=0, column=4, sticky="e", padx=(12, 0))
-        cols = ("job", "platform", "title", "duration", "uploader", "status", "path")
+        cols = ("job", "platform", "title", "hashtags", "duration", "uploader", "status", "path")
         self._tree_uv = ttk.Treeview(lib, columns=cols, show="headings", height=8, selectmode="extended")
         heads = {
             "job": "Job",
             "platform": "Nền tảng",
             "title": "Tiêu đề",
+            "hashtags": "Hashtag",
             "duration": "Thời lượng",
             "uploader": "Kênh/Tác giả",
             "status": "Trạng thái",
             "path": "Đường dẫn file",
         }
-        widths = {"job": 140, "platform": 86, "title": 180, "duration": 70, "uploader": 110, "status": 86, "path": 360}
+        widths = {
+            "job": 140,
+            "platform": 86,
+            "title": 160,
+            "hashtags": 150,
+            "duration": 70,
+            "uploader": 110,
+            "status": 86,
+            "path": 320,
+        }
         for c in cols:
             self._tree_uv.heading(c, text=heads[c])
             self._tree_uv.column(c, width=widths[c], stretch=True if c == "path" else False)
@@ -1291,13 +1302,14 @@ class AIVideoDialog:
                 self._tree_tt_channel.column("url", width=max(180, int(w * 0.60)), stretch=True)
             if self._tree_uv is not None:
                 w = max(260, int(self._tree_uv.winfo_width()))
-                self._tree_uv.column("job", width=max(100, int(w * 0.13)), stretch=True)
-                self._tree_uv.column("platform", width=max(84, int(w * 0.09)), stretch=False)
-                self._tree_uv.column("title", width=max(140, int(w * 0.20)), stretch=True)
-                self._tree_uv.column("duration", width=max(70, int(w * 0.07)), stretch=False)
-                self._tree_uv.column("uploader", width=max(120, int(w * 0.14)), stretch=True)
-                self._tree_uv.column("status", width=max(90, int(w * 0.09)), stretch=False)
-                self._tree_uv.column("path", width=max(180, int(w * 0.28)), stretch=True)
+                self._tree_uv.column("job", width=max(100, int(w * 0.12)), stretch=True)
+                self._tree_uv.column("platform", width=max(84, int(w * 0.08)), stretch=False)
+                self._tree_uv.column("title", width=max(120, int(w * 0.16)), stretch=True)
+                self._tree_uv.column("hashtags", width=max(100, int(w * 0.12)), stretch=True)
+                self._tree_uv.column("duration", width=max(70, int(w * 0.06)), stretch=False)
+                self._tree_uv.column("uploader", width=max(120, int(w * 0.12)), stretch=True)
+                self._tree_uv.column("status", width=max(90, int(w * 0.08)), stretch=False)
+                self._tree_uv.column("path", width=max(180, int(w * 0.26)), stretch=True)
 
         def _reflow_download_tab() -> None:
             # Cho cửa sổ hẹp / DPI cao: vẫn co wrap + cột tree, tránh nhãn cắt chữ và thanh ngang vô dụng.
@@ -2787,6 +2799,7 @@ class AIVideoDialog:
                     display_job,
                     str(r.get("platform") or ""),
                     str(r.get("title") or "")[:120],
+                    self._uv_format_library_hashtags_cell(r),
                     ds,
                     str(r.get("uploader") or "")[:40],
                     str(r.get("status") or ""),
@@ -2831,6 +2844,35 @@ class AIVideoDialog:
         if jname and jid and jname != jid:
             return f"{jname} | {jid}"
         return jname or jid
+
+    @staticmethod
+    def _uv_format_library_hashtags_cell(row: dict[str, Any]) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+
+        def push(tag: str) -> None:
+            t = str(tag).strip()
+            if not t:
+                return
+            if not t.startswith("#"):
+                t = "#" + t.lstrip("#")
+            key = t.casefold()
+            if key in seen:
+                return
+            seen.add(key)
+            parts.append(t)
+
+        raw = row.get("hashtags")
+        if isinstance(raw, str) and raw.strip():
+            for piece in re.split(r"[\s,;]+", raw.strip()):
+                push(piece)
+        elif isinstance(raw, list):
+            for x in raw:
+                push(str(x))
+        for h in _extract_hashtags_from_text(str(row.get("title") or "")):
+            push(h)
+        joined = " ".join(parts)
+        return joined[:240] if len(joined) > 240 else joined
 
     def _on_uv_library_job_filter_changed(self) -> None:
         self._refresh_uv_library()

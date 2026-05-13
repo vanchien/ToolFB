@@ -19,9 +19,16 @@ from loguru import logger
 from src.services.ai_video_store import AIVideoStore
 from src.services.tiktok.account_lock import try_run_for_account
 from src.services.tiktok.account_manager import TikTokAccountStore, default_account_dict
-from src.services.tiktok.browser_external import open_tiktok_profile_for_manual_login
+from src.services.tiktok.browser_external import (
+    close_tiktok_manual_profile_session,
+    open_tiktok_profile_for_manual_login,
+)
 from src.services.tiktok.job_manager import TikTokJobStore, default_job_dict
-from src.services.tiktok.layout import ensure_tiktok_layout
+from src.services.tiktok.layout import (
+    delete_tiktok_profile_dir_by_account_id,
+    ensure_tiktok_layout,
+    resolve_tiktok_profile_dir,
+)
 from src.services.tiktok.upload_runner import run_tiktok_login_check_sync, run_tiktok_upload_job_sync
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.utils.browser_exe_discover import find_browser_exe_in_directory
@@ -68,6 +75,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
 
     acc_bar = ttk.Frame(acc_fr)
     acc_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    var_show_browser = tk.BooleanVar(value=True)
     job_log_lines: list[str] = []
 
     def log_tt(msg: str) -> None:
@@ -94,6 +102,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     def refresh_accounts() -> None:
         tree_acc.delete(*tree_acc.get_children())
         for r in acc_store.load_all():
+            prof_used = str(resolve_tiktok_profile_dir(r))
             px = r.get("proxy") if isinstance(r.get("proxy"), dict) else {}
             px_on = bool(px.get("enabled")) and str(px.get("server", "")).strip()
             tree_acc.insert(
@@ -103,7 +112,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
                 values=(
                     str(r.get("name", "")),
                     str(r.get("username", "")),
-                    str(r.get("profile_path", "")),
+                    prof_used,
                     "có" if px_on else "không",
                     str(r.get("status", "")),
                 ),
@@ -364,9 +373,10 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
             if not name:
                 messagebox.showwarning("TikTok", "Nhập tên tài khoản.", parent=top)
                 return None
-            prof = var_prof.get().strip()
-            if not prof:
-                prof = str((ensure_tiktok_layout()["root"] / "profiles" / aid).resolve())
+            # Profile runtime luôn theo account_id trong data/tiktok/profiles/<account_id>.
+            # Nếu người dùng nhập profile_path cũ, resolve_tiktok_profile_dir sẽ migrate 1 lần.
+            prof_hint = var_prof.get().strip()
+            prof = str(resolve_tiktok_profile_dir({"id": aid, "profile_path": prof_hint}).resolve())
             host = var_px_host.get().strip()
             port_raw = var_px_port.get().strip()
             if bool(var_px_on.get()) and (not host or not port_raw):
@@ -428,10 +438,13 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
             if row is None:
                 return
             try:
-                open_tiktok_profile_for_manual_login(row)
+                open_tiktok_profile_for_manual_login(row, show_browser=bool(var_show_browser.get()))
                 messagebox.showinfo(
                     "TikTok",
-                    "Đã mở browser profile để đăng nhập TikTok.\nĐăng nhập xong quay lại bấm «Lưu».",
+                    (
+                        "Đã mở profile TikTok."
+                        + ("\nĐăng nhập xong quay lại bấm «Lưu»." if bool(var_show_browser.get()) else "\nĐang chạy ẩn (headless).")
+                    ),
                     parent=top,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -485,19 +498,51 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
             messagebox.showwarning("TikTok", "Chọn một tài khoản.", parent=root)
             return
         try:
-            open_tiktok_profile_for_manual_login(acc)
-            messagebox.showinfo("TikTok", "Đã mở trình duyệt với profile — đăng nhập TikTok thủ công.", parent=root)
+            open_tiktok_profile_for_manual_login(acc, show_browser=bool(var_show_browser.get()))
+            messagebox.showinfo(
+                "TikTok",
+                "Đã mở profile TikTok."
+                + (" (hiện browser)." if bool(var_show_browser.get()) else " (chế độ ẩn/headless)."),
+                parent=root,
+            )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("TikTok", str(exc), parent=root)
+
+    def on_close_profile() -> None:
+        aid = selected_account_id()
+        if not aid:
+            messagebox.showwarning("TikTok", "Chọn một tài khoản.", parent=root)
+            return
+        closed = close_tiktok_manual_profile_session(aid)
+        if closed:
+            messagebox.showinfo("TikTok", "Đã đóng profile/browser đang mở cho tài khoản này.", parent=root)
+        else:
+            messagebox.showinfo("TikTok", "Không có phiên profile đang mở để đóng.", parent=root)
 
     def on_delete_account() -> None:
         aid = selected_account_id()
         if not aid:
             return
-        if not messagebox.askyesno("TikTok", f"Xóa tài khoản {aid}?", parent=root):
+        prof_dir = resolve_tiktok_profile_dir({"id": aid}) if aid else None
+        prof_text = str(prof_dir) if prof_dir else "(không rõ)"
+        if not messagebox.askyesno(
+            "TikTok",
+            f"Xóa tài khoản {aid} và xóa sạch profile?\n\n{prof_text}",
+            parent=root,
+        ):
             return
         acc_store.delete(aid)
+        if not delete_tiktok_profile_dir_by_account_id(aid):
+            logger.warning("TikTok: profile account {} chưa xóa sạch (có thể còn process giữ file).", aid)
+        # Dọn job liên quan account để tránh job mồ côi.
+        for j in job_store.load_all():
+            if str(j.get("account_id", "")).strip() == aid:
+                try:
+                    job_store.delete(str(j.get("id", "")))
+                except Exception:
+                    pass
         refresh_accounts()
+        refresh_jobs()
 
     def on_edit_account() -> None:
         aid = selected_account_id()
@@ -651,6 +696,8 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     ttk.Button(acc_bar, text="Sửa tài khoản", command=on_edit_account).pack(side=tk.LEFT, padx=(0, 6))
     ttk.Button(acc_bar, text="Kiểm tra login", command=on_check_login).pack(side=tk.LEFT, padx=(0, 6))
     ttk.Button(acc_bar, text="Mở profile", command=on_open_profile).pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Button(acc_bar, text="Đóng profile đang mở", command=on_close_profile).pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Checkbutton(acc_bar, text="Hiện browser", variable=var_show_browser).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Button(acc_bar, text="Xóa tài khoản", command=on_delete_account).pack(side=tk.LEFT, padx=(0, 6))
     ttk.Button(acc_bar, text="Làm mới", command=lambda: (refresh_accounts(), refresh_jobs())).pack(side=tk.LEFT)
 

@@ -4,7 +4,7 @@ from src.services.video_editor.audio_mix_manager import AudioMixManager
 from src.services.video_editor.export_preset_manager import ExportPresetManager, default_export_presets
 from src.services.video_editor.ffmpeg_builder import FFmpegCommandBuilder
 from src.services.video_editor.keyframe_animation_manager import KeyframeAnimationManager
-from src.services.video_editor.layout import ensure_video_editor_layout
+from src.services.video_editor.layout import ensure_video_editor_layout, video_editor_schedule_jobs_json_path
 from src.services.video_editor.library_integration import add_editor_export_to_library
 from src.services.video_editor.media_manager import MediaManager
 from src.services.video_editor.project_manager import VideoEditorProjectManager
@@ -38,5 +38,6 @@ __all__ = [
     "ensure_video_editor_layout",
     "merge_phase2_defaults",
     "validate_export",
+    "video_editor_schedule_jobs_json_path",
     "AudioExtractor",
 ]

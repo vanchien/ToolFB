@@ -33,13 +33,26 @@ def _ffplay_portable_path() -> Path:
 
 def _iter_ffplay_source_candidates() -> list[Path]:
     """
-    Các vị trí có thể có ffplay: PATH, cùng thư mục ffmpeg/ffprobe, thư mục cài phổ biến (Windows).
+    Các vị trí có thể có ffplay để **copy** vào portable.
+
+    Ưu tiên ffplay **cùng thư mục với ffmpeg/ffprobe** mà app đang dùng (thường bản mới, có AV1),
+    rồi mới tới ``shutil.which("ffplay")`` (tránh bản PATH rất cũ như 2.7.x).
     """
     exe = _ffplay_exe_name()
     out: list[Path] = []
-    w = shutil.which("ffplay")
-    if w:
-        out.append(Path(w).resolve())
+    seen: set[str] = set()
+
+    def push(p: Path) -> None:
+        try:
+            r = p.resolve()
+        except OSError:
+            r = p
+        k = str(r).lower()
+        if k in seen:
+            return
+        seen.add(k)
+        out.append(r)
+
     ff, ffp = resolve_ffmpeg_ffprobe_paths()
     for base in (ff, ffp):
         if not base:
@@ -47,16 +60,19 @@ def _iter_ffplay_source_candidates() -> list[Path]:
         try:
             sib = Path(base).resolve().parent / exe
             if sib.is_file():
-                out.append(sib)
+                push(sib)
         except OSError:
             continue
+    w = shutil.which("ffplay")
+    if w:
+        push(Path(w))
     if os.name == "nt":
         for key in ("ProgramFiles", "ProgramFiles(x86)"):
             root = os.environ.get(key, "").strip()
             if root:
                 p = Path(root) / "ffmpeg" / "bin" / exe
                 if p.is_file():
-                    out.append(p.resolve())
+                    push(p)
     return out
 
 
@@ -77,14 +93,9 @@ def _try_copy_ffplay_into_portable() -> bool:
         logger.warning("Không tạo được thư mục {}: {}", portable_ffmpeg_bin_dir(), exc)
         return False
 
-    seen: set[str] = set()
     for src in _iter_ffplay_source_candidates():
         if not src.is_file():
             continue
-        key = str(src).lower()
-        if key in seen:
-            continue
-        seen.add(key)
         try:
             if src.resolve() == local.resolve():
                 return True
@@ -122,7 +133,7 @@ def ensure_ffplay_portable() -> bool:
     Đảm bảo có ffplay trong ``tools/ffmpeg/bin``:
 
     1. Đã có sẵn trong bin → xong.
-    2. Tìm trên máy (PATH, cạnh ffmpeg/ffprobe, Program Files\\ffmpeg\\bin) → **copy** vào bin.
+    2. Tìm trên máy (cạnh ffmpeg/ffprobe → PATH → Program Files\\ffmpeg\\bin) → **copy** vào bin.
     3. (Windows) Vẫn thiếu → tải zip **full** Gyan, chỉ trích ffplay.
 
     Tắt tải mạng (vẫn copy nếu tìm thấy): ``TOOLFB_NO_AUTO_FFPLAY=1``.
@@ -210,10 +221,9 @@ def ffplay_resolve_skips_ensure_heavy_work() -> bool:
     ``True`` nếu ``resolve_ffplay_executable()`` có thể trả lời mà **không** gọi
     ``ensure_ffplay_portable()`` (tránh copy/tải zip đồng bộ — thường gây treo UI).
 
-    Heuristic: PATH, file portable đã có, hoặc ffplay cạnh ffmpeg/ffprobe đã phát hiện.
+    Heuristic: ffplay portable đã có, hoặc ffplay cạnh ffmpeg/ffprobe đã phát hiện,
+    hoặc ``shutil.which("ffplay")``.
     """
-    if shutil.which("ffplay"):
-        return True
     exe = _ffplay_exe_name()
     p = portable_ffmpeg_bin_dir() / exe
     if p.is_file():
@@ -228,19 +238,19 @@ def ffplay_resolve_skips_ensure_heavy_work() -> bool:
                 return True
         except OSError:
             continue
+    if shutil.which("ffplay"):
+        return True
     return False
 
 
 def resolve_ffplay_executable() -> str | None:
     """
-    ffplay: PATH → portable ``tools/ffmpeg/bin`` → cùng thư mục với ``ffmpeg``/``ffprobe`` đã phát hiện
-    → ``ensure_ffplay_portable()`` (copy từ máy hoặc tải zip trên Windows).
+    ffplay: **portable** ``tools/ffmpeg/bin`` → cùng thư mục ``ffmpeg``/``ffprobe`` đã phát hiện
+    → ``PATH`` → ``ensure_ffplay_portable()`` (copy từ máy hoặc tải zip trên Windows).
 
-    Một số máy chỉ có ``ffmpeg`` trên PATH nhưng ``ffplay`` nằm cùng folder (bản Gyan đầy đủ).
+    Không ưu tiên PATH trước: nhiều máy có ffplay 2.7.x trên PATH (không AV1) trong khi
+    ffmpeg mới nằm cạnh hoặc trong bundle — video YouTube dạng AV1 sẽ không mở được.
     """
-    fp = shutil.which("ffplay")
-    if fp:
-        return fp
     exe = _ffplay_exe_name()
     p = portable_ffmpeg_bin_dir() / exe
     if p.is_file():
@@ -255,6 +265,9 @@ def resolve_ffplay_executable() -> str | None:
                 return str(sibling)
         except OSError:
             continue
+    fp = shutil.which("ffplay")
+    if fp:
+        return fp
     if ensure_ffplay_portable() and p.is_file():
         return str(p)
     return None

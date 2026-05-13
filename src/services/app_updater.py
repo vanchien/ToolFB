@@ -1032,6 +1032,22 @@ def github_repo_raw_manifest_url(owner_slash_repo: str, *, branch: str = "main")
     return f"https://raw.githubusercontent.com/{a}/{b}/{br}/release/update/latest.json"
 
 
+def _manifest_local_only_enabled(_unused_root: Path, channel_raw: dict[str, Any]) -> bool:
+    """
+    Máy chủ / mạng kín: không fallback ``git remote`` hay ``TOOLFB_PUBLIC_REPO``.
+
+    Bật bằng biến môi trường ``TOOLFB_MANIFEST_LOCAL_ONLY=1`` hoặc
+    ``\"manifest_local_only\": true`` trong ``config/update_channel.json``.
+    """
+    env = os.environ.get("TOOLFB_MANIFEST_LOCAL_ONLY", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    v = channel_raw.get("manifest_local_only")
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def prefer_repo_raw_manifest_url(manifest_url: str) -> str:
     """
     Nếu manifest trỏ tới GitHub Release ``…/releases/latest/download/*.json`` (dễ cũ),
@@ -1058,6 +1074,7 @@ def resolve_manifest_url(project_root: Path) -> str:
     - hoặc ``config/update_channel.json``:
       - ``manifest_url`` (http/https) — URL kiểu Release ``latest/download`` được chuyển sang raw trên ``main``
       - ``manifest_file`` (đường dẫn tương đối tới project, dùng khi dev không có CDN)
+      - ``manifest_local_only`` (bool) hoặc env ``TOOLFB_MANIFEST_LOCAL_ONLY=1`` — chặn fallback GitHub / git remote
     - ``dist/latest.json`` chỉ khi: có ``.git`` (môi trường dev) hoặc ``TOOLFB_USE_DIST_MANIFEST=1`` —
       tránh bản portable chép nhầm ``dist`` cũ làm «Không có bản mới».
     - ``raw.githubusercontent.com/.../main/release/update/latest.json`` từ ``git remote origin``
@@ -1066,27 +1083,31 @@ def resolve_manifest_url(project_root: Path) -> str:
     env_url = os.environ.get("TOOLFB_UPDATE_MANIFEST_URL", "").strip()
     if env_url:
         return prefer_repo_raw_manifest_url(env_url)
+    channel_raw: dict[str, Any] = {}
     cf = project_root / "config" / "update_channel.json"
     if cf.is_file():
         try:
             raw = json.loads(cf.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                channel_raw = raw
         except Exception:
-            raw = {}
-        if isinstance(raw, dict):
-            u = str(raw.get("manifest_url", "")).strip()
-            if u:
-                return prefer_repo_raw_manifest_url(u)
-            mf_local = str(raw.get("manifest_file", "")).strip()
-            if mf_local:
-                p = Path(mf_local)
-                if not p.is_absolute():
-                    p = (project_root / p).resolve()
-                if p.is_file():
-                    return p.as_uri()
+            channel_raw = {}
+    u = str(channel_raw.get("manifest_url", "")).strip()
+    if u:
+        return prefer_repo_raw_manifest_url(u)
+    mf_local = str(channel_raw.get("manifest_file", "")).strip()
+    if mf_local:
+        p = Path(mf_local)
+        if not p.is_absolute():
+            p = (project_root / p).resolve()
+        if p.is_file():
+            return p.as_uri()
     use_dist = os.environ.get("TOOLFB_USE_DIST_MANIFEST", "").strip().lower() in ("1", "true", "yes")
     dev_latest = (project_root / "dist" / "latest.json").resolve()
     if dev_latest.is_file() and (use_dist or (project_root / ".git").exists()):
         return dev_latest.as_uri()
+    if _manifest_local_only_enabled(project_root, channel_raw):
+        return ""
     # Clone git thường chưa có update_channel.json: manifest raw trên nhánh main.
     try:
         from src.utils.github_repo_detect import github_owner_repo_from_git

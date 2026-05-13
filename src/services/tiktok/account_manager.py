@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from src.services.tiktok.json_io import read_json_list, write_json_resilient
-from src.services.tiktok.layout import ensure_tiktok_layout
+from src.services.tiktok.layout import ensure_tiktok_layout, resolve_tiktok_profile_dir
 
 
 def _now_iso() -> str:
@@ -68,6 +68,9 @@ class TikTokAccountStore:
             row = dict(row)
             row["id"] = f"tt_acc_{uuid.uuid4().hex[:10]}"
             rid = row["id"]
+        # Chuẩn hóa profile runtime: mỗi account một profile nội bộ.
+        row = dict(row)
+        row["profile_path"] = str(resolve_tiktok_profile_dir({"id": rid, "profile_path": row.get("profile_path", "")}))
         found = False
         out: list[dict[str, Any]] = []
         for r in rows:

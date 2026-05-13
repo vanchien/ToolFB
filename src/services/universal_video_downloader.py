@@ -529,6 +529,13 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "playlist_scan_socket_timeout_sec": 90,
             # Mặc định ưu tiên tốc độ; máy yếu sẽ đỡ bị "lag" khi tải nhiều URL.
             "sleep_interval_sec": 0,
+            # Chỉ khi tải batch (-a nhiều URL): yt-dlp --sleep-interval giữa các video (giảm 403/rate-limit YouTube).
+            # Đặt 0 trong config để tắt hành vi mặc định.
+            "batch_inter_request_sleep_sec": 0.75,
+            # Sau batch: thử lại từng URL còn thiếu/ghép meta lỗi bằng một lần yt-dlp mỗi URL.
+            "batch_sequential_retry": True,
+            # Số URL tối đa được retry tuần tự sau batch (0 = không giới hạn; trần 500).
+            "batch_sequential_retry_max_urls": 20,
             # DASH/HLS: tăng mặc định giúp máy mạng tốt tải nhanh hơn (trần 16 trong download()).
             "concurrent_fragments": 12,
             "max_videos_default": 50,
@@ -750,16 +757,21 @@ def classify_url_type(url: str) -> str:
 
 
 def _extract_hashtags_from_text(text: str) -> list[str]:
+    """Trích hashtag có dấu # trong mô tả (Unicode, không chỉ ASCII)."""
     raw = str(text or "")
     if not raw:
         return []
-    found = re.findall(r"#([A-Za-z0-9_]{2,64})", raw)
+    # Mọi cụm #... tới khoảng trắng hoặc # tiếp theo (hỗ trợ tiếng Việt và ký tự hashtag thông thường)
+    found = re.findall(r"#([^\s#]{1,120})", raw)
     out: list[str] = []
     seen: set[str] = set()
     for tag in found:
-        v = "#" + str(tag).strip()
+        body = str(tag).strip()
+        if not body:
+            continue
+        v = "#" + body
         k = v.lower()
-        if not tag or k in seen:
+        if k in seen:
             continue
         seen.add(k)
         out.append(v)
@@ -1598,10 +1610,15 @@ class UniversalYTDLPWrapper:
             # để tránh chậm/lỗi do yt-dlp thử ghép AV rồi fail.
             fmt = YTDLP_FORMAT_HD_SINGLE
             log_lines("[yt-dlp] Không thấy ffmpeg -> fallback format không cần merge (ưu tiên HD nếu có).")
-        sleep_sec = max(0, int(self._yt.get("sleep_interval_sec") or 0))
-        # Batch theo URL đơn không nên chèn sleep giữa request, sẽ rất chậm trên máy yếu.
-        if ut in ("single_video", "unknown"):
-            sleep_sec = 0
+        sleep_sec = max(0.0, float(self._yt.get("sleep_interval_sec") or 0))
+        # Batch (-a): thêm sleep giữa các video (mặc định batch_inter_request_sleep_sec) để YouTube ít chặn hàng loạt.
+        if use_batch_file:
+            bsleep = float(self._yt.get("batch_inter_request_sleep_sec", 0.75) or 0)
+            if bsleep > 0:
+                sleep_sec = min(30.0, max(sleep_sec, bsleep))
+        elif ut in ("single_video", "unknown"):
+            # Một URL đơn: không chèn sleep (tránh chậm); playlist/kênh vẫn dùng sleep_interval_sec.
+            sleep_sec = 0.0
         max_fs = int(self._yt.get("max_filesize_mb") or 300)
         timeout = int(self._yt.get("timeout_sec") or 600)
         if use_batch_file:
@@ -1635,8 +1652,9 @@ class UniversalYTDLPWrapper:
             cmd.extend(["--merge-output-format", merge_fmt, "--ffmpeg-location", ffmpeg_bin])
             if bool(self._yt.get("ffmpeg_quiet_log", True)):
                 cmd.extend(["--postprocessor-args", "ffmpeg:-loglevel error -hide_banner -nostats"])
-        if sleep_sec:
-            cmd.extend(["--sleep-interval", str(sleep_sec), "--max-sleep-interval", str(max(sleep_sec, 5))])
+        if sleep_sec > 0:
+            mx = max(float(sleep_sec), 5.0)
+            cmd.extend(["--sleep-interval", str(sleep_sec), "--max-sleep-interval", str(mx)])
         if write_info_json:
             cmd.append("--write-info-json")
         if write_thumbnail:
@@ -2330,8 +2348,59 @@ class UniversalVideoDownloader:
             self._store.save_downloaded_videos(records)
 
         missing = _batch_urls_still_missing(urls, job_paths_acc)
+        od = Path(str(job.get("output_dir") or "")).expanduser().resolve()
+        rescue_records: list[dict[str, Any]] = []
+        if missing and od.is_dir():
+            for m in missing:
+                for fp in scan_output_dir_for_existing_media(root=od, url=m):
+                    try:
+                        norm = str(Path(fp).expanduser().resolve())
+                        pl = norm.lower()
+                    except OSError:
+                        norm = str(fp)
+                        pl = norm.lower()
+                    if pl in seen_lower:
+                        continue
+                    rec = self._build_video_record(video_path=fp, job=job, item_url=m)
+                    rescue_records.append(rec)
+                    seen_lower.add(pl)
+                    job_paths_acc.append(norm)
+        if rescue_records:
+            self._store.save_downloaded_videos(rescue_records)
+
+        missing = _batch_urls_still_missing(urls, job_paths_acc)
+        yt_opts = dict(self._uvd.get("yt_dlp") or {})
+        if missing and bool(yt_opts.get("batch_sequential_retry", True)):
+            raw_cap = yt_opts.get("batch_sequential_retry_max_urls", 20)
+            try:
+                cap = int(raw_cap)
+            except (TypeError, ValueError):
+                cap = 20
+            cap = max(0, min(500, cap))
+            retry_list = list(missing) if cap == 0 else list(missing)[:cap]
+            skipped = len(missing) - len(retry_list)
+            if skipped > 0:
+                self._log(
+                    f"[yt-dlp] batch retry: giới hạn {len(retry_list)}/{len(missing)} URL "
+                    f"(batch_sequential_retry_max_urls={cap}; {skipped} URL bỏ qua retry, vẫn báo lỗi/ghép sau)."
+                )
+            for m in retry_list:
+                try:
+                    self.run_download_url_for_job(job_id, m, on_progress=on_progress)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"[yt-dlp] batch retry URL lỗi: {m[:120]}… | {exc}")
+            job = self._store.get_job(job_id) or job
+            failed_items = list(job.get("failed_items") or [])
+            videos_rows_after = self._store.list_downloaded_videos()
+            _, job_paths_acc = _paths_seen_and_list_for_job(videos_rows_after, jid_q)
+            missing = _batch_urls_still_missing(urls, job_paths_acc)
+
+        failed_by_url = {str(x.get("url") or "").strip() for x in failed_items if str(x.get("url") or "").strip()}
         for m in missing:
+            if m in failed_by_url:
+                continue
             failed_items.append({"url": m, "error": "Không tải được hoặc không khớp metadata sau batch (xem log)."})
+            failed_by_url.add(m)
         job["failed_items"] = failed_items
         job["downloaded_files"] = list(dict.fromkeys(job_paths_acc))
         job["status"] = "running"
@@ -2468,13 +2537,27 @@ class UniversalVideoDownloader:
                             if not s:
                                 continue
                             if not s.startswith("#"):
-                                s = "#" + s
+                                s = "#" + s.lstrip("#")
                             if s.lower() not in {x.lower() for x in hashtags}:
                                 hashtags.append(s)
                             if len(hashtags) >= 50:
                                 break
-                    if not hashtags:
-                        hashtags = _extract_hashtags_from_text(description)
+                    elif isinstance(tags_raw, str) and tags_raw.strip():
+                        for t in re.split(r"[,;\n\r]+", tags_raw):
+                            s = str(t or "").strip()
+                            if not s:
+                                continue
+                            if not s.startswith("#"):
+                                s = "#" + s.lstrip("#")
+                            if s.lower() not in {x.lower() for x in hashtags}:
+                                hashtags.append(s)
+                            if len(hashtags) >= 50:
+                                break
+                    for s in _extract_hashtags_from_text(description):
+                        if s.lower() not in {x.lower() for x in hashtags}:
+                            hashtags.append(s)
+                            if len(hashtags) >= 50:
+                                break
             except Exception:
                 pass
         return {

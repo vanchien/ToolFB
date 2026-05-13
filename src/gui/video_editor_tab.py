@@ -42,6 +42,7 @@ from src.services.video_editor import (
     ensure_video_editor_layout,
     merge_phase2_defaults,
     validate_export,
+    video_editor_schedule_jobs_json_path,
 )
 from src.services.video_editor.keyframe_animation_manager import KeyframeAnimationManager
 from src.services.video_editor.remote_stock_audio import (
@@ -62,7 +63,11 @@ from src.services.video_editor.stock_audio_library import (
     filter_stock_paths_by_topic,
     stock_topic_filter_labels,
 )
-from src.services.universal_video_downloader import DownloadMetadataStore, ensure_downloader_layout
+from src.services.universal_video_downloader import (
+    DownloadMetadataStore,
+    _extract_hashtags_from_text,
+    ensure_downloader_layout,
+)
 from src.utils.ffmpeg_paths import (
     ffplay_resolve_skips_ensure_heavy_work,
     resolve_ffmpeg_executable,
@@ -652,6 +657,29 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         failed = 0
         source_video_ids: list[str] = []
         source_video_meta_by_id: dict[str, dict[str, Any]] = {}
+
+        def _merge_hashtags_from_download_row(row: dict[str, Any], desc: str) -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+
+            def add(tag: str) -> None:
+                s = str(tag or "").strip()
+                if not s:
+                    return
+                if not s.startswith("#"):
+                    s = "#" + s.lstrip("#")
+                k = s.lower()
+                if k in seen:
+                    return
+                seen.add(k)
+                out.append(s)
+
+            for x in (row.get("hashtags") or []):
+                add(str(x))
+            for s in _extract_hashtags_from_text(desc):
+                add(s)
+            return out
+
         for r in rows:
             src_vid = str(r.get("id") or "").strip()
             vp = Path(str(r.get("video_path") or "")).expanduser().resolve()
@@ -662,7 +690,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             src_meta = {
                 "title": _normalize_post_caption_title(raw_t, description=raw_d),
                 "description": raw_d,
-                "hashtags": [str(x).strip() for x in (r.get("hashtags") or []) if str(x).strip()],
+                "hashtags": _merge_hashtags_from_download_row(r, raw_d),
             }
             if src_vid:
                 source_video_meta_by_id[src_vid] = src_meta
@@ -1235,6 +1263,17 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         win_h = max(360, min(900, int(sh * h_ratio)))
         return ["-x", str(win_w), "-y", str(win_h), "-window_title", window_title]
 
+    def _ffplay_video_decode_display_fix() -> list[str]:
+        """
+        Tránh màn đen vẫn có tiếng khi xem MP4 trong ffplay (thường gặp trên Windows):
+        ép về 8-bit yuv420p để SDL/ffplay vẽ ổn (HEVC 10-bit, pixel format lạ).
+
+        Không dùng ``-hwaccel no``: ffplay cũ (ví dụ 2.7.x) không có tùy chọn này → lỗi
+        «Failed to set value 'no' for option 'hwaccel': Option not found».
+        Trên ffplay/ffmpeg mới, nếu vẫn màn đen có tiếng nên cập nhật ffplay portable trong app.
+        """
+        return ["-vf", "format=yuv420p"]
+
     def _stop_managed_ffplay(*, wait_s: float = 2.0) -> None:
         p = ffplay_managed_proc_ref.get("p")
         ffplay_managed_proc_ref["p"] = None
@@ -1269,8 +1308,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             pass
         _stop_managed_ffplay(wait_s=1.5)
         popen_kw: dict[str, Any] = {}
-        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-            popen_kw["creationflags"] = int(subprocess.CREATE_NO_WINDOW)
+        # Không dùng CREATE_NO_WINDOW: ffplay cần cửa sổ SDL — cờ này trên Windows có thể khiến
+        # không thấy cửa sổ phát dù log vẫn báo «Đã mở ffplay».
         try:
             proc = subprocess.Popen(argv, **popen_kw)
             ffplay_managed_proc_ref["p"] = proc
@@ -1367,7 +1406,13 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     return
                 try:
                     _popen_ffplay_managed(
-                        [ffplay, *_ffplay_window_args(window_title="ToolFB - ffplay preview nháp"), "-autoexit", p]
+                        [
+                            ffplay,
+                            *_ffplay_video_decode_display_fix(),
+                            *_ffplay_window_args(window_title="ToolFB - ffplay preview nháp"),
+                            "-autoexit",
+                            p,
+                        ]
                     )
                     notify(f"Đã mở ffplay (preview nháp / composite): {Path(p).name}")
                 except Exception as e:
@@ -1390,10 +1435,66 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         notify("Chưa có preview composite — đang render nháp ~20s, xong sẽ mở ffplay.")
         run_preview_draft()
 
-    def open_with_ffplay() -> None:
+    def _open_source_path_in_ffplay(p: str, trim_pre: list[str], *, window_title: str) -> None:
+        """Một file nguồn + trim tùy chọn — cùng lệnh ffplay cho timeline và tab Media (Video)."""
+        if not str(p or "").strip():
+            notify("Không có đường dẫn file để mở.")
+            return
+
+        def _open_src_ff_done(ffplay: str | None) -> None:
+            if not ffplay:
+                notify("Không tìm thấy ffplay — dùng «Mở file preview» hoặc trình phát mặc định.")
+                open_path_with_default_player(p)
+                return
+            try:
+                _popen_ffplay_managed(
+                    [
+                        ffplay,
+                        *_ffplay_video_decode_display_fix(),
+                        *trim_pre,
+                        *_ffplay_window_args(window_title=window_title),
+                        "-autoexit",
+                        p,
+                    ]
+                )
+                notify(f"Đã mở ffplay: {Path(p).name}")
+            except Exception as e:
+                messagebox.showerror("ffplay", str(e))
+
+        if ffplay_resolve_skips_ensure_heavy_work():
+            _open_src_ff_done(resolve_ffplay_executable())
+        else:
+            _resolve_ffplay_async(
+                busy_message="Đang chuẩn bị ffplay (copy/tải portable nếu cần)…",
+                on_ready=_open_src_ff_done,
+                notify_busy=True,
+            )
+
+    def open_with_ffplay(*, prefer_selected_library_media: bool = False) -> None:
+        """Menu timeline «Xem file nguồn clip» hoặc tab Video: cùng pipeline ffplay (file gốc + trim nếu có)."""
+        if prefer_selected_library_media:
+            mid = _selected_media_id()
+            if not mid:
+                notify("Chọn một video trong danh sách Media.")
+                return
+            media = _find_media(mid)
+            if not media or str(media.get("type") or "") != "video":
+                notify("Chọn một dòng video trong tab Video.")
+                return
+            mp = mm.resolve_media_path_on_disk(media)
+            if not mp or not mp.is_file():
+                notify("Không tìm thấy file media đã chọn.")
+                return
+            _open_source_path_in_ffplay(
+                str(mp),
+                [],
+                window_title="ToolFB - ffplay (nguồn timeline)",
+            )
+            return
+
         # Menu timeline «Xem file nguồn clip» — file media gốc, không phải bản composite đã render.
         p = ""
-        media_path = ""
+        media_path: Path | str | None = None
         cl_pick: dict[str, Any] | None = None
         try:
             rows = _selected_video_timeline_rows()
@@ -1427,22 +1528,28 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 or ""
             ).strip()
             media2 = _find_media(cid_mid) if cid_mid else None
-            media_path2 = mm.resolve_media_path_on_disk(media2) if media2 else ""
-            if media_path2 and Path(media_path2).is_file():
+            media_path2 = mm.resolve_media_path_on_disk(media2) if media2 else None
+            if media_path2 is not None and media_path2.is_file():
                 media_path = media_path2
-        if (not media_path) or (not Path(media_path).is_file()):
+        if media_path is None or (isinstance(media_path, Path) and not media_path.is_file()):
             mid = _selected_media_id()
             media = _find_media(mid) if mid else None
-            media_path = mm.resolve_media_path_on_disk(media) if media else ""
+            media_path = mm.resolve_media_path_on_disk(media) if media else None
         trim_pre: list[str] = []
-        if media_path and Path(media_path).is_file():
-            p = str(media_path)
-            if cl_pick is not None:
-                ss = float((cl_pick or {}).get("source_start") or 0.0)
-                du = max(0.05, float((cl_pick or {}).get("duration") or 0.0))
-                trim_pre = ["-ss", f"{ss:.3f}", "-t", f"{du:.3f}"]
-            notify("Mở đoạn nguồn theo clip (ffplay có trim). Bản đã ghép timeline: «Preview nháp» hoặc double-click dòng.")
-        else:
+        if media_path is not None:
+            mp_ok = media_path if isinstance(media_path, Path) else Path(str(media_path))
+            if mp_ok.is_file():
+                p = str(mp_ok)
+                if cl_pick is not None:
+                    ss = float((cl_pick or {}).get("source_start") or 0.0)
+                    du = max(0.05, float((cl_pick or {}).get("duration") or 0.0))
+                    trim_pre = ["-ss", f"{ss:.3f}", "-t", f"{du:.3f}"]
+                    notify(
+                        "Mở đoạn nguồn theo clip (ffplay có trim). Bản đã ghép timeline: «Preview nháp» hoặc double-click dòng."
+                    )
+                else:
+                    notify("Mở file nguồn (ffplay) — cùng luồng «Xem file nguồn clip» trên timeline.")
+        if not p:
             p = preview_path_var.get().strip()
             if not p or not Path(p).is_file():
                 notify("Chưa có file preview hoặc media hợp lệ để mở.")
@@ -1450,27 +1557,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             if preview_busy_ref.get("busy"):
                 notify("Preview đang render nền — mở bản preview gần nhất bằng ffplay.")
 
-        def _open_src_ff_done(ffplay: str | None) -> None:
-            if not ffplay:
-                notify("Không tìm thấy ffplay — dùng «Mở file preview».")
-                open_path_with_default_player(p)
-                return
-            try:
-                _popen_ffplay_managed(
-                    [ffplay, *trim_pre, *_ffplay_window_args(window_title="ToolFB - ffplay (nguồn timeline)"), "-autoexit", p]
-                )
-                notify(f"Đã mở ffplay: {Path(p).name}")
-            except Exception as e:
-                messagebox.showerror("ffplay", str(e))
-
-        if ffplay_resolve_skips_ensure_heavy_work():
-            _open_src_ff_done(resolve_ffplay_executable())
-        else:
-            _resolve_ffplay_async(
-                busy_message="Đang chuẩn bị ffplay (copy/tải portable nếu cần)…",
-                on_ready=_open_src_ff_done,
-                notify_busy=True,
-            )
+        _open_source_path_in_ffplay(p, trim_pre, window_title="ToolFB - ffplay (nguồn timeline)")
 
     def _primary_timeline_clip_id_for_preview() -> str:
         """Clip ưu tiên: dòng đang chọn đúng — không dùng focus lệch; không lấy phần tử đầu tuple selection (thường là clip đầu cây)."""
@@ -1497,38 +1584,18 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 pass
         return str(sel_list[-1])
 
-    def open_selected_media_with_ffplay() -> None:
+    def open_selected_imported_media_default() -> None:
+        """Tab Logo/Ảnh hoặc File nhạc: double-click / menu → mở file bằng ứng dụng hệ thống."""
         mid = _selected_media_id()
         if not mid:
-            notify("Chọn 1 video trong danh sách Media để xem.")
+            notify("Chọn một dòng trong danh sách Media.")
             return
         media = _find_media(mid)
-        media_path = mm.resolve_media_path_on_disk(media) if media else ""
-        if not media_path or not Path(media_path).is_file():
+        media_path = mm.resolve_media_path_on_disk(media) if media else None
+        if not media_path or not media_path.is_file():
             notify("Không tìm thấy file media đã chọn.")
             return
-
-        def _open_media_ff_done(ffplay: str | None) -> None:
-            if not ffplay:
-                notify("Không tìm thấy ffplay — dùng trình phát mặc định.")
-                open_path_with_default_player(media_path)
-                return
-            try:
-                _popen_ffplay_managed(
-                    [ffplay, *_ffplay_window_args(window_title="ToolFB - ffplay media"), "-autoexit", str(media_path)]
-                )
-                notify(f"Đã mở ffplay: {Path(media_path).name}")
-            except Exception as e:
-                messagebox.showerror("ffplay", str(e))
-
-        if ffplay_resolve_skips_ensure_heavy_work():
-            _open_media_ff_done(resolve_ffplay_executable())
-        else:
-            _resolve_ffplay_async(
-                busy_message="Đang chuẩn bị ffplay (copy/tải portable nếu cần)…",
-                on_ready=_open_media_ff_done,
-                notify_busy=True,
-            )
+        open_path_with_default_player(str(media_path))
 
     def run_preview_draft() -> None:
         """Xuất nháp timeline (giới hạn thời lượng) để xem trước export đầy đủ."""
@@ -2286,7 +2353,30 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         tv.bind("<Control-A>", _select_all, add="+")
         tv.bind("<Button-3>", _on_context_menu, add="+")
         if callable(view_selected_fn):
-            tv.bind("<Double-1>", lambda _e: (view_selected_fn(), "break")[1], add="+")
+
+            def _on_treeview_double_click(e: Any) -> str | None:
+                # Đồng bộ selection với dòng dưới con trỏ — double-click đôi khi không cập nhật selection trước khi handler chạy.
+                try:
+                    region = str(tv.identify_region(e.x, e.y) or "")
+                except Exception:
+                    region = ""
+                if region == "heading":
+                    return None
+                row = ""
+                try:
+                    row = str(tv.identify_row(e.y) or "")
+                except Exception:
+                    row = ""
+                if row:
+                    try:
+                        tv.selection_set(row)
+                        tv.focus(row)
+                    except Exception:
+                        pass
+                view_selected_fn()
+                return "break"
+
+            tv.bind("<Double-1>", _on_treeview_double_click, add="+")
 
     _install_tree_multi_actions(tree_tl)
     _install_tree_multi_actions(tree_tl_grouped)
@@ -2295,8 +2385,14 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         if _kind == "video":
             _install_tree_multi_actions(
                 _tv,
-                view_selected_label="Xem video đã chọn",
-                view_selected_fn=open_selected_media_with_ffplay,
+                view_selected_label="Xem file nguồn (ffplay — như timeline)",
+                view_selected_fn=lambda: open_with_ffplay(prefer_selected_library_media=True),
+            )
+        elif _kind in ("image", "audio"):
+            _install_tree_multi_actions(
+                _tv,
+                view_selected_label="Mở file bằng ứng dụng mặc định",
+                view_selected_fn=open_selected_imported_media_default,
             )
         else:
             _install_tree_multi_actions(_tv)
@@ -3439,12 +3535,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         ),
                         state="readonly",
                         width=36,
-                    ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+                    ).grid(row=0, column=1, columnspan=2, sticky="ew", padx=(0, 0))
                     ttk.Button(
                         lf_reset_bt,
                         text="Reset theo kiểu đã chọn",
                         command=_reset_selected_videos_to_default,
-                    ).grid(row=0, column=2, sticky="w")
+                    ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
                     ttk.Label(
                         lf_reset_bt,
                         text="Chọn kiểu trong danh sách trước; reset chỉ chạy khi bấm nút (đổi menu không tự áp dụng).",
@@ -3452,7 +3548,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         foreground="#666",
                         wraplength=680,
                         justify=tk.LEFT,
-                    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+                    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
                     try:
                         _br_bar.pack(fill=tk.X, pady=(4, 6), before=fr_quick_edit_host)
                     except tk.TclError:
@@ -6612,7 +6708,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     try:
         main.paneconfigure(media_fr, minsize=96)
         main.paneconfigure(center, minsize=140)
-        main.paneconfigure(right, minsize=200)
+        # Tránh panel phải bị bó quá hẹp làm che nút trong inspector/export.
+        main.paneconfigure(right, minsize=320)
     except tk.TclError:
         pass
 
@@ -6657,8 +6754,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     clip_tab_bottom = ttk.Frame(tab_insp_clip)
     clip_tab_scroll_host = ttk.Frame(tab_insp_clip)
     tab_insp_clip.columnconfigure(0, weight=1)
-    tab_insp_clip.rowconfigure(0, weight=1, minsize=120)
-    tab_insp_clip.rowconfigure(1, weight=0, minsize=140)
+    # Ưu tiên còn chỗ cho footer «Áp dụng tất cả» khi cửa sổ thấp.
+    tab_insp_clip.rowconfigure(0, weight=1, minsize=72)
+    tab_insp_clip.rowconfigure(1, weight=0, minsize=92)
     clip_tab_scroll_host.grid(row=0, column=0, sticky="nsew")
     clip_tab_bottom.grid(row=1, column=0, sticky="nsew")
     clip_tab_bottom.columnconfigure(0, weight=1)
@@ -8743,8 +8841,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     exp_fr = ttk.LabelFrame(right, text="Xuất video (Export)", padding=4)
     right.add(exp_fr, weight=1)
     try:
-        right.paneconfigure(insp_fr, minsize=120)
-        right.paneconfigure(exp_fr, minsize=88)
+        right.paneconfigure(insp_fr, minsize=150)
+        right.paneconfigure(exp_fr, minsize=110)
     except tk.TclError:
         pass
     exp_inner = _pack_scrollable_vertical(exp_fr)
@@ -8922,18 +9020,27 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     ).grid(row=0, column=0, columnspan=2, sticky="w")
     ttk.Checkbutton(
         fr_export_post,
-        text="Sau khi lưu job, chuyển qua tab Job lịch đăng",
+        text="Sau khi lưu job, chuyển qua tab «7.Job chờ đăng từ Video Editor»",
         variable=var_exp_open_jobs_after_save,
     ).grid(row=1, column=0, columnspan=2, sticky="w")
-    ttk.Label(fr_export_post, text="Tên job chờ đăng").grid(row=2, column=0, sticky="w", pady=(4, 0))
-    ttk.Entry(fr_export_post, textvariable=var_exp_saved_job_name).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
+    ttk.Label(
+        fr_export_post,
+        text="Đích đăng (Facebook / TikTok / Page): cấu hình trong popup «Nạp job chờ đăng từ Export» (mở từ tab «7.Job chờ đăng từ Video Editor») — có «Chờ chọn» và «Lưu gợi ý đích».",
+        foreground="#555",
+        font=("Segoe UI", 9),
+        wraplength=620,
+        justify="left",
+    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 2))
+
+    ttk.Label(fr_export_post, text="Tên job chờ đăng").grid(row=3, column=0, sticky="w", pady=(4, 0))
+    ttk.Entry(fr_export_post, textvariable=var_exp_saved_job_name).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
     ttk.Checkbutton(
         fr_export_post,
         text="Xuất mỗi clip video thành 1 file riêng (auto map metadata chuẩn nhất)",
         variable=var_exp_per_clip,
-    ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-    ttk.Label(fr_export_post, text="Mẫu tên file nhiều clip").grid(row=4, column=0, sticky="w", pady=(4, 0))
-    ttk.Entry(fr_export_post, textvariable=var_exp_name_tpl).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
+    ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    ttk.Label(fr_export_post, text="Mẫu tên file nhiều clip").grid(row=5, column=0, sticky="w", pady=(4, 0))
+    ttk.Entry(fr_export_post, textvariable=var_exp_name_tpl).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
 
     btns_fr = ttk.Frame(exp_inner)
     btns_fr.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 4))
@@ -9005,7 +9112,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         return str(out_dir / f"{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
 
     def _load_saved_export_jobs() -> list[dict[str, Any]]:
-        p = ensure_downloader_layout()["root"] / "video_editor_schedule_jobs.json"
+        p = video_editor_schedule_jobs_json_path()
         if not p.is_file():
             return []
         try:
@@ -9015,27 +9122,35 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             return []
 
     def _save_saved_export_jobs(rows: list[dict[str, Any]]) -> None:
-        p = ensure_downloader_layout()["root"] / "video_editor_schedule_jobs.json"
+        p = video_editor_schedule_jobs_json_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    def _append_saved_export_job(job_name: str, items: list[dict[str, Any]], source_type: str) -> str:
+    def _append_saved_export_job(
+        job_name: str,
+        items: list[dict[str, Any]],
+        source_type: str,
+        *,
+        publish_extra: dict[str, Any] | None = None,
+    ) -> str:
         rows = _load_saved_export_jobs()
         jid = f"expjob_{uuid.uuid4().hex[:10]}"
         pipe = dict((project or {}).get("pipeline") or {})
-        rows.append(
-            {
-                "id": jid,
-                "job_name": str(job_name or "").strip() or jid,
-                "status": "saved",
-                "source_type": source_type,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "source_project_id": str((project or {}).get("id") or ""),
-                "source_download_job_id": str(pipe.get("source_download_job_id") or ""),
-                "source_download_job_label": str(pipe.get("source_download_job_label") or ""),
-                "items": list(items),
-            }
-        )
+        row_out: dict[str, Any] = {
+            "id": jid,
+            "job_name": str(job_name or "").strip() or jid,
+            "status": "saved",
+            "source_type": source_type,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source_project_id": str((project or {}).get("id") or ""),
+            "source_download_job_id": str(pipe.get("source_download_job_id") or ""),
+            "source_download_job_label": str(pipe.get("source_download_job_label") or ""),
+            "items": list(items),
+        }
+        if isinstance(publish_extra, dict):
+            for k, v in publish_extra.items():
+                row_out[str(k)] = v
+        rows.append(row_out)
         _save_saved_export_jobs(rows)
         return jid
 
@@ -9679,16 +9794,41 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             str(var_exp_saved_job_name.get() or "").strip(),
                             items_for_job,
                             ("multi_clip_custom" if len(items_for_job) > 1 else "single_export_custom"),
+                            publish_extra={
+                                "publish_target": "unspecified",
+                                "preset_fb_account_id": "",
+                                "preset_fb_page_id": "",
+                                "preset_tiktok_account_id": "",
+                            },
                         )
                         notify(f"Đã xuất {len(managed_list)} file + lưu job chờ đăng: {saved_jid}")
                         if bool(var_exp_open_jobs_after_save.get()):
                             _open_schedule_jobs_tab(saved_jid)
                     else:
                         notify(f"Đã xuất {len(managed_list)} file.")
+                    try:
+                        rdir = ensure_video_editor_layout()["renders"]
+                        lines = [
+                            f"Đã xuất {len(managed_list)} file.",
+                            "",
+                            f"Thư mục: {rdir.resolve()}",
+                        ]
+                        for mp in managed_list[:6]:
+                            lines.append(f"• {mp.name}")
+                        if len(managed_list) > 6:
+                            lines.append(f"… và {len(managed_list) - 6} file khác")
+                        messagebox.showinfo("Xuất MP4", "\n".join(lines), parent=root)
+                    except Exception:
+                        messagebox.showinfo(
+                            "Xuất MP4",
+                            f"Đã xuất {len(managed_list)} file.",
+                            parent=root,
+                        )
                     if failures:
                         messagebox.showwarning(
                             "Export",
                             "Có file lỗi:\n" + "\n".join(failures[:8]) + (f"\n… (+{len(failures)-8})" if len(failures) > 8 else ""),
+                            parent=root,
                         )
                     return
                 if export_worker.is_cancel_requested() or _export_user_abort_ref.get("v"):
