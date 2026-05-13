@@ -1,7 +1,7 @@
 {
-  "version": "1.0.47",
+  "version": "1.0.48",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "faf6633e5119ff97ab03e19052caa82cc1c7a38d4bb01bf5ff5f3f5241c7b160",
-  "notes": "Sửa TclError wrap nhãn sau refresh inspector; ổn định GUI video editor.",
-  "generated_at": "2026-05-13T02:03:17"
+  "sha256": "2869bd81c4f1e42ddff3f48da61604eeecd17a9522d007b1aaa5bcffd40aab8f",
+  "notes": "Updater: manifest mặc định repo công khai; bỏ ưu tiên dist/latest cũ; tải manifest đa URL + no-cache. Seed update_channel cho portable.",
+  "generated_at": "2026-05-13T08:45:31"
 }

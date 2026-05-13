@@ -15,6 +15,12 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _github_raw_manifest_main(repo: str) -> str:
+    """URL ``release/update/latest.json`` trên ``main`` (ghi ``update_channel.json`` — khớp updater ưu tiên raw)."""
+    r = (repo or "").strip().strip("/").replace(" ", "")
+    return f"https://raw.githubusercontent.com/{r}/main/release/update/latest.json"
+
+
 def _run(cmd: list[str], *, cwd: Path) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
@@ -122,7 +128,7 @@ def main() -> int:
         shutil.copy2(dist_latest, repo_manifest)
         print(f"REPO_MANIFEST_SYNCED={repo_manifest}")
 
-    manifest_url = github_latest_asset_url(repo, "latest.json")
+    manifest_url = _github_raw_manifest_main(repo)
     print(f"MANIFEST_URL={manifest_url}")
     print(f"DOWNLOAD_URL_IN_MANIFEST={dl}")
 
