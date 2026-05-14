@@ -7847,17 +7847,20 @@ class _ManagerWindow:
                     root_p = project_root()
                     rid = resolve_github_owner_repo_for_version_check(root_p)
                     raw_v, raw_br = read_remote_version_from_github_raw(rid) if rid else (None, "")
-                    if raw_v and is_newer_version(raw_v, local_v):
+                    if (
+                        raw_v
+                        and is_newer_version(raw_v, local_v)
+                        and is_newer_version(raw_v, mf.version)
+                    ):
                         messagebox.showwarning(
                             "Cập nhật — manifest chưa kịp theo GitHub",
                             (
-                                f"Manifest (Release) báo không có zip mới hơn bạn ({local_v}).\n"
-                                f"Nhưng trên GitHub nhánh «{raw_br}» (raw) có version.json = {raw_v}.\n\n"
-                                "Cách xử lý:\n"
-                                "• Máy clone: cài Git, mở app trong thư mục có .git, hoặc đặt TOOLFB_GIT=…\\git.exe — "
-                                "sẽ cập nhật bằng git pull.\n"
-                                "• Bản zip/.exe: cần maintainer cập nhật file latest.json + gói zip trên Release, "
-                                "rồi bấm «Cập nhật» lại."
+                                f"Manifest kênh zip hiện báo bản {mf.version}; trên nhánh «{raw_br}» "
+                                f"(raw) có version.json = {raw_v} — có thể chưa đóng gói Release.\n\n"
+                                "• Bản zip/.exe: không cần thư mục .git hay đăng nhập GitHub; khi maintainer đã "
+                                "đăng latest.json + zip lên Release «Latest», bấm «Chỉ kiểm tra» rồi «Cập nhật».\n"
+                                "• Máy clone: có thể dùng git pull nếu đã cài Git và mở app trong thư mục có .git "
+                                r"(hoặc TOOLFB_GIT trỏ tới git.exe)."
                             ),
                             parent=self._root,
                         )

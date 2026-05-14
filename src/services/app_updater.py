@@ -438,7 +438,8 @@ def _manifest_fetch_urls(primary: str) -> list[str]:
     Thứ tự URL thử khi tải manifest (tránh CDN/proxy trả bản cũ; dự phòng khi một nguồn lỗi).
 
     - ``file:`` chỉ một URL.
-    - HTTP(S): thêm bản raw GitHub + asset ``releases/latest/download/latest.json`` cùng repo nếu parse được owner/repo.
+    - Nếu URL chính là raw ``…/release/update/latest.json``: ưu tiên asset Release «Latest» trước
+      (máy zip/.exe không cần ``.git``; tải công khai không đăng nhập), rồi raw + bản dự phòng.
     """
     u = (primary or "").strip()
     if not u:
@@ -452,11 +453,20 @@ def _manifest_fetch_urls(primary: str) -> list[str]:
         if s and s not in out:
             out.append(s)
 
-    add(u)
     rid = parse_github_owner_repo_from_url(u)
+    low = u.lower()
+    release_json = ""
+    if rid:
+        try:
+            release_json = github_release_latest_manifest_url(rid)
+        except ValueError:
+            release_json = ""
+    if rid and release_json and "raw.githubusercontent.com" in low and "release/update/latest.json" in low:
+        add(release_json)
+    add(u)
     if rid:
         add(github_repo_raw_manifest_url(rid))
-        add(f"https://github.com/{rid}/releases/latest/download/latest.json")
+        add(release_json)
     return out
 
 
@@ -1067,6 +1077,19 @@ def github_repo_raw_manifest_url(owner_slash_repo: str, *, branch: str = "main")
     return f"https://raw.githubusercontent.com/{a}/{b}/{br}/release/update/latest.json"
 
 
+def github_release_latest_manifest_url(owner_slash_repo: str) -> str:
+    """
+    URL ``latest.json`` đính kèm GitHub Release «Latest» — HTTPS công khai, không cần ``.git`` hay đăng nhập.
+    """
+    r = (owner_slash_repo or "").strip().strip("/").replace(" ", "")
+    if not r or "/" not in r:
+        raise ValueError("Repo phải dạng owner/repo (ví dụ vanchien/ToolFB).")
+    a, b, *rest = r.split("/", 2)
+    if not a or not b or rest:
+        raise ValueError("Repo phải dạng owner/repo (một dấu / giữa owner và tên repo).")
+    return f"https://github.com/{a}/{b}/releases/latest/download/latest.json"
+
+
 def _manifest_local_only_enabled(_unused_root: Path, channel_raw: dict[str, Any]) -> bool:
     """
     Máy chủ / mạng kín: không fallback ``git remote`` hay ``TOOLFB_PUBLIC_REPO``.
@@ -1085,21 +1108,12 @@ def _manifest_local_only_enabled(_unused_root: Path, channel_raw: dict[str, Any]
 
 def prefer_repo_raw_manifest_url(manifest_url: str) -> str:
     """
-    Nếu manifest trỏ tới GitHub Release ``…/releases/latest/download/*.json`` (dễ cũ),
-    chuyển sang manifest raw trên nhánh ``main`` trong cùng repo.
+    Giữ nguyên URL manifest (env / ``update_channel.json``).
+
+    Trước đây từng ép ``…/releases/latest/download/*.json`` sang raw trên ``main``, khiến máy zip
+    đọc manifest cũ nếu ``release/update/latest.json`` trên nhánh chưa commit — đã bỏ hành vi đó.
     """
-    u = (manifest_url or "").strip()
-    if not u:
-        return u
-    low = u.lower()
-    if "raw.githubusercontent.com" in low and "release/update/latest.json" in low:
-        return u
-    rid = parse_github_owner_repo_from_url(u)
-    if not rid:
-        return u
-    if "/releases/latest/download/" in low and low.rstrip("/").endswith(".json"):
-        return github_repo_raw_manifest_url(rid)
-    return u
+    return (manifest_url or "").strip()
 
 
 def resolve_manifest_url(project_root: Path) -> str:
@@ -1107,13 +1121,14 @@ def resolve_manifest_url(project_root: Path) -> str:
     URL manifest update:
     - env ``TOOLFB_UPDATE_MANIFEST_URL``
     - hoặc ``config/update_channel.json``:
-      - ``manifest_url`` (http/https) — URL kiểu Release ``latest/download`` được chuyển sang raw trên ``main``
+      - ``manifest_url`` (http/https) — nên dùng URL Release ``…/releases/latest/download/latest.json``
+        (công khai, không cần ``.git`` / đăng nhập); raw ``main`` vẫn được dùng làm dự phòng khi đọc manifest.
       - ``manifest_file`` (đường dẫn tương đối tới project, dùng khi dev không có CDN)
       - ``manifest_local_only`` (bool) hoặc env ``TOOLFB_MANIFEST_LOCAL_ONLY=1`` — chặn fallback GitHub / git remote
     - ``dist/latest.json`` chỉ khi: có ``.git`` (môi trường dev) hoặc ``TOOLFB_USE_DIST_MANIFEST=1`` —
       tránh bản portable chép nhầm ``dist`` cũ làm «Không có bản mới».
     - ``raw.githubusercontent.com/.../main/release/update/latest.json`` từ ``git remote origin``
-    - cuối: manifest raw repo công khai ``TOOLFB_PUBLIC_REPO`` (máy cài zip không có ``.git`` / chưa cấu hình).
+    - cuối: ``…/releases/latest/download/latest.json`` của ``TOOLFB_PUBLIC_REPO`` (máy zip không ``.git``).
     """
     env_url = os.environ.get("TOOLFB_UPDATE_MANIFEST_URL", "").strip()
     if env_url:
@@ -1152,13 +1167,13 @@ def resolve_manifest_url(project_root: Path) -> str:
             return github_repo_raw_manifest_url(r)
     except Exception:
         pass
-    return github_repo_raw_manifest_url(TOOLFB_PUBLIC_REPO)
+    return github_release_latest_manifest_url(TOOLFB_PUBLIC_REPO)
 
 
 def github_latest_manifest_url(owner_slash_repo: str) -> str:
     """
-    Sinh URL manifest cập nhật (file ``release/update/latest.json`` trên nhánh ``main``).
+    URL ``latest.json`` trên GitHub Release «Latest» — khuyến nghị cho máy zip/.exe (không có ``.git``).
 
-    Giữ tên hàm để tương thích GUI; không còn trỏ tới Release ``latest/download`` (dễ lệch version).
+    Tải HTTPS công khai, không cần đăng nhập GitHub.
     """
-    return github_repo_raw_manifest_url(owner_slash_repo, branch="main")
+    return github_release_latest_manifest_url(owner_slash_repo)

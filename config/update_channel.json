@@ -1,3 +1,4 @@
 {
-  "manifest_url": "https://raw.githubusercontent.com/vanchien/ToolFB/main/release/update/latest.json"
+  "manifest_url": "https://github.com/vanchien/ToolFB/releases/latest/download/latest.json",
+  "manifest_local_only": false
 }
