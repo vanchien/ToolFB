@@ -1,7 +1,7 @@
 {
-  "version": "1.0.50",
+  "version": "1.0.51",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "d6ce077dfaa9ac7d15cc548e6d8d869e1c8605e09252cda28d1d1f28b2e254f4",
-  "notes": "Dong goi day du (browser bundle); CI dung gh san co runner.",
-  "generated_at": "2026-05-13T18:14:57"
+  "sha256": "54b9f4fdeebd52640c2e30a163e2704f69167e2dc9448125289f0533bb358272",
+  "notes": "Video editor: chỉnh clip — độ sáng và hiệu ứng ánh sáng (nhãn tiếng Việt). Build nhẹ (không đóng gói browser Playwright trong zip); cần playwright install nếu dùng automation browser.",
+  "generated_at": "2026-05-14T21:35:51"
 }
