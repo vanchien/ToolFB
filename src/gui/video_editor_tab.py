@@ -3151,6 +3151,10 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 var_b_mute = tk.BooleanVar(value=bool(_batch_edit_draft.get("mute", False)))
                 var_b_set_flip = tk.BooleanVar(value=bool(_batch_edit_draft.get("set_flip", False)))
                 var_b_set_mute = tk.BooleanVar(value=bool(_batch_edit_draft.get("set_mute", False)))
+                var_b_brightness = tk.StringVar(value=str(_batch_edit_draft.get("brightness") or ""))
+                var_b_light_fx = tk.StringVar(
+                    value=VideoFilterManager.light_effect_normalize_to_label_ui(str(_batch_edit_draft.get("light_effect") or ""))
+                )
 
                 def _set_field_status(lbl: ttk.Label, changed: bool) -> None:
                     lbl.configure(
@@ -3207,16 +3211,47 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     st.grid(row=r, column=2, sticky="w", padx=(4, 0), pady=(0, 4))
                     _bind_status_text(draft_key, var, st)
 
-                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 10))
+                _lb_br_b = ttk.Label(
+                    insp_grid,
+                    text="Độ sáng (-1…1; 0 = gốc; âm = tối hơn, dương = sáng hơn; để trống = giữ)",
+                    justify=tk.LEFT,
+                )
+                _lb_br_b.grid(row=5, column=0, sticky="ew", pady=(0, 4))
+                _bind_label_wrap_to_frame(_lb_br_b, insp_grid, inset=18)
+                ttk.Entry(insp_grid, textvariable=var_b_brightness, width=13).grid(
+                    row=5, column=1, sticky="ew", pady=(0, 4), padx=(0, 6)
+                )
+                st_br_b = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888", width=11)
+                st_br_b.grid(row=5, column=2, sticky="w", padx=(4, 0), pady=(0, 4))
+                _bind_status_text("brightness", var_b_brightness, st_br_b)
+                _lb_lx_b = ttk.Label(
+                    insp_grid,
+                    text="Hiệu ứng ánh sáng (chọn mô tả bên dưới; để trống = giữ từng clip)",
+                    justify=tk.LEFT,
+                )
+                _lb_lx_b.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+                _bind_label_wrap_to_frame(_lb_lx_b, insp_grid, inset=18)
+                ttk.Combobox(
+                    insp_grid,
+                    textvariable=var_b_light_fx,
+                    values=VideoFilterManager.light_effect_batch_combo_display_values(),
+                    state="readonly",
+                    width=36,
+                ).grid(row=6, column=1, sticky="ew", pady=(0, 4), padx=(0, 6))
+                st_lx_b = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888", width=11)
+                st_lx_b.grid(row=6, column=2, sticky="w", padx=(4, 0), pady=(0, 4))
+                _bind_status_text("light_effect", var_b_light_fx, st_lx_b)
+
+                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 10))
                 _lb_tf_hdr = ttk.Label(insp_grid, text="Transform & canvas", font=("Segoe UI", 9, "bold"), justify=tk.LEFT)
-                _lb_tf_hdr.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+                _lb_tf_hdr.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 6))
                 _bind_label_wrap_to_frame(_lb_tf_hdr, insp_grid, inset=8)
 
                 def _explain_toggle(msg_on: str, msg_off: str, val: tk.BooleanVar) -> None:
                     notify(msg_on if bool(val.get()) else msg_off)
 
                 rf = ttk.Frame(insp_grid)
-                rf.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+                rf.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(2, 0))
                 rf.columnconfigure(0, weight=1)
                 ttk.Checkbutton(
                     rf,
@@ -3239,7 +3274,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     ),
                 ).pack(side=tk.LEFT, padx=(8, 0))
                 st_flip = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
-                st_flip.grid(row=7, column=2, sticky="w", padx=(8, 0), pady=(2, 0))
+                st_flip.grid(row=9, column=2, sticky="w", padx=(8, 0), pady=(2, 0))
                 _bind_status_bool("set_flip", var_b_set_flip, st_flip)
                 ttk.Checkbutton(
                     rf,
@@ -3253,7 +3288,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 ).pack(side=tk.LEFT, padx=(8, 0))
 
                 rm = ttk.Frame(insp_grid)
-                rm.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+                rm.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(2, 0))
                 rm.columnconfigure(0, weight=1)
                 ttk.Checkbutton(
                     rm,
@@ -3276,11 +3311,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     ),
                 ).pack(side=tk.LEFT, padx=(8, 0))
                 st_mute = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
-                st_mute.grid(row=8, column=2, sticky="w", padx=(8, 0), pady=(2, 0))
+                st_mute.grid(row=10, column=2, sticky="w", padx=(8, 0), pady=(2, 0))
                 _bind_status_bool("set_mute", var_b_set_mute, st_mute)
 
                 _lb_rot = ttk.Label(insp_grid, text="Xoay (để trống / 0 / 90 / 180 / 270)", justify=tk.LEFT)
-                _lb_rot.grid(row=9, column=0, sticky="ew", pady=2)
+                _lb_rot.grid(row=11, column=0, sticky="ew", pady=2)
                 _bind_label_wrap_to_frame(_lb_rot, insp_grid, inset=18)
                 ttk.Combobox(
                     insp_grid,
@@ -3288,12 +3323,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     values=["", "0", "90", "180", "270"],
                     state="readonly",
                     width=12,
-                ).grid(row=9, column=1, sticky="ew", pady=2)
+                ).grid(row=11, column=1, sticky="ew", pady=2)
                 st_rot = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
-                st_rot.grid(row=9, column=2, sticky="w", padx=(8, 0), pady=2)
+                st_rot.grid(row=11, column=2, sticky="w", padx=(8, 0), pady=2)
                 _bind_status_text("rotation", var_b_rot, st_rot)
                 _lb_cv = ttk.Label(insp_grid, text="Vào khung (Fit/Fill/Stretch)", justify=tk.LEFT)
-                _lb_cv.grid(row=10, column=0, sticky="ew", pady=2)
+                _lb_cv.grid(row=12, column=0, sticky="ew", pady=2)
                 _bind_label_wrap_to_frame(_lb_cv, insp_grid, inset=18)
                 ttk.Combobox(
                     insp_grid,
@@ -3301,16 +3336,16 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     values=["", "fit", "fill", "stretch"],
                     state="readonly",
                     width=12,
-                ).grid(row=10, column=1, sticky="ew", pady=2)
+                ).grid(row=12, column=1, sticky="ew", pady=2)
                 st_canvas = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
-                st_canvas.grid(row=10, column=2, sticky="w", padx=(8, 0), pady=2)
+                st_canvas.grid(row=12, column=2, sticky="w", padx=(8, 0), pady=2)
                 _bind_status_text("canvas_mode", var_b_canvas, st_canvas)
                 _lb_zm = ttk.Label(insp_grid, text="Zoom (1 = vừa khung; để trống = giữ)", justify=tk.LEFT)
-                _lb_zm.grid(row=11, column=0, sticky="ew", pady=2)
+                _lb_zm.grid(row=13, column=0, sticky="ew", pady=2)
                 _bind_label_wrap_to_frame(_lb_zm, insp_grid, inset=18)
-                ttk.Entry(insp_grid, textvariable=var_b_zoom, width=12).grid(row=11, column=1, sticky="ew", pady=2)
+                ttk.Entry(insp_grid, textvariable=var_b_zoom, width=12).grid(row=13, column=1, sticky="ew", pady=2)
                 st_zoom = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
-                st_zoom.grid(row=11, column=2, sticky="w", padx=(8, 0), pady=2)
+                st_zoom.grid(row=13, column=2, sticky="w", padx=(8, 0), pady=2)
                 _bind_status_text("zoom", var_b_zoom, st_zoom)
 
                 media_audios = [m for m in (project.get("media") or []) if isinstance(m, dict) and str(m.get("type") or "") == "audio"]
@@ -3347,10 +3382,10 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     except (NameError, tk.TclError):
                         pass
 
-                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=12, column=0, columnspan=3, sticky="ew", pady=6)
+                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=14, column=0, columnspan=3, sticky="ew", pady=6)
 
                 batch_media_fr = ttk.Frame(insp_grid)
-                batch_media_fr.grid(row=13, column=0, columnspan=3, sticky="ew")
+                batch_media_fr.grid(row=15, column=0, columnspan=3, sticky="ew")
                 batch_media_fr.columnconfigure(0, weight=1)
 
                 ov_hint_b = ttk.Label(
@@ -3395,7 +3430,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     font=("Segoe UI", 8),
                     justify=tk.LEFT,
                 )
-                _bat_scope.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(8, 6))
+                _bat_scope.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(8, 6))
                 _bind_label_wrap_to_frame(_bat_scope, insp_grid, inset=8)
 
                 var_b_reset_mode = tk.StringVar(
@@ -3454,6 +3489,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         },
                         "canvas_mode": "fit",
                         "zoom": 1.0,
+                        "brightness": 0.0,
+                        "light_effect": "none",
                     }
                     patch_basic = {
                         "speed": 1.0,
@@ -3464,6 +3501,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         "flip_horizontal": False,
                         "flip_vertical": False,
                         "rotation": 0,
+                        "brightness": 0.0,
+                        "light_effect": "none",
                     }
                     patch_frame = {
                         "x": 0,
@@ -3645,6 +3684,27 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         except ValueError:
                             messagebox.showerror("Hàng loạt", "Giá trị Zoom không hợp lệ.", parent=root)
                             return
+
+                    bright_s = str(var_b_brightness.get() or "").strip()
+                    if bright_s:
+                        if applied.get("brightness") == _sig(bright_s):
+                            bright_s = ""
+                    if bright_s:
+                        try:
+                            bb = float(bright_s)
+                            patch["brightness"] = max(-1.0, min(1.0, bb))
+                        except ValueError:
+                            messagebox.showerror("Hàng loạt", "Độ sáng phải là số (vd. 0, 0.15, -0.2).", parent=root)
+                            return
+                    le_raw = VideoFilterManager.light_effect_label_ui_to_key(str(var_b_light_fx.get() or "").strip())
+                    if le_raw:
+                        if applied.get("light_effect") == _sig(le_raw):
+                            le_raw = ""
+                    if le_raw:
+                        if le_raw not in VideoFilterManager.LIGHT_EFFECT_PRESETS:
+                            messagebox.showerror("Hàng loạt", "Giá trị hiệu ứng ánh sáng không hợp lệ.", parent=root)
+                            return
+                        patch["light_effect"] = le_raw
 
                     def _batch_explicit_logo_mid() -> str:
                         raw = str(var_q_logo_media.get() or "").strip()
@@ -3854,7 +3914,17 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     # Lưu trạng thái đã áp để lần bấm sau chỉ chạy phần chưa chạy.
                     if sc_clip_b:
                         for k in patch.keys():
-                            if k in ("volume", "speed", "fade_in", "fade_out", "rotation", "canvas_mode", "zoom"):
+                            if k in (
+                                "volume",
+                                "speed",
+                                "fade_in",
+                                "fade_out",
+                                "rotation",
+                                "canvas_mode",
+                                "zoom",
+                                "brightness",
+                                "light_effect",
+                            ):
                                 applied[k] = _sig(_batch_edit_draft.get(k))
                             elif k in ("flip_horizontal", "flip_vertical"):
                                 applied["flip"] = f"{int(bool(var_b_flip_h.get()))}:{int(bool(var_b_flip_v.get()))}"
@@ -3954,7 +4024,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             _vh_intro = ttk.Label(
                 insp_grid,
                 text=(
-                    "Một clip video: timeline / cắt nguồn / tốc độ / fade… là bản nháp — bấm «Áp dụng tất cả» "
+                    "Một clip video: timeline / cắt nguồn / tốc độ / fade / độ sáng & hiệu ứng ánh sáng… là bản nháp — bấm «Áp dụng tất cả» "
                     "ở cuối tab để ghi (theo «Phạm vi»). Transform & canvas (lật, khung, zoom, tắt âm gốc) cũng bật "
                     "trong «Phạm vi» — không đụng timeline hay cắt nguồn khi chỉ chọn các mục đó."
                 ),
@@ -4003,6 +4073,36 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             ttk.Label(insp_grid, text="Fade ra (giây)").grid(row=vr, column=0, sticky="nw", pady=2)
             var_sv_fo = tk.StringVar(value=str(cl.get("fade_out") or 0))
             ttk.Entry(insp_grid, textvariable=var_sv_fo, width=18).grid(row=vr, column=1, sticky="ew", pady=2)
+            vr += 1
+
+            try:
+                _br_sv0 = float(cl.get("brightness") or 0)
+            except (TypeError, ValueError):
+                _br_sv0 = 0.0
+            var_sv_brightness = tk.StringVar(value=str(_br_sv0))
+            ttk.Label(
+                insp_grid,
+                text="Độ sáng (-1…1; 0 = gốc; âm = tối hơn, dương = sáng hơn)",
+            ).grid(row=vr, column=0, sticky="nw", pady=2)
+            ttk.Entry(insp_grid, textvariable=var_sv_brightness, width=18).grid(row=vr, column=1, sticky="ew", pady=2)
+            vr += 1
+            _le_sv0 = str(cl.get("light_effect") or "none").strip().lower()
+            if _le_sv0 not in VideoFilterManager.LIGHT_EFFECT_PRESETS:
+                _le_sv0 = "none"
+            var_sv_light_fx = tk.StringVar(
+                value=VideoFilterManager.light_effect_normalize_to_label_ui(_le_sv0)
+            )
+            ttk.Label(
+                insp_grid,
+                text="Hiệu ứng ánh sáng (mô tả góc nhìn màu — áp khi «Áp dụng tất cả»)",
+            ).grid(row=vr, column=0, sticky="nw", pady=2)
+            ttk.Combobox(
+                insp_grid,
+                textvariable=var_sv_light_fx,
+                values=VideoFilterManager.light_effect_single_combo_display_values(),
+                width=36,
+                state="readonly",
+            ).grid(row=vr, column=1, sticky="ew", pady=2)
             vr += 1
 
             ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=vr, column=0, columnspan=2, sticky="ew", pady=8)
@@ -4385,6 +4485,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 zm: float,
                 cm: str,
                 muted: bool,
+                brightness: float,
+                light_effect: str,
             ) -> tuple[dict[str, Any], bool, bool, list[str]]:
                 """
                 So sánh UI với clip đang lưu trong project.
@@ -4437,6 +4539,22 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 mute_changed = muted != bool(cur_clip.get("muted"))
                 if mute_changed:
                     labels.append("tắt âm gốc")
+                try:
+                    br_cur = float(cur_clip.get("brightness") or 0)
+                except (TypeError, ValueError):
+                    br_cur = 0.0
+                if not _ve_float_eq(brightness, br_cur):
+                    patch["brightness"] = float(brightness)
+                    labels.append("độ sáng")
+                le_cur = str(cur_clip.get("light_effect") or "none").strip().lower()
+                if le_cur not in VideoFilterManager.LIGHT_EFFECT_PRESETS:
+                    le_cur = "none"
+                le_new = str(light_effect or "none").strip().lower()
+                if le_new not in VideoFilterManager.LIGHT_EFFECT_PRESETS:
+                    le_new = "none"
+                if le_new != le_cur:
+                    patch["light_effect"] = le_new
+                    labels.append("hiệu ứng ánh sáng")
                 return patch, canvas_changed, mute_changed, labels
 
             def _ve_transform_branches_dirty(
@@ -4508,6 +4626,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 zm = 1.0
                 fh = fv = muted = False
                 ts = ss = se = du = sp = vol = fi = fo = 0.0
+                br_ui = 0.0
+                le_ui = "none"
                 if sc_clip or sc_tf_any:
                     try:
                         rot_i = int(str(var_sv_rot.get()).strip())
@@ -4542,13 +4662,18 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         vol = float(str(var_sv_vol.get()).strip())
                         fi = float(str(var_sv_fi.get()).strip())
                         fo = float(str(var_sv_fo.get()).strip())
+                        br_ui = float(str(var_sv_brightness.get()).strip())
+                        le_ui = VideoFilterManager.light_effect_label_ui_to_key(str(var_sv_light_fx.get() or "").strip())
+                        if not le_ui:
+                            le_ui = "none"
                     except ValueError:
                         messagebox.showerror(
                             "Clip",
-                            "Giá trị số không hợp lệ (timeline / nguồn / độ dài / tốc độ / âm / fade).",
+                            "Giá trị số không hợp lệ (timeline / nguồn / độ dài / tốc độ / âm / fade / độ sáng).",
                             parent=root,
                         )
                         return
+                    br_ui = max(-1.0, min(1.0, br_ui))
                     if sp <= 0:
                         messagebox.showerror("Clip", "Tốc độ phải > 0.", parent=root)
                         return
@@ -4571,6 +4696,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             zm=zm,
                             cm=cm,
                             muted=muted,
+                            brightness=br_ui,
+                            light_effect=le_ui,
                         )
                     else:
                         patch = {
@@ -4582,6 +4709,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             "volume": vol,
                             "fade_in": fi,
                             "fade_out": fo,
+                            "brightness": br_ui,
+                            "light_effect": le_ui,
                             "flip_horizontal": fh,
                             "flip_vertical": fv,
                             "rotation": rot_i,
@@ -6967,7 +7096,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     lf_clip.columnconfigure(0, weight=1)
     _scope_checkbox_wrapped(
         lf_clip,
-        text="Chỉnh clip đầy đủ (timeline, cắt nguồn, tốc độ, fade, lật trong inspector clip…)",
+        text="Chỉnh clip đầy đủ (timeline, cắt nguồn, tốc độ, fade, độ sáng / hiệu ứng ánh sáng, lật trong inspector clip…)",
         variable=var_ve_apply_clip,
     ).grid(row=0, column=0, sticky="ew")
     _scope_checkbox_wrapped(

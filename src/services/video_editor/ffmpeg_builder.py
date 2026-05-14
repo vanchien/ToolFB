@@ -237,13 +237,10 @@ class FFmpegCommandBuilder:
             except (TypeError, ValueError):
                 return 1.0
 
-        def color_vf_for(clip_id: str) -> str:
+        def color_vf_for(clip_dict: dict[str, Any]) -> str:
             if not features.get("color_filters", True):
                 return ""
-            for f in project.get("filters") or []:
-                if isinstance(f, dict) and str(f.get("clip_id")) == str(clip_id):
-                    return self._vf.build_ffmpeg_filter(f).strip()
-            return ""
+            return self._vf.build_clip_color_adjust_vf(clip_dict, project).strip()
 
         fc: list[str] = []
         seg_v_labels: list[str] = []
@@ -278,7 +275,7 @@ class FFmpegCommandBuilder:
             cv_mid = f"cv{si}"
 
             vf_speed, af_speed = sm.build_speed_filter(sp)
-            col_vf = color_vf_for(str(clip.get("id") or ""))
+            col_vf = color_vf_for(clip)
             tf = self._vtf.build_transform_filters(clip, project).strip()
             vol_fade = self._afb.build_volume_fade_filters(clip, du)
 

@@ -131,6 +131,8 @@ class TimelineManager:
                 },
                 "canvas_mode": "fit",
                 "zoom": 1.0,
+                "brightness": 0.0,
+                "light_effect": "none",
             }
             if clips:
                 last_end = 0.0
