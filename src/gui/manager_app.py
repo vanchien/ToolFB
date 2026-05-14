@@ -7448,7 +7448,7 @@ class _ManagerWindow:
                 "Kênh cập nhật",
                 "Đã lưu config/update_channel.json.\n"
                 "Vài giây sau app sẽ kiểm tra nền — nếu có bản mới sẽ hiện nút «Cập nhật».\n"
-                "Hoặc bấm «Chỉ kiểm tra» để kiểm tra và cập nhật ngay.",
+                "Hoặc bấm «Chỉ kiểm tra» để xem ngay; để tải/cài bản zip hãy bấm «Cập nhật».",
                 parent=self._root,
             )
             self._root.after(400, self._schedule_probe_update_button_visibility)
@@ -7728,7 +7728,7 @@ class _ManagerWindow:
         threading.Thread(target=worker_download, name="apply_update_download", daemon=True).start()
 
     def _on_check_updates(self) -> None:
-        """«Chỉ kiểm tra»: git fetch / đọc manifest; nếu có bản mới thì hiện nút «Cập nhật» và tải/áp dụng luôn."""
+        """«Chỉ kiểm tra»: git fetch / đọc manifest; nếu có bản mới thì hiện nút «Cập nhật» (zip: không tự tải — bấm «Cập nhật»)."""
         root = project_root()
         if should_use_git_updates(root):
 
@@ -7752,11 +7752,18 @@ class _ManagerWindow:
                             return
                         if info.has_new_commits:
                             self._show_apply_update_button()
-                            self._set_ui_busy("apply_update")
-                            self._btn_check_updates.configure(state=tk.DISABLED)
-                            self._btn_apply_update.configure(state=tk.DISABLED)
-                            self._lbl_state.configure(text="Update (git): đang pull…")
-                            self._git_run_pull_thread(root, info)
+                            self._btn_check_updates.configure(state=tk.NORMAL)
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._clear_ui_busy()
+                            messagebox.showinfo(
+                                "Cập nhật (git)",
+                                (
+                                    f"Có thay đổi trên {info.remote_ref} mà bạn chưa kéo về "
+                                    f"({info.commits_behind} commit, nhánh «{info.branch}»).\n\n"
+                                    "Bấm «Cập nhật» để chạy git pull — «Chỉ kiểm tra» không tự pull."
+                                ),
+                                parent=self._root,
+                            )
                             return
                         self._hide_apply_update_button()
                         self._btn_check_updates.configure(state=tk.NORMAL)
@@ -7821,10 +7828,17 @@ class _ManagerWindow:
                     self._latest_update_manifest = mf if has_new else None
                     if has_new:
                         self._show_apply_update_button()
-                        self._set_ui_busy("apply_update")
-                        self._btn_check_updates.configure(state=tk.DISABLED)
-                        self._btn_apply_update.configure(state=tk.DISABLED)
-                        self._run_manifest_download_apply_thread(mf)
+                        self._btn_check_updates.configure(state=tk.NORMAL)
+                        self._btn_apply_update.configure(state=tk.NORMAL)
+                        self._clear_ui_busy()
+                        messagebox.showinfo(
+                            "Cập nhật",
+                            (
+                                f"Có phiên bản mới trên kênh: {mf.version} (đang dùng {local_v}).\n\n"
+                                "Bấm «Cập nhật» để tải và cài — «Chỉ kiểm tra» không tự cài bản zip."
+                            ),
+                            parent=self._root,
+                        )
                         return
                     self._hide_apply_update_button()
                     self._btn_check_updates.configure(state=tk.NORMAL)

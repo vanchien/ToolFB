@@ -1,7 +1,7 @@
 {
-  "version": "1.0.49",
+  "version": "1.0.50",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "4b5049a792e2851e21aa225abfd9d1a6bd02a43be3e5cd9eacff764b5ed2a0b2",
-  "notes": "ToolFB 1.0.49: đóng gói portable + exe đầy đủ; đồng bộ manifest; dọn file tạm và tooling test.",
-  "generated_at": "2026-05-13T11:02:43"
+  "sha256": "d6ce077dfaa9ac7d15cc548e6d8d869e1c8605e09252cda28d1d1f28b2e254f4",
+  "notes": "Dong goi day du (browser bundle); CI dung gh san co runner.",
+  "generated_at": "2026-05-13T18:14:57"
 }

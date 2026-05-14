@@ -57,6 +57,8 @@ class UpdateManifest:
     download_url: str
     sha256: str
     notes: str
+    patch_download_url: str = ""
+    patch_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -388,9 +390,17 @@ def read_remote_version_from_github_raw(
     if not r or "/" not in r:
         return None, ""
     for br in branches:
-        url = f"https://raw.githubusercontent.com/{r}/{br}/version.json"
+        base = f"https://raw.githubusercontent.com/{r}/{br}/version.json"
+        url = f"{base}?_toolfb_ts={int(time.time())}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ToolFB-Updater/1.0"})
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "ToolFB-Updater/1.0",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            )
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 data = resp.read()
             raw = json.loads(data.decode("utf-8", errors="replace"))
@@ -409,9 +419,18 @@ def _manifest_dict_to_model(raw: dict[str, Any]) -> UpdateManifest:
     download_url = str(raw.get("download_url", "")).strip()
     sha256 = str(raw.get("sha256", "")).strip().lower()
     notes = str(raw.get("notes", "")).strip()
+    patch_url = str(raw.get("patch_download_url", "")).strip()
+    patch_sha = str(raw.get("patch_sha256", "")).strip().lower()
     if not version or not download_url:
         raise ValueError("Manifest thiếu version hoặc download_url.")
-    return UpdateManifest(version=version, download_url=download_url, sha256=sha256, notes=notes)
+    return UpdateManifest(
+        version=version,
+        download_url=download_url,
+        sha256=sha256,
+        notes=notes,
+        patch_download_url=patch_url,
+        patch_sha256=patch_sha,
+    )
 
 
 def _manifest_fetch_urls(primary: str) -> list[str]:
@@ -442,10 +461,12 @@ def _manifest_fetch_urls(primary: str) -> list[str]:
 
 
 def _http_manifest_request(url: str, *, bust_cache: bool) -> urllib.request.Request:
-    """Request GET manifest: header no-cache + (tuỳ chọn) query bust cho raw GitHub."""
+    """Request GET manifest: header no-cache + (tuỳ chọn) query bust (raw GitHub / Release latest/download)."""
     get_url = url
     low = url.lower()
-    if bust_cache and "raw.githubusercontent.com" in low and "://" in low:
+    if bust_cache and "://" in url and (
+        "raw.githubusercontent.com" in low or "/releases/latest/download/" in low
+    ):
         sep = "&" if "?" in url else "?"
         get_url = f"{url}{sep}_toolfb_ts={int(time.time())}"
     return urllib.request.Request(
@@ -462,14 +483,19 @@ def read_manifest_from_url(manifest_url: str, *, timeout_sec: int = 20) -> Updat
     """
     Tải manifest JSON từ URL (hoặc ``file:``).
 
-    Thử lần lượt các URL ứng viên; với mỗi URL HTTP(S) thử không bust rồi bust cache (raw GitHub hay bị cache cũ).
+    Thử từng URL ứng viên (xem ``_manifest_fetch_urls``); với HTTP(S) thử không bust rồi bust cache.
+    Nếu nhiều nguồn trả JSON hợp lệ (vd. raw ``main`` cũ nhưng Release «Latest» đã lên bản mới),
+    chọn manifest có ``version`` **mới nhất** theo ``is_newer_version``.
     """
     bases = _manifest_fetch_urls(manifest_url)
     if not bases:
         raise ValueError("Thiếu URL manifest.")
     last_exc: BaseException | None = None
+    collected: list[UpdateManifest] = []
     for base in bases:
-        for bust in (False, True) if not base.lower().startswith("file:") else (False,):
+        got: UpdateManifest | None = None
+        busts = (False, True) if not base.lower().startswith("file:") else (False,)
+        for bust in busts:
             try:
                 req = _http_manifest_request(base, bust_cache=bust)
                 with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
@@ -477,7 +503,8 @@ def read_manifest_from_url(manifest_url: str, *, timeout_sec: int = 20) -> Updat
                 raw = json.loads(data.decode("utf-8", errors="replace"))
                 if not isinstance(raw, dict):
                     raise ValueError("Manifest cập nhật không hợp lệ (không phải object).")
-                return _manifest_dict_to_model(raw)
+                got = _manifest_dict_to_model(raw)
+                break
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 if exc.code in {403, 404}:
@@ -486,6 +513,14 @@ def read_manifest_from_url(manifest_url: str, *, timeout_sec: int = 20) -> Updat
             except (ValueError, json.JSONDecodeError, OSError, TimeoutError) as exc:
                 last_exc = exc
                 continue
+        if got is not None:
+            collected.append(got)
+    if collected:
+        best = collected[0]
+        for m in collected[1:]:
+            if is_newer_version(m.version, best.version):
+                best = m
+        return best
     msg = "Không tải được manifest từ bất kỳ URL nào đã thử."
     if last_exc is not None:
         raise RuntimeError(f"{msg}\nURL gốc: {manifest_url}\nLỗi cuối: {last_exc}") from last_exc
