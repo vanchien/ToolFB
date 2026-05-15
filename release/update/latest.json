@@ -1,7 +1,7 @@
 {
-  "version": "1.0.51",
+  "version": "1.0.52",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "54b9f4fdeebd52640c2e30a163e2704f69167e2dc9448125289f0533bb358272",
-  "notes": "Video editor: chỉnh clip — độ sáng và hiệu ứng ánh sáng (nhãn tiếng Việt). Build nhẹ (không đóng gói browser Playwright trong zip); cần playwright install nếu dùng automation browser.",
-  "generated_at": "2026-05-14T21:35:51"
+  "sha256": "d69259f6fd4e2be2e7a488a9150ffe02b7c04e2e1c50837a1a5e13109adc68db",
+  "notes": "Video Editor: dong bo audio/video, chon thu muc xuat MP4, ten file am thanh/logo de doc. Logo PNG trong suot hien dung. Delay giua cac buoc dang Page (cau hinh env FB_*_DELAY).",
+  "generated_at": "2026-05-15T22:10:01"
 }
