@@ -10,7 +10,6 @@ Luồng đăng tách theo profile: ``posting_engine`` = ``chromium`` | ``firefox
 from __future__ import annotations
 
 import os
-import random
 import time
 import ctypes
 from datetime import datetime, timedelta, timezone
@@ -23,6 +22,7 @@ from src.automation.facebook_actions import (
     _disable_view_only_guard,
     _enable_view_only_guard,
     _is_meta_business_composer_context,
+    human_pause,
     click_post_button,
     complete_meta_business_reel_post_wizard,
     ensure_content_present,
@@ -71,18 +71,8 @@ def _pipeline_perf_enabled() -> bool:
 
 
 def _human_step_delay(*, label: str = "") -> None:
-    """
-    Delay giữa các bước lớn (upload -> caption -> publish) để giống thao tác người dùng thật.
-    Cấu hình qua env (ms):
-    - FB_STEP_DELAY_MIN_MS (mặc định 900)
-    - FB_STEP_DELAY_MAX_MS (mặc định 1800)
-    """
-    min_ms = max(120, int(str(os.environ.get("FB_STEP_DELAY_MIN_MS", "900")).strip() or "900"))
-    max_ms = max(min_ms, int(str(os.environ.get("FB_STEP_DELAY_MAX_MS", "1800")).strip() or "1800"))
-    d_ms = random.randint(min_ms, max_ms)
-    if label:
-        logger.info("[FB human-delay] {}: {} ms", label, d_ms)
-    time.sleep(d_ms / 1000.0)
+    """Delay giữa các bước pipeline đăng (upload → caption → publish). Cấu hình: ``FB_STEP_DELAY_*_MS``."""
+    human_pause(label=label, kind="step")
 
 
 def _log_job_flow_catalog(pt: str, *, tracker: JobRunTracker | None) -> None:

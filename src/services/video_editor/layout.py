@@ -58,3 +58,8 @@ def video_editor_schedule_jobs_json_path() -> Path:
     if dl_ok:
         return p_dl.resolve()
     return p_ve.resolve()
+
+
+def video_editor_export_ui_prefs_path() -> Path:
+    """Preference UI xuất MP4 (thư mục lưu, tạo subfolder theo job, …)."""
+    return ensure_video_editor_layout()["presets"] / "export_ui_prefs.json"

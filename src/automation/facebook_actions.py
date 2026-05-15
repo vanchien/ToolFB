@@ -437,12 +437,60 @@ def _wait_fb_path_matches(page: Page, normalized_url: str, *, timeout_ms: int | 
         raise
 
 
-def _human_pause() -> None:
+def _rand_delay_ms(min_ms: int, max_ms: int) -> int:
+    lo = max(0, int(min_ms))
+    hi = max(lo, int(max_ms))
+    return random.randint(lo, hi)
+
+
+def human_pause(*, label: str = "", kind: str = "action") -> None:
     """
-    Tạm dừng ngẫu nhiên 1–3 giây giữa các thao tác (hành vi giống người dùng).
+    Tạm dừng ngẫu nhiên giữa click / nhập / chọn / bước đăng (giống người dùng).
+
+    ``kind``:
+      - ``action`` — giữa thao tác UI chung (env ``FB_HUMAN_DELAY_*_SEC``, mặc định 1.4–3.2s)
+      - ``click`` — trước/sau bấm nút (``FB_CLICK_DELAY_*_MS``, mặc định 450–1100ms)
+      - ``input`` — sau focus/nhập/chọn (``FB_INPUT_DELAY_*_MS``, mặc định 650–1400ms)
+      - ``step`` — giữa bước pipeline đăng (``FB_STEP_DELAY_*_MS``, mặc định 1200–2800ms)
     """
-    delay = random.uniform(1.0, 3.0)
-    time.sleep(delay)
+    k = str(kind or "action").strip().lower()
+    if k == "click":
+        d_ms = _rand_delay_ms(
+            max(80, _env_int("FB_CLICK_DELAY_MIN_MS", 450)),
+            max(80, _env_int("FB_CLICK_DELAY_MAX_MS", 1100)),
+        )
+    elif k == "input":
+        d_ms = _rand_delay_ms(
+            max(100, _env_int("FB_INPUT_DELAY_MIN_MS", 650)),
+            max(100, _env_int("FB_INPUT_DELAY_MAX_MS", 1400)),
+        )
+    elif k == "step":
+        d_ms = _rand_delay_ms(
+            max(120, _env_int("FB_STEP_DELAY_MIN_MS", 1200)),
+            max(120, _env_int("FB_STEP_DELAY_MAX_MS", 2800)),
+        )
+    else:
+        min_s = max(0.1, float(_env_int("FB_HUMAN_DELAY_MIN_SEC", 14)) / 10.0)
+        max_s = max(min_s, float(_env_int("FB_HUMAN_DELAY_MAX_SEC", 32)) / 10.0)
+        d_ms = int(random.uniform(min_s, max_s) * 1000.0)
+    if d_ms <= 0:
+        return
+    if label:
+        logger.info("[FB human-delay][{}] {}: {} ms", k, label, d_ms)
+    time.sleep(d_ms / 1000.0)
+
+
+def _human_pause(*, label: str = "", kind: str = "action") -> None:
+    """Alias nội bộ — dùng :func:`human_pause`."""
+    human_pause(label=label, kind=kind)
+
+
+def _reel_inter_click_wait_ms() -> int:
+    """Khoảng chờ giữa các lần bấm Next/Share trong wizard Reel."""
+    return _rand_delay_ms(
+        max(300, _env_int("FB_REEL_CLICK_GAP_MIN_MS", 750)),
+        max(300, _env_int("FB_REEL_CLICK_GAP_MAX_MS", 1450)),
+    )
 
 
 def _view_only_mode_enabled() -> bool:
@@ -573,12 +621,15 @@ def _disable_view_only_guard(page: Page) -> None:
 
 def _typing_delay_ms() -> int:
     """
-    Trả về độ trễ gõ phím (ms) ngẫu nhiên trong khoảng 100–300.
+    Trả về độ trễ gõ phím (ms) ngẫu nhiên (env ``FB_TYPING_DELAY_*_MS``, mặc định 80–220).
 
     Returns:
         Số nguyên milliseconds.
     """
-    return random.randint(100, 300)
+    return _rand_delay_ms(
+        max(40, _env_int("FB_TYPING_DELAY_MIN_MS", 80)),
+        max(40, _env_int("FB_TYPING_DELAY_MAX_MS", 220)),
+    )
 
 
 def _resolve_path(maybe_relative: str | Path) -> Path:
@@ -1089,8 +1140,9 @@ def _try_navigate_via_page_name_link(page: Page, page_name: str, dest: str) -> b
     try:
         link = page.get_by_role("link", name=re.compile(re.escape(pn), re.I)).first
         if link.is_visible(timeout=2500):
+            human_pause(kind="click", label="chọn Page (link)")
             link.click(timeout=8000, force=True)
-            page.wait_for_timeout(2800)
+            page.wait_for_timeout(_reel_inter_click_wait_ms())
             if _is_on_target_surface(page, dest):
                 return True
     except Exception as exc:  # noqa: BLE001
@@ -1098,8 +1150,9 @@ def _try_navigate_via_page_name_link(page: Page, page_name: str, dest: str) -> b
     try:
         btn = page.get_by_role("button", name=re.compile(re.escape(pn), re.I)).first
         if btn.is_visible(timeout=1500):
+            human_pause(kind="click", label="chọn Page (nút)")
             btn.click(timeout=6000, force=True)
-            page.wait_for_timeout(2800)
+            page.wait_for_timeout(_reel_inter_click_wait_ms())
             return _is_on_target_surface(page, dest)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[FB] Fallback tên Page (button): {}", exc)
@@ -1863,8 +1916,10 @@ def fill_content(page: Page, text: str) -> None:
         except Exception:
             pass
         page.wait_for_selector(selector, state="visible", timeout=15_000)
+        human_pause(kind="click", label="focus ô nhập caption")
         page.click(selector, timeout=10_000, force=True)
         page.wait_for_selector(selector, state="visible", timeout=15_000)
+        human_pause(kind="input", label="sau focus ô nhập")
         delay = _typing_delay_ms()
         # Business Composer có thể dùng combobox/contenteditable: ưu tiên nhập nhanh.
         try:
@@ -1986,7 +2041,7 @@ def fill_content(page: Page, text: str) -> None:
             except Exception:
                 pass
         logger.info("Đã nhập nội dung ({} ký tự, mode={}).", len(text), used)
-        _human_pause()
+        human_pause(kind="input", label="sau nhập caption")
         _enable_view_only_guard(page)
     except PlaywrightTimeoutError:
         _enable_view_only_guard(page)
@@ -2265,12 +2320,13 @@ def _wait_click_locator_when_ready(loc: Locator, *, timeout_ms: int = 120_000) -
             busy = (loc.get_attribute("aria-busy") or "").lower() == "true"
             dis = (loc.get_attribute("aria-disabled") or "").lower() == "true"
             if not busy and not dis:
+                human_pause(kind="click", label="trước click nút")
                 try:
                     loc.click(timeout=15_000, force=True)
                 except Exception:
                     # Meta / Firefox: lớp phủ hoặc hit-target lệch — thử HTMLElement.click().
                     loc.evaluate("el => { if (el && typeof el.click === 'function') el.click(); }")
-                _human_pause()
+                human_pause(kind="click", label="sau click nút")
                 return
         except Exception:
             pass
@@ -3210,6 +3266,7 @@ def complete_meta_business_reel_post_wizard(
                 return False
             if (d.get_attribute("aria-disabled") or "").strip().lower() == "true":
                 return False
+            human_pause(kind="click", label="trước Done (Reel)")
             try:
                 d.evaluate("el => el && el.click && el.click()")
                 logger.info("{} _click_done_strict: đã dispatch JS click.", stage)
@@ -3249,6 +3306,7 @@ def complete_meta_business_reel_post_wizard(
             if (b.get_attribute("aria-disabled") or "").strip().lower() == "true":
                 logger.warning("{} _click_next: Next đang aria-disabled=true.", stage)
                 return False
+            human_pause(kind="click", label="trước Next (Reel)")
             # Ưu tiên click qua JS để tránh actionability của Playwright kéo scroll liên tục.
             try:
                 b.evaluate("el => el && el.click && el.click()")
@@ -3271,25 +3329,25 @@ def complete_meta_business_reel_post_wizard(
         before = _reel_active_step_label(page)
         advanced = False
         for attempt in (1, 2):
-            page.wait_for_timeout(random.randint(500, 900))
+            page.wait_for_timeout(_reel_inter_click_wait_ms())
             clicked = _click_next_strict(timeout_ms=20_000)
             if not clicked:
                 if attempt == 2:
                     raise PlaywrightTimeoutError(f"Không bấm được nút Next (lần {idx}) trong luồng chuẩn.")
-                page.wait_for_timeout(700)
+                page.wait_for_timeout(_reel_inter_click_wait_ms())
                 continue
-            _human_pause()
+            human_pause(kind="step", label=f"sau Next Reel lần {idx}")
             if _wait_reel_step_change(page, before, timeout_ms=10_000):
                 logger.info("{} Đã bấm Next chuẩn (lần {}, attempt {}).", _reel_strict_prefix("Wizard"), idx, attempt)
                 advanced = True
                 break
             # Click có thể bị "ăn" nhưng step label chưa đổi; thử lại 1 lần có kiểm soát.
-            page.wait_for_timeout(650)
+            page.wait_for_timeout(_reel_inter_click_wait_ms())
         if not advanced:
             raise PlaywrightTimeoutError(f"Next lần {idx} không đổi step ({before}).")
         if idx == 1 and thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
             try:
-                page.wait_for_timeout(random.randint(420, 900))
+                page.wait_for_timeout(_reel_inter_click_wait_ms())
             except Exception:
                 pass
             _choose_first_reel_thumbnail_method1_best_effort(page)
@@ -3307,6 +3365,7 @@ def complete_meta_business_reel_post_wizard(
             if (s.get_attribute("aria-disabled") or "").strip().lower() == "true":
                 logger.warning("{} _click_share: Share đang aria-disabled=true.", stage)
                 return False
+            human_pause(kind="click", label="trước Share (Reel)")
             try:
                 s.evaluate("el => el && el.click && el.click()")
                 logger.info("{} _click_share: đã dispatch JS click.", stage)
@@ -3330,7 +3389,7 @@ def complete_meta_business_reel_post_wizard(
     sdis = (sb.get_attribute("aria-disabled") or "").strip().lower()
     if sdis == "true":
         raise RuntimeError("Nút Share đang disabled.")
-    page.wait_for_timeout(random.randint(800, 1400))
+    page.wait_for_timeout(_reel_inter_click_wait_ms())
     share_ok = False
     for attempt in (1, 2):
         if _click_share_strict(timeout_ms=20_000):
@@ -3338,7 +3397,7 @@ def complete_meta_business_reel_post_wizard(
             logger.info("{} Đã bấm Share chuẩn (attempt {}).", _reel_strict_prefix("Wizard"), attempt)
             break
         try:
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(_reel_inter_click_wait_ms())
         except Exception as exc:
             if "closed" in str(exc).lower():
                 logger.info("{} Page đóng trong lúc retry Share → coi như đã submit.", _reel_strict_prefix("Wizard"))
@@ -3400,10 +3459,12 @@ def _click_visible_enabled_button(candidates: Locator, *, timeout_ms: int = 1200
                 continue
             if b.get_attribute("disabled") is not None:
                 continue
+            human_pause(kind="click", label="trước click nút (dialog)")
             try:
                 b.click(timeout=timeout_ms)
             except Exception:
                 b.click(timeout=timeout_ms, force=True, no_wait_after=True)
+            human_pause(kind="click", label="sau click nút (dialog)")
             return True
         except Exception:
             continue
@@ -3415,11 +3476,11 @@ def _click_next_in_dialog(page: Page, dialog: Locator) -> None:
     pat = re.compile(r"Next|Tiếp|Tiếp theo", re.I)
     cands = dialog.get_by_role("button", name=pat)
     if _click_visible_enabled_button(cands, timeout_ms=1400):
-        page.wait_for_timeout(1800)
+        page.wait_for_timeout(_reel_inter_click_wait_ms())
         return
     txt_cands = dialog.get_by_text(pat)
     if _click_visible_enabled_button(txt_cands, timeout_ms=1200):
-        page.wait_for_timeout(1800)
+        page.wait_for_timeout(_reel_inter_click_wait_ms())
         return
     raise PlaywrightTimeoutError("Không tìm thấy nút Next usable trong popup Reel.")
 
@@ -4080,7 +4141,7 @@ def click_post_button(page: Page) -> None:
     """
     try:
         scroll_randomly(page)
-        submit_delay_ms = max(200, _env_int("FB_REEL_PUBLISH_STEP_DELAY_MS", 900))
+        submit_delay_ms = max(350, _env_int("FB_REEL_PUBLISH_STEP_DELAY_MS", 1200))
         try:
             page.wait_for_timeout(submit_delay_ms)
         except Exception:

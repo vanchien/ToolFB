@@ -46,6 +46,127 @@ def _update_project_duration(project: dict[str, Any]) -> None:
     project["duration"] = round(end, 4)
 
 
+def compute_video_timeline_end(project: dict[str, Any]) -> float:
+    """Độ dài timeline chỉ tính từ track video (không kéo dài vì clip audio cũ)."""
+    end = 0.0
+    for tr in project.get("tracks") or []:
+        if not isinstance(tr, dict) or str(tr.get("type") or "") != "video":
+            continue
+        for cl in tr.get("clips") or []:
+            if not isinstance(cl, dict) or str(cl.get("type") or "") != "video":
+                continue
+            ts = float(cl.get("timeline_start") or 0)
+            du = float(cl.get("duration") or 0)
+            end = max(end, ts + du)
+    return round(end, 4)
+
+
+def audio_source_bounds_for_timeline(
+    *,
+    timeline_duration: float,
+    speed: float,
+    media_duration: float = 0.0,
+    source_start: float = 0.0,
+) -> tuple[float, float, bool]:
+    """
+    Nguồn cần đọc để phát ``timeline_duration`` giây trên timeline (sau atempo).
+
+    Returns:
+        (source_start, source_end, loop) — ``loop`` chỉ khi file nguồn ngắn hơn đoạn cần phát.
+    """
+    sp = float(speed) if float(speed) > 1e-6 else 1.0
+    du = max(0.05, float(timeline_duration))
+    ss = max(0.0, float(source_start))
+    need_src = du * sp
+    md = max(0.0, float(media_duration))
+    if md > 0:
+        avail = max(0.05, md - ss)
+        use_src = min(avail, max(0.05, need_src))
+        se = ss + use_src
+        loop = use_src + 1e-6 < need_src
+    else:
+        se = ss + max(0.05, need_src)
+        loop = False
+    return ss, round(se, 4), loop
+
+
+def _intervals_overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
+    return min(a1, b1) > max(a0, b0)
+
+
+def sync_overlapping_audio_clips_to_video(
+    project: dict[str, Any],
+    video_clip_id: str,
+    *,
+    align_timeline_start: bool = False,
+    speed: float | None = None,
+) -> int:
+    """
+    Cắt / kéo clip audio chồng khung thời gian clip video — tránh audio dài hơn video sau khi trim.
+
+    ``align_timeline_start``: True khi gán âm mới (cùng điểm bắt đầu với video).
+    """
+    found = _find_clip(project, str(video_clip_id))
+    if not found:
+        return 0
+    _, vc = found
+    if str(vc.get("type") or "") != "video":
+        return 0
+    v_ts = float(vc.get("timeline_start") or 0)
+    v_du = max(0.05, float(vc.get("duration") or 0))
+    v_te = v_ts + v_du
+    media_by_id = {
+        str(m.get("id") or ""): m
+        for m in (project.get("media") or [])
+        if isinstance(m, dict) and m.get("id")
+    }
+    n = 0
+    for tr in project.get("tracks") or []:
+        if not isinstance(tr, dict) or str(tr.get("type") or "") != "audio":
+            continue
+        for ac in tr.get("clips") or []:
+            if not isinstance(ac, dict) or str(ac.get("type") or "") != "audio":
+                continue
+            a_ts = float(ac.get("timeline_start") or 0)
+            a_du = max(0.0, float(ac.get("duration") or 0))
+            a_te = a_ts + a_du
+            if not _intervals_overlap(v_ts, v_te, a_ts, a_te):
+                continue
+            if align_timeline_start or abs(a_ts - v_ts) < 0.05:
+                ac["timeline_start"] = round(v_ts, 4)
+                a_ts = v_ts
+            o0 = max(v_ts, a_ts)
+            o1 = min(v_te, a_te)
+            new_du = max(0.05, o1 - o0)
+            ac["duration"] = round(new_du, 4)
+            try:
+                sp_a = float(speed) if speed is not None else float(ac.get("speed") or 1.0)
+            except (TypeError, ValueError):
+                sp_a = 1.0
+            if sp_a <= 0:
+                sp_a = 1.0
+            if speed is not None:
+                ac["speed"] = sp_a
+            mid = str(ac.get("media_id") or "")
+            md = 0.0
+            if mid and mid in media_by_id:
+                try:
+                    md = max(0.0, float(media_by_id[mid].get("duration") or 0))
+                except (TypeError, ValueError):
+                    md = 0.0
+            ss, se, loop = audio_source_bounds_for_timeline(
+                timeline_duration=new_du,
+                speed=sp_a,
+                media_duration=md,
+                source_start=float(ac.get("source_start") or 0),
+            )
+            ac["source_start"] = ss
+            ac["source_end"] = se
+            ac["loop"] = loop
+            n += 1
+    return n
+
+
 class TimelineManager:
     """Xử lý timeline."""
 
@@ -55,6 +176,22 @@ class TimelineManager:
     def refresh_project_duration(self, project: dict[str, Any]) -> None:
         """Cập nhật ``project['duration']`` từ toàn bộ clip (gọi sau thao tác hàng loạt nếu đã tắt recompute từng bước)."""
         _update_project_duration(project)
+
+    def sync_overlapping_audio_to_video(
+        self,
+        project: dict[str, Any],
+        video_clip_id: str,
+        *,
+        align_timeline_start: bool = False,
+        speed: float | None = None,
+    ) -> int:
+        """Đồng bộ clip audio chồng khung với clip video (độ dài + nguồn + tốc độ)."""
+        return sync_overlapping_audio_clips_to_video(
+            project,
+            video_clip_id,
+            align_timeline_start=align_timeline_start,
+            speed=speed,
+        )
 
     def add_clip(
         self,

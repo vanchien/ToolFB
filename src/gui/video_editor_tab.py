@@ -26,6 +26,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from src.services.video_editor.timeline_manager import audio_source_bounds_for_timeline
 from src.services.video_editor import (
     AudioExtractor,
     AudioMixManager,
@@ -40,6 +41,7 @@ from src.services.video_editor import (
     VideoFilterManager,
     WaveformGenerator,
     ensure_video_editor_layout,
+    video_editor_export_ui_prefs_path,
     merge_phase2_defaults,
     validate_export,
     video_editor_schedule_jobs_json_path,
@@ -258,6 +260,90 @@ def _normalize_post_caption_title(title: str, *, description: str = "") -> str:
     return (cleaned or str(title or "").strip()).strip()
 
 
+def _ve_media_display_name(media: dict[str, Any], *, fallback: str = "media") -> str:
+    """Tên hiển thị trong combobox — ưu tiên name / original_name / tên file."""
+    for key in ("name", "original_name", "title"):
+        v = str(media.get(key) or "").strip()
+        if v:
+            return v
+    for key in ("local_path", "path"):
+        p = str(media.get(key) or "").strip()
+        if p:
+            try:
+                return Path(p).name
+            except (TypeError, ValueError):
+                return p
+    mid = str(media.get("id") or "").strip()
+    return mid or fallback
+
+
+def _ve_build_media_combo_maps(
+    media_items: list[dict[str, Any]],
+    *,
+    fallback: str = "media",
+    include_empty: bool = True,
+) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    """Danh sách nhãn combobox, map nhãn→id và id→nhãn (tránh trùng tên)."""
+    labels: list[str] = []
+    label_to_id: dict[str, str] = {}
+    id_to_label: dict[str, str] = {}
+    if include_empty:
+        labels.append("")
+    name_count: dict[str, int] = {}
+    for m in media_items:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "").strip()
+        if not mid:
+            continue
+        base = _ve_media_display_name(m, fallback=fallback)
+        key = base.casefold()
+        name_count[key] = name_count.get(key, 0) + 1
+        n = name_count[key]
+        lbl = base if n == 1 else f"{base} ({n})"
+        while lbl in label_to_id and label_to_id[lbl] != mid:
+            lbl = f"{base} [{mid[-8:]}]"
+        labels.append(lbl)
+        label_to_id[lbl] = mid
+        id_to_label[mid] = lbl
+    return labels, label_to_id, id_to_label
+
+
+def _ve_media_id_from_combo(raw: str, label_to_id: dict[str, str] | None = None) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if label_to_id and s in label_to_id:
+        return label_to_id[s]
+    if "|" in s:
+        return s.split("|", 1)[0].strip()
+    return s
+
+
+def _ve_resolve_combo_display(
+    raw: str,
+    *,
+    id_to_label: dict[str, str],
+    label_to_id: dict[str, str],
+    media_items: list[dict[str, Any]] | None = None,
+    fallback: str = "media",
+) -> str:
+    """Chuyển id cũ / nhãn cũ «id|tên» sang nhãn hiển thị trong combobox."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if s in label_to_id:
+        return s
+    mid = _ve_media_id_from_combo(s, label_to_id)
+    if mid and mid in id_to_label:
+        return id_to_label[mid]
+    if media_items and mid:
+        for m in media_items:
+            if isinstance(m, dict) and str(m.get("id") or "") == mid:
+                return _ve_media_display_name(m, fallback=fallback)
+    return s
+
+
 def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[], None], Callable[[], None]]:
     ve_paths = ensure_video_editor_layout()
     pm = VideoEditorProjectManager(paths=ve_paths)
@@ -287,7 +373,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     _apply_batch_video_ref: dict[str, Any] = {"fn": None}
     _apply_transform_subset_ref: dict[str, Any] = {"fn": None}
     _ve_batch_reset_bar_ref: dict[str, Any] = {"fr": None}
-    _q_logo_media_combo_refresh: dict[str, Any] = {"fn": None}
+    _q_logo_media_combo_refresh: dict[str, Any] = {"fn": None, "label_to_id": {}, "id_to_label": {}}
     _batch_edit_draft: dict[str, Any] = {}
     q_font_label_to_path: dict[str, str] = {}
     q_font_label_to_preview_font: dict[str, tuple[str, int, str, str]] = {}
@@ -828,8 +914,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 qlogo()
             mid0 = str(last_image_rec.get("id") or "").strip()
             if mid0:
-                nm0 = str(last_image_rec.get("name") or last_image_rec.get("original_name") or "image")
-                lbl0 = f"{mid0}|{nm0}"
+                lbl0 = _ve_media_display_name(last_image_rec, fallback="image")
+                i2l = _q_logo_media_combo_refresh.get("id_to_label") or {}
+                lbl0 = str(i2l.get(mid0) or lbl0)
                 try:
                     var_q_logo_media.set(lbl0)
                 except Exception:
@@ -3348,15 +3435,44 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 st_zoom.grid(row=13, column=2, sticky="w", padx=(8, 0), pady=2)
                 _bind_status_text("zoom", var_b_zoom, st_zoom)
 
-                media_audios = [m for m in (project.get("media") or []) if isinstance(m, dict) and str(m.get("type") or "") == "audio"]
-                audio_opts = [""] + [f"{str(m.get('id'))}|{str(m.get('name') or 'audio')}" for m in media_audios]
-                var_b_audio = tk.StringVar(value=str(_batch_edit_draft.get("audio_media") or ""))
+                media_audios = [
+                    m for m in (project.get("media") or []) if isinstance(m, dict) and str(m.get("type") or "") == "audio"
+                ]
+                audio_opts, audio_label_to_id, audio_id_to_label = _ve_build_media_combo_maps(
+                    media_audios, fallback="audio"
+                )
+                var_b_audio = tk.StringVar(
+                    value=_ve_resolve_combo_display(
+                        str(_batch_edit_draft.get("audio_media") or ""),
+                        id_to_label=audio_id_to_label,
+                        label_to_id=audio_label_to_id,
+                        media_items=media_audios,
+                        fallback="audio",
+                    )
+                )
                 var_b_audio_vol = tk.StringVar(value=str(_batch_edit_draft.get("audio_vol") or "1.0"))
                 var_b_audio_sp = tk.StringVar(value=str(_batch_edit_draft.get("audio_sp") or "1.0"))
 
                 _lm_d = str(_batch_edit_draft.get("logo_media") or "").strip()
                 try:
-                    var_q_logo_media.set(_lm_d if _lm_d else _AUTO_LOGO_MEDIA_LBL)
+                    if _lm_d:
+                        _logo_i2l = _q_logo_media_combo_refresh.get("id_to_label") or {}
+                        _logo_l2i = _q_logo_media_combo_refresh.get("label_to_id") or {}
+                        _logo_imgs = [
+                            m
+                            for m in (project.get("media") or [])
+                            if isinstance(m, dict) and str(m.get("type") or "") == "image"
+                        ]
+                        _lm_show = _ve_resolve_combo_display(
+                            _lm_d,
+                            id_to_label=_logo_i2l,
+                            label_to_id=_logo_l2i,
+                            media_items=_logo_imgs,
+                            fallback="image",
+                        )
+                        var_q_logo_media.set(_lm_show or _AUTO_LOGO_MEDIA_LBL)
+                    else:
+                        var_q_logo_media.set(_AUTO_LOGO_MEDIA_LBL)
                 except NameError:
                     pass
                 try:
@@ -3594,8 +3710,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         _br_bar.pack(fill=tk.X, pady=(4, 6))
 
                 def _pick_media_id(raw: str) -> str:
-                    s = str(raw or "").strip()
-                    return s.split("|", 1)[0].strip() if "|" in s else s
+                    return _ve_media_id_from_combo(raw, audio_label_to_id)
 
                 def _find_track_clips(track_type: str) -> list[dict[str, Any]]:
                     for tr in project.get("tracks") or []:
@@ -3710,7 +3825,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         raw = str(var_q_logo_media.get() or "").strip()
                         if not raw or raw == _AUTO_LOGO_MEDIA_LBL:
                             return ""
-                        return _pick_media_id(raw)
+                        return _ve_media_id_from_combo(
+                            raw, _q_logo_media_combo_refresh.get("label_to_id") or {}
+                        )
 
                     logo_mid = _batch_explicit_logo_mid()
                     if logo_mid and not _media_id_valid_for_type(logo_mid, "image"):
@@ -3854,14 +3971,18 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         if prog_step and (j == n_batch or j % prog_step == 0):
                             _ve_batch_status_progress(j, n_batch, "áp dụng clip")
 
-                    if effective_patch and "speed" in effective_patch:
-                        try:
-                            sp_batch = float(effective_patch["speed"])
-                        except (TypeError, ValueError):
-                            sp_batch = 1.0
-                        if sp_batch > 0:
-                            for cid_b, _c_b in current_rows:
-                                _sync_overlapping_timeline_audio_speed_to_video(cid_b, sp_batch)
+                    _sync_keys = frozenset({"duration", "timeline_start", "source_start", "source_end", "speed"})
+                    if effective_patch and _sync_keys & set(effective_patch.keys()):
+                        sp_batch = None
+                        if "speed" in effective_patch:
+                            try:
+                                sp_batch = float(effective_patch["speed"])
+                            except (TypeError, ValueError):
+                                sp_batch = 1.0
+                            if sp_batch <= 0:
+                                sp_batch = 1.0
+                        for cid_b, _c_b in current_rows:
+                            _sync_overlapping_timeline_audio_to_video(cid_b, sp_batch)
 
                     if add_logo or add_audio or add_text:
                         lg_ops_b, au_ops_b, tx_ops_b = apply_logo_audio_text_to_video_rows(
@@ -4273,9 +4394,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 for m in (project.get("media") or [])
                 if isinstance(m, dict) and str(m.get("type") or "") == "audio"
             ]
-            audio_opts_ov = [""] + [
-                f"{str(m.get('id'))}|{str(m.get('name') or m.get('original_name') or 'audio')}" for m in media_aud_ov
-            ]
+            audio_opts_ov, audio_ov_label_to_id, audio_ov_id_to_label = _ve_build_media_combo_maps(
+                media_aud_ov, fallback="audio"
+            )
+            _, _logo_ov_l2i, logo_ov_id_to_label = _ve_build_media_combo_maps(
+                media_imgs_ov, fallback="image", include_empty=False
+            )
 
             def _defaults_logo_audio_text_ov() -> tuple[str, str, str]:
                 ts_v = float(cl.get("timeline_start") or 0)
@@ -4289,12 +4413,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     if _ve_iv_overlap(ts_v, te_v, ots, ote):
                         mid = str(oc.get("media_id") or "").strip()
                         if mid:
-                            for m in media_imgs_ov:
-                                if str(m.get("id")) == mid:
-                                    lv = f"{mid}|{str(m.get('name') or m.get('original_name') or 'image')}"
-                                    break
-                            else:
-                                lv = f"{mid}|image"
+                            lv = logo_ov_id_to_label.get(mid, "")
+                            if not lv:
+                                for m in media_imgs_ov:
+                                    if str(m.get("id")) == mid:
+                                        lv = _ve_media_display_name(m, fallback="image")
+                                        break
                         break
                 for ac in _find_track_clips_local("audio"):
                     if not isinstance(ac, dict) or str(ac.get("type") or "") != "audio":
@@ -4304,12 +4428,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     if _ve_iv_overlap(ts_v, te_v, ats, ate):
                         mid = str(ac.get("media_id") or "").strip()
                         if mid:
-                            for m in media_aud_ov:
-                                if str(m.get("id")) == mid:
-                                    av = f"{mid}|{str(m.get('name') or m.get('original_name') or 'audio')}"
-                                    break
-                            else:
-                                av = f"{mid}|audio"
+                            av = audio_ov_id_to_label.get(mid, "")
+                            if not av:
+                                for m in media_aud_ov:
+                                    if str(m.get("id")) == mid:
+                                        av = _ve_media_display_name(m, fallback="audio")
+                                        break
                         break
                 for tc in _find_track_clips_local("text"):
                     if not isinstance(tc, dict) or not _clip_is_text_track_payload(tc):
@@ -4370,14 +4494,13 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     q_synced_logo = True
                     mid0 = str(oc.get("media_id") or "").strip()
                     if mid0:
-                        found_lbl = ""
-                        for m in media_imgs_ov:
-                            if str(m.get("id")) == mid0:
-                                found_lbl = f"{mid0}|{str(m.get('name') or m.get('original_name') or 'image')}"
-                                break
+                        found_lbl = logo_ov_id_to_label.get(mid0, "")
                         if not found_lbl:
-                            found_lbl = f"{mid0}|image"
-                        var_q_logo_media.set(found_lbl)
+                            for m in media_imgs_ov:
+                                if str(m.get("id")) == mid0:
+                                    found_lbl = _ve_media_display_name(m, fallback="image")
+                                    break
+                        var_q_logo_media.set(found_lbl or _AUTO_LOGO_MEDIA_LBL)
                     elif d_logo_ov:
                         var_q_logo_media.set(d_logo_ov)
                     else:
@@ -4459,8 +4582,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             var_ov_text.set(d_text_ov)
 
             def _pick_ov_id(raw: str) -> str:
-                s = str(raw or "").strip()
-                return s.split("|", 1)[0].strip() if "|" in s else s
+                return _ve_media_id_from_combo(raw, audio_ov_label_to_id)
 
             def _ve_float_eq(a: Any, b: Any, *, eps: float = 1e-4) -> bool:
                 try:
@@ -4774,8 +4896,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                                 )
                             elif patch:
                                 tm.update_clip(project, cid, {}, persist=False, recompute_duration=True)
-                            if "speed" in patch:
-                                _sync_overlapping_timeline_audio_speed_to_video(cid, float(patch["speed"]))
+                            _sync_keys_ins = frozenset(
+                                {"duration", "timeline_start", "source_start", "source_end", "speed"}
+                            )
+                            if _sync_keys_ins & set(patch.keys()):
+                                sp_ins = float(patch["speed"]) if "speed" in patch else None
+                                _sync_overlapping_timeline_audio_to_video(cid, sp_ins)
                             clip_scope_msg = f"clip {w_dim}×{h_dim}: {', '.join(diff_labels)}"
                     except Exception as ex:
                         messagebox.showerror("Clip", str(ex), parent=root)
@@ -4841,7 +4967,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         raw = str(var_q_logo_media.get() or "").strip()
                         if not raw or raw == _AUTO_LOGO_MEDIA_LBL:
                             return ""
-                        return _pick_ov_id(raw)
+                        return _ve_media_id_from_combo(
+                            raw, _q_logo_media_combo_refresh.get("label_to_id") or {}
+                        )
 
                     rows_one = [(cid, fc0[1])]
                     _lm_ins = _logo_mid_inspector_explicit_only()
@@ -5826,44 +5954,31 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     def _ve_iv_overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
         return min(a1, b1) > max(a0, b0)
 
-    def _sync_overlapping_timeline_audio_speed_to_video(video_cid: str, video_speed: float) -> int:
+    def _sync_overlapping_timeline_audio_to_video(
+        video_cid: str,
+        video_speed: float | None = None,
+        *,
+        align_timeline_start: bool = False,
+    ) -> int:
         """
-        Cập nhật ``speed`` của mọi clip audio trên timeline chồng khung thời gian với clip video.
-        Dùng sau khi đổi tốc độ video để nhạc phụ khớp nhịp phát.
+        Đồng bộ clip audio chồng khung với clip video (tốc độ, độ dài timeline, cắt nguồn, loop).
         """
         if not project:
             return 0
-        try:
-            sp = float(video_speed)
-        except (TypeError, ValueError):
-            sp = 1.0
-        if sp <= 0:
-            sp = 1.0
-        fc = _find_clip(str(video_cid))
-        if not fc or not fc[1]:
-            return 0
-        vc = fc[1]
-        if str(vc.get("type") or "") != "video":
-            return 0
-        ts = float(vc.get("timeline_start") or 0.0)
-        te = ts + max(0.0, float(vc.get("duration") or 0.0))
-        n = 0
-        for ac in _find_track_clips_local("audio"):
-            if not isinstance(ac, dict) or str(ac.get("type") or "") != "audio":
-                continue
-            ats = float(ac.get("timeline_start") or 0.0)
-            ate = ats + max(0.0, float(ac.get("duration") or 0.0))
-            if not _ve_iv_overlap(ts, te, ats, ate):
-                continue
-            aid = str(ac.get("id") or "").strip()
-            if not aid:
-                continue
+        sp: float | None = None
+        if video_speed is not None:
             try:
-                tm.update_clip(project, aid, {"speed": sp}, persist=False, recompute_duration=False)
-                n += 1
-            except Exception:
-                pass
-        return n
+                sp = float(video_speed)
+            except (TypeError, ValueError):
+                sp = 1.0
+            if sp is not None and sp <= 0:
+                sp = 1.0
+        return tm.sync_overlapping_audio_to_video(
+            project,
+            str(video_cid),
+            align_timeline_start=align_timeline_start,
+            speed=sp,
+        )
 
     def _logo_corner_xy_from_label(pos_pick: str, pw: int, ph: int, side: int, margin: int = 24) -> tuple[int, int]:
         side = max(1, int(side))
@@ -6124,6 +6239,22 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         _new_overlay: list[dict[str, Any]] = []
         _new_audio: list[dict[str, Any]] = []
         _new_text: list[dict[str, Any]] = []
+
+        def _patch_timeline_audio_clip(ac: dict[str, Any], *, ts: float, du: float, a_sp: float) -> None:
+            ss, se, loop = audio_source_bounds_for_timeline(
+                timeline_duration=du,
+                speed=a_sp,
+                media_duration=audio_media_duration,
+                source_start=0.0,
+            )
+            ac["timeline_start"] = ts
+            ac["source_start"] = ss
+            ac["source_end"] = se
+            ac["duration"] = du
+            ac["loop"] = loop
+            ac["volume"] = a_vol
+            ac["speed"] = a_sp
+
         for cid, c in rows:
             ts = float(c.get("timeline_start") or 0)
             du = max(0.1, float(c.get("duration") or 0))
@@ -6215,16 +6346,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 elif audio_hits and aoc == "replace":
                     ac0 = audio_hits[0]
                     ac0["media_id"] = am
-                    ac0["timeline_start"] = ts
-                    ac0["source_start"] = 0.0
-                    if audio_media_duration > 0:
-                        ac0["source_end"] = max(0.1, float(audio_media_duration))
-                    else:
-                        ac0["source_end"] = du
-                    ac0["duration"] = du
-                    ac0["loop"] = True
-                    ac0["volume"] = a_vol
-                    ac0["speed"] = a_sp_row
+                    _patch_timeline_audio_clip(ac0, ts=ts, du=du, a_sp=a_sp_row)
                     for _extra in audio_hits[1:]:
                         _eid = str((_extra or {}).get("id") or "").strip()
                         if _eid:
@@ -6242,16 +6364,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     )
                     if _new_audio:
                         ac = _new_audio[0]
-                        ac["timeline_start"] = ts
-                        ac["source_start"] = 0.0
-                        if audio_media_duration > 0:
-                            ac["source_end"] = max(0.1, float(audio_media_duration))
-                        else:
-                            ac["source_end"] = du
-                        ac["duration"] = du
-                        ac["loop"] = True
-                        ac["volume"] = a_vol
-                        ac["speed"] = a_sp_row
+                        _patch_timeline_audio_clip(ac, ts=ts, du=du, a_sp=a_sp_row)
                         audio_ops += 1
                 elif not audio_hits:
                     _new_audio.clear()
@@ -6265,16 +6378,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     )
                     if _new_audio:
                         ac = _new_audio[0]
-                        ac["timeline_start"] = ts
-                        ac["source_start"] = 0.0
-                        if audio_media_duration > 0:
-                            ac["source_end"] = max(0.1, float(audio_media_duration))
-                        else:
-                            ac["source_end"] = du
-                        ac["duration"] = du
-                        ac["loop"] = True
-                        ac["volume"] = a_vol
-                        ac["speed"] = a_sp_row
+                        _patch_timeline_audio_clip(ac, ts=ts, du=du, a_sp=a_sp_row)
                         audio_ops += 1
             if add_text:
                 text_hits: list[dict[str, Any]] = []
@@ -6327,6 +6431,17 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         _new_text[0]["timeline_start"] = ts
                         _new_text[0]["duration"] = tdur
                         text_ops += 1
+        if add_audio:
+            for _cid, _c in rows:
+                try:
+                    _sp_row = float(audio_speed) if audio_speed is not None else float(_c.get("speed") or 1.0)
+                except (TypeError, ValueError):
+                    _sp_row = 1.0
+                if _sp_row <= 0:
+                    _sp_row = 1.0
+                _sync_overlapping_timeline_audio_to_video(
+                    _cid, _sp_row, align_timeline_start=True
+                )
         if defer_tm:
             tm.refresh_project_duration(project)
         pm.save_project(project)
@@ -6341,7 +6456,13 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         if not rows:
             messagebox.showinfo(title, f"Không có media loại {media_type} trong project.")
             return ""
-        choices = [f"{str(m.get('id') or '')}|{str(m.get('name') or m.get('original_name') or media_type)}" for m in rows]
+        _dlg_labels, _dlg_l2i, _dlg_i2l = _ve_build_media_combo_maps(
+            rows, fallback=media_type, include_empty=False
+        )
+        if not _dlg_labels:
+            messagebox.showinfo(title, f"Không có media loại {media_type} trong project.")
+            return ""
+        choices = _dlg_labels
         picked = tk.StringVar(value=choices[0])
         dlg = tk.Toplevel(root)
         dlg.title(title)
@@ -6368,8 +6489,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         dlg.wait_window()
         if not ok_flag["v"]:
             return ""
-        raw = str(picked.get() or "").strip()
-        return raw.split("|", 1)[0].strip() if "|" in raw else raw
+        return _ve_media_id_from_combo(str(picked.get() or ""), _dlg_l2i)
 
     def add_logo_to_selected_video_clips() -> None:
         if not project:
@@ -6475,14 +6595,17 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             if audio_hits:
                 ac0 = audio_hits[0]
                 ac0["media_id"] = audio_mid
+                ss, se, loop = audio_source_bounds_for_timeline(
+                    timeline_duration=du,
+                    speed=sp_row,
+                    media_duration=audio_media_duration,
+                    source_start=0.0,
+                )
                 ac0["timeline_start"] = ts
-                ac0["source_start"] = 0.0
-                if audio_media_duration > 0:
-                    ac0["source_end"] = max(0.1, float(audio_media_duration))
-                else:
-                    ac0["source_end"] = du
+                ac0["source_start"] = ss
+                ac0["source_end"] = se
                 ac0["duration"] = du
-                ac0["loop"] = True
+                ac0["loop"] = loop
                 ac0["volume"] = max(0.0, float(audio_vol))
                 ac0["speed"] = sp_row
                 for _extra in audio_hits[1:]:
@@ -6502,17 +6625,21 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 )
                 if _new_ac:
                     ac = _new_ac[0]
+                    ss, se, loop = audio_source_bounds_for_timeline(
+                        timeline_duration=du,
+                        speed=sp_row,
+                        media_duration=audio_media_duration,
+                        source_start=0.0,
+                    )
                     ac["timeline_start"] = ts
-                    ac["source_start"] = 0.0
-                    if audio_media_duration > 0:
-                        ac["source_end"] = max(0.1, float(audio_media_duration))
-                    else:
-                        ac["source_end"] = du
+                    ac["source_start"] = ss
+                    ac["source_end"] = se
                     ac["duration"] = du
-                    ac["loop"] = True
+                    ac["loop"] = loop
                     ac["volume"] = max(0.0, float(audio_vol))
                     ac["speed"] = sp_row
                     audio_added += 1
+            _sync_overlapping_timeline_audio_to_video(_cid, sp_row, align_timeline_start=True)
             if prog_step and (j == n_rows or j % prog_step == 0):
                 _ve_batch_status_progress(j, n_rows, "thêm âm thanh")
         if defer:
@@ -7343,29 +7470,69 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
     def _reload_q_logo_media_combo() -> None:
         vals = [_AUTO_LOGO_MEDIA_LBL]
+        label_to_id: dict[str, str] = {}
+        id_to_label: dict[str, str] = {}
         if project:
-            for m in project.get("media") or []:
-                if isinstance(m, dict) and str(m.get("type") or "") == "image":
-                    mid = str(m.get("id") or "").strip()
-                    if not mid:
-                        continue
-                    nm = str(m.get("name") or m.get("original_name") or "image")
-                    vals.append(f"{mid}|{nm}")
+            imgs = [
+                m for m in (project.get("media") or []) if isinstance(m, dict) and str(m.get("type") or "") == "image"
+            ]
+            img_labels, label_to_id, id_to_label = _ve_build_media_combo_maps(
+                imgs, fallback="image", include_empty=False
+            )
+            vals.extend(img_labels)
+        _q_logo_media_combo_refresh["label_to_id"] = label_to_id
+        _q_logo_media_combo_refresh["id_to_label"] = id_to_label
         try:
             cb_q_logo_media.configure(values=vals)
         except Exception:
             return
         cur = str(var_q_logo_media.get() or "").strip()
+        if cur == _AUTO_LOGO_MEDIA_LBL:
+            return
         if cur and cur in vals:
+            return
+        resolved = _ve_resolve_combo_display(
+            cur,
+            id_to_label=id_to_label,
+            label_to_id=label_to_id,
+            media_items=[
+                m for m in (project.get("media") or [])
+                if isinstance(m, dict) and str(m.get("type") or "") == "image"
+            ]
+            if project
+            else None,
+            fallback="image",
+        )
+        if resolved and resolved in vals:
+            var_q_logo_media.set(resolved)
             return
         try:
             mem = _batch_meta_store()
             saved = str(mem.get("quick_logo_media_pick") or "").strip()
         except Exception:
             saved = ""
-        if saved and saved in vals:
-            var_q_logo_media.set(saved)
-        else:
+        if saved:
+            saved_show = _ve_resolve_combo_display(
+                saved,
+                id_to_label=id_to_label,
+                label_to_id=label_to_id,
+                media_items=[
+                    m for m in (project.get("media") or [])
+                    if isinstance(m, dict) and str(m.get("type") or "") == "image"
+                ]
+                if project
+                else None,
+                fallback="image",
+            )
+            if saved_show and saved_show in vals:
+                var_q_logo_media.set(saved_show)
+                return
+        if cur and "|" in cur:
+            mid_legacy = cur.split("|", 1)[0].strip()
+            if mid_legacy in id_to_label:
+                var_q_logo_media.set(id_to_label[mid_legacy])
+                return
+        if not cur:
             var_q_logo_media.set(_AUTO_LOGO_MEDIA_LBL)
 
     def _persist_quick_logo_media_pick(_e: Any = None) -> None:
@@ -7997,10 +8164,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             pick = str(var_q_logo_media.get() or "").strip()
             if not pick or pick == _AUTO_LOGO_MEDIA_LBL:
                 return _first_image_media_id()
-            if "|" in pick:
-                mid = pick.split("|", 1)[0].strip()
-            else:
-                mid = pick
+            mid = _ve_media_id_from_combo(pick, _q_logo_media_combo_refresh.get("label_to_id") or {})
             if mid and project:
                 for m in project.get("media") or []:
                     if (
@@ -9101,8 +9265,107 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         font=("Segoe UI", 8),
     ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(6, 0))
 
+    fr_export_out = ttk.LabelFrame(exp_inner, text="Thư mục lưu MP4", padding=6)
+    fr_export_out.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    fr_export_out.columnconfigure(1, weight=1)
+
+    var_exp_output_dir = tk.StringVar(value=str(ve_paths["renders"].resolve()))
+    var_exp_output_subdir_job = tk.BooleanVar(value=True)
+
+    def _load_export_ui_prefs() -> dict[str, Any]:
+        p = video_editor_export_ui_prefs_path()
+        if not p.is_file():
+            return {}
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            return dict(raw) if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_export_ui_prefs() -> None:
+        p = video_editor_export_ui_prefs_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "output_dir": str(var_exp_output_dir.get() or "").strip(),
+            "subdir_per_job": bool(var_exp_output_subdir_job.get()),
+        }
+        try:
+            p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _pick_export_output_dir() -> None:
+        cur = str(var_exp_output_dir.get() or "").strip()
+        initial = cur if cur and Path(cur).expanduser().is_dir() else str(ve_paths["renders"].resolve())
+        picked = filedialog.askdirectory(parent=root, title="Chọn thư mục lưu file MP4 xuất ra", initialdir=initial)
+        if not picked:
+            return
+        var_exp_output_dir.set(str(Path(picked).expanduser().resolve()))
+        _save_export_ui_prefs()
+        notify(f"Thư mục lưu: {var_exp_output_dir.get()}")
+
+    def _reset_export_output_dir() -> None:
+        var_exp_output_dir.set(str(ve_paths["renders"].resolve()))
+        _save_export_ui_prefs()
+        notify("Đã đặt lại thư mục mặc định (renders).")
+
+    def _safe_job_folder_name(raw: str) -> str:
+        s = "".join(c for c in str(raw or "").strip() if c.isalnum() or c in "-_ ")
+        s = s.replace(" ", "_").strip("_")
+        return (s[:64] or "export")
+
+    def _resolve_export_output_dir(*, for_job_name: str = "") -> Path:
+        raw = str(var_exp_output_dir.get() or "").strip()
+        base = Path(raw).expanduser() if raw else ve_paths["renders"]
+        try:
+            base = base.resolve()
+        except OSError:
+            base = ve_paths["renders"].resolve()
+        if not base.is_dir():
+            base = ve_paths["renders"].resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        if bool(var_exp_output_subdir_job.get()):
+            job_raw = str(for_job_name or "").strip()
+            if not job_raw:
+                job_raw = str(var_exp_saved_job_name.get() or "").strip()
+            if not job_raw:
+                pid = str((project or {}).get("id") or "export")
+                job_raw = f"{pid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            sub = base / _safe_job_folder_name(job_raw)
+            sub.mkdir(parents=True, exist_ok=True)
+            return sub
+        return base
+
+    _exp_prefs = _load_export_ui_prefs()
+    if str(_exp_prefs.get("output_dir") or "").strip():
+        var_exp_output_dir.set(str(Path(str(_exp_prefs["output_dir"])).expanduser()))
+    if "subdir_per_job" in _exp_prefs:
+        var_exp_output_subdir_job.set(bool(_exp_prefs.get("subdir_per_job")))
+
+    ttk.Label(fr_export_out, text="Thư mục gốc").grid(row=0, column=0, sticky="w")
+    ent_exp_out = ttk.Entry(fr_export_out, textvariable=var_exp_output_dir, state="readonly")
+    ent_exp_out.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+    row_out_btns = ttk.Frame(fr_export_out)
+    row_out_btns.grid(row=0, column=2, sticky="e")
+    ttk.Button(row_out_btns, text="Chọn…", command=_pick_export_output_dir, width=8).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(row_out_btns, text="Mặc định", command=_reset_export_output_dir, width=9).pack(side=tk.LEFT)
+    ttk.Checkbutton(
+        fr_export_out,
+        text="Tạo thư mục con theo «Tên job chờ đăng» (mỗi lần xuất 1 folder — dễ quản lý từng job)",
+        variable=var_exp_output_subdir_job,
+        command=_save_export_ui_prefs,
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    ttk.Label(
+        fr_export_out,
+        text="File MP4 được ghi trực tiếp vào thư mục bạn chọn (không copy sang renders nếu chọn folder khác).",
+        foreground="#666",
+        font=("Segoe UI", 8),
+        wraplength=620,
+        justify="left",
+    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
     fr_export_prog = ttk.LabelFrame(exp_inner, text="Tiến trình", padding=6)
-    fr_export_prog.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    fr_export_prog.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
     fr_export_prog.columnconfigure(0, weight=1)
     prog_exp = ttk.Progressbar(fr_export_prog, maximum=100)
     prog_exp.grid(row=0, column=0, sticky="ew")
@@ -9135,7 +9398,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         _schedule_on_main_thread(lambda m=msg, lg=log: _set_export_status(m, log=lg))
 
     fr_export_post = ttk.LabelFrame(exp_inner, text="Sau khi xuất", padding=6)
-    fr_export_post.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    fr_export_post.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 6))
     fr_export_post.columnconfigure(1, weight=1)
     var_exp_save_pending = tk.BooleanVar(value=True)
     var_exp_open_jobs_after_save = tk.BooleanVar(value=True)
@@ -9172,7 +9435,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     ttk.Entry(fr_export_post, textvariable=var_exp_name_tpl).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
 
     btns_fr = ttk.Frame(exp_inner)
-    btns_fr.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    btns_fr.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
     btn_exp_refs: dict[str, Any] = {"run": None, "stop": None}
 
     def _sync_export_running_ui() -> None:
@@ -9233,10 +9496,10 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         except Exception:
             pass
 
-    def _build_default_out_path() -> str:
+    def _build_default_out_path(*, export_dir: Path | None = None) -> str:
         pid = str((project or {}).get("id") or "export")
         safe = "".join(c for c in pid if c.isalnum() or c in "-_")[:48] or "export"
-        out_dir = ensure_video_editor_layout()["renders"]
+        out_dir = export_dir if export_dir is not None else _resolve_export_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         return str(out_dir / f"{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
 
@@ -9498,14 +9761,31 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 return c
             n += 1
 
-    def _ensure_output_in_renders(src_path: Path) -> Path:
-        renders_dir = ensure_video_editor_layout()["renders"]
-        renders_dir.mkdir(parents=True, exist_ok=True)
+    def _ensure_output_in_renders(src_path: Path, *, export_dir: Path | None = None) -> Path:
+        """Giữ file tại thư mục xuất đã chọn; chỉ copy sang ``renders`` nếu xuất vào folder mặc định renders."""
+        renders_dir = ve_paths["renders"].resolve()
         try:
-            if src_path.resolve().parent == renders_dir.resolve():
+            parent = src_path.resolve().parent
+        except OSError:
+            parent = src_path.parent
+        if export_dir is not None:
+            try:
+                if parent == export_dir.resolve():
+                    return src_path
+            except OSError:
+                pass
+        try:
+            if parent == renders_dir:
                 return src_path
         except Exception:
             pass
+        if export_dir is not None:
+            try:
+                if export_dir.resolve() != renders_dir:
+                    return src_path
+            except OSError:
+                return src_path
+        renders_dir.mkdir(parents=True, exist_ok=True)
         base = src_path.stem or "export"
         dst = renders_dir / f"{base}.mp4"
         idx = 2
@@ -9541,15 +9821,19 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 notify("Đang có tiến trình export chạy.")
                 return
             _mark_export_started()
-        out_input = Path(_build_default_out_path())
+        _save_export_ui_prefs()
+        job_label = str(var_exp_saved_job_name.get() or "").strip()
+        export_dir_used = _resolve_export_output_dir(for_job_name=job_label)
+        out_input = Path(_build_default_out_path(export_dir=export_dir_used))
         _export_user_abort_ref["v"] = False
         _prime_render_for_export()
         prog_exp.configure(value=0)
-        _set_export_status("Đang chuẩn bị export…", log=True)
+        _set_export_status(f"Đang chuẩn bị export… → {export_dir_used}", log=True)
         def work() -> None:
             exports_done: list[Path] = []
             failures: list[str] = []
             exported_meta_rows: list[dict[str, Any]] = []
+            export_dir_ref = export_dir_used
             try:
                 export_worker.clear_cancel()
             except Exception:
@@ -9895,7 +10179,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     managed_list: list[Path] = []
                     for p0 in exports_done:
                         try:
-                            managed_list.append(_ensure_output_in_renders(p0))
+                            managed_list.append(_ensure_output_in_renders(p0, export_dir=export_dir_ref))
                         except Exception:
                             managed_list.append(p0)
                     items_for_job: list[dict[str, Any]] = []
@@ -9936,7 +10220,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     else:
                         notify(f"Đã xuất {len(managed_list)} file.")
                     try:
-                        rdir = ensure_video_editor_layout()["renders"]
+                        rdir = export_dir_ref
                         lines = [
                             f"Đã xuất {len(managed_list)} file.",
                             "",
@@ -9983,8 +10267,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     btn_export_stop.pack(side=tk.LEFT, padx=(8, 0))
     btn_exp_refs["stop"] = btn_export_stop
 
-    def open_renders_folder() -> None:
-        r = ensure_video_editor_layout()["renders"]
+    def open_export_output_folder() -> None:
+        try:
+            r = _resolve_export_output_dir(for_job_name=str(var_exp_saved_job_name.get() or ""))
+        except Exception:
+            r = ve_paths["renders"]
         r.mkdir(parents=True, exist_ok=True)
         try:
             if os.name == "nt":
@@ -9994,8 +10281,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         except Exception as e:
             messagebox.showerror("Folder", str(e))
 
-    ttk.Button(exp_inner, text="Mở folder chứa file đã render", command=open_renders_folder).grid(
-        row=6, column=0, sticky="w", pady=(0, 4)
+    ttk.Button(exp_inner, text="Mở thư mục lưu MP4", command=open_export_output_folder).grid(
+        row=7, column=0, sticky="w", pady=(0, 4)
     )
     exp_inner.columnconfigure(0, weight=1)
     _sync_export_running_ui()

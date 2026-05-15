@@ -14,6 +14,7 @@ from src.services.video_editor.speed_manager import SpeedManager
 from src.services.video_editor.transition_manager import TransitionManager
 from src.services.video_editor.video_filter_manager import VideoFilterManager
 from src.services.video_editor.random_motion_expr import drawtext_random_xy_expr, overlay_random_xy_expr
+from src.services.video_editor.timeline_manager import compute_video_timeline_end
 from src.services.video_editor.video_transform_filter_builder import VideoTransformFilterBuilder, ensure_video_transform_defaults
 
 
@@ -78,6 +79,84 @@ def _normalize_video_source_trim(ss: float, se: float, du: float, speed: float) 
     if (se - ss) > need + tol:
         return ss, ss + need
     return ss, se
+
+
+def _overlay_filter_params(*, ts: float, te: float, x: str, y: str) -> str:
+    """Ghép logo RGBA lên video YUV — format=auto + lặp frame khi ảnh tĩnh chỉ có 1 frame."""
+    return f"{x}:{y}:format=auto:eof_action=repeat:enable='between(t,{ts},{te})'"
+
+
+def _build_still_image_overlay_chain(
+    input_idx: int,
+    *,
+    ow: int,
+    oh: int,
+    fps: float,
+    opacity: float,
+    extra_vf: str,
+    out_label: str,
+) -> str:
+    """
+    Chuỗi filter cho logo/ảnh tĩnh (PNG trong suốt).
+
+    - pad nền trong suốt, giữ alpha khi scale
+    - loop size=1 (ảnh 1 frame) — size=32767 dễ làm mất/loạn alpha trên PNG
+    - fps khớp timeline để overlay không «chỉ hiện frame đầu»
+    """
+    ifr = max(1, min(120, int(round(float(fps)))))
+    ow = max(2, int(ow))
+    oh = max(2, int(oh))
+    opa = max(0.0, min(1.0, float(opacity)))
+    parts: list[str] = [
+        f"[{input_idx}:v]scale={ow}:{oh}:force_original_aspect_ratio=decrease:flags=lanczos",
+        f"pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
+        "format=rgba",
+        "loop=loop=-1:size=1:start=0",
+        f"fps={ifr}",
+        f"setpts=N/{ifr}/TB",
+    ]
+    ev = str(extra_vf or "").strip().lstrip(",")
+    if ev:
+        parts.append(ev)
+    if opa < 0.999:
+        parts.append(f"colorchannelmixer=aa={opa:.6f}")
+    parts.append("format=rgba")
+    parts.append(f"[{out_label}]")
+    return ",".join(parts)
+
+
+def _build_video_overlay_chain(
+    input_idx: int,
+    *,
+    ow: int,
+    oh: int,
+    fps: float,
+    opacity: float,
+    extra_vf: str,
+    out_label: str,
+    loop_size: int | None = None,
+) -> str:
+    """Clip overlay dạng video/GIF — vẫn ép RGBA + fps để alpha ổn định."""
+    ifr = max(1, min(120, int(round(float(fps)))))
+    ow = max(2, int(ow))
+    oh = max(2, int(oh))
+    opa = max(0.0, min(1.0, float(opacity)))
+    parts: list[str] = [
+        f"[{input_idx}:v]scale={ow}:{oh}:flags=lanczos",
+        "format=rgba",
+    ]
+    if loop_size is not None:
+        ls = max(0, int(loop_size))
+        parts.append(f"loop=loop=-1:size={ls}:start=0")
+    parts.append(f"fps={ifr}")
+    ev = str(extra_vf or "").strip().lstrip(",")
+    if ev:
+        parts.append(ev)
+    if opa < 0.999:
+        parts.append(f"colorchannelmixer=aa={opa:.6f}")
+    parts.append("format=rgba")
+    parts.append(f"[{out_label}]")
+    return ",".join(parts)
 
 
 class FFmpegCommandBuilder:
@@ -373,11 +452,13 @@ class FFmpegCommandBuilder:
             fc.append(f"[{cur_v}]format=yuv420p[basev]")
             fc.append(f"[{cur_a}]aresample=48000[basea]")
             current_v = "basev"
+            master_av_dur = float(cum_d)
         else:
             # concat=n:v=1:a=1 bắt buộc thứ tự [v0][a0][v1][a1]… — không được gom hết v rồi hết a.
             concat_in = "".join(f"[{seg_v_labels[i]}][{seg_a_labels[i]}]" for i in range(len(seg_v_labels)))
             fc.append(f"{concat_in}concat=n={len(seg_v_labels)}:v=1:a=1[basev][basea]")
             current_v = "basev"
+            master_av_dur = float(sum(seg_durations))
 
         for oi, ovc in enumerate(overlay_clips):
             mid = str(ovc.get("media_id") or "")
@@ -413,19 +494,38 @@ class FFmpegCommandBuilder:
                 opa = 1.0
             opa = max(0.0, min(1.0, opa))
 
-            ifr = max(1, min(120, int(round(fps))))
-            if mtype == "image":
-                # size=32767: đủ buffer nếu ảnh nhiều frame (GIF); PNG logo 1 frame vẫn ổn.
-                scale_chain = (
-                    f"[{ii}:v]scale={ow}:{oh},format=rgba,loop=loop=-1:size=32767:start=0,fps={ifr}"
+            is_still = mtype == "image"
+            if is_still and ip.suffix.lower() == ".gif":
+                scale_chain = _build_video_overlay_chain(
+                    ii,
+                    ow=ow,
+                    oh=oh,
+                    fps=float(fps),
+                    opacity=opa,
+                    extra_vf=extra_vf,
+                    out_label=olab,
+                    loop_size=0,
+                )
+            elif is_still:
+                scale_chain = _build_still_image_overlay_chain(
+                    ii,
+                    ow=ow,
+                    oh=oh,
+                    fps=float(fps),
+                    opacity=opa,
+                    extra_vf=extra_vf,
+                    out_label=olab,
                 )
             else:
-                scale_chain = f"[{ii}:v]scale={ow}:{oh}"
-            if extra_vf:
-                scale_chain += f",{extra_vf}"
-            if opa < 0.999:
-                scale_chain += f",format=rgba,colorchannelmixer=aa={opa:.5f}"
-            scale_chain += f"[{olab}]"
+                scale_chain = _build_video_overlay_chain(
+                    ii,
+                    ow=ow,
+                    oh=oh,
+                    fps=float(fps),
+                    opacity=opa,
+                    extra_vf=extra_vf,
+                    out_label=olab,
+                )
 
             rand_m = bool(ovc.get("random_motion_enabled"))
             try:
@@ -440,23 +540,18 @@ class FFmpegCommandBuilder:
 
             if rand_m:
                 xex, yex = overlay_random_xy_expr(r_int, seed=r_seed, smooth=r_smooth)
-                fc.append(
-                    f"{scale_chain};"
-                    f"[{current_v}][{olab}]overlay=x={xex}:y={yex}:enable='between(t,{ts},{te})'[{out_lab}]"
-                )
+                ov_p = _overlay_filter_params(ts=ts, te=te, x=str(xex), y=str(yex))
+                fc.append(f"{scale_chain};[{current_v}][{olab}]overlay={ov_p}[{out_lab}]")
             elif anim.get("use_expr"):
                 xex = str(anim.get("x_expr") or ox)
                 yex = str(anim.get("y_expr") or oy)
-                fc.append(
-                    f"{scale_chain};"
-                    f"[{current_v}][{olab}]overlay=x={xex}:y={yex}:enable='between(t,{ts},{te})'[{out_lab}]"
-                )
+                ov_p = _overlay_filter_params(ts=ts, te=te, x=xex, y=yex)
+                fc.append(f"{scale_chain};[{current_v}][{olab}]overlay={ov_p}[{out_lab}]")
             else:
-                fc.append(
-                    f"{scale_chain};"
-                    f"[{current_v}][{olab}]overlay={ox}:{oy}:enable='between(t,{ts},{te})'[{out_lab}]"
-                )
-            current_v = out_lab
+                ov_p = _overlay_filter_params(ts=ts, te=te, x=str(ox), y=str(oy))
+                fc.append(f"{scale_chain};[{current_v}][{olab}]overlay={ov_p}[{out_lab}]")
+            fc.append(f"[{out_lab}]format=yuv420p[{out_lab}y]")
+            current_v = f"{out_lab}y"
 
         default_fontfile = _escape_drawtext("C:/Windows/Fonts/arial.ttf") if os.name == "nt" else ""
 
@@ -573,28 +668,31 @@ class FFmpegCommandBuilder:
                 ss_a = float(acl.get("source_start") or 0)
                 se_a = float(acl.get("source_end") or 0)
                 du_a = float(acl.get("duration") or 0)
-                if se_a <= ss_a and du_a > 0:
-                    se_a = ss_a + du_a
-                elif se_a <= ss_a:
-                    se_a = ss_a + 0.1
-                elif du_a > 0 and (se_a - ss_a) > du_a + 0.08:
-                    se_a = ss_a + max(0.05, du_a)
                 ts_a = float(acl.get("timeline_start") or 0)
-                src_len = max(1e-3, float(se_a) - float(ss_a))
                 try:
                     sp_a = float(acl.get("speed") or 1.0)
                 except (TypeError, ValueError):
                     sp_a = 1.0
                 if sp_a <= 1e-6:
                     sp_a = 1.0
+                if du_a <= 0 and se_a > ss_a:
+                    du_a = max(0.05, (se_a - ss_a) / sp_a)
+                elif du_a <= 0:
+                    du_a = 0.1
+                need_src = max(0.05, du_a * sp_a)
+                if se_a <= ss_a:
+                    se_a = ss_a + need_src
+                elif (se_a - ss_a) > need_src + 0.08:
+                    se_a = ss_a + need_src
+                src_len = max(1e-3, float(se_a) - float(ss_a))
                 _, af_tl_spd = SpeedManager().build_speed_filter(sp_a)
-                proj_dur_tl = float(project.get("duration") or 0)
-                out_dur = float(du_a)
-                if proj_dur_tl > 0:
-                    out_dur = max(out_dur, max(0.0, proj_dur_tl - ts_a))
+                out_dur = max(0.05, float(du_a))
+                if master_av_dur > 0 and ts_a < master_av_dur - 1e-6:
+                    out_dur = min(out_dur, max(0.05, master_av_dur - ts_a))
                 wall_after_tempo = src_len / sp_a
-                use_aloop = bool(acl.get("loop", True)) and out_dur > wall_after_tempo + 0.02
-                vol_fade_a = self._afb.build_volume_fade_filters(acl, out_dur if use_aloop else du_a)
+                want_loop = bool(acl.get("loop", False))
+                use_aloop = want_loop and out_dur > wall_after_tempo + 0.02
+                vol_fade_a = self._afb.build_volume_fade_filters(acl, out_dur)
                 delay_ms_a = max(0, int(round(ts_a * 1000)))
                 alab_tl = f"tlau{ai}"
                 chain_tl = f"[{aidx}:a]atrim=start={ss_a}:end={se_a},asetpts=PTS-STARTPTS"
@@ -603,6 +701,8 @@ class FFmpegCommandBuilder:
                 chain_tl += ",aresample=48000"
                 if use_aloop:
                     chain_tl += f",aloop=loop=-1:size=0,atrim=0:{out_dur:.6f},asetpts=PTS-STARTPTS"
+                elif wall_after_tempo > out_dur + 0.02:
+                    chain_tl += f",atrim=0:{out_dur:.6f},asetpts=PTS-STARTPTS"
                 if vol_fade_a:
                     chain_tl += f",{vol_fade_a}"
                 if delay_ms_a > 0:
@@ -614,6 +714,11 @@ class FFmpegCommandBuilder:
                     f"[{final_audio}][{alab_tl}]amix=inputs=2:duration=first:dropout_transition=2[{mix_tl}]"
                 )
                 final_audio = mix_tl
+
+        if master_av_dur > 0.05:
+            a_cap = "aoutcap"
+            fc.append(f"[{final_audio}]atrim=0:{master_av_dur:.6f},asetpts=PTS-STARTPTS[{a_cap}]")
+            final_audio = a_cap
 
         # Tránh FFmpeg chờ/đọc stdin (treo trên Windows khi subprocess không nối stdin).
         # stats_period: ghi progress ra stderr thường xuyên hơn → UI không «im lặng» khi encode lâu.
@@ -745,9 +850,11 @@ class FFmpegCommandBuilder:
             )
             if cap_out:
                 try:
-                    pdur = float(project.get("duration") or 0.0)
+                    pdur = float(master_av_dur)
                 except (TypeError, ValueError):
                     pdur = 0.0
+                if pdur <= 0.05:
+                    pdur = compute_video_timeline_end(project)
                 if pdur > 0.05:
                     args.extend(["-t", f"{pdur + 0.08:.4f}"])
         args.append(out)
