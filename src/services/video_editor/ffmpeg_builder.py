@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -81,9 +82,60 @@ def _normalize_video_source_trim(ss: float, se: float, du: float, speed: float) 
     return ss, se
 
 
+def _join_vfilters(parts: list[str], *, out_label: str | None = None) -> str:
+    """
+    Nối chuỗi filter video/audio trong một nhánh filter_complex.
+
+    Pad output ``[label]`` phải dính liền filter cuối — *không* có dấu phẩy trước ``[``,
+  vì ``setpts=...[pre0]`` đúng còn ``setpts=...,[pre0]`` khiến FFmpeg báo «No such filter: ''».
+    """
+    cleaned = [str(p).strip().strip(",") for p in parts if str(p or "").strip().strip(",")]
+    label = (str(out_label or "").strip() or None)
+    if cleaned:
+        last = cleaned[-1]
+        if last.startswith("[") and last.endswith("]") and "=" not in last and ":" not in last[1:-1]:
+            label = label or last[1:-1]
+            cleaned.pop()
+    body = ",".join(cleaned)
+    if label:
+        return f"{body}[{label}]" if body else f"[{label}]"
+    return body
+
+
+def _enable_between(ts: float, te: float) -> str:
+    """Biểu thức enable không chứa dấu phẩy (tránh lẫn delimiter filter_complex)."""
+    return f"gte(t,{ts})*lte(t,{te})"
+
+
+# Pad output sai: `filter...,[label]` — FFmpeg hiểu filter tên rỗng.
+_FC_BAD_COMMA_BEFORE_PAD = re.compile(r",\[[A-Za-z_][A-Za-z0-9_]*\]$")
+
+
+def _validate_filter_complex_graph(fc_parts: list[str]) -> None:
+    """Phát hiện sớm lỗi cú pháp filter_complex trước khi gọi FFmpeg."""
+    for i, raw in enumerate(fc_parts):
+        seg = str(raw or "").strip()
+        if not seg:
+            raise ValueError(f"filter_complex: đoạn #{i} rỗng.")
+        if ",," in seg:
+            raise ValueError(f"filter_complex: đoạn #{i} có filter rỗng (,,).")
+        if _FC_BAD_COMMA_BEFORE_PAD.search(seg):
+            raise ValueError(
+                f"filter_complex: đoạn #{i} có dấu phẩy trước pad output "
+                f"(dùng `filter...[label]`, không `filter...,[label]`)."
+            )
+
+
 def _overlay_filter_params(*, ts: float, te: float, x: str, y: str) -> str:
     """Ghép logo RGBA lên video YUV — format=auto + lặp frame khi ảnh tĩnh chỉ có 1 frame."""
-    return f"{x}:{y}:format=auto:eof_action=repeat:enable='between(t,{ts},{te})'"
+    xs = str(x).strip()
+    ys = str(y).strip()
+    if not xs.startswith("x="):
+        xs = f"x={xs}"
+    if not ys.startswith("y="):
+        ys = f"y={ys}"
+    en = _enable_between(ts, te)
+    return f"{xs}:{ys}:format=auto:eof_action=repeat:enable='{en}'"
 
 
 def _build_still_image_overlay_chain(
@@ -121,8 +173,7 @@ def _build_still_image_overlay_chain(
     if opa < 0.999:
         parts.append(f"colorchannelmixer=aa={opa:.6f}")
     parts.append("format=rgba")
-    parts.append(f"[{out_label}]")
-    return ",".join(parts)
+    return _join_vfilters(parts, out_label=out_label)
 
 
 def _build_video_overlay_chain(
@@ -155,8 +206,7 @@ def _build_video_overlay_chain(
     if opa < 0.999:
         parts.append(f"colorchannelmixer=aa={opa:.6f}")
     parts.append("format=rgba")
-    parts.append(f"[{out_label}]")
-    return ",".join(parts)
+    return _join_vfilters(parts, out_label=out_label)
 
 
 class FFmpegCommandBuilder:
@@ -358,54 +408,59 @@ class FFmpegCommandBuilder:
             tf = self._vtf.build_transform_filters(clip, project).strip()
             vol_fade = self._afb.build_volume_fade_filters(clip, du)
 
-            vchain = f"[{vi}:v]trim=start={ss}:end={se},setpts=PTS-STARTPTS"
-            if vf_speed:
-                vchain += f",{vf_speed}"
-            if tf:
-                vchain += f",{tf}"
-            vchain += f"[{pre_lab}]"
+            vchain = _join_vfilters(
+                [
+                    f"[{vi}:v]trim=start={ss}:end={se},setpts=PTS-STARTPTS",
+                    vf_speed,
+                    tf,
+                ],
+                out_label=pre_lab,
+            )
             fc.append(vchain)
 
             cv_vf = self._cvb.build_simple_canvas_vf(clip, w, h)
             zoom_vf = self._cvb.build_canvas_zoom_vf(clip, w, h).strip()
+            canvas_parts: list[str] = [f"[{pre_lab}]{cv_vf}"]
             if zoom_vf:
-                fc.append(f"[{pre_lab}]{cv_vf},{zoom_vf}[{cv_mid}]")
-            else:
-                fc.append(f"[{pre_lab}]{cv_vf}[{cv_mid}]")
+                canvas_parts.append(zoom_vf)
+            fc.append(_join_vfilters(canvas_parts, out_label=cv_mid))
 
             # concat / xfade bắt buộc khớp width, height, SAR và pixel format giữa mọi đoạn.
-            # Một số nguồn (đặc biệt vertical phone) có SAR lạ; scale+pad trước đó đôi khi vẫn để SAR khác 1:1
-            # hoặc kích thước lệch nhẹ → concat báo lỗi (Invalid argument / configure concat).
-            v_up = f"[{cv_mid}]fps={fps}"
+            v_up_parts: list[str] = [f"[{cv_mid}]fps={fps}"]
             if col_vf:
-                v_up += f",{col_vf}"
+                v_up_parts.append(col_vf)
             if fi > 0:
-                v_up += f",fade=t=in:st=0:d={fi}"
+                v_up_parts.append(f"fade=t=in:st=0:d={fi}")
             if fo > 0 and du > fo:
                 st_out = max(0.0, du - fo)
-                v_up += f",fade=t=out:st={st_out}:d={fo}"
-            v_up += (
-                f",scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                v_up_parts.append(f"fade=t=out:st={st_out}:d={fo}")
+            v_up_parts.append(
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p"
             )
-            v_up += f"[{vlab}]"
-            fc.append(v_up)
+            fc.append(_join_vfilters(v_up_parts, out_label=vlab))
 
             if has_audio:
-                achain = f"[{vi}:a]atrim=start={ss}:end={se},asetpts=PTS-STARTPTS"
-                if af_speed:
-                    achain += f",{af_speed}"
-                achain += ",aresample=48000"
-                if vol_fade:
-                    achain += f",{vol_fade}"
-                achain += f"[{alab}]"
+                achain = _join_vfilters(
+                    [
+                        f"[{vi}:a]atrim=start={ss}:end={se},asetpts=PTS-STARTPTS",
+                        af_speed,
+                        "aresample=48000",
+                        vol_fade,
+                    ],
+                    out_label=alab,
+                )
                 fc.append(achain)
             else:
                 ai = silence_input_index(du)
-                achain = f"[{ai}:a]atrim=0:{du},asetpts=PTS-STARTPTS,aresample=48000"
-                if vol_fade:
-                    achain += f",{vol_fade}"
-                achain += f"[{alab}]"
+                achain = _join_vfilters(
+                    [
+                        f"[{ai}:a]atrim=0:{du},asetpts=PTS-STARTPTS",
+                        "aresample=48000",
+                        vol_fade,
+                    ],
+                    out_label=alab,
+                )
                 fc.append(achain)
 
             seg_v_labels.append(vlab)
@@ -591,12 +646,12 @@ class FFmpegCommandBuilder:
                 xex_t, yex_t = drawtext_random_xy_expr(r_txt, seed=r_seed_t, smooth=r_smooth_t)
                 fc.append(
                     f"[{current_v}]drawtext=text='{esc}'{fontpart}:x={xex_t}:y={yex_t}:fontsize={fs}"
-                    f":fontcolor={col}:enable='between(t,{ts},{te})'[{tlab}]"
+                    f":fontcolor={col}:enable='{_enable_between(ts, te)}'[{tlab}]"
                 )
             else:
                 fc.append(
                     f"[{current_v}]drawtext=text='{esc}'{fontpart}:x={tx}:y={ty}:fontsize={fs}"
-                    f":fontcolor={col}:enable='between(t,{ts},{te})'[{tlab}]"
+                    f":fontcolor={col}:enable='{_enable_between(ts, te)}'[{tlab}]"
                 )
             current_v = tlab
 
@@ -639,16 +694,19 @@ class FFmpegCommandBuilder:
                 fo_b = float(bg.get("fade_out") or 0)
                 expr = amix.build_bgm_volume_expression(vol, duck if features.get("ducking", True) else [])
                 blab = f"bgm{bi}"
-                chain = f"[{bidx}:a]atrim=0:{du_b},asetpts=PTS-STARTPTS,aresample=48000"
+                bgm_parts: list[str] = [
+                    f"[{bidx}:a]atrim=0:{du_b},asetpts=PTS-STARTPTS",
+                    "aresample=48000",
+                ]
                 if fi_b > 0:
-                    chain += f",afade=t=in:st=0:d={fi_b}"
+                    bgm_parts.append(f"afade=t=in:st=0:d={fi_b}")
                 if fo_b > 0 and du_b > fo_b:
-                    chain += f",afade=t=out:st={max(0.0, du_b - fo_b)}:d={fo_b}"
+                    bgm_parts.append(f"afade=t=out:st={max(0.0, du_b - fo_b)}:d={fo_b}")
                 if t0_bg > 0:
                     dm = max(0, int(round(t0_bg * 1000)))
-                    chain += f",adelay={dm}|{dm}"
-                chain += f",volume='{expr}':eval=frame[{blab}]"
-                fc.append(chain)
+                    bgm_parts.append(f"adelay={dm}|{dm}")
+                bgm_parts.append(f"volume='{expr}':eval=frame")
+                fc.append(_join_vfilters(bgm_parts, out_label=blab))
                 mix_out = f"aout{bi}"
                 fc.append(f"[{final_audio}][{blab}]amix=inputs=2:duration=first:dropout_transition=2[{mix_out}]")
                 final_audio = mix_out
@@ -695,20 +753,23 @@ class FFmpegCommandBuilder:
                 vol_fade_a = self._afb.build_volume_fade_filters(acl, out_dur)
                 delay_ms_a = max(0, int(round(ts_a * 1000)))
                 alab_tl = f"tlau{ai}"
-                chain_tl = f"[{aidx}:a]atrim=start={ss_a}:end={se_a},asetpts=PTS-STARTPTS"
+                tl_parts: list[str] = [
+                    f"[{aidx}:a]atrim=start={ss_a}:end={se_a},asetpts=PTS-STARTPTS",
+                ]
                 if af_tl_spd:
-                    chain_tl += f",{af_tl_spd}"
-                chain_tl += ",aresample=48000"
+                    tl_parts.append(af_tl_spd)
+                tl_parts.append("aresample=48000")
                 if use_aloop:
-                    chain_tl += f",aloop=loop=-1:size=0,atrim=0:{out_dur:.6f},asetpts=PTS-STARTPTS"
+                    tl_parts.append(
+                        f"aloop=loop=-1:size=0,atrim=0:{out_dur:.6f},asetpts=PTS-STARTPTS"
+                    )
                 elif wall_after_tempo > out_dur + 0.02:
-                    chain_tl += f",atrim=0:{out_dur:.6f},asetpts=PTS-STARTPTS"
+                    tl_parts.append(f"atrim=0:{out_dur:.6f},asetpts=PTS-STARTPTS")
                 if vol_fade_a:
-                    chain_tl += f",{vol_fade_a}"
+                    tl_parts.append(vol_fade_a)
                 if delay_ms_a > 0:
-                    chain_tl += f",adelay={delay_ms_a}|{delay_ms_a}"
-                chain_tl += f"[{alab_tl}]"
-                fc.append(chain_tl)
+                    tl_parts.append(f"adelay={delay_ms_a}|{delay_ms_a}")
+                fc.append(_join_vfilters(tl_parts, out_label=alab_tl))
                 mix_tl = f"tlmix{ai}"
                 fc.append(
                     f"[{final_audio}][{alab_tl}]amix=inputs=2:duration=first:dropout_transition=2[{mix_tl}]"
@@ -717,8 +778,15 @@ class FFmpegCommandBuilder:
 
         if master_av_dur > 0.05:
             a_cap = "aoutcap"
-            fc.append(f"[{final_audio}]atrim=0:{master_av_dur:.6f},asetpts=PTS-STARTPTS[{a_cap}]")
+            fc.append(
+                _join_vfilters(
+                    [f"[{final_audio}]atrim=0:{master_av_dur:.6f},asetpts=PTS-STARTPTS"],
+                    out_label=a_cap,
+                )
+            )
             final_audio = a_cap
+
+        _validate_filter_complex_graph(fc)
 
         # Tránh FFmpeg chờ/đọc stdin (treo trên Windows khi subprocess không nối stdin).
         # stats_period: ghi progress ra stderr thường xuyên hơn → UI không «im lặng» khi encode lâu.
