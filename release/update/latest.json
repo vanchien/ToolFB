@@ -1,7 +1,7 @@
 {
-  "version": "1.0.53",
+  "version": "1.0.54",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "78bda966dce527efb15cc40e1f65bf78ab19a72ad6a9b8b7985c2e3b53cf29f4",
-  "notes": "Sua loi Preview nhap / xuat MP4: FFmpeg No such filter (filter graph). Logo PNG trong suot, validate filter_complex. May khac: cap nhat qua menu hoac manifest GitHub.",
-  "generated_at": "2026-05-16T13:54:35"
+  "sha256": "ac7d8104c1a606e448509801386623d7d6385d69e5800fb261da31017e268f93",
+  "notes": "Logo: resolve file đa máy (long-path Windows), chế độ Tự động inspector/hàng loạt, tỉ lệ đúng, lỗi export rõ. Cắt nguồn trong tab Chỉnh clip; đồng bộ âm thanh và duration theo speed.",
+  "generated_at": "2026-05-17T21:43:17"
 }
