@@ -13,6 +13,36 @@ def _clip_duration(source_start: float, source_end: float) -> float:
     return max(0.0, float(source_end) - float(source_start))
 
 
+def timeline_duration_from_source(
+    source_start: float,
+    source_end: float,
+    speed: float = 1.0,
+) -> float:
+    """
+    Độ dài clip trên timeline (giây) từ đoạn nguồn đã cắt và tốc độ.
+
+    Khớp FFmpeg: output ≈ (source_end - source_start) / speed.
+    """
+    span = _clip_duration(source_start, source_end)
+    sp = float(speed) if float(speed) > 1e-6 else 1.0
+    return round(max(0.05, span / sp), 4)
+
+
+def reconcile_clip_duration_from_source(clip: dict[str, Any]) -> None:
+    """Cập nhật ``duration`` trên clip video/audio từ ``source_start`` / ``source_end`` / ``speed``."""
+    if str(clip.get("type") or "") not in ("video", "audio"):
+        return
+    ss = float(clip.get("source_start") or 0)
+    se = float(clip.get("source_end") or ss)
+    try:
+        sp = float(clip.get("speed") or 1.0)
+    except (TypeError, ValueError):
+        sp = 1.0
+    if sp <= 0:
+        sp = 1.0
+    clip["duration"] = timeline_duration_from_source(ss, se, sp)
+
+
 def _find_track(project: dict[str, Any], track_type: str) -> dict[str, Any] | None:
     for tr in project.get("tracks") or []:
         if isinstance(tr, dict) and str(tr.get("type") or "") == track_type:
@@ -477,8 +507,13 @@ class TimelineManager:
             raise ValueError("source_start phải nhỏ hơn source_end.")
         clip["source_start"] = ss
         clip["source_end"] = se
-        du = _clip_duration(ss, se)
-        clip["duration"] = round(du, 4)
+        try:
+            sp = float(clip.get("speed") or 1.0)
+        except (TypeError, ValueError):
+            sp = 1.0
+        if sp <= 0:
+            sp = 1.0
+        clip["duration"] = timeline_duration_from_source(ss, se, sp)
         if recompute_duration:
             _update_project_duration(project)
         if persist:
@@ -620,11 +655,9 @@ class TimelineManager:
             if k == "id":
                 continue
             clip[str(k)] = deepcopy(v)
-        if "source_start" in patch or "source_end" in patch:
-            ss = float(clip.get("source_start") or 0)
-            se = float(clip.get("source_end") or 0)
-            if str(clip.get("type")) == "video":
-                clip["duration"] = round(max(0.0, se - ss), 4)
+        if "source_start" in patch or "source_end" in patch or "speed" in patch:
+            if str(clip.get("type") or "") in ("video", "audio"):
+                reconcile_clip_duration_from_source(clip)
         if recompute_duration:
             _update_project_duration(project)
         if persist:

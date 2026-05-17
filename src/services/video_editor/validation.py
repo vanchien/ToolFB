@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.services.video_editor.media_manager import MediaManager
+from src.services.video_editor.overlay_utils import validate_overlay_clips
 
 
 def _ffmpeg_executable_ok(ffmpeg_path: str | None) -> bool:
@@ -102,5 +103,7 @@ def validate_export(
         du = float(cl.get("duration") or 0)
         if du <= 0:
             errors.append(f"clip {cl.get('id')}: duration phải > 0.")
+
+    errors.extend(validate_overlay_clips(project, media_resolver=mr))
 
     return errors

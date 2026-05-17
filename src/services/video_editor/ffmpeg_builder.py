@@ -15,6 +15,10 @@ from src.services.video_editor.speed_manager import SpeedManager
 from src.services.video_editor.transition_manager import TransitionManager
 from src.services.video_editor.video_filter_manager import VideoFilterManager
 from src.services.video_editor.random_motion_expr import drawtext_random_xy_expr, overlay_random_xy_expr
+from src.services.video_editor.overlay_utils import (
+    normalize_path_for_ffmpeg,
+    resolve_media_file_path,
+)
 from src.services.video_editor.timeline_manager import compute_video_timeline_end
 from src.services.video_editor.video_transform_filter_builder import VideoTransformFilterBuilder, ensure_video_transform_defaults
 
@@ -31,24 +35,7 @@ def _escape_drawtext(s: str) -> str:
 
 def _norm_os_path(p: Path) -> str:
     """Chuẩn hoá đường dẫn cho FFmpeg; Windows: bơm \\\\?\\ khi dài để tránh MAX_PATH."""
-    try:
-        resolved = p.expanduser().resolve(strict=False)
-    except (OSError, RuntimeError):
-        resolved = p.expanduser()
-    s = os.path.normpath(str(resolved))
-    if os.name != "nt":
-        return s
-    if str(os.environ.get("TOOLFB_FFMPEG_NO_LONGPATH", "0") or "0").strip().lower() in ("1", "true", "yes", "on"):
-        return s
-    if s.startswith("\\\\?\\"):
-        return s
-    if len(s) <= 220:
-        return s
-    if len(s) >= 2 and s[1] == ":":
-        return "\\\\?\\" + s
-    if s.startswith("\\\\"):
-        return "\\\\?\\UNC\\" + s[2:]
-    return s
+    return normalize_path_for_ffmpeg(p)
 
 
 def _ass_path_filter(path: Path) -> str:
@@ -297,15 +284,7 @@ class FFmpegCommandBuilder:
         media_by_id = {str(m.get("id")): m for m in (project.get("media") or []) if isinstance(m, dict) and m.get("id")}
 
         def resolve_path(media: dict[str, Any]) -> Path | None:
-            lp = str(media.get("local_path") or "").strip()
-            op = str(media.get("path") or "").strip()
-            for candidate in (lp, op):
-                if not candidate:
-                    continue
-                p = Path(candidate).expanduser()
-                if p.is_file():
-                    return p.resolve()
-            return None
+            return resolve_media_file_path(media)
 
         tracks = project.get("tracks") or []
         video_clips: list[dict[str, Any]] = []
@@ -515,13 +494,20 @@ class FFmpegCommandBuilder:
             current_v = "basev"
             master_av_dur = float(sum(seg_durations))
 
+        overlay_skip_errors: list[str] = []
         for oi, ovc in enumerate(overlay_clips):
             mid = str(ovc.get("media_id") or "")
             media = media_by_id.get(mid)
+            ocid = str(ovc.get("id") or f"ov{oi}")
             if not media:
+                overlay_skip_errors.append(f"{ocid}: media_id «{mid}» không có trong project.")
                 continue
             ip = resolve_path(media)
             if not ip:
+                nm = str(media.get("original_name") or media.get("path") or mid)
+                overlay_skip_errors.append(
+                    f"{ocid}: không đọc được file logo «{nm}» (copy vào thư viện hoặc chọn lại ảnh)."
+                )
                 continue
             # Ảnh tĩnh: KHÔNG dùng -stream_loop -1 (decode PNG lặp vô hạn — dễ lỗi zlib / crash 0xC0000005 sau encode dài).
             # Giải mã một lần rồi loop trong filter_complex (xem scale_chain bên dưới).
@@ -607,6 +593,12 @@ class FFmpegCommandBuilder:
                 fc.append(f"{scale_chain};[{current_v}][{olab}]overlay={ov_p}[{out_lab}]")
             fc.append(f"[{out_lab}]format=yuv420p[{out_lab}y]")
             current_v = f"{out_lab}y"
+
+        if overlay_skip_errors:
+            detail = "\n".join(overlay_skip_errors[:6])
+            if len(overlay_skip_errors) > 6:
+                detail += f"\n… và {len(overlay_skip_errors) - 6} lỗi khác."
+            raise ValueError(f"Logo/overlay không ghép được vào video:\n{detail}")
 
         default_fontfile = _escape_drawtext("C:/Windows/Fonts/arial.ttf") if os.name == "nt" else ""
 
