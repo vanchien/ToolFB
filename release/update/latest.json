@@ -1,7 +1,7 @@
 {
-  "version": "1.0.54",
+  "version": "1.0.55",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "ac7d8104c1a606e448509801386623d7d6385d69e5800fb261da31017e268f93",
-  "notes": "Logo: resolve file đa máy (long-path Windows), chế độ Tự động inspector/hàng loạt, tỉ lệ đúng, lỗi export rõ. Cắt nguồn trong tab Chỉnh clip; đồng bộ âm thanh và duration theo speed.",
-  "generated_at": "2026-05-17T21:43:17"
+  "sha256": "d0eeafa6739a5e1a62d8c6539965e0c971222f4459c9e26943e92e23e1603738",
+  "notes": "v1.0.55 — bản đầy đủ cho máy khách: kèm Chromium Playwright trong zip (không cần cài browser riêng). Đăng Reel: nhận Cách 1/2, bấm Next đến ô mô tả (sửa Edit reel). Video editor: cắt đuôi, logo % khung, tab Chỉnh clip. Lỗi đăng bài rõ hơn; đồng bộ trình duyệt bundle giữa máy.",
+  "generated_at": "2026-05-18T13:07:30"
 }
