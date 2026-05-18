@@ -7,6 +7,7 @@ Khởi tạo Playwright persistent context theo từng tài khoản: profile por
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -98,6 +99,8 @@ def _playwright_chromium_channel(*, browser_key: str, has_executable_path: bool)
     Không áp dụng khi đã có ``browser_exe_path`` hợp lệ trên account.
     """
     if browser_key not in ("chromium", "chrome") or has_executable_path:
+        return None
+    if getattr(sys, "frozen", False) or _env_bool("TOOLFB_ENFORCE_BUNDLED_BROWSER", False):
         return None
     raw_env = os.environ.get("FB_PLAYWRIGHT_CHROMIUM_CHANNEL")
     raw = ("chrome" if raw_env is None else str(raw_env)).strip().lower()

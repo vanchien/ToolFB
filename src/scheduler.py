@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import threading
@@ -41,6 +42,8 @@ from src.services.job_post_runtime import (
     STEP_VALIDATE_JOB,
     STEP_VALIDATE_PAGE,
     JobRunTracker,
+    format_post_job_error,
+    job_run_monitor_path,
     log_job_step,
     validate_account_for_post_job,
     validate_page_for_post_job,
@@ -1476,7 +1479,11 @@ def run_scheduled_post_for_account(
         if acc is None:
             append_failed_account_log(account_id, "Không tìm thấy trong accounts.json")
             logger.error("Bỏ qua job: không có account {}", account_id)
-            err_msg = "Không tìm thấy trong accounts.json"
+            err_msg = format_post_job_error(
+                "account",
+                f"account_id={account_id} không có trong config/accounts.json "
+                f"(sau cập nhật: chạy «Di chuyển dữ liệu» hoặc thêm lại tài khoản).",
+            )
             return False
         account_run_slot = _acquire_account_run_slot(account_id)
         acc_runtime, runtime_profile_dir = _prepare_account_for_parallel_run(
@@ -1490,11 +1497,10 @@ def run_scheduled_post_for_account(
             log_job_step(STEP_VALIDATE_ACCOUNT, f"Kiểm tra tài khoản trước khi mở browser", account_id=account_id)
             validate_account_for_post_job(dict(acc_runtime))
         except ValueError as exc:
-            msg = str(exc)[:900]
+            msg = format_post_job_error("account", str(exc))
             append_failed_account_log(account_id, f"Validate account: {msg}")
             logger.error("Validate account thất bại: {}", exc)
-            if schedule_post_job_id:
-                _finalize_schedule_post_job_record(schedule_post_job_id, False, msg)
+            err_msg = msg
             return False
 
         name = str(acc_runtime.get("name", account_id))
@@ -1519,7 +1525,10 @@ def run_scheduled_post_for_account(
                     f"Entity {eid_raw} không thuộc tài khoản này (account_id mismatch).",
                 )
                 logger.error("Bỏ qua job: entity không khớp account_id={}", account_id)
-                err_msg = "entity account_id mismatch"
+                err_msg = format_post_job_error(
+                    "page",
+                    f"entity_id={eid_raw} không thuộc account_id={account_id}.",
+                )
                 return False
             else:
                 entity_dict = dict(ent)
@@ -1528,7 +1537,10 @@ def run_scheduled_post_for_account(
             if pr is None:
                 append_failed_account_log(account_id, f"page_id={pid_raw} không tồn tại trong pages.json")
                 logger.error("Bỏ qua job: không có page_id={}", pid_raw)
-                err_msg = "page_id không tồn tại"
+                err_msg = format_post_job_error(
+                    "page",
+                    f"page_id={pid_raw} không có trong config/pages.json.",
+                )
                 return False
             if str(pr.get("account_id", "")).strip() != str(account_id).strip():
                 append_failed_account_log(
@@ -1536,7 +1548,10 @@ def run_scheduled_post_for_account(
                     f"Page {pid_raw} không thuộc tài khoản này (account_id mismatch).",
                 )
                 logger.error("Bỏ qua job: page không khớp account_id={}", account_id)
-                err_msg = "page account_id mismatch"
+                err_msg = format_post_job_error(
+                    "page",
+                    f"page_id={pid_raw} không thuộc account_id={account_id}.",
+                )
                 return False
             page_row = dict(pr)
             entity_dict = _page_record_to_entity_dict(page_row)
@@ -1619,22 +1634,20 @@ def run_scheduled_post_for_account(
                 log_job_step(STEP_VALIDATE_PAGE, "Kiểm tra page (mapping, URL điều hướng).")
                 validate_page_for_post_job(dict(row_for_validate), account_id)
             except ValueError as exc:
-                msg = str(exc)[:900]
+                msg = format_post_job_error("page", str(exc))
                 append_failed_account_log(account_id, f"Validate page: {msg}")
                 logger.error("Validate page thất bại: {}", exc)
-                if schedule_post_job_id:
-                    _finalize_schedule_post_job_record(schedule_post_job_id, False, msg)
+                err_msg = msg
                 return False
         if queue_job:
             try:
                 log_job_step(STEP_VALIDATE_JOB, "Kiểm tra job (post_type, media_files).")
                 validate_queue_job_payload(dict(queue_job))
             except ValueError as exc:
-                msg = str(exc)[:900]
+                msg = format_post_job_error("job", str(exc))
                 append_failed_account_log(account_id, f"Validate job: {msg}")
                 logger.error("Validate job thất bại: {}", exc)
-                if schedule_post_job_id:
-                    _finalize_schedule_post_job_record(schedule_post_job_id, False, msg)
+                err_msg = msg
                 return False
 
         resolved_draft_id = str(draft_id).strip() if draft_id else ""
@@ -1665,7 +1678,7 @@ def run_scheduled_post_for_account(
         except Exception as exc:  # noqa: BLE001
             append_failed_account_log(account_id, f"Nội dung: {exc!r}")
             logger.exception("Tài khoản {} — lỗi chuẩn bị nội dung.", account_id)
-            err_msg = f"Lỗi nội dung: {exc!r}"[:900]
+            err_msg = format_post_job_error("content", str(exc))
             try:
                 _record_post_run_outcome(
                     account_id=account_id,
@@ -1750,7 +1763,18 @@ def run_scheduled_post_for_account(
             logger.exception("Tài khoản {} — đăng thất bại, tiếp tục hàng chờ khác.", account_id)
             logger.error("Lỗi đăng Facebook — đã thử chụp screenshot (nếu còn trang mở): {}", exc)
             capture_failure_screenshot(page, account_id)
-            err_msg = str(exc)[:900]
+            err_msg = format_post_job_error("post", str(exc))
+            try:
+                mon = job_run_monitor_path()
+                if mon.is_file() and schedule_post_job_id:
+                    data = json.loads(mon.read_text(encoding="utf-8"))
+                    if str(data.get("job_id") or "").strip() == str(schedule_post_job_id).strip():
+                        step = str(data.get("step") or "").strip()
+                        sm = str(data.get("message") or "").strip()
+                        if step and step not in err_msg:
+                            err_msg = f"{err_msg} (bước cuối: {step}" + (f" — {sm}" if sm else "") + ")"
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             keep_open = _keep_browser_open_after_post_debug()
             if keep_open:

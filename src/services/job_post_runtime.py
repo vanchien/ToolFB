@@ -88,6 +88,25 @@ def _acc_status_active(acc: dict[str, Any]) -> bool:
     return st in ("", "active", "ok", "enabled")
 
 
+def format_post_job_error(step_key: str, message: str) -> str:
+    """Gắn nhãn bước lỗi để GUI / schedule_posts hiển thị rõ vị trí lỗi."""
+    labels = {
+        "account": "KIỂM TRA TÀI KHOẢN",
+        "page": "KIỂM TRA PAGE",
+        "job": "KIỂM TRA JOB",
+        "content": "CHUẨN BỊ NỘI DUNG",
+        "browser": "MỞ TRÌNH DUYỆT",
+        "post": "ĐĂNG FACEBOOK",
+    }
+    label = labels.get(str(step_key or "").strip().lower(), str(step_key or "LỖI").upper())
+    msg = str(message or "").strip()
+    if not msg:
+        return f"[{label}] Lỗi không rõ (xem logs/failed_accounts.log)."
+    if msg.startswith("["):
+        return msg[:900]
+    return f"[{label}] {msg}"[:900]
+
+
 def validate_account_for_post_job(acc: dict[str, Any], *, project_root: Path | None = None) -> None:
     """
     Kiểm tra account trước khi mở browser.
@@ -113,7 +132,9 @@ def validate_account_for_post_job(acc: dict[str, Any], *, project_root: Path | N
         prof = (root / prof).resolve()
     if not prof.is_dir():
         raise ValueError(
-            f"Thư mục profile không tồn tại: {prof}. Không tự tạo profile mới trong bước đăng bài."
+            f"Thư mục profile không tồn tại: {prof}. "
+            f"Sau khi cập nhật/cài sang máy khác: chạy «Di chuyển dữ liệu» hoặc sửa portable_path "
+            f"(thư mục app: {root})."
         )
     use_px = account_use_proxy_enabled(acc)
     px = acc.get("proxy")
@@ -128,7 +149,10 @@ def validate_account_for_post_job(acc: dict[str, Any], *, project_root: Path | N
         if not cp.is_absolute():
             cp = (root / cp).resolve()
         if not cp.is_file():
-            raise ValueError(f"cookie_path không trỏ tới file hợp lệ: {cp}")
+            raise ValueError(
+                f"cookie_path không trỏ tới file hợp lệ: {cp}. "
+                f"Lấy cookie lại (Playwright) trên máy này nếu vừa cập nhật app."
+            )
 
 
 def validate_page_for_post_job(page_row: dict[str, Any], account_id: str) -> None:
@@ -171,7 +195,10 @@ def validate_queue_job_payload(
             if not p.is_absolute():
                 p = (root / p).resolve()
             if not p.is_file():
-                raise ValueError(f"File ảnh không tồn tại: {p}")
+                raise ValueError(
+                    f"File ảnh không tồn tại trên máy này: {p} "
+                    f"(thư mục app: {root}). Xuất lại ảnh hoặc sửa media_files trong job."
+                )
             if not _IMG_EXT.search(p.name):
                 raise ValueError(f"Định dạng ảnh không hỗ trợ: {p.name}")
     elif pt in ("video", "text_video", "reel"):
@@ -190,7 +217,11 @@ def validate_queue_job_payload(
             if not p.is_absolute():
                 p = (root / p).resolve()
             if not p.is_file():
-                raise ValueError(f"File video không tồn tại: {p}")
+                raise ValueError(
+                    f"File video không tồn tại trên máy này: {p} "
+                    f"(thư mục app: {root}). Sau khi cập nhật sang máy khác: xuất lại video, "
+                    f"chạy «Di chuyển dữ liệu», hoặc sửa video_path/media_files trong job."
+                )
             if not _VID_EXT.search(p.name):
                 raise ValueError(f"Định dạng video không hỗ trợ: {p.name}")
         if pt == "reel":

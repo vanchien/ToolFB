@@ -47,9 +47,31 @@ def _configure_frozen_runtime() -> None:
             os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(p.resolve()))
             break
     os.environ.setdefault("FB_PLAYWRIGHT_CHROMIUM_CHANNEL", "bundled")
+    os.environ.setdefault("TOOLFB_ENFORCE_BUNDLED_BROWSER", "1")
 
 
 _configure_frozen_runtime()
+
+
+def _enforce_playwright_browser_lock() -> None:
+    """Khóa trình duyệt theo manifest build — máy khách không dùng Chrome/playwright install lệch bản."""
+    try:
+        from src.utils.paths import project_root
+        from src.utils.playwright_browser_lock import enforce_bundled_browser_policy
+
+        ok, msgs = enforce_bundled_browser_policy(project_root=project_root())
+        for line in msgs:
+            if ok:
+                logger.warning("Playwright browser: {}", line)
+            else:
+                logger.error("Playwright browser: {}", line)
+        if not ok and getattr(sys, "frozen", False):
+            logger.error(
+                "Đăng bài / automation có thể lỗi — cài bản release ĐẦY ĐỦ từ máy chính "
+                "(zip có _internal/ms-playwright), không chạy playwright install riêng."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Bỏ qua kiểm tra khóa trình duyệt: {}", exc)
 
 from loguru import logger
 
@@ -212,6 +234,7 @@ def main() -> None:
     args = parser.parse_args()
 
     _configure_logging()
+    _enforce_playwright_browser_lock()
     _cleanup_previous_background_instances()
     cleanup_runtime_junk()
     logger.info("Facebook Automation — Giai đoạn 4 (AI + lịch). Đang khởi động...")

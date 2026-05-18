@@ -175,36 +175,20 @@ class _GuiLogStream:
 
 def _log_playwright_runtime_paths() -> None:
     """Ghi log đường dẫn trình duyệt Playwright khi mở GUI (hỗ trợ bản EXE / máy lạ)."""
-    frozen = getattr(sys, "frozen", False)
-    pw_raw = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
-    ch_raw = os.environ.get("FB_PLAYWRIGHT_CHROMIUM_CHANNEL", "").strip()
+    from src.utils.playwright_browser_lock import (
+        enforce_bundled_browser_policy,
+        format_browser_status_lines,
+    )
+
     proot = project_root()
-    if pw_raw:
-        p = Path(pw_raw)
-        exists = p.is_dir()
-        preview = ""
-        if exists:
-            try:
-                dirs = sorted(x.name for x in p.iterdir() if x.is_dir())
-                preview = ", ".join(dirs[:6]) + (" …" if len(dirs) > 6 else "")
-            except OSError:
-                preview = "(không đọc được thư mục)"
-        logger.info(
-            "Playwright runtime | frozen={} | PLAYWRIGHT_BROWSERS_PATH={} | tồn_tại={} | gói_con={!r} | FB_PLAYWRIGHT_CHROMIUM_CHANNEL={!r} | project_root={}",
-            frozen,
-            pw_raw,
-            exists,
-            preview,
-            ch_raw,
-            proot,
-        )
-    else:
-        logger.info(
-            "Playwright runtime | frozen={} | PLAYWRIGHT_BROWSERS_PATH=(mặc định cache hệ thống, vd. %LOCALAPPDATA%\\ms-playwright) | FB_PLAYWRIGHT_CHROMIUM_CHANNEL={!r} | project_root={}",
-            frozen,
-            ch_raw,
-            proot,
-        )
+    ok, msgs = enforce_bundled_browser_policy(project_root=proot)
+    for line in format_browser_status_lines(project_root=proot):
+        logger.info("Playwright | {}", line)
+    for m in msgs:
+        if ok:
+            logger.warning("Playwright | {}", m)
+        else:
+            logger.error("Playwright | {}", m)
 
 
 def run_manager_gui(*, accounts: AccountsDatabaseManager) -> None:
@@ -215,6 +199,40 @@ def run_manager_gui(*, accounts: AccountsDatabaseManager) -> None:
         accounts: ``AccountsDatabaseManager`` đã preflight (dùng chung cho scheduler).
     """
     _log_playwright_runtime_paths()
+    if getattr(sys, "frozen", False):
+        from src.utils.playwright_browser_lock import (
+            enforce_bundled_browser_policy,
+            validate_browser_bundle,
+        )
+
+        ok, msgs = enforce_bundled_browser_policy(project_root=project_root())
+        if not ok and msgs:
+            try:
+                import tkinter as _tk
+                from tkinter import messagebox as _mb
+
+                _r = _tk.Tk()
+                _r.withdraw()
+                _mb.showwarning(
+                    "Trình duyệt không khớp bản cài",
+                    "Máy này cần cùng gói trình duyệt với máy chính:\n\n"
+                    + "\n".join(msgs[:8])
+                    + (
+                        f"\n\n… và {len(msgs) - 8} lỗi khác."
+                        if len(msgs) > 8
+                        else ""
+                    )
+                    + "\n\n→ Tải bản zip release ĐẦY ĐỦ (có _internal/ms-playwright). "
+                    "Không chạy «playwright install» riêng.",
+                    parent=_r,
+                )
+                _r.destroy()
+            except Exception:
+                pass
+        elif ok:
+            val = validate_browser_bundle(project_root=project_root())
+            if val:
+                logger.warning("Playwright validate: {}", "; ".join(val[:3]))
     app = _ManagerWindow(accounts)
     app.run()
 
@@ -644,6 +662,7 @@ class _ManagerWindow:
             "image_prompt",
             "scheduled_at",
             "status",
+            "last_error",
             "retry",
             "missing",
         )
@@ -660,13 +679,18 @@ class _ManagerWindow:
             "image_prompt": "Prompt ảnh (EN)",
             "scheduled_at": "Hẹn đăng (Local)",
             "status": "Trạng thái",
+            "last_error": "Lỗi gần nhất",
             "retry": "retry",
             "missing": "Thiếu field",
         }
-        widths_j = (120, 72, 72, 88, 78, 120, 240, 160, 88, 44, 160)
+        widths_j = (120, 72, 72, 88, 78, 120, 240, 160, 88, 220, 44, 160)
         for c, w in zip(cols_j, widths_j):
             self._tree_jobs.heading(c, text=heads_j[c])
-            self._tree_jobs.column(c, width=w, stretch=c in ("title", "image_prompt", "scheduled_at", "missing"))
+            self._tree_jobs.column(
+                c,
+                width=w,
+                stretch=c in ("title", "image_prompt", "scheduled_at", "last_error", "missing"),
+            )
         sy_j = ttk.Scrollbar(j_tree_fr, orient=tk.VERTICAL, command=self._tree_jobs.yview)
         self._tree_jobs.configure(yscrollcommand=sy_j.set)
         self._tree_jobs.grid(row=0, column=0, sticky="nsew")
@@ -3812,6 +3836,7 @@ class _ManagerWindow:
                 img_prompt = img_prompt[:87] + "…"
             miss_txt = format_missing_fields_for_display(j.get("_missing_fields") or [])
             status_txt = self._job_status_with_retry(j)
+            err_txt = self._schedule_job_error_display(j)
             self._tree_jobs.insert(
                 "",
                 tk.END,
@@ -3825,12 +3850,25 @@ class _ManagerWindow:
                     img_prompt,
                     j.get("_display_scheduled_local", "—"),
                     status_txt,
+                    err_txt,
                     j.get("retry_count", 0),
                     miss_txt,
                 ),
             )
         self._update_schedule_jobs_sort_indicator()
         self._update_schedule_jobs_stats_label()
+
+    def _schedule_job_error_display(self, job: dict[str, Any], *, max_len: int = 120) -> str:
+        """Rút gọn ``error_note`` để hiện trên cây job."""
+        note = str(job.get("error_note") or "").strip()
+        if not note:
+            st = str(job.get("status") or "").strip().lower()
+            if st in {"failed", "need_manual_check"}:
+                return "(chưa ghi chi tiết — xem failed_accounts.log)"
+            return ""
+        if len(note) <= max_len:
+            return note
+        return note[: max_len - 1] + "…"
 
     def _job_status_with_retry(self, job: dict[str, Any]) -> str:
         """Hiển thị status kèm retry trực quan: pending (retry 1/3)."""
@@ -4795,6 +4833,7 @@ class _ManagerWindow:
             ok = 0
             fail = 0
             skipped_notes: list[str] = []
+            fail_notes: list[str] = []
             for jid in job_ids:
                 row = self._schedule_posts.get_by_id(jid)
                 if not row:
@@ -4828,31 +4867,55 @@ class _ManagerWindow:
                         ok += 1
                     else:
                         fail += 1
+                        row_after = self._schedule_posts.get_by_id(jid)
+                        note = self._schedule_job_error_display(
+                            dict(row_after or {}), max_len=500
+                        )
+                        if not note:
+                            note = "Đăng thất bại (không có error_note — xem logs/failed_accounts.log)"
+                        fail_notes.append(f"- {jid}:\n  {note}")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Đăng ngay job {} lỗi: {}", jid, exc)
                     fail += 1
-                    skipped_notes.append(f"- {jid}: lỗi ngoại lệ {exc}")
-            self._root.after(0, lambda: self._finish_run_selected_jobs_now(ok, fail, skipped_notes))
+                    fail_notes.append(f"- {jid}: lỗi ngoại lệ (GUI/worker): {exc}")
+            self._root.after(
+                0,
+                lambda: self._finish_run_selected_jobs_now(
+                    ok, fail, skipped_notes, fail_notes
+                ),
+            )
 
         threading.Thread(target=worker, name="run_selected_jobs_now", daemon=True).start()
 
-    def _finish_run_selected_jobs_now(self, ok: int, fail: int, skipped_notes: list[str] | None = None) -> None:
+    def _finish_run_selected_jobs_now(
+        self,
+        ok: int,
+        fail: int,
+        skipped_notes: list[str] | None = None,
+        fail_notes: list[str] | None = None,
+    ) -> None:
         self._root.configure(cursor="")
         self._fill_schedule_jobs_tree()
         skipped_notes = skipped_notes or []
+        fail_notes = fail_notes or []
         skip_count = len(skipped_notes)
         detail = ""
+        if fail_notes:
+            shown_f = fail_notes[:5]
+            detail += "\n\nThất bại (chi tiết):\n" + "\n".join(shown_f)
+            if len(fail_notes) > len(shown_f):
+                detail += f"\n... và {len(fail_notes) - len(shown_f)} job lỗi khác (xem cột «Lỗi gần nhất»)"
         if skipped_notes:
-            # Giữ popup gọn: hiển thị tối đa 8 dòng đầu.
             shown = skipped_notes[:8]
-            detail = "\n\nBỏ qua:\n" + "\n".join(shown)
+            detail += "\n\nBỏ qua:\n" + "\n".join(shown)
             if skip_count > len(shown):
                 detail += f"\n... và {skip_count - len(shown)} mục khác"
-        messagebox.showinfo(
-            "Kết quả đăng ngay",
-            f"Thành công: {ok}\nThất bại: {fail}\nBỏ qua: {skip_count}{detail}",
-            parent=self._root,
-        )
+        title = "Kết quả đăng ngay"
+        body = f"Thành công: {ok}\nThất bại: {fail}\nBỏ qua: {skip_count}{detail}"
+        if fail > 0:
+            messagebox.showwarning(title, body, parent=self._root)
+        else:
+            messagebox.showinfo(title, body, parent=self._root)
 
     def _open_posting_visual_monitor(self) -> None:
         """

@@ -61,12 +61,23 @@ def _normalize_video_source_trim(ss: float, se: float, du: float, speed: float) 
     ss = max(0.0, float(ss))
     se = float(se)
     need = max(0.05, du * sp)
-    tol = 0.08
+    tol = 0.02
     if se <= ss + 1e-6:
         return ss, ss + need
     if (se - ss) > need + tol:
         return ss, ss + need
     return ss, se
+
+
+def _source_trim_duration_sec(du: float, speed: float) -> float:
+    """Độ dài đoạn nguồn cần decode (giây) — khớp timeline × speed."""
+    try:
+        sp = float(speed)
+    except (TypeError, ValueError):
+        sp = 1.0
+    if sp <= 0:
+        sp = 1.0
+    return max(0.05, float(du) * sp)
 
 
 def _join_vfilters(parts: list[str], *, out_label: str | None = None) -> str:
@@ -372,6 +383,7 @@ class FFmpegCommandBuilder:
             du = float(clip.get("duration") or 0)
             sp = clip_speed(clip)
             ss, se = _normalize_video_source_trim(ss, se, du, sp)
+            src_dur = _source_trim_duration_sec(du, sp)
             fi = float(clip.get("fade_in") or 0)
             fo = float(clip.get("fade_out") or 0)
 
@@ -389,7 +401,7 @@ class FFmpegCommandBuilder:
 
             vchain = _join_vfilters(
                 [
-                    f"[{vi}:v]trim=start={ss}:end={se},setpts=PTS-STARTPTS",
+                    f"[{vi}:v]trim=start={ss}:duration={src_dur:.6f},setpts=PTS-STARTPTS",
                     vf_speed,
                     tf,
                 ],
@@ -422,7 +434,7 @@ class FFmpegCommandBuilder:
             if has_audio:
                 achain = _join_vfilters(
                     [
-                        f"[{vi}:a]atrim=start={ss}:end={se},asetpts=PTS-STARTPTS",
+                        f"[{vi}:a]atrim=start={ss}:duration={src_dur:.6f},asetpts=PTS-STARTPTS",
                         af_speed,
                         "aresample=48000",
                         vol_fade,

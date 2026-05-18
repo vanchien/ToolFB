@@ -60,6 +60,41 @@ def resolve_media_file_path(media: dict[str, Any]) -> Path | None:
     return None
 
 
+def logo_corner_xy_from_label(
+    pos_pick: str,
+    canvas_w: int,
+    canvas_h: int,
+    logo_w: int,
+    logo_h: int | None = None,
+    *,
+    margin_x_ratio: float = 0.035,
+    margin_y_ratio: float = 0.035,
+    min_margin_px: int = 12,
+) -> tuple[int, int]:
+    """
+    Góc logo theo % khung canvas (không cố định 24px) — đổi kích logo vẫn giữ vị trí tương đối.
+    """
+    pw = max(1, int(canvas_w))
+    ph = max(1, int(canvas_h))
+    lw = max(1, int(logo_w))
+    lh = max(1, int(logo_h if logo_h is not None else logo_w))
+    mx = max(min_margin_px, int(round(pw * max(0.01, min(0.2, float(margin_x_ratio))))))
+    my = max(min_margin_px, int(round(ph * max(0.01, min(0.2, float(margin_y_ratio))))))
+    if pos_pick == "Giữa trên":
+        return max(mx, pw // 2 - lw // 2), my
+    if pos_pick == "Trái trên":
+        return mx, my
+    if pos_pick == "Phải trên":
+        return max(mx, pw - lw - mx), my
+    if pos_pick == "Trái dưới":
+        return mx, max(my, ph - lh - my)
+    if pos_pick == "Phải dưới":
+        return max(mx, pw - lw - mx), max(my, ph - lh - my)
+    if pos_pick == "Giữa dưới":
+        return max(mx, pw // 2 - lw // 2), max(my, ph - lh - my)
+    return mx, my
+
+
 def compute_logo_overlay_dimensions(
     media: dict[str, Any] | None,
     *,

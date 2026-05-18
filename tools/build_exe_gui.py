@@ -48,6 +48,22 @@ def _bundle_playwright_browsers(*, project_root: Path, dist_dir: Path) -> None:
         shutil.rmtree(dest, ignore_errors=True)
     shutil.copytree(src, dest)
     print(f"PLAYWRIGHT_BROWSERS_BUNDLED={dest}", file=sys.stderr)
+    _write_manifest = project_root / "tools" / "write_browser_bundle_manifest.py"
+    if _write_manifest.is_file():
+        subprocess.run(
+            [
+                sys.executable,
+                str(_write_manifest),
+                "--browsers-path",
+                str(dest),
+                "--out",
+                str(dest.parent / "browser_bundle_manifest.json"),
+                "--out",
+                str(project_root / "release" / "browser_bundle_manifest.json"),
+            ],
+            cwd=str(project_root),
+            check=True,
+        )
 
 
 def _copy_portable_ffmpeg_if_present(*, project_root: Path, dist_dir: Path) -> None:

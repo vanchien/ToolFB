@@ -28,6 +28,38 @@ def timeline_duration_from_source(
     return round(max(0.05, span / sp), 4)
 
 
+def effective_source_span(
+    clip: dict[str, Any],
+    *,
+    media_duration: float | None = None,
+    slack_sec: float = 0.02,
+) -> tuple[float, float]:
+    """
+    Khung ``source_start`` / ``source_end`` khớp ``duration`` × ``speed`` trên timeline.
+
+    Tránh ``source_end`` = cả file (phút) trong khi timeline chỉ vài giây — gây đuôi video thừa 1–2s khi export.
+    """
+    ss = float(clip.get("source_start") or 0.0)
+    try:
+        sp = float(clip.get("speed") or 1.0)
+    except (TypeError, ValueError):
+        sp = 1.0
+    if sp <= 0:
+        sp = 1.0
+    du = max(0.0, float(clip.get("duration") or 0.0))
+    se_raw = float(clip.get("source_end") or 0.0)
+    need = max(0.05, du * sp)
+    se = se_raw if se_raw > ss + 1e-6 else (ss + need)
+    cap = ss + need + max(0.0, float(slack_sec))
+    if se > cap:
+        se = cap
+    if media_duration is not None and float(media_duration) > 0:
+        se = min(se, max(ss + 0.05, float(media_duration)))
+    if se <= ss + 0.05:
+        se = ss + 0.05
+    return ss, se
+
+
 def reconcile_clip_duration_from_source(clip: dict[str, Any]) -> None:
     """Cập nhật ``duration`` trên clip video/audio từ ``source_start`` / ``source_end`` / ``speed``."""
     if str(clip.get("type") or "") not in ("video", "audio"):

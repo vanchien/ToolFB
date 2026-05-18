@@ -19,7 +19,7 @@ from src.services.video_editor.ffmpeg_builder import FFmpegCommandBuilder
 from src.services.video_editor.media_manager import MediaManager
 from src.services.video_editor.project_manager import VideoEditorProjectManager
 from src.services.video_editor.render_worker import RenderWorker
-from src.services.video_editor.timeline_manager import TimelineManager
+from src.services.video_editor.timeline_manager import TimelineManager, effective_source_span
 from src.services.video_editor.validation import validate_export
 from src.utils.ffmpeg_paths import resolve_ffmpeg_executable, resolve_ffmpeg_ffprobe_paths
 
@@ -182,3 +182,133 @@ def test_validate_export_non_contiguous_timeline_ok_by_default(tmp_path: Path) -
         require_contiguous_video_timeline=True,
     )
     assert any("nối tiếp" in e for e in strict), strict
+
+
+def _probe_duration_sec(mm: MediaManager, path: Path) -> float:
+    info = mm.probe_video(str(path))
+    return float(info.get("duration") or 0)
+
+
+def test_export_duration_respects_timeline_not_inflated_source_end(tmp_path: Path) -> None:
+    """Cắt timeline 1s nhưng source_end = cả file — xuất không kéo dài theo metadata."""
+    ffmpeg_bin = _require_ffmpeg()
+    src = tmp_path / "long_src.mp4"
+    _synthetic_mp4(ffmpeg_bin, src)
+
+    paths = _ve_paths(tmp_path / "ve_trim")
+    pm = VideoEditorProjectManager(paths=paths)
+    mm = MediaManager(paths=paths)
+    project = pm.create_project("trim-e2e", width=320, height=240, fps=30)
+    media = mm.import_media(str(src), "video", copy_to_library=True)
+    project.setdefault("media", []).append(media)
+    mid = str(media["id"])
+    probed = float(media.get("duration") or 2.5)
+
+    tm = TimelineManager(project_manager=pm)
+    tm.add_clip(project, mid, "video", persist=True)
+    project = pm.load_project(str(project["id"]))
+    vclip = next(
+        c
+        for t in project["tracks"]
+        if isinstance(t, dict) and t.get("type") == "video"
+        for c in t.get("clips") or []
+        if isinstance(c, dict) and c.get("type") == "video"
+    )
+    vclip["duration"] = 1.0
+    vclip["source_start"] = 0.0
+    vclip["source_end"] = probed
+    ss, se = effective_source_span(vclip, media_duration=probed)
+    vclip["source_start"] = ss
+    vclip["source_end"] = se
+    pm.save_project(project)
+
+    out_p = paths["renders"] / "trim_export.mp4"
+    errs = validate_export(project, ffmpeg_path=ffmpeg_bin, output_path=str(out_p), media_resolver=mm)
+    assert errs == [], errs
+
+    cmd = FFmpegCommandBuilder().build_export_command(
+        project,
+        str(out_p),
+        ffmpeg_bin=ffmpeg_bin,
+        output_duration_limit_sec=None,
+        lightweight_mode_override=True,
+    )
+    worker = RenderWorker()
+    result = worker.render(project, str(out_p), cmd, duration_sec=2.0)
+    assert result.get("ok") is True, result.get("error_message", result)
+    assert out_p.is_file()
+
+    out_dur = _probe_duration_sec(mm, out_p)
+    assert 0.75 <= out_dur <= 1.35, f"Kỳ vọng ~1s, ffprobe={out_dur:.3f}"
+
+
+def test_export_with_logo_overlay(tmp_path: Path) -> None:
+    """Project có overlay PNG — validate + xuất MP4 (luồng logo)."""
+    ffmpeg_bin = _require_ffmpeg()
+    src = tmp_path / "src.mp4"
+    logo = tmp_path / "logo.png"
+    _synthetic_mp4(ffmpeg_bin, src)
+    subprocess.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue@0.6:s=48x48:d=1",
+            "-frames:v",
+            "1",
+            str(logo),
+        ],
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+
+    paths = _ve_paths(tmp_path / "ve_logo")
+    pm = VideoEditorProjectManager(paths=paths)
+    mm = MediaManager(paths=paths)
+    project = pm.create_project("logo-e2e", width=320, height=240, fps=30)
+    v_media = mm.import_media(str(src), "video", copy_to_library=True)
+    i_media = mm.import_media(str(logo), "image", copy_to_library=True)
+    project.setdefault("media", []).extend([v_media, i_media])
+    mid_v, mid_i = str(v_media["id"]), str(i_media["id"])
+
+    tm = TimelineManager(project_manager=pm)
+    tm.add_clip(project, mid_v, "video", persist=True)
+    project = pm.load_project(str(project["id"]))
+    otrack = next(t for t in project["tracks"] if isinstance(t, dict) and t.get("type") == "overlay")
+    otrack.setdefault("clips", []).append(
+        {
+            "id": "ov_logo",
+            "media_id": mid_i,
+            "timeline_start": 0.0,
+            "duration": 1.0,
+            "x": 8,
+            "y": 8,
+            "width": 48,
+            "height": 48,
+            "opacity": 0.9,
+        }
+    )
+    pm.save_project(project)
+
+    out_p = paths["renders"] / "logo_export.mp4"
+    errs = validate_export(project, ffmpeg_path=ffmpeg_bin, output_path=str(out_p), media_resolver=mm)
+    assert errs == [], errs
+
+    cmd = FFmpegCommandBuilder().build_export_command(
+        project,
+        str(out_p),
+        ffmpeg_bin=ffmpeg_bin,
+        output_duration_limit_sec=1.0,
+        lightweight_mode_override=True,
+    )
+    fc_idx = cmd.index("-filter_complex")
+    fc = cmd[fc_idx + 1]
+    assert "overlay" in fc.lower()
+
+    worker = RenderWorker()
+    result = worker.render(project, str(out_p), cmd, duration_sec=1.2)
+    assert result.get("ok") is True, result.get("error_message", result)
+    assert out_p.is_file() and out_p.stat().st_size > 500

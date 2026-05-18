@@ -10,12 +10,19 @@ import pytest
 from src.automation.browser_factory import _project_root
 from src.services.job_post_runtime import (
     JobRunTracker,
+    format_post_job_error,
     job_run_monitor_path,
     validate_account_for_post_job,
     validate_page_for_post_job,
     validate_queue_job_payload,
 )
 from src.scheduler import _compose_job_text_payload, _draft_id_for_queue_job
+
+
+def test_format_post_job_error_adds_step_prefix() -> None:
+    out = format_post_job_error("job", "File video không tồn tại")
+    assert out.startswith("[KIỂM TRA JOB]")
+    assert "File video" in out
 
 
 def test_validate_account_rejects_missing_profile() -> None:

@@ -238,7 +238,10 @@ def _run_chromium_posting_flow(
             if video_path is None and str(reel_video_path or "").strip():
                 video_path = Path(str(reel_video_path).strip())
             if video_path is None:
-                raise RuntimeError("Job reel thiếu video_path/media video để upload.")
+                raise RuntimeError(
+                    "[KIỂM TRA JOB] Thiếu file video để upload "
+                    "(media_files / video_path trong job trống hoặc không resolve được)."
+                )
             _track(STEP_COMPOSER, "Reel: Professional Dashboard -> Create -> Reel")
             post_reel_via_page_dashboard(
                 page,
@@ -247,6 +250,7 @@ def _run_chromium_posting_flow(
                 title=str(reel_title or "").strip(),
                 content=str(reel_content or reel_description_override or text_body or "").strip(),
                 hashtags=list(reel_tags or []),
+                reel_thumbnail_choice=reel_thumbnail_choice,
                 on_step=lambda k, m: _track("REEL_" + str(k), m),
             )
             _track(STEP_VERIFY_RESULT, "Xác nhận đã đăng (Reel Dashboard)")
