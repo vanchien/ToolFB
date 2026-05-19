@@ -1,7 +1,7 @@
 {
-  "version": "1.0.55",
+  "version": "1.0.56",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "d0eeafa6739a5e1a62d8c6539965e0c971222f4459c9e26943e92e23e1603738",
-  "notes": "v1.0.55 — bản đầy đủ cho máy khách: kèm Chromium Playwright trong zip (không cần cài browser riêng). Đăng Reel: nhận Cách 1/2, bấm Next đến ô mô tả (sửa Edit reel). Video editor: cắt đuôi, logo % khung, tab Chỉnh clip. Lỗi đăng bài rõ hơn; đồng bộ trình duyệt bundle giữa máy.",
-  "generated_at": "2026-05-18T13:07:30"
+  "sha256": "9dc47efc156d77381f38ef6d6ddab5eb1d8f44dbbfa7c1e3bdfcd6b02e33f909",
+  "notes": "Reel: luồng Next/nhập caption/Post thống nhất (Cách 1 & 2). Sửa nhập ô Lexical «Describe your reel…» trên màn Edit reel. Full browser bundle (Chromium/FF/WebKit).",
+  "generated_at": "2026-05-19T08:38:15"
 }
