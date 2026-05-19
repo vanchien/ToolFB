@@ -19,7 +19,13 @@ from src.services.video_editor.ffmpeg_builder import FFmpegCommandBuilder
 from src.services.video_editor.media_manager import MediaManager
 from src.services.video_editor.project_manager import VideoEditorProjectManager
 from src.services.video_editor.render_worker import RenderWorker
-from src.services.video_editor.timeline_manager import TimelineManager, effective_source_span
+from src.services.video_editor.timeline_manager import (
+    TimelineManager,
+    effective_source_span,
+    iter_video_clips,
+    sync_overlapping_audio_clips_to_video,
+    video_timeline_clips_overlap,
+)
 from src.services.video_editor.validation import validate_export
 from src.utils.ffmpeg_paths import resolve_ffmpeg_executable, resolve_ffmpeg_ffprobe_paths
 
@@ -52,18 +58,18 @@ def _require_ffmpeg() -> str:
     return ff
 
 
-def _synthetic_mp4(ffmpeg: str, dest: Path) -> None:
+def _synthetic_mp4(ffmpeg: str, dest: Path, *, duration: float = 2.5) -> None:
     cmd = [
         ffmpeg,
         "-y",
         "-f",
         "lavfi",
         "-i",
-        "testsrc=duration=2.5:size=320x240:rate=30",
+        f"testsrc=duration={duration}:size=320x240:rate=30",
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:sample_rate=44100:duration=2.5",
+        f"sine=frequency=440:sample_rate=44100:duration={duration}",
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -75,6 +81,95 @@ def _synthetic_mp4(ffmpeg: str, dest: Path) -> None:
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     assert r.returncode == 0, (r.stderr or r.stdout or "")[-2000:]
+
+
+def _synthetic_logo_png(ffmpeg: str, dest: Path) -> None:
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red@0.7:s=40x40:d=1",
+            "-frames:v",
+            "1",
+            str(dest),
+        ],
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+
+
+def _first_video_clip(project: dict[str, Any]) -> dict[str, Any]:
+    clips = iter_video_clips(project)
+    assert clips, "Cần ít nhất một clip video."
+    return clips[0]
+
+
+def _attach_overlay_logo(
+    project: dict[str, Any],
+    tm: TimelineManager,
+    *,
+    logo_mid: str,
+    timeline_start: float,
+    duration: float,
+) -> None:
+    """Mô phỏng «Chỉnh clip» gắn logo theo khung clip video."""
+    buf: list[dict[str, Any]] = []
+    tm.add_clip(
+        project,
+        logo_mid,
+        "overlay",
+        persist=False,
+        recompute_duration=False,
+        out_new_clip=buf,
+    )
+    assert buf, "Không tạo được clip overlay logo."
+    oc = buf[0]
+    oc["timeline_start"] = float(timeline_start)
+    oc["duration"] = max(0.1, float(duration))
+    oc["x"] = 6
+    oc["y"] = 6
+    oc["width"] = 40
+    oc["height"] = 40
+    oc["opacity"] = 0.88
+
+
+def _render_project(
+    project: dict[str, Any],
+    *,
+    mm: MediaManager,
+    pm: VideoEditorProjectManager,
+    ffmpeg_bin: str,
+    out_p: Path,
+    duration_hint: float,
+    limit_sec: float | None = None,
+) -> None:
+    errs = validate_export(
+        project,
+        ffmpeg_path=ffmpeg_bin,
+        output_path=str(out_p),
+        media_resolver=mm,
+        require_contiguous_video_timeline=True,
+    )
+    assert errs == [], errs
+    cmd = FFmpegCommandBuilder().build_export_command(
+        project,
+        str(out_p),
+        ffmpeg_bin=ffmpeg_bin,
+        output_duration_limit_sec=limit_sec,
+        lightweight_mode_override=True,
+    )
+    assert cmd
+    worker = RenderWorker()
+    cap = max(0.5, float(duration_hint) + 1.5)
+    if limit_sec is not None:
+        cap = min(cap, float(limit_sec) + 1.5)
+    result = worker.render(project, str(out_p), cmd, duration_sec=cap)
+    assert result.get("ok") is True, result.get("error_message", result)
+    assert out_p.is_file() and out_p.stat().st_size > 400
 
 
 def test_video_editor_export_pipeline_e2e(tmp_path: Path) -> None:
@@ -312,3 +407,243 @@ def test_export_with_logo_overlay(tmp_path: Path) -> None:
     result = worker.render(project, str(out_p), cmd, duration_sec=1.2)
     assert result.get("ok") is True, result.get("error_message", result)
     assert out_p.is_file() and out_p.stat().st_size > 500
+
+
+def test_e2e_single_video_chinh_clip_trim_zoom_text_logo(tmp_path: Path) -> None:
+    """
+    E2E 1 video: cắt nguồn → zoom → tốc độ → logo + chữ → xuất MP4.
+    Tương đương tab «Chỉnh clip» + «Áp dụng» cho một clip.
+    """
+    ffmpeg_bin = _require_ffmpeg()
+    src = tmp_path / "one.mp4"
+    logo = tmp_path / "logo.png"
+    _synthetic_mp4(ffmpeg_bin, src, duration=2.2)
+    _synthetic_logo_png(ffmpeg_bin, logo)
+
+    paths = _ve_paths(tmp_path / "ve_one_edit")
+    pm = VideoEditorProjectManager(paths=paths)
+    mm = MediaManager(paths=paths)
+    project = pm.create_project("one-edit", width=320, height=240, fps=24)
+    v_media = mm.import_media(str(src), "video", copy_to_library=True)
+    i_media = mm.import_media(str(logo), "image", copy_to_library=True)
+    project.setdefault("media", []).extend([v_media, i_media])
+    mid_v, mid_i = str(v_media["id"]), str(i_media["id"])
+
+    tm = TimelineManager(project_manager=pm)
+    tm.add_clip(project, mid_v, "video", persist=False, recompute_duration=False)
+    vclip = _first_video_clip(project)
+    cid = str(vclip["id"])
+    probed = float(v_media.get("duration") or 2.2)
+
+    ss0 = 0.25
+    se0 = min(probed, 1.35)
+    tm.trim_clip(project, cid, ss0, se0, persist=False, recompute_duration=False)
+    tm.set_speed(project, cid, 1.1, persist=False, recompute_duration=False)
+    tm.update_clip(
+        project,
+        cid,
+        {"zoom": 1.2, "brightness": 0.08, "canvas_mode": "fit"},
+        persist=False,
+        recompute_duration=False,
+    )
+    vclip = _first_video_clip(project)
+    ts = float(vclip.get("timeline_start") or 0)
+    du = float(vclip.get("duration") or 0)
+    assert 0.85 <= du <= 1.15, f"duration timeline sau cắt+tốc độ: {du}"
+
+    _attach_overlay_logo(project, tm, logo_mid=mid_i, timeline_start=ts, duration=du)
+    tm.add_text_clip(project, "E2E-1", timeline_start=ts, duration=du, persist=False, recompute_duration=False)
+    sync_overlapping_audio_clips_to_video(project, cid, speed=float(vclip.get("speed") or 1.0))
+    tm.refresh_project_duration(project)
+    pm.save_project(project)
+
+    out_p = paths["renders"] / "one_edit.mp4"
+    cmd = FFmpegCommandBuilder().build_export_command(
+        project,
+        str(out_p),
+        ffmpeg_bin=ffmpeg_bin,
+        output_duration_limit_sec=None,
+        lightweight_mode_override=True,
+    )
+    fc = cmd[cmd.index("-filter_complex") + 1]
+    assert "overlay" in fc.lower()
+    assert "drawtext" in fc.lower()
+
+    _render_project(
+        project,
+        mm=mm,
+        pm=pm,
+        ffmpeg_bin=ffmpeg_bin,
+        out_p=out_p,
+        duration_hint=du,
+    )
+    out_dur = _probe_duration_sec(mm, out_p)
+    assert 0.75 <= out_dur <= 1.35, f"Xuất 1 clip kỳ vọng ~1s, ffprobe={out_dur:.3f}"
+
+
+def test_e2e_multi_video_per_clip_export_not_concat(tmp_path: Path) -> None:
+    """
+    E2E nhiều video: mỗi clip T=0 độc lập → chỉnh riêng → xuất 2 file MP4 (ID/clip riêng), không concat.
+    """
+    ffmpeg_bin = _require_ffmpeg()
+    logo = tmp_path / "logo.png"
+    _synthetic_logo_png(ffmpeg_bin, logo)
+
+    paths = _ve_paths(tmp_path / "ve_multi_edit")
+    pm = VideoEditorProjectManager(paths=paths)
+    mm = MediaManager(paths=paths)
+    project = pm.create_project("multi-edit", width=320, height=240, fps=24)
+
+    mids: list[str] = []
+    for i in range(2):
+        src = paths["media"] / f"v{i}.mp4"
+        dur = 1.15 + i * 0.35
+        _synthetic_mp4(ffmpeg_bin, src, duration=dur)
+        media = mm.import_media(str(src), "video", copy_to_library=True)
+        media["source_download_video_id"] = f"src_vid_{i}"
+        project.setdefault("media", []).append(media)
+        mids.append(str(media["id"]))
+
+    i_media = mm.import_media(str(logo), "image", copy_to_library=True)
+    project.setdefault("media", []).append(i_media)
+    mid_i = str(i_media["id"])
+
+    tm = TimelineManager(project_manager=pm)
+    for mid in mids:
+        tm.add_clip(project, mid, "video", persist=False, recompute_duration=False)
+        cl = iter_video_clips(project)[-1]
+        cl["timeline_start"] = 0.0
+
+    trim_head = 0.15
+    dur_by_cid: dict[str, float] = {}
+    for cl in iter_video_clips(project):
+        cid = str(cl["id"])
+        ss = float(cl.get("source_start") or 0)
+        se = float(cl.get("source_end") or 0)
+        tm.trim_clip(project, cid, ss + trim_head, se, persist=False, recompute_duration=False)
+        tm.update_clip(
+            project,
+            cid,
+            {"zoom": 1.15, "canvas_mode": "fill"},
+            persist=False,
+            recompute_duration=False,
+        )
+        fc = _find_clip_in_project(project, cid)
+        assert fc is not None
+        assert float(fc.get("timeline_start") or 0) == 0.0
+        du = float(fc.get("duration") or 0)
+        dur_by_cid[cid] = du
+        _attach_overlay_logo(project, tm, logo_mid=mid_i, timeline_start=0.0, duration=du)
+        sync_overlapping_audio_clips_to_video(project, cid, speed=float(fc.get("speed") or 1.0))
+
+    assert video_timeline_clips_overlap(project)
+    tm.refresh_project_duration(project)
+    pm.save_project(project)
+
+    out_dir = paths["renders"] / "per_clip"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    exported: list[tuple[str, Path]] = []
+    rows = [(str(c.get("id") or ""), c) for c in iter_video_clips(project)]
+    for idx, (cid, _cl) in enumerate(sorted(rows, key=lambda x: x[0]), start=1):
+        bproj, _meta = _build_clip_only_project_for_test(project, str(cid))
+        assert bproj is not None
+        out_p = out_dir / f"clip_{idx}_{cid}.mp4"
+        _render_project(
+            bproj,
+            mm=mm,
+            pm=pm,
+            ffmpeg_bin=ffmpeg_bin,
+            out_p=out_p,
+            duration_hint=dur_by_cid.get(cid, 1.0),
+            limit_sec=None,
+        )
+        exported.append((cid, out_p))
+
+    assert len(exported) == 2
+    assert exported[0][1] != exported[1][1]
+    for cid, out_p in exported:
+        d = _probe_duration_sec(mm, out_p)
+        exp = dur_by_cid[cid]
+        assert exp * 0.72 <= d <= exp * 1.45, f"{cid}: kỳ vọng ~{exp:.2f}s, ffprobe={d:.3f}s"
+
+
+def _build_clip_only_project_for_test(
+    src_project: dict[str, Any], clip_id: str
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Bản rút gọn logic _build_clip_only_project trong video_editor_tab."""
+    import copy
+
+    tracks = src_project.get("tracks") or []
+    src_video_clip: dict[str, Any] | None = None
+    for tr in tracks:
+        if not isinstance(tr, dict) or str(tr.get("type") or "") != "video":
+            continue
+        for cl in tr.get("clips") or []:
+            if isinstance(cl, dict) and str(cl.get("id") or "") == clip_id:
+                src_video_clip = cl
+                break
+        if src_video_clip is not None:
+            break
+    if src_video_clip is None:
+        return None, {}
+    ts = float(src_video_clip.get("timeline_start") or 0.0)
+    dur = max(0.1, float(src_video_clip.get("duration") or 0.0))
+    te = ts + dur
+    out = copy.deepcopy(src_project)
+    out_tracks: list[dict[str, Any]] = []
+    for tr in out.get("tracks") or []:
+        if not isinstance(tr, dict):
+            continue
+        tr_type = str(tr.get("type") or "")
+        new_clips: list[dict[str, Any]] = []
+        for cl in tr.get("clips") or []:
+            if not isinstance(cl, dict):
+                continue
+            cs = float(cl.get("timeline_start") or 0.0)
+            cd = max(0.0, float(cl.get("duration") or 0.0))
+            ce = cs + cd
+            ov_start = max(ts, cs)
+            ov_end = min(te, ce)
+            if ov_end <= ov_start:
+                continue
+            if tr_type == "video" and str(cl.get("id") or "") != clip_id:
+                continue
+            ncl = dict(cl)
+            old_cs = cs
+            ncl["timeline_start"] = max(0.0, ov_start - ts)
+            ncl["duration"] = max(0.05, ov_end - ov_start)
+            if "source_start" in ncl:
+                try:
+                    sp = float(cl.get("speed") or 1.0)
+                    if sp <= 0:
+                        sp = 1.0
+                    ncl["source_start"] = float(cl.get("source_start") or 0.0) + max(0.0, ov_start - old_cs) * sp
+                except Exception:
+                    pass
+            if "source_end" in ncl:
+                try:
+                    sp = float(cl.get("speed") or 1.0)
+                    if sp <= 0:
+                        sp = 1.0
+                    ss1 = float(ncl.get("source_start") or 0.0)
+                    ncl["source_end"] = ss1 + max(0.05, (ov_end - ov_start) * sp)
+                except Exception:
+                    pass
+            new_clips.append(ncl)
+        ntr = dict(tr)
+        ntr["clips"] = new_clips
+        out_tracks.append(ntr)
+    out["tracks"] = out_tracks
+    out["duration"] = dur
+    return out, {}
+
+
+def _find_clip_in_project(project: dict[str, Any], clip_id: str) -> dict[str, Any] | None:
+    cid = str(clip_id)
+    for tr in project.get("tracks") or []:
+        if not isinstance(tr, dict):
+            continue
+        for cl in tr.get("clips") or []:
+            if isinstance(cl, dict) and str(cl.get("id") or "") == cid:
+                return cl
+    return None

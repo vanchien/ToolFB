@@ -1847,18 +1847,22 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     ncl = dict(cl)
                     ncl["timeline_start"] = max(0.0, ov_s - win_s)
                     ncl["duration"] = max(0.05, ov_e - ov_s)
-                    # Đồng bộ source_start/source_end cho clip có nguồn media.
-                    if "source_start" in ncl:
+                    # Đồng bộ source theo cửa sổ timeline (nhân speed cho video/audio).
+                    if "source_start" in ncl or "source_end" in ncl:
                         try:
-                            ss = float(cl.get("source_start") or 0.0)
-                            ncl["source_start"] = ss + max(0.0, ov_s - cs)
-                        except Exception:
-                            pass
-                    if "source_end" in ncl:
-                        try:
-                            ncl["source_end"] = float(ncl.get("source_start") or 0.0) + float(ncl.get("duration") or 0.0)
-                        except Exception:
-                            pass
+                            sp = float(cl.get("speed") or 1.0)
+                        except (TypeError, ValueError):
+                            sp = 1.0
+                        if sp <= 0:
+                            sp = 1.0
+                        tl0 = max(0.0, ov_s - cs)
+                        tl1 = max(tl0, ov_e - cs)
+                        ss0 = float(cl.get("source_start") or 0.0)
+                        if "source_start" in ncl:
+                            ncl["source_start"] = ss0 + tl0 * sp
+                        if "source_end" in ncl:
+                            ss1 = float(ncl.get("source_start") or ss0)
+                            ncl["source_end"] = ss1 + max(0.05, (tl1 - tl0) * sp)
                     nclips.append(ncl)
                 ntr["clips"] = nclips
                 new_tracks.append(ntr)
@@ -4018,7 +4022,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                             logo_corner=logo_corner_b,
                             audio_mid=str(audio_mid or "").strip() if add_audio else "",
                             audio_volume=audio_vol,
-                            audio_speed=batch_audio_sp if add_audio else None,
+                            audio_speed=None,
                             text_content=text_val if add_text else "",
                             logo_on_conflict=loc_b if add_logo else "skip",
                             audio_on_conflict=aoc_b if add_audio else "skip",
@@ -5636,6 +5640,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         recompute_duration=not defer_tm,
                         out_new_clip=_new_v,
                     )
+                    # Mỗi video độc lập (cùng mốc T=0) — xuất per-clip, không ghép nối timeline.
                     if _new_v:
                         _new_v[0]["timeline_start"] = 0.0
                     type_counts["video"] += 1
@@ -5668,7 +5673,12 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             if type_counts["audio"]:
                 parts.append(f"{type_counts['audio']} audio")
             extra = f", bỏ qua {skipped}" if skipped else ""
-            notify(f"Đã thêm {added} clip lên timeline ({', '.join(parts)}){extra}.")
+            indep_hint = (
+                " — mỗi video độc lập (T=0), xuất riêng theo ID"
+                if type_counts["video"] > 1
+                else ""
+            )
+            notify(f"Đã thêm {added} clip lên timeline ({', '.join(parts)}){extra}{indep_hint}.")
         elif skipped > 0:
             messagebox.showinfo("Timeline", "Các mục đã chọn không thuộc loại hỗ trợ (video/ảnh/audio).")
         if errs:
@@ -5860,11 +5870,10 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             )
             if sync_audio:
                 fc_sync = _find_clip(str(cid))
-                sp_sync = (
-                    float(fc_sync[1].get("speed") or 1.0)
-                    if fc_sync and fc_sync[1]
-                    else sp
-                )
+                try:
+                    sp_sync = float((fc_sync[1] if fc_sync and fc_sync[1] else cl).get("speed") or 1.0)
+                except (TypeError, ValueError):
+                    sp_sync = 1.0
                 if sp_sync <= 0:
                     sp_sync = 1.0
                 _sync_overlapping_timeline_audio_to_video(str(cid), sp_sync)
@@ -9297,7 +9306,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         exp_inner,
         text=(
             "Xuất MP4 theo cấu hình bạn chọn: tỷ lệ khung hình, độ phân giải và FPS.\n"
-            "Luồng này xuất toàn timeline hiện tại thành 1 file MP4."
+            "Một clip video → 1 file MP4. Nhiều clip → mỗi video 1 file riêng (theo ID nguồn), không ghép nối."
         ),
         foreground="#555",
         font=("Segoe UI", 9),
@@ -9570,7 +9579,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     ttk.Entry(fr_export_post, textvariable=var_exp_saved_job_name).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
     ttk.Checkbutton(
         fr_export_post,
-        text="Xuất mỗi clip video thành 1 file riêng (auto map metadata chuẩn nhất)",
+        text="Xuất mỗi clip video thành 1 file riêng (bắt buộc khi có ≥2 video — map metadata theo ID)",
         variable=var_exp_per_clip,
     ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
     ttk.Label(fr_export_post, text="Mẫu tên file nhiều clip").grid(row=5, column=0, sticky="w", pady=(4, 0))
@@ -9957,7 +9966,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         if not all_rows:
             messagebox.showinfo("Export", "Timeline chưa có clip video để xuất.")
             return
-        per_clip = bool(var_exp_per_clip.get()) and len(all_rows) > 1
+        # Nhiều video: luôn xuất tách file (ID riêng) — không concat thành 1 MP4.
+        per_clip = len(all_rows) > 1 or bool(var_exp_per_clip.get())
         with _export_start_lock:
             if int(_export_run_state.get("running") or 0) > 0:
                 notify("Đang có tiến trình export chạy.")

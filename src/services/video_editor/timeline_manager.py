@@ -108,18 +108,55 @@ def _update_project_duration(project: dict[str, Any]) -> None:
     project["duration"] = round(end, 4)
 
 
-def compute_video_timeline_end(project: dict[str, Any]) -> float:
-    """Độ dài timeline chỉ tính từ track video (không kéo dài vì clip audio cũ)."""
-    end = 0.0
+def iter_video_clips(project: dict[str, Any]) -> list[dict[str, Any]]:
+    """Clip video trên timeline, sắp theo ``timeline_start``."""
+    out: list[dict[str, Any]] = []
     for tr in project.get("tracks") or []:
         if not isinstance(tr, dict) or str(tr.get("type") or "") != "video":
             continue
         for cl in tr.get("clips") or []:
-            if not isinstance(cl, dict) or str(cl.get("type") or "") != "video":
-                continue
-            ts = float(cl.get("timeline_start") or 0)
-            du = float(cl.get("duration") or 0)
-            end = max(end, ts + du)
+            if isinstance(cl, dict) and str(cl.get("type") or "") == "video":
+                out.append(cl)
+    out.sort(key=lambda c: float(c.get("timeline_start") or 0))
+    return out
+
+
+def video_timeline_clips_overlap(project: dict[str, Any], *, epsilon: float = 0.02) -> bool:
+    """True nếu hai clip video chồng khung thời gian (cùng mốc T hoặc overlap)."""
+    clips = iter_video_clips(project)
+    eps = max(0.0, float(epsilon))
+    for i, a in enumerate(clips):
+        ta = float(a.get("timeline_start") or 0)
+        da = float(a.get("duration") or 0)
+        ae = ta + da
+        for b in clips[i + 1 :]:
+            tb = float(b.get("timeline_start") or 0)
+            be = tb + float(b.get("duration") or 0)
+            if min(ae, be) > max(ta, tb) + eps:
+                return True
+    return False
+
+
+def repack_video_clips_sequential(project: dict[str, Any]) -> float:
+    """
+    Đặt lại ``timeline_start`` các clip video nối đuôi (0 → tổng duration).
+    Dùng sau cắt/đổi độ dài clip để clip sau không còn khoảng trống/chồng lệch.
+    """
+    clips = iter_video_clips(project)
+    cursor = 0.0
+    for cl in clips:
+        cl["timeline_start"] = round(cursor, 4)
+        cursor += max(0.0, float(cl.get("duration") or 0.0))
+    return round(cursor, 4)
+
+
+def compute_video_timeline_end(project: dict[str, Any]) -> float:
+    """Độ dài timeline chỉ tính từ track video (không kéo dài vì clip audio cũ)."""
+    end = 0.0
+    for cl in iter_video_clips(project):
+        ts = float(cl.get("timeline_start") or 0)
+        du = float(cl.get("duration") or 0)
+        end = max(end, ts + du)
     return round(end, 4)
 
 
@@ -238,6 +275,14 @@ class TimelineManager:
     def refresh_project_duration(self, project: dict[str, Any]) -> None:
         """Cập nhật ``project['duration']`` từ toàn bộ clip (gọi sau thao tác hàng loạt nếu đã tắt recompute từng bước)."""
         _update_project_duration(project)
+
+    def repack_video_sequential(self, project: dict[str, Any], *, persist: bool = True) -> float:
+        """Xếp lại clip video nối đuôi; trả về độ dài timeline video."""
+        end = repack_video_clips_sequential(project)
+        _update_project_duration(project)
+        if persist:
+            self._pm.save_project(project)
+        return end
 
     def sync_overlapping_audio_to_video(
         self,
