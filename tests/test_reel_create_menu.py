@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from src.automation.facebook_actions import (
     _REEL_LEXICAL_TEXTBOX_SELECTORS,
+    _REEL_POST_CSS_SELECTORS,
+    _REEL_POST_STRICT_XPATHS,
     _REEL_MENU_LABEL_RE,
     _REEL_MENU_NAME_RE,
     _REEL_UPLOAD_READY_RE,
@@ -51,6 +53,21 @@ def test_reel_lexical_selectors_match_describe_placeholder() -> None:
     joined = " ".join(_REEL_LEXICAL_TEXTBOX_SELECTORS)
     assert "data-lexical-editor" in joined
     assert "Describe" in joined
+
+
+def test_reel_post_strict_xpaths_match_html_div_post() -> None:
+    joined = " ".join(_REEL_POST_STRICT_XPATHS)
+    assert "html-div" in joined
+    assert "x1j85h84" in joined
+    assert "Post" in joined
+    assert "dir='auto'" in joined or "dir=auto" in joined
+    assert "Save" in joined
+
+
+def test_reel_post_css_selectors_match_html_div_post() -> None:
+    joined = " ".join(_REEL_POST_CSS_SELECTORS)
+    assert "html-div" in joined
+    assert "x1j85h84" in joined
 
 
 def test_build_reel_text_payload_merges_title_content_tags() -> None:
