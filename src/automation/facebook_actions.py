@@ -2384,6 +2384,116 @@ def _meta_reel_next_any_visible(page: Page) -> bool:
     return False
 
 
+_REEL_NEXT_LABEL_RE = re.compile(r"^(Next|Tiếp|Tiếp theo)$", re.I)
+
+# Nút Next dashboard Reel — cùng pattern html-div như Post
+_REEL_NEXT_STRICT_XPATHS: tuple[str, ...] = (
+    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x1j85h84') and normalize-space()='Next']])[last()]",
+    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[normalize-space()='Next']])[last()]",
+    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[normalize-space()='Tiếp']])[last()]",
+    "(//span[normalize-space()='Next']/ancestor::div[contains(@class,'html-div')][1])[last()]",
+    "(//div[@role='none' and .//span[normalize-space()='Next']])[last()]",
+    "(//div[@role='button' and @tabindex='0' and .//div[normalize-space()='Next']])[last()]",
+)
+
+_REEL_NEXT_CSS_SELECTORS: tuple[str, ...] = (
+    "div.html-div:has(div[role='none'] span:has-text('Next'))",
+    "div.html-div div[role='none'] span:has-text('Next')",
+    "div.html-div div[role='none'] span:has-text('Tiếp')",
+)
+
+_REEL_WIZARD_PROCESSING_MARKERS: tuple[str, ...] = (
+    "Checking for copyrighted content",
+    "Đang kiểm tra bản quyền",
+    "Processing",
+    "Uploading",
+    "Đang xử lý",
+    "đang tải",
+    "Your reel is being processed",
+)
+
+
+def _reel_wizard_processing(page: Page, *, timeout_ms: int = 280) -> bool:
+    """Upload/copyright/Processing — chờ, chưa bấm Next."""
+    for m in _REEL_WIZARD_PROCESSING_MARKERS:
+        try:
+            if page.get_by_text(m, exact=False).first.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    if _meta_reel_next_any_visible(page) and not _meta_reel_next_clickable(page):
+        return True
+    return False
+
+
+def _try_click_reel_wizard_next(page: Page) -> bool:
+    """Bấm Next — mọi biến thể UI (role=button, html-div, dialog/page)."""
+    if _click_meta_reel_next_strict(page):
+        return True
+    for xp in _REEL_NEXT_STRICT_XPATHS:
+        try:
+            loc = page.locator(f"xpath={xp}")
+            if loc.count() <= 0 or not loc.last.is_visible(timeout=600):
+                continue
+            try:
+                loc.last.evaluate(_REEL_POST_CLICK_JS)
+            except Exception:
+                loc.last.click(timeout=1400, force=True, no_wait_after=True)
+            return True
+        except Exception:
+            continue
+    for css in _REEL_NEXT_CSS_SELECTORS:
+        try:
+            loc = page.locator(css).last
+            if loc.count() > 0 and loc.is_visible(timeout=500):
+                try:
+                    loc.evaluate(_REEL_POST_CLICK_JS)
+                except Exception:
+                    loc.click(timeout=1400, force=True, no_wait_after=True)
+                return True
+        except Exception:
+            continue
+    return _click_meta_reel_next_best_effort(page)
+
+
+def _wait_after_reel_next_click(page: Page, *, prev_label: str = "") -> None:
+    """Chờ UI chuyển màn sau Next (caption / post / hết processing)."""
+    inner = time.time() + 20.0
+    while time.time() < inner:
+        if prev_label and _reel_active_step_label(page) != prev_label:
+            break
+        if _reel_caption_input_usable(page, timeout_ms=320):
+            break
+        if _reel_post_button_maybe_visible(page, timeout_ms=320):
+            break
+        if not _reel_wizard_processing(page, timeout_ms=220):
+            break
+        page.wait_for_timeout(320)
+    page.wait_for_timeout(random.randint(700, 1400))
+
+
+def _reel_wizard_needs_next(
+    page: Page,
+    *,
+    payload: str,
+    filled: bool,
+) -> bool:
+    """
+    Cần bấm Next khi:
+    - Chưa có ô caption (cần Next tới màn nhập), hoặc
+    - Đã nhập caption nhưng chưa thấy Post.
+    """
+    if _reel_wizard_ready_to_post(page, payload=payload, filled=filled, next_clicks=0):
+        return False
+    if payload and not filled:
+        if _reel_caption_input_usable(page, timeout_ms=400):
+            return False
+        return True
+    if payload and filled:
+        return True
+    return not _reel_strict_post_button_visible(page, timeout_ms=300)
+
+
 def _reel_edit_reel_header_visible(page: Page, *, timeout_ms: int = 350) -> bool:
     """Tiêu đề màn «Edit reel» — chưa phải màn nhập caption."""
     for rx in (r"^\s*Edit reel\s*$", r"^\s*Chỉnh sửa Thước phim\s*$"):
@@ -3441,18 +3551,11 @@ def complete_meta_business_reel_post_wizard(
     reel_thumbnail_choice: str | None = None,
 ) -> bool:
     """
-    Hoàn tất đăng Reel sau upload: mô tả (tuỳ chọn) → Tags từ ``#hashtag`` (tuỳ chọn) → Next → Next → Share now hoặc Schedule + giờ job;
-    nếu Meta hiện **Video post processing** thì bấm **Done** để kết thúc luồng.
+    Legacy Meta Business **composer** Reel wizard (Share/Done) — không dùng cho job ``video|text_video|reel``
+    (các job đó đi ``post_reel_via_page_dashboard`` + ``submit_mode='post'``).
 
-    Args:
-        page: Trang Playwright.
-        description: Hashtag / caption cho ô mô tả Reel.
-        share_now: True → ``Share now``; False → chọn ``Schedule`` và điền giờ best-effort.
-        scheduled_at_utc_iso: ISO UTC của job (khi ``share_now`` = False).
-
-    Returns:
-        True nếu đã bấm được ít nhất một nút submit thật (Share/Publish/Post/Schedule),
-        False nếu không bấm được submit.
+    Hoàn tất đăng Reel sau upload trong composer: Next → nhập caption → Share now;
+    nếu Meta hiện **Video post processing** thì bấm **Done**.
     """
     ui_way = detect_meta_reel_ui_way(page)
     if ui_way == "unknown":
@@ -3462,203 +3565,24 @@ def complete_meta_business_reel_post_wizard(
         ui_way = "way1"
     if ui_way == "unknown":
         ui_way = "way1"
-    logger.info("{} detect_meta_reel_ui_way → {}", _reel_strict_prefix("Wizard"), ui_way)
-    if ui_way == "way2":
-        logger.info(
-            "{} UI cách 2 — dùng luồng Next/nhập/Post thống nhất (không post ngay).",
-            _reel_strict_prefix("Wizard"),
-        )
-        complete_reel_wizard_fill_next_and_post(
-            page,
-            content=str(description or "").strip(),
-            reel_thumbnail_choice=reel_thumbnail_choice,
-            max_next_clicks=15,
-            total_timeout_sec=240.0,
-        )
-        _human_pause()
-        return True
-
-    thumb_mode = normalize_reel_thumbnail_choice(reel_thumbnail_choice)
-
-    fill_meta_reel_description(page, description)
-    fill_meta_reel_tags_best_effort(page, description, reel_tags=reel_tags)
-
-    if thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
-        try:
-            page.wait_for_timeout(random.randint(380, 780))
-        except Exception:
-            pass
-        _choose_first_reel_thumbnail_method1_best_effort(page)
+    logger.info(
+        "{} Legacy composer wizard (Share) | detect_meta_reel_ui_way → {}",
+        _reel_strict_prefix("Wizard"),
+        ui_way,
+    )
 
     if not share_now:
         raise RuntimeError("Luồng chuẩn video/reel hiện chỉ hỗ trợ Share now.")
 
-    def _share_btn() -> Locator:
-        return page.locator(
-            "xpath=(//div[@role='button' and @tabindex='0' and @aria-busy='false' and .//div[normalize-space()='Share']])[last()]"
-        )
-
-    def _done_btn() -> Locator:
-        return page.locator(
-            "xpath=(//div[@role='button' and @tabindex='0' and @aria-busy='false' "
-            "and (.//div[normalize-space()='Done'] or .//div[normalize-space()='Xong'])])[last()]"
-        )
-
-    def _click_done_strict(timeout_ms: int = 15_000) -> bool:
-        stage = _reel_strict_prefix("Wizard")
-        d = _done_btn()
-        try:
-            if d.count() <= 0:
-                return False
-            if not d.is_visible(timeout=2_500):
-                return False
-            if (d.get_attribute("aria-disabled") or "").strip().lower() == "true":
-                return False
-            human_pause(kind="click", label="trước Done (Reel)")
-            try:
-                d.evaluate("el => el && el.click && el.click()")
-                logger.info("{} _click_done_strict: đã dispatch JS click.", stage)
-                return True
-            except Exception as exc_js:
-                logger.debug("{} _click_done_strict: JS click lỗi: {}", stage, exc_js)
-            try:
-                d.click(timeout=min(timeout_ms, 5_000), force=True, no_wait_after=True)
-                logger.info("{} _click_done_strict: đã click force (fallback).", stage)
-                return True
-            except Exception as exc_force:
-                logger.warning("{} _click_done_strict: force click lỗi: {}", stage, exc_force)
-                return False
-        except Exception as exc:
-            logger.debug("{} _click_done_strict: lỗi không xác định: {}", stage, exc)
-            return False
-
-    def _wait_next_button_ready(next_btn: Locator, *, timeout_ms: int = 10_000) -> None:
-        next_btn.wait_for(state="visible", timeout=timeout_ms)
-        dis = (next_btn.get_attribute("aria-disabled") or "").strip().lower()
-        if dis == "true":
-            raise RuntimeError("Nút Next đang disabled.")
-
-    def _click_next_strict(timeout_ms: int = 20_000) -> bool:
-        return _click_meta_reel_next_strict(page, timeout_ms=timeout_ms)
-
-    for idx in (1, 2):
-        before = _reel_active_step_label(page)
-        advanced = False
-        for attempt in (1, 2):
-            page.wait_for_timeout(_reel_inter_click_wait_ms())
-            clicked = _click_meta_reel_next_with_verify(page, step_index=idx)
-            if not clicked:
-                clicked = _click_next_strict(timeout_ms=20_000)
-            if not clicked:
-                if attempt == 2:
-                    raise PlaywrightTimeoutError(f"Không bấm được nút Next (lần {idx}) trong luồng chuẩn.")
-                page.wait_for_timeout(_reel_inter_click_wait_ms())
-                continue
-            human_pause(kind="step", label=f"sau Next Reel lần {idx}")
-            if _wait_reel_step_change(page, before, timeout_ms=10_000):
-                logger.info("{} Đã bấm Next chuẩn (lần {}, attempt {}).", _reel_strict_prefix("Wizard"), idx, attempt)
-                advanced = True
-                break
-            # Click có thể bị "ăn" nhưng step label chưa đổi; thử lại 1 lần có kiểm soát.
-            page.wait_for_timeout(_reel_inter_click_wait_ms())
-        if not advanced:
-            raise PlaywrightTimeoutError(f"Next lần {idx} không đổi step ({before}).")
-        if idx == 1 and thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
-            try:
-                page.wait_for_timeout(_reel_inter_click_wait_ms())
-            except Exception:
-                pass
-            _choose_first_reel_thumbnail_method1_best_effort(page)
-
-    def _click_share_strict(timeout_ms: int = 20_000) -> bool:
-        stage = _reel_strict_prefix("Wizard")
-        s = _share_btn()
-        try:
-            if s.count() <= 0:
-                logger.warning("{} _click_share: không thấy Share theo XPath chuẩn.", stage)
-                return False
-            if not s.is_visible(timeout=2_500):
-                logger.warning("{} _click_share: Share tồn tại nhưng chưa visible.", stage)
-                return False
-            if (s.get_attribute("aria-disabled") or "").strip().lower() == "true":
-                logger.warning("{} _click_share: Share đang aria-disabled=true.", stage)
-                return False
-            human_pause(kind="click", label="trước Share (Reel)")
-            try:
-                s.evaluate("el => el && el.click && el.click()")
-                logger.info("{} _click_share: đã dispatch JS click.", stage)
-                return True
-            except Exception as exc_js:
-                logger.debug("{} _click_share: JS click lỗi: {}", stage, exc_js)
-            try:
-                s.click(timeout=min(timeout_ms, 6_000), force=True, no_wait_after=True)
-                logger.info("{} _click_share: đã click force (fallback).", stage)
-                return True
-            except Exception as exc_force:
-                logger.warning("{} _click_share: force click lỗi: {}", stage, exc_force)
-                return False
-        except Exception as exc:
-            logger.warning("{} _click_share: lỗi không xác định: {}", stage, exc)
-            return False
-
-    sb = _share_btn()
-    if sb.count() <= 0 or not sb.is_visible(timeout=4_000):
-        raise PlaywrightTimeoutError("Không tìm thấy nút Share trong luồng chuẩn.")
-    sdis = (sb.get_attribute("aria-disabled") or "").strip().lower()
-    if sdis == "true":
-        raise RuntimeError("Nút Share đang disabled.")
-    page.wait_for_timeout(_reel_inter_click_wait_ms())
-    share_ok = False
-    for attempt in (1, 2):
-        if _click_share_strict(timeout_ms=20_000):
-            share_ok = True
-            logger.info("{} Đã bấm Share chuẩn (attempt {}).", _reel_strict_prefix("Wizard"), attempt)
-            break
-        try:
-            page.wait_for_timeout(_reel_inter_click_wait_ms())
-        except Exception as exc:
-            if "closed" in str(exc).lower():
-                logger.info("{} Page đóng trong lúc retry Share → coi như đã submit.", _reel_strict_prefix("Wizard"))
-                return True
-            raise
-    if not share_ok:
-        raise PlaywrightTimeoutError("Không bấm được nút Share trong luồng chuẩn.")
-    _human_pause()
-
-    done_clicked = False
-    try:
-        db = _done_btn()
-        if db.count() > 0 and db.is_visible(timeout=20_000):
-            if _click_done_strict(timeout_ms=15_000):
-                logger.info("{} Đã bấm Done chuẩn.", _reel_strict_prefix("Wizard"))
-                done_clicked = True
-                _human_pause()
-    except Exception as exc:
-        # Page/browser có thể đóng sau Share → xem như đã submit.
-        if "closed" in str(exc).lower():
-            logger.info("{} Page đóng sau Share trước khi kiểm tra Done → coi như đã submit.", _reel_strict_prefix("Wizard"))
-            return True
-        raise
-
-    try:
-        processed = dismiss_meta_video_post_processing_modal_best_effort(
-            page, timeout_ms=120_000, give_up_if_never_seen_ms=15_000
-        )
-    except Exception as exc:
-        if "closed" in str(exc).lower():
-            logger.info("{} Page đóng khi chờ processing → coi như đã submit.", _reel_strict_prefix("Wizard"))
-            return True
-        raise
-    submit_clicked = bool(done_clicked or processed)
-    try:
-        _enable_view_only_guard(page)
-    except Exception as exc:
-        if "closed" in str(exc).lower():
-            logger.info("{} Page đóng khi bật lại lock-ui cuối wizard → coi như đã submit.", _reel_strict_prefix("Wizard"))
-            return True
-        logger.debug("{} Không bật lại được lock-ui cuối wizard: {}", _reel_strict_prefix("Wizard"), exc)
-    if not submit_clicked:
-        raise PlaywrightTimeoutError("Đã bấm Share nhưng không thấy Done/processing xác nhận.")
+    complete_reel_wizard_fill_next_and_post(
+        page,
+        content=str(description or "").strip(),
+        hashtags=list(reel_tags or []),
+        reel_thumbnail_choice=reel_thumbnail_choice,
+        submit_mode="share",
+        max_next_clicks=18,
+        total_timeout_sec=300.0,
+    )
     return True
 
 
@@ -3992,19 +3916,19 @@ def _click_next_in_dialog(page: Page, dialog: Locator) -> None:
 
 _REEL_POST_LABEL_RE = re.compile(r"^(Post|Đăng|Publish)$", re.I)
 
-# Reel settings: div.html-div > div[role=none] > span[dir=auto] > span.x1j85h84 «Post»
-_REEL_POST_STRICT_XPATHS: tuple[str, ...] = (
+_REEL_POST_STRICT_ONLY_XPATHS: tuple[str, ...] = (
     "(//div[contains(@class,'html-div')][.//div[@role='none']//span[@dir='auto']//span[contains(@class,'x1j85h84') and normalize-space()='Post']])[last()]",
     "(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x1j85h84') and normalize-space()='Post']])[last()]",
-    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[normalize-space()='Đăng' and contains(@class,'x1j85h84')]])[last()]",
+    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x1j85h84') and normalize-space()='Đăng']])[last()]",
     "(//span[contains(@class,'x1j85h84') and normalize-space()='Post']/ancestor::div[contains(@class,'html-div')][1])[last()]",
     "(//span[contains(@class,'x1j85h84') and normalize-space()='Đăng']/ancestor::div[contains(@class,'html-div')][1])[last()]",
     "(//div[contains(@class,'html-div')][.//span[normalize-space()='Save']]/following::div[contains(@class,'html-div')][.//span[contains(@class,'x1j85h84') and normalize-space()='Post']])[last()]",
     "(//div[@role='none' and .//span[normalize-space()='Post' and contains(@class,'x1j85h84')]])[last()]",
     "(//div[@role='none' and .//span[normalize-space()='Đăng' and contains(@class,'x1j85h84')]])[last()]",
-    "(//div[@role='none' and .//span[normalize-space()='Post']])[last()]",
-    "(//div[@role='none' and .//span[normalize-space()='Đăng']])[last()]",
 )
+
+# Giữ alias cũ — chỉ xpath chặt (không match «Posts», menu Create…)
+_REEL_POST_STRICT_XPATHS = _REEL_POST_STRICT_ONLY_XPATHS
 _REEL_POST_CSS_SELECTORS: tuple[str, ...] = (
     "div.html-div:has(div[role='none'] span.x1j85h84)",
     "div.html-div div[role='none'] span.x1j85h84",
@@ -4040,8 +3964,35 @@ def _reel_settings_screen_visible(page: Page, *, timeout_ms: int = 350) -> bool:
     return False
 
 
-def _reel_post_button_locators(page: Page, *, dialog: Locator | None = None) -> list[Locator]:
-    """Ứng viên nút Post — quét dialog + toàn trang (Reel settings)."""
+def _reel_post_label_text(loc: Locator) -> str:
+    try:
+        return str(loc.inner_text(timeout=400) or "").strip()
+    except Exception:
+        return ""
+
+
+def _reel_locator_is_post_submit(loc: Locator) -> bool:
+    """Xác minh locator là nút Post/Đăng thật (không phải «Posts», «Create post»…)."""
+    try:
+        if loc.count() <= 0 or not loc.is_visible(timeout=350):
+            return False
+    except Exception:
+        return False
+    txt = _reel_post_label_text(loc)
+    if txt and _REEL_POST_LABEL_RE.match(txt):
+        return True
+    try:
+        span = loc.locator("span.x1j85h84").first
+        if span.count() > 0 and span.is_visible(timeout=200):
+            inner = _reel_post_label_text(span)
+            return bool(inner and _REEL_POST_LABEL_RE.match(inner))
+    except Exception:
+        pass
+    return False
+
+
+def _reel_strict_post_button_locators(page: Page, *, dialog: Locator | None = None) -> list[Locator]:
+    """Chỉ nút Post Reel settings — trong dialog Reel, xpath/css chặt."""
     scopes: list[Locator] = []
     if dialog is not None:
         scopes.append(dialog)
@@ -4051,10 +4002,8 @@ def _reel_post_button_locators(page: Page, *, dialog: Locator | None = None) -> 
             scopes.append(dlg)
     except Exception:
         pass
-    scopes.append(page)
     out: list[Locator] = []
     seen: set[int] = set()
-    pat = re.compile(r"Post|Đăng|Publish", re.I)
 
     def _add(loc: Locator) -> None:
         key = id(loc)
@@ -4064,7 +4013,7 @@ def _reel_post_button_locators(page: Page, *, dialog: Locator | None = None) -> 
         out.append(loc)
 
     for scope in scopes:
-        for xp in _REEL_POST_STRICT_XPATHS:
+        for xp in _REEL_POST_STRICT_ONLY_XPATHS:
             _add(scope.locator(f"xpath={xp}"))
         for css in _REEL_POST_CSS_SELECTORS:
             try:
@@ -4074,25 +4023,225 @@ def _reel_post_button_locators(page: Page, *, dialog: Locator | None = None) -> 
         try:
             _add(
                 scope.locator("div.html-div").filter(
-                    has=scope.locator('div[role="none"] span.x1j85h84', has_text=_REEL_POST_LABEL_RE)
+                    has=scope.locator(
+                        'div[role="none"] span.x1j85h84',
+                        has_text=_REEL_POST_LABEL_RE,
+                    )
                 ).last
             )
         except Exception:
             pass
-        try:
-            _add(scope.get_by_role("button", name=pat).last)
-        except Exception:
-            pass
-        try:
-            _add(
-                scope.get_by_text(_REEL_POST_LABEL_RE, exact=True)
-                .filter(has=scope.locator("span.x1j85h84"))
-                .locator("xpath=ancestor::div[contains(@class,'html-div')][1]")
-                .last
-            )
-        except Exception:
-            pass
     return out
+
+
+def _reel_strict_post_button_visible(page: Page, *, timeout_ms: int = 450) -> bool:
+    dialog = _active_reel_dialog(page)
+    for loc in _reel_strict_post_button_locators(page, dialog=dialog):
+        if _reel_locator_is_post_submit(loc):
+            return True
+    return False
+
+
+def _reel_share_button_locator(page: Page) -> Locator:
+    return page.locator(
+        "xpath=(//div[@role='button' and @tabindex='0' and @aria-busy='false' "
+        "and .//div[normalize-space()='Share']])[last()]"
+    )
+
+
+def _reel_done_button_locator(page: Page) -> Locator:
+    return page.locator(
+        "xpath=(//div[@role='button' and @tabindex='0' and @aria-busy='false' "
+        "and (.//div[normalize-space()='Done'] or .//div[normalize-space()='Xong'])])[last()]"
+    )
+
+
+def _reel_share_button_visible(page: Page, *, timeout_ms: int = 400) -> bool:
+    s = _reel_share_button_locator(page)
+    try:
+        if s.count() <= 0:
+            return False
+        if not s.is_visible(timeout=timeout_ms):
+            return False
+        if (s.get_attribute("aria-disabled") or "").strip().lower() == "true":
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _click_reel_share_best_effort(page: Page, *, timeout_ms: int = 20_000) -> bool:
+    stage = _reel_strict_prefix("Wizard")
+    s = _reel_share_button_locator(page)
+    try:
+        if s.count() <= 0:
+            logger.warning("{} _click_share: không thấy Share theo XPath chuẩn.", stage)
+            return False
+        if not s.is_visible(timeout=2_500):
+            logger.warning("{} _click_share: Share tồn tại nhưng chưa visible.", stage)
+            return False
+        if (s.get_attribute("aria-disabled") or "").strip().lower() == "true":
+            logger.warning("{} _click_share: Share đang aria-disabled=true.", stage)
+            return False
+        human_pause(kind="click", label="trước Share (Reel)")
+        try:
+            s.evaluate("el => el && el.click && el.click()")
+            logger.info("{} _click_share: đã dispatch JS click.", stage)
+            return True
+        except Exception as exc_js:
+            logger.debug("{} _click_share: JS click lỗi: {}", stage, exc_js)
+        try:
+            s.click(timeout=min(timeout_ms, 6_000), force=True, no_wait_after=True)
+            logger.info("{} _click_share: đã click force (fallback).", stage)
+            return True
+        except Exception as exc_force:
+            logger.warning("{} _click_share: force click lỗi: {}", stage, exc_force)
+            return False
+    except Exception as exc:
+        logger.warning("{} _click_share: lỗi không xác định: {}", stage, exc)
+        return False
+
+
+def _click_reel_done_best_effort(page: Page, *, timeout_ms: int = 15_000) -> bool:
+    stage = _reel_strict_prefix("Wizard")
+    d = _reel_done_button_locator(page)
+    try:
+        if d.count() <= 0:
+            return False
+        if not d.is_visible(timeout=2_500):
+            return False
+        if (d.get_attribute("aria-disabled") or "").strip().lower() == "true":
+            return False
+        human_pause(kind="click", label="trước Done (Reel)")
+        try:
+            d.evaluate("el => el && el.click && el.click()")
+            logger.info("{} _click_done: đã dispatch JS click.", stage)
+            return True
+        except Exception as exc_js:
+            logger.debug("{} _click_done: JS click lỗi: {}", stage, exc_js)
+        try:
+            d.click(timeout=min(timeout_ms, 5_000), force=True, no_wait_after=True)
+            logger.info("{} _click_done: đã click force (fallback).", stage)
+            return True
+        except Exception as exc_force:
+            logger.warning("{} _click_done: force click lỗi: {}", stage, exc_force)
+            return False
+    except Exception as exc:
+        logger.debug("{} _click_done: lỗi không xác định: {}", stage, exc)
+        return False
+
+
+def _finish_reel_after_share_submit(page: Page) -> bool:
+    """Sau Share trên Meta Business composer: Done + chờ modal processing nếu có."""
+    stage = _reel_strict_prefix("Wizard")
+    _human_pause()
+    done_clicked = False
+    try:
+        db = _reel_done_button_locator(page)
+        if db.count() > 0 and db.is_visible(timeout=20_000):
+            if _click_reel_done_best_effort(page):
+                logger.info("{} Đã bấm Done chuẩn.", stage)
+                done_clicked = True
+                _human_pause()
+    except Exception as exc:
+        if "closed" in str(exc).lower():
+            logger.info("{} Page đóng sau Share trước khi kiểm tra Done → coi như đã submit.", stage)
+            return True
+        raise
+
+    try:
+        processed = dismiss_meta_video_post_processing_modal_best_effort(
+            page, timeout_ms=120_000, give_up_if_never_seen_ms=15_000
+        )
+    except Exception as exc:
+        if "closed" in str(exc).lower():
+            logger.info("{} Page đóng khi chờ processing → coi như đã submit.", stage)
+            return True
+        raise
+    submit_clicked = bool(done_clicked or processed)
+    try:
+        _enable_view_only_guard(page)
+    except Exception as exc:
+        if "closed" in str(exc).lower():
+            logger.info("{} Page đóng khi bật lại lock-ui cuối wizard → coi như đã submit.", stage)
+            return True
+        logger.debug("{} Không bật lại được lock-ui cuối wizard: {}", stage, exc)
+    if not submit_clicked:
+        raise PlaywrightTimeoutError("Đã bấm Share nhưng không thấy Done/processing xác nhận.")
+    return True
+
+
+def _reel_wizard_ready_to_share(
+    page: Page,
+    *,
+    payload: str,
+    filled: bool,
+    next_clicks: int,
+) -> bool:
+    """Meta Business composer: Share sau ≥1 Next và đã nhập caption nếu có payload."""
+    if not _reel_share_button_visible(page, timeout_ms=400):
+        return False
+    if payload and not filled:
+        return False
+    if next_clicks >= 1:
+        return True
+    if filled:
+        return True
+    return not payload and next_clicks >= 1
+
+
+def _resolve_reel_submit_action(
+    page: Page,
+    *,
+    payload: str,
+    filled: bool,
+    next_clicks: int,
+    submit_mode: Literal["post", "share", "auto"],
+) -> Literal["post", "share", ""]:
+    mode = (submit_mode or "auto").strip().lower()  # type: ignore[assignment]
+    if mode == "post":
+        return "post" if _reel_wizard_ready_to_post(
+            page, payload=payload, filled=filled, next_clicks=next_clicks
+        ) else ""
+    if mode == "share":
+        return "share" if _reel_wizard_ready_to_share(
+            page, payload=payload, filled=filled, next_clicks=next_clicks
+        ) else ""
+    if _reel_wizard_ready_to_post(page, payload=payload, filled=filled, next_clicks=next_clicks):
+        return "post"
+    if _reel_wizard_ready_to_share(page, payload=payload, filled=filled, next_clicks=next_clicks):
+        return "share"
+    return ""
+
+
+def _reel_wizard_ready_to_post(
+    page: Page,
+    *,
+    payload: str,
+    filled: bool,
+    next_clicks: int,
+) -> bool:
+    """
+    Chỉ đăng khi nút Post thật (Reel settings) VÀ đã qua wizard:
+    - Màn «Reel settings», hoặc
+    - Đã bấm Next ≥1 và (đã nhập caption nếu có payload).
+    """
+    if not _reel_strict_post_button_visible(page, timeout_ms=400):
+        return False
+    if _reel_settings_screen_visible(page, timeout_ms=280):
+        return True
+    if payload and not filled:
+        return False
+    if filled and next_clicks >= 1:
+        return True
+    if not payload and next_clicks >= 1:
+        return True
+    return False
+
+
+def _reel_post_button_locators(page: Page, *, dialog: Locator | None = None) -> list[Locator]:
+    """Ứng viên nút Post — chỉ selector chặt trong dialog Reel."""
+    return _reel_strict_post_button_locators(page, dialog=dialog)
 
 
 def _click_reel_post_locator(page: Page, loc: Locator) -> None:
@@ -4112,7 +4261,7 @@ def _wait_post_button_in_dialog(dialog: Locator, *, timeout_ms: int = 20_000) ->
     while time.time() < deadline:
         for c in candidates:
             try:
-                if c.count() > 0 and c.is_visible(timeout=250):
+                if _reel_locator_is_post_submit(c):
                     if _reel_settings_screen_visible(page, timeout_ms=120):
                         logger.info(
                             "{} Thấy nút Post (Reel settings / html-div).",
@@ -4129,7 +4278,7 @@ def _click_post_strict_for_reel(page: Page, dialog: Locator) -> None:
     """Click nút Post Reel (html-div / role=none / span.x1j85h84), tránh nhầm Share to groups."""
     for c in _reel_post_button_locators(page, dialog=dialog):
         try:
-            if c.count() <= 0 or not c.is_visible(timeout=600):
+            if not _reel_locator_is_post_submit(c):
                 continue
             _click_reel_post_locator(page, c)
             return
@@ -4307,13 +4456,7 @@ def _active_reel_dialog(page: Page) -> Locator:
 
 
 def _reel_post_button_maybe_visible(page: Page, *, timeout_ms: int = 450) -> bool:
-    for loc in _reel_post_button_locators(page, dialog=_active_reel_dialog(page)):
-        try:
-            if loc.count() > 0 and loc.is_visible(timeout=timeout_ms):
-                return True
-        except Exception:
-            continue
-    return False
+    return _reel_strict_post_button_visible(page, timeout_ms=timeout_ms)
 
 
 def _reel_still_on_edit_trim_screen(page: Page, *, timeout_ms: int = 280) -> bool:
@@ -4339,13 +4482,24 @@ def _reel_still_on_edit_trim_screen(page: Page, *, timeout_ms: int = 280) -> boo
 
 
 def _reel_caption_input_usable(page: Page, *, timeout_ms: int = 450) -> bool:
-    """Ô nhập caption — gồm Lexical «Describe your reel…» trên màn Edit reel."""
+    """Ô nhập caption — Lexical Edit reel, aria-placeholder, hoặc editor Meta cũ."""
     if _reel_lexical_description_usable(page, timeout_ms=timeout_ms):
+        return True
+    for sel in (
+        "[role='textbox'][contenteditable='true'][aria-placeholder*='Describe' i]",
+        "[role='textbox'][contenteditable='true'][aria-placeholder*='reel' i]",
+        "[role='textbox'][contenteditable='true'][aria-placeholder*='Mô tả' i]",
+        "[role='textbox'][contenteditable='true'][aria-placeholder*='Thước phim' i]",
+    ):
+        try:
+            if page.locator(sel).first.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    if _reel_caption_screen_markers_visible(page, timeout_ms=timeout_ms):
         return True
     if _reel_edit_reel_header_visible(page, timeout_ms=timeout_ms):
         return False
-    if _reel_caption_screen_markers_visible(page, timeout_ms=timeout_ms):
-        return True
     if _reel_still_on_edit_trim_screen(page, timeout_ms=timeout_ms):
         return False
     for loc in _meta_reel_description_editor_locators(page):
@@ -4523,13 +4677,17 @@ def complete_reel_wizard_fill_next_and_post(
     hashtags: list[str] | str | None = None,
     reel_thumbnail_choice: str | None = None,
     on_step: Callable[[str, str], None] | None = None,
-    max_next_clicks: int = 15,
-    total_timeout_sec: float = 240.0,
+    max_next_clicks: int = 18,
+    total_timeout_sec: float = 300.0,
+    submit_mode: Literal["post", "share", "auto"] = "auto",
 ) -> tuple[int, bool]:
     """
-  Luồng thống nhất (Cách 1 & 2): khi có ô caption → nhập; Next lặp; thấy Post → đăng.
+    Luồng thống nhất: Next tới ô text → nhập → Next tiếp → submit.
 
-    Không dừng sau lần Next đầu tiên thấy ô text — tiếp tục Next tới màn Post.
+    ``submit_mode``:
+    - ``post``: Professional Dashboard (chỉ nút Post strict)
+    - ``share``: Meta Business composer legacy (chỉ Share + Done)
+    - ``auto``: ưu tiên Post, fallback Share
     """
     stage = _reel_strict_prefix("Wizard")
     payload = _build_reel_text_payload(title, content, hashtags)
@@ -4537,7 +4695,8 @@ def complete_reel_wizard_fill_next_and_post(
     thumb_done = False
     filled = False
     next_clicks = 0
-    deadline = time.time() + max(45.0, float(total_timeout_sec))
+    deadline = time.time() + max(60.0, float(total_timeout_sec))
+    mode = submit_mode or "auto"
 
     try:
         _disable_view_only_guard(page)
@@ -4552,14 +4711,57 @@ def complete_reel_wizard_fill_next_and_post(
             except Exception:
                 pass
 
+    def _try_submit() -> bool:
+        nonlocal filled
+        action = _resolve_reel_submit_action(
+            page,
+            payload=payload,
+            filled=filled,
+            next_clicks=next_clicks,
+            submit_mode=mode,
+        )
+        if action == "post":
+            if payload and not filled and _reel_caption_input_usable(page, timeout_ms=500):
+                _fire("FILL_CAPTION", "Có Post — nhập caption trước khi đăng.")
+                if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
+                    filled = True
+            _fire("CLICK_POST", "Reel settings — bấm Post.")
+            _click_reel_post_best_effort(page)
+            logger.info("{} Hoàn tất (Post): Next×{} filled={}.", stage, next_clicks, filled)
+            return True
+        if action == "share":
+            if payload and not filled and _reel_caption_input_usable(page, timeout_ms=500):
+                _fire("FILL_CAPTION", "Có Share — nhập caption trước khi đăng.")
+                if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
+                    filled = True
+            _fire("CLICK_SHARE", "Meta Business composer — bấm Share.")
+            share_ok = False
+            for attempt in (1, 2):
+                if _click_reel_share_best_effort(page):
+                    share_ok = True
+                    logger.info("{} Đã bấm Share (attempt {}).", stage, attempt)
+                    break
+                page.wait_for_timeout(_reel_inter_click_wait_ms())
+            if not share_ok:
+                return False
+            _finish_reel_after_share_submit(page)
+            logger.info("{} Hoàn tất (Share): Next×{} filled={}.", stage, next_clicks, filled)
+            return True
+        return False
+
+    logger.info("{} Bắt đầu wizard (submit_mode={}): payload={} ký tự.", stage, mode, len(payload))
+
     while time.time() < deadline:
-        if payload and not filled and _reel_caption_input_usable(page, timeout_ms=500):
+        if _try_submit():
+            return next_clicks, filled
+
+        if payload and not filled and _reel_caption_input_usable(page, timeout_ms=550):
             _fire("FILL_CAPTION", "Thấy ô nhập — đang nhập caption.")
             if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
                 filled = True
                 logger.info("{} Caption đã nhập ({} ký tự).", stage, len(payload))
             else:
-                logger.warning("{} Nhập caption thất bại — thử lại ở vòng sau.", stage)
+                logger.warning("{} Nhập caption thất bại — thử lại.", stage)
             page.wait_for_timeout(random.randint(500, 1100))
             continue
 
@@ -4568,50 +4770,42 @@ def complete_reel_wizard_fill_next_and_post(
                 thumb_done = True
                 page.wait_for_timeout(random.randint(400, 900))
 
-        if _reel_post_button_maybe_visible(page, timeout_ms=550):
-            if payload and not filled:
-                _fire("FILL_CAPTION", "Có Post nhưng chưa nhập — thử nhập trước khi đăng.")
-                if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
-                    filled = True
-            _fire("CLICK_POST", "Thấy nút Post/Publish — đăng.")
-            _click_reel_post_best_effort(page)
-            logger.info("{} Hoàn tất: Next×{} filled={}.", stage, next_clicks, filled)
-            return next_clicks, filled
+        if next_clicks < max_next_clicks and _reel_wizard_needs_next(
+            page, payload=payload, filled=filled
+        ):
+            if _meta_reel_next_clickable(page) or _meta_reel_next_any_visible(page):
+                before = _reel_active_step_label(page)
+                _fire("CLICK_NEXT", f"Bấm Next (lần {next_clicks + 1}) — tới ô text/submit.")
+                if _try_click_reel_wizard_next(page):
+                    next_clicks += 1
+                    _wait_after_reel_next_click(page, prev_label=before)
+                    continue
+                logger.warning("{} Next visible nhưng click thất bại (lần {}).", stage, next_clicks + 1)
+
+        if _reel_wizard_processing(page, timeout_ms=350):
+            page.wait_for_timeout(random.randint(900, 1800))
+            continue
 
         if next_clicks >= max_next_clicks:
-            page.wait_for_timeout(450)
+            page.wait_for_timeout(500)
             continue
 
-        if _meta_reel_next_clickable(page):
-            _fire("CLICK_NEXT", f"Bấm Next (lần {next_clicks + 1}) — tới caption/Post.")
-            if _click_meta_reel_next_best_effort(page):
-                next_clicks += 1
-                page.wait_for_timeout(random.randint(1100, 2200))
-            else:
-                page.wait_for_timeout(500)
-            continue
-
-        if _reel_still_on_edit_trim_screen(page):
-            page.wait_for_timeout(random.randint(700, 1400))
-            continue
-
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(450)
 
     if payload and not filled and _reel_caption_input_usable(page, timeout_ms=800):
         filled = _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags)
 
-    if _reel_post_button_maybe_visible(page, timeout_ms=1200):
-        _fire("CLICK_POST", "Post (lần cuối trước timeout).")
-        _click_reel_post_best_effort(page)
+    if _try_submit():
         return next_clicks, filled
 
     _failure_screenshot(page, "reel_wizard_fill_next_post_timeout")
     if payload and not filled:
         raise PlaywrightTimeoutError(
-            f"Không nhập được caption sau {next_clicks} lần Next (có payload)."
+            f"Sau {next_clicks} lần Next vẫn chưa nhập được caption (có payload)."
         )
+    submit_label = "Post" if mode == "post" else "Share" if mode == "share" else "Post/Share"
     raise PlaywrightTimeoutError(
-        f"Không thấy nút Post sau {next_clicks} lần Next. Xem logs/screenshots."
+        f"Sau {next_clicks} lần Next không thấy {submit_label}. Xem logs/screenshots."
     )
 
 
@@ -4656,41 +4850,23 @@ def advance_reel_wizard_until_description_input(
             return clicks, filled
 
         if not _meta_reel_next_clickable(page):
-            if _reel_still_on_edit_trim_screen(page):
+            if _reel_wizard_processing(page, timeout_ms=400):
                 page.wait_for_timeout(random.randint(700, 1400))
                 continue
             page.wait_for_timeout(500)
-            if not _meta_reel_next_clickable(page):
+            if not _meta_reel_next_clickable(page) and not _meta_reel_next_any_visible(page):
                 break
 
         if clicks >= max_next_clicks:
             break
 
-        if not _click_meta_reel_next_best_effort(page):
+        before = _reel_active_step_label(page)
+        if not _try_click_reel_wizard_next(page):
             page.wait_for_timeout(600)
             continue
 
         clicks += 1
-        if _reel_edit_reel_header_visible(page, timeout_ms=400):
-            screen = "Edit reel"
-        elif _reel_still_on_edit_trim_screen(page):
-            screen = "edit/trim/copyright"
-        else:
-            screen = _reel_active_step_label(page)
-        logger.info("{} advance_until_text: Next #{} (màn: {}).", stage, clicks, screen)
-        page.wait_for_timeout(random.randint(1100, 2200))
-
-        inner_deadline = time.time() + max(4.0, float(wait_after_click_sec))
-        while time.time() < inner_deadline:
-            if _reel_still_on_edit_trim_screen(page, timeout_ms=320):
-                break
-            if _reel_caption_input_usable(page, timeout_ms=420):
-                _try_fill_now()
-                logger.info("{} Ô caption sau Next #{} (filled={}).", stage, clicks, filled)
-                return clicks, filled
-            if _reel_post_button_maybe_visible(page, timeout_ms=380):
-                return clicks, filled
-            page.wait_for_timeout(320)
+        _wait_after_reel_next_click(page, prev_label=before)
 
     if _reel_caption_input_usable(page, timeout_ms=900):
         _try_fill_now()
@@ -5078,8 +5254,9 @@ def post_reel_via_page_dashboard(
             hashtags=hashtags,
             reel_thumbnail_choice=reel_thumbnail_choice,
             on_step=_wizard_on_step,
-            max_next_clicks=15,
-            total_timeout_sec=240.0,
+            max_next_clicks=18,
+            total_timeout_sec=300.0,
+            submit_mode="post",
         )
         logger.info(
             "{} [REEL DASHBOARD] wizard done: way={} Next×{} filled={}.",

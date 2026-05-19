@@ -53,10 +53,22 @@ from src.utils.posting_browser import PostingBrowserEngine
 from src.utils.screenshot import capture_page_screenshot
 
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv"})
+_REEL_DASHBOARD_POST_TYPES = frozenset({"video", "text_video", "reel"})
+
+
+def _is_reel_dashboard_post_type(post_type: str) -> bool:
+    """Job video/reel mới — luôn đi Professional Dashboard, không qua composer legacy."""
+    return str(post_type or "").strip().lower() in _REEL_DASHBOARD_POST_TYPES
+
+
+def _draft_has_video_attachment(media_paths: list[Path]) -> bool:
+    return any(Path(mp).suffix.lower() in _VIDEO_SUFFIXES for mp in media_paths)
+
 
 _JOB_FLOW_CATALOG: tuple[str, ...] = (
-    "FLOW_REEL_DASHBOARD: OPEN_PAGE_URL -> SWITCH -> CONTENT_LIBRARY -> CREATE -> REEL -> UPLOAD -> NEXT1 -> INPUT -> NEXT2 -> POST -> VERIFY",
-    "FLOW_TEXT_IMAGE_LEGACY: ENSURE_SESSION -> NAV_TARGET -> OPEN_COMPOSER -> UPLOAD_MEDIA(optional) -> FILL_CONTENT -> POST -> VERIFY",
+    "FLOW_REEL_DASHBOARD: page_url -> Dashboard -> Create Reel -> upload -> Next/caption -> Post (video|text_video|reel)",
+    "FLOW_LEGACY_MB_REEL: Meta Business composer + video đính kèm -> wizard Share (KHÔNG dùng cho video|text_video|reel)",
+    "FLOW_TEXT_IMAGE_LEGACY: composer -> media tuỳ chọn -> fill -> Post",
 )
 
 
@@ -78,7 +90,7 @@ def _human_step_delay(*, label: str = "") -> None:
 def _log_job_flow_catalog(pt: str, *, tracker: JobRunTracker | None) -> None:
     msg = " | ".join(_JOB_FLOW_CATALOG)
     logger.info("[FB pipeline] CÁC LUỒNG ĐĂNG JOB HIỆN TẠI: {}", msg)
-    active = "FLOW_REEL_DASHBOARD" if str(pt).strip().lower() in {"video", "text_video", "reel"} else "FLOW_TEXT_IMAGE_LEGACY"
+    active = "FLOW_REEL_DASHBOARD" if _is_reel_dashboard_post_type(pt) else "FLOW_TEXT_IMAGE_LEGACY"
     logger.info("[FB pipeline] LUỒNG ĐANG CHẠY CHO JOB: {} (post_type={})", active, pt)
     if tracker is not None:
         tracker.set_step("FLOW_CATALOG", msg)
@@ -181,9 +193,8 @@ def _run_chromium_posting_flow(
     page_display_name = str(row.get("page_name", "")).strip() or None
     pt = str(post_type or "text").strip().lower()
     _log_job_flow_catalog(pt, tracker=tracker)
-    # Luồng job mới: toàn bộ job video/reel đi qua Dashboard Reel flow.
-    is_reel_dashboard_flow = pt in ("video", "text_video", "reel")
-    use_video_upload = pt in ("video", "text_video", "reel")
+    is_reel_dashboard_flow = _is_reel_dashboard_post_type(pt)
+    has_video_in_draft = _draft_has_video_attachment(draft_media_paths)
     share_now_fb = bool(force_share_now)
     if not share_now_fb and job_scheduled_at_iso:
         try:
@@ -302,8 +313,11 @@ def _run_chromium_posting_flow(
                 return None
             return extra
 
+        # Meta Business composer + video đính kèm (job text/image có file .mp4).
+        # Job video|text_video|reel đã return sớm ở FLOW_REEL_DASHBOARD — không vào nhánh này.
         use_reel_wizard = (
-            use_video_upload
+            not is_reel_dashboard_flow
+            and has_video_in_draft
             and bool(draft_media_paths)
             and _is_meta_business_composer_context(page)
         )
@@ -311,7 +325,7 @@ def _run_chromium_posting_flow(
         if use_reel_wizard:
             _track(STEP_MEDIA, "Đính kèm video (Meta Business → Reels)")
             for mp in draft_media_paths:
-                if use_video_upload or Path(mp).suffix.lower() in _VIDEO_SUFFIXES:
+                if Path(mp).suffix.lower() in _VIDEO_SUFFIXES:
                     upload_video(page, mp)
                 else:
                     upload_photo(page, str(mp))
@@ -403,7 +417,7 @@ def _run_chromium_posting_flow(
         if not reel_upload_done:
             _track(STEP_MEDIA, "Đính kèm media")
             for mp in draft_media_paths:
-                if use_video_upload or Path(mp).suffix.lower() in _VIDEO_SUFFIXES:
+                if Path(mp).suffix.lower() in _VIDEO_SUFFIXES:
                     upload_video(page, mp)
                 else:
                     upload_photo(page, str(mp))
@@ -433,7 +447,7 @@ def _run_chromium_posting_flow(
         _human_step_delay(label="sau bấm Publish/Post")
         t0 = _perf_mark(perf_on, "click_post_button", t0)
         _track(STEP_VERIFY_RESULT, "Xác nhận đã đăng")
-        verify_timeout = 180_000 if use_video_upload else 120_000
+        verify_timeout = 180_000 if has_video_in_draft else 120_000
         snippet = (text_body or "").strip()[:200] or None
         verify_post_submitted(page, text_snippet=snippet, timeout_ms=verify_timeout)
         _perf_mark(perf_on, "verify_submitted", t0)
