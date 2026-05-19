@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from src.automation.facebook_actions import (
+    _REEL_LEXICAL_TEXTBOX_SELECTORS,
     _REEL_MENU_LABEL_RE,
     _REEL_MENU_NAME_RE,
     _REEL_UPLOAD_READY_RE,
     _build_reel_text_payload,
     _reel_caption_screen_markers_visible,
     _reel_edit_reel_header_visible,
+    _reel_lexical_description_usable,
     _reel_pre_text_wizard_screen,
     advance_reel_wizard_until_description_input,
     detect_meta_reel_ui_way,
+    fill_reel_lexical_description,
 )
 
 
@@ -40,6 +43,14 @@ def test_advance_until_text_helpers_callable() -> None:
     assert callable(_reel_pre_text_wizard_screen)
     assert callable(_reel_edit_reel_header_visible)
     assert callable(_reel_caption_screen_markers_visible)
+    assert callable(_reel_lexical_description_usable)
+    assert callable(fill_reel_lexical_description)
+
+
+def test_reel_lexical_selectors_match_describe_placeholder() -> None:
+    joined = " ".join(_REEL_LEXICAL_TEXTBOX_SELECTORS)
+    assert "data-lexical-editor" in joined
+    assert "Describe" in joined
 
 
 def test_build_reel_text_payload_merges_title_content_tags() -> None:

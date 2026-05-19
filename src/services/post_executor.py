@@ -243,16 +243,31 @@ def _run_chromium_posting_flow(
                     "(media_files / video_path trong job trống hoặc không resolve được)."
                 )
             _track(STEP_COMPOSER, "Reel: Professional Dashboard -> Create -> Reel")
-            post_reel_via_page_dashboard(
-                page,
-                page_url=page_url,
-                video_path=video_path,
-                title=str(reel_title or "").strip(),
-                content=str(reel_content or reel_description_override or text_body or "").strip(),
-                hashtags=list(reel_tags or []),
-                reel_thumbnail_choice=reel_thumbnail_choice,
-                on_step=lambda k, m: _track("REEL_" + str(k), m),
-            )
+            unlock_reel_wizard = lock_ui
+            if unlock_reel_wizard:
+                try:
+                    _disable_view_only_guard(page)
+                    logger.info("[FB lock-ui] Tạm mở thao tác browser trong Reel dashboard (Next/nhập/Post).")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[FB lock-ui] Không tắt tạm lock UI: {}", exc)
+            try:
+                post_reel_via_page_dashboard(
+                    page,
+                    page_url=page_url,
+                    video_path=video_path,
+                    title=str(reel_title or "").strip(),
+                    content=str(reel_content or reel_description_override or text_body or "").strip(),
+                    hashtags=list(reel_tags or []),
+                    reel_thumbnail_choice=reel_thumbnail_choice,
+                    on_step=lambda k, m: _track("REEL_" + str(k), m),
+                )
+            finally:
+                if unlock_reel_wizard:
+                    try:
+                        _enable_view_only_guard(page)
+                        logger.info("[FB lock-ui] Đã khóa lại browser sau Reel dashboard.")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("[FB lock-ui] Không khóa lại UI: {}", exc)
             _track(STEP_VERIFY_RESULT, "Xác nhận đã đăng (Reel Dashboard)")
             _perf_mark(perf_on, "reel_dashboard_posted", t0)
             return

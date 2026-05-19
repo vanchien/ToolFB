@@ -2420,6 +2420,203 @@ def _reel_caption_screen_markers_visible(page: Page, *, timeout_ms: int = 450) -
                 return True
     except Exception:
         pass
+    if _reel_lexical_description_usable(page, timeout_ms=timeout_ms):
+        return True
+    return False
+
+
+# Lexical editor trên màn Edit reel / Post details (Meta dashboard Reel).
+_REEL_LEXICAL_TEXTBOX_SELECTORS: tuple[str, ...] = (
+    "div.notranslate[role='textbox'][contenteditable='true'][data-lexical-editor='true'][aria-placeholder*='Describe' i]",
+    "[role='textbox'][contenteditable='true'][data-lexical-editor='true'][aria-placeholder*='Describe' i]",
+    "[role='textbox'][contenteditable='true'][data-lexical-editor='true'][aria-placeholder*='reel' i]",
+    "[role='textbox'][contenteditable='true'][data-lexical-editor='true'][aria-placeholder*='Thước phim' i]",
+    "[role='textbox'][contenteditable='true'][data-lexical-editor='true'][aria-placeholder*='Mô tả' i]",
+    "div.notranslate[role='textbox'][contenteditable='true'][data-lexical-editor='true']",
+    "[role='textbox'][contenteditable='true'][data-lexical-editor='true']",
+)
+
+
+def _reel_lexical_description_locators(page: Page, *, dialog: Locator | None = None) -> list[Locator]:
+    """Ô mô tả Lexical (``data-lexical-editor``) — kể cả trên màn «Edit reel»."""
+    out: list[Locator] = []
+    seen: set[str] = set()
+    scopes: list[Locator] = []
+    if dialog is not None:
+        scopes.append(dialog)
+    try:
+        dlg = page.locator("[role='dialog']").last
+        if dlg.count() > 0:
+            scopes.append(dlg)
+    except Exception:
+        pass
+    scopes.append(page)
+    for scope in scopes:
+        for sel in _REEL_LEXICAL_TEXTBOX_SELECTORS:
+            key = f"{id(scope)}:{sel[:72]}"
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                inner = scope.locator(sel)
+                if inner.count() <= 0:
+                    continue
+                out.append(inner.first)
+            except Exception:
+                continue
+    return out
+
+
+def _reel_lexical_description_usable(page: Page, *, timeout_ms: int = 450) -> bool:
+    for loc in _reel_lexical_description_locators(page):
+        try:
+            if loc.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _lexical_editor_text_content(box: Locator) -> str:
+    try:
+        return str(
+            box.evaluate(
+                """(el) => {
+                  const t = (el.innerText || el.textContent || '').toString().trim();
+                  if (t) return t;
+                  const p = el.querySelector('p');
+                  return p ? (p.innerText || p.textContent || '').toString().trim() : '';
+                }"""
+            )
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _fill_lexical_contenteditable(box: Locator, text: str) -> bool:
+    """Nhập Lexical editor: focus → insert_text → synthetic paste nếu cần."""
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    page = box.page
+    needle = " ".join(raw.split())[:80].lower()
+
+    def _verified() -> bool:
+        cur = _lexical_editor_text_content(box)
+        return bool(needle and needle in " ".join(cur.split()).lower())
+
+    _focus_contenteditable_for_input(box)
+    try:
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+    except Exception:
+        pass
+    page.wait_for_timeout(120)
+    try:
+        page.keyboard.insert_text(raw)
+    except Exception:
+        pass
+    page.wait_for_timeout(280)
+    if _verified():
+        return True
+
+    try:
+        box.evaluate(
+            """(el, val) => {
+              try { el.focus(); } catch (_) {}
+              try {
+                const sel = window.getSelection();
+                const r = document.createRange();
+                r.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(r);
+                document.execCommand('delete', false);
+              } catch (_) {}
+              const makeDT = () => {
+                try {
+                  const dt = new DataTransfer();
+                  dt.setData('text/plain', val);
+                  return dt;
+                } catch (_) { return null; }
+              };
+              try {
+                const dt = makeDT();
+                const ev = new InputEvent('beforeinput', {
+                  inputType: 'insertFromPaste',
+                  data: val,
+                  dataTransfer: dt,
+                  bubbles: true,
+                  cancelable: true,
+                });
+                el.dispatchEvent(ev);
+              } catch (_) {}
+              try {
+                const dt = makeDT();
+                const ev = new ClipboardEvent('paste', {
+                  clipboardData: dt,
+                  bubbles: true,
+                  cancelable: true,
+                });
+                try { Object.defineProperty(ev, 'clipboardData', { value: dt }); } catch (_) {}
+                el.dispatchEvent(ev);
+              } catch (_) {}
+              try {
+                el.dispatchEvent(new InputEvent('input', {
+                  inputType: 'insertFromPaste',
+                  data: val,
+                  bubbles: true,
+                }));
+              } catch (_) {
+                try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+              }
+            }""",
+            raw,
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(350)
+    if _verified():
+        return True
+
+    try:
+        box.type(raw, delay=_typing_delay_ms())
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
+    return _verified()
+
+
+def fill_reel_lexical_description(page: Page, text: str) -> bool:
+    """Điền ô «Describe your reel…» (Lexical) trên Edit reel / wizard."""
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    stage = _reel_strict_prefix("Wizard")
+    last_exc: Exception | None = None
+    for idx, box in enumerate(_reel_lexical_description_locators(page)):
+        try:
+            if box.count() <= 0:
+                continue
+            box.wait_for(state="visible", timeout=8_000)
+        except Exception as exc:
+            last_exc = exc
+            continue
+        try:
+            if _fill_lexical_contenteditable(box, raw):
+                logger.info(
+                    "{} Đã nhập mô tả Lexical ({} ký tự, candidate={}).",
+                    stage,
+                    len(raw),
+                    idx,
+                )
+                _human_pause()
+                return True
+        except Exception as exc:
+            last_exc = exc
+            logger.debug("{} fill Lexical candidate {} lỗi: {}", stage, idx, exc)
+    if last_exc:
+        logger.warning("{} Không nhập được Lexical: {}", stage, last_exc)
     return False
 
 
@@ -2836,14 +3033,18 @@ def _meta_reel_description_editor_locators(page: Page) -> list[Locator]:
         seen.add(key)
         out.append(loc)
 
+    for loc in _reel_lexical_description_locators(page):
+        _add(loc, "lexical_desc")
     try:
         dlg = page.locator("[role='dialog']").filter(
             has_text=re.compile(
-                r"Reel|Thumbnail|Description|Chi tiết|Mô tả|Hashtag|Let viewers know",
+                r"Reel|Thumbnail|Description|Chi tiết|Mô tả|Hashtag|Let viewers know|Edit reel",
                 re.I,
             )
         )
         if dlg.count() > 0:
+            for loc in _reel_lexical_description_locators(page, dialog=dlg.last):
+                _add(loc, f"lexical_dialog_{id(loc)}")
             inner = dlg.last.locator(
                 "div.notranslate._5rpu[role='textbox'][contenteditable='true'], "
                 "div[role='textbox'][contenteditable='true'][aria-label*='dialogue box' i]"
@@ -2903,7 +3104,7 @@ def _focus_contenteditable_for_input(box: Locator) -> None:
         pass
 
 
-def fill_meta_reel_description(page: Page, text: str) -> None:
+def fill_meta_reel_description(page: Page, text: str, *, relock_guard: bool = True) -> None:
     """
     Điền ô mô tả / hashtag ở bước Reel (``role=textbox`` + ``contenteditable``).
 
@@ -2915,6 +3116,10 @@ def fill_meta_reel_description(page: Page, text: str) -> None:
     """
     raw = (text or "").strip()
     if not raw:
+        return
+    if fill_reel_lexical_description(page, raw):
+        if relock_guard:
+            _enable_view_only_guard(page)
         return
     # Luồng chuẩn theo editor DraftJS của Reel (data-editor/data-block).
     try:
@@ -2932,7 +3137,8 @@ def fill_meta_reel_description(page: Page, text: str) -> None:
                 draft_block.fill(raw, timeout=25_000)
             logger.info("{} Đã nhập mô tả Reel ({} ký tự, candidate=strict_draftjs).", _reel_strict_prefix("Wizard"), len(raw))
             _human_pause()
-            _enable_view_only_guard(page)
+            if relock_guard:
+                _enable_view_only_guard(page)
             return
     except Exception:
         pass
@@ -2952,7 +3158,8 @@ def fill_meta_reel_description(page: Page, text: str) -> None:
             )
             candidates = [page.locator(sel).first]
         except PlaywrightTimeoutError:
-            _enable_view_only_guard(page)
+            if relock_guard:
+                _enable_view_only_guard(page)
             raise
     try:
         for idx, box in enumerate(candidates):
@@ -2979,7 +3186,8 @@ def fill_meta_reel_description(page: Page, text: str) -> None:
                         box.type(raw, delay=_typing_delay_ms())
                 logger.info("{} Đã nhập mô tả Reel ({} ký tự, candidate={}).", _reel_strict_prefix("Wizard"), len(raw), idx)
                 _human_pause()
-                _enable_view_only_guard(page)
+                if relock_guard:
+                    _enable_view_only_guard(page)
                 return
             except Exception as exc:
                 last_exc = exc
@@ -2989,10 +3197,12 @@ def fill_meta_reel_description(page: Page, text: str) -> None:
             raise last_exc
         raise PlaywrightTimeoutError("Không điền được ô mô tả Reel (không có candidate hợp lệ).")
     except PlaywrightTimeoutError:
-        _enable_view_only_guard(page)
+        if relock_guard:
+            _enable_view_only_guard(page)
         raise
     except Exception as exc:
-        _enable_view_only_guard(page)
+        if relock_guard:
+            _enable_view_only_guard(page)
         _failure_screenshot(page, f"fill_meta_reel_description: {exc}")
         raise
 
@@ -3254,11 +3464,17 @@ def complete_meta_business_reel_post_wizard(
         ui_way = "way1"
     logger.info("{} detect_meta_reel_ui_way → {}", _reel_strict_prefix("Wizard"), ui_way)
     if ui_way == "way2":
-        logger.info("{} Phát hiện UI cách 2 (Post details + Publish), chuyển nhánh submit trực tiếp.", _reel_strict_prefix("Wizard"))
-        if str(description or "").strip():
-            fill_content(page, description)
-            _human_pause()
-        click_post_button(page)
+        logger.info(
+            "{} UI cách 2 — dùng luồng Next/nhập/Post thống nhất (không post ngay).",
+            _reel_strict_prefix("Wizard"),
+        )
+        complete_reel_wizard_fill_next_and_post(
+            page,
+            content=str(description or "").strip(),
+            reel_thumbnail_choice=reel_thumbnail_choice,
+            max_next_clicks=15,
+            total_timeout_sec=240.0,
+        )
         _human_pause()
         return True
 
@@ -4009,40 +4225,105 @@ def _reel_post_button_maybe_visible(page: Page, *, timeout_ms: int = 450) -> boo
         return False
 
 
-def _reel_description_screen_ready(page: Page, *, timeout_ms: int = 450) -> bool:
-    """
-    Màn nhập title/mô tả Reel đã sẵn sàng.
-
-    Không được true khi vẫn ở «Edit reel» (textbox trim/caption ẩn gây false positive).
-    """
+def _reel_still_on_edit_trim_screen(page: Page, *, timeout_ms: int = 280) -> bool:
+    """Còn ở Edit reel / trim / copyright — chưa có ô caption dùng được."""
+    if _reel_lexical_description_usable(page, timeout_ms=timeout_ms):
+        return False
     if _reel_edit_reel_header_visible(page, timeout_ms=timeout_ms):
-        return False
-
-    if _reel_caption_screen_markers_visible(page, timeout_ms=timeout_ms):
         return True
-
-    if _reel_pre_text_wizard_screen(page):
+    if _reel_caption_screen_markers_visible(page, timeout_ms=250):
         return False
-
-    if _meta_reel_details_visible(page):
-        return True
-
-    for loc in _meta_reel_description_editor_locators(page):
+    for m in (
+        "Trim video",
+        "Cắt video",
+        "Checking for copyrighted content",
+        "Đang kiểm tra bản quyền",
+    ):
         try:
-            if not loc.is_visible(timeout=timeout_ms):
-                continue
-            al = ""
-            try:
-                al = str(loc.get_attribute("aria-label") or "").lower()
-            except Exception:
-                pass
-            if al and ("dialogue" in al or "describe" in al or "caption" in al or "mô tả" in al):
-                return True
-            if not _reel_edit_reel_header_visible(page, timeout_ms=200):
+            if page.get_by_text(m, exact=False).first.is_visible(timeout=timeout_ms):
                 return True
         except Exception:
             continue
+    return False
 
+
+def _reel_caption_input_usable(page: Page, *, timeout_ms: int = 450) -> bool:
+    """Ô nhập caption — gồm Lexical «Describe your reel…» trên màn Edit reel."""
+    if _reel_lexical_description_usable(page, timeout_ms=timeout_ms):
+        return True
+    if _reel_edit_reel_header_visible(page, timeout_ms=timeout_ms):
+        return False
+    if _reel_caption_screen_markers_visible(page, timeout_ms=timeout_ms):
+        return True
+    if _reel_still_on_edit_trim_screen(page, timeout_ms=timeout_ms):
+        return False
+    for loc in _meta_reel_description_editor_locators(page):
+        try:
+            if loc.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _reel_description_screen_ready(page: Page, *, timeout_ms: int = 450) -> bool:
+    """Alias: màn nhập caption sẵn sàng."""
+    return _reel_caption_input_usable(page, timeout_ms=timeout_ms)
+
+
+def _fill_reel_dashboard_caption(
+    page: Page,
+    *,
+    title: str,
+    content: str,
+    hashtags: list[str] | str | None,
+) -> bool:
+    """Nhập caption Reel dashboard — gọi ngay khi thấy ô text sau Next."""
+    payload = _build_reel_text_payload(title, content, hashtags)
+    if not payload:
+        return False
+    stage = _reel_strict_prefix("Wizard")
+    try:
+        _disable_view_only_guard(page)
+    except Exception:
+        pass
+
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        if _reel_caption_input_usable(page, timeout_ms=450):
+            break
+        page.wait_for_timeout(280)
+    if not _reel_caption_input_usable(page, timeout_ms=600):
+        logger.warning("{} Chưa thấy ô caption để nhập.", stage)
+        return False
+
+    dialog = _active_reel_dialog(page)
+    last_exc: Exception | None = None
+
+    def _try_lexical_fill() -> None:
+        if not fill_reel_lexical_description(page, payload):
+            raise RuntimeError("lexical fill failed")
+
+    for label, fn in (
+        ("lexical", _try_lexical_fill),
+        ("fill_meta", lambda: fill_meta_reel_description(page, payload, relock_guard=False)),
+        (
+            "dialog_input",
+            lambda: _input_reel_title_content_and_hashtags(
+                dialog, title=title, content=content, hashtags=hashtags
+            ),
+        ),
+    ):
+        try:
+            fn()
+            logger.info("{} Đã nhập caption Reel qua {} ({} ký tự).", stage, label, len(payload))
+            human_pause(kind="input", label="sau nhập caption dashboard")
+            return True
+        except Exception as exc:
+            last_exc = exc
+            logger.debug("{} Nhập caption {} lỗi: {}", stage, label, exc)
+    if last_exc:
+        logger.warning("{} Không nhập được caption: {}", stage, last_exc)
     return False
 
 
@@ -4123,32 +4404,168 @@ def _click_meta_reel_next_best_effort(page: Page) -> bool:
     return False
 
 
+def _click_reel_post_best_effort(page: Page) -> None:
+    """Bấm Post/Publish trong popup Reel (strict → click_post_button)."""
+    dialog = _active_reel_dialog(page)
+    try:
+        _click_post_strict_for_reel(page, dialog)
+        return
+    except Exception:
+        pass
+    try:
+        click_post_button(page)
+        return
+    except Exception:
+        pass
+    post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
+    try:
+        post_btn.evaluate("el => el && el.click && el.click()")
+    except Exception:
+        post_btn.click(timeout=1800, force=True, no_wait_after=True)
+
+
+def complete_reel_wizard_fill_next_and_post(
+    page: Page,
+    *,
+    title: str = "",
+    content: str = "",
+    hashtags: list[str] | str | None = None,
+    reel_thumbnail_choice: str | None = None,
+    on_step: Callable[[str, str], None] | None = None,
+    max_next_clicks: int = 15,
+    total_timeout_sec: float = 240.0,
+) -> tuple[int, bool]:
+    """
+  Luồng thống nhất (Cách 1 & 2): khi có ô caption → nhập; Next lặp; thấy Post → đăng.
+
+    Không dừng sau lần Next đầu tiên thấy ô text — tiếp tục Next tới màn Post.
+    """
+    stage = _reel_strict_prefix("Wizard")
+    payload = _build_reel_text_payload(title, content, hashtags)
+    thumb_mode = normalize_reel_thumbnail_choice(reel_thumbnail_choice)
+    thumb_done = False
+    filled = False
+    next_clicks = 0
+    deadline = time.time() + max(45.0, float(total_timeout_sec))
+
+    try:
+        _disable_view_only_guard(page)
+    except Exception:
+        pass
+
+    def _fire(step_key: str, message: str) -> None:
+        logger.info("{} [REEL WIZARD] {} — {}", stage, step_key, message)
+        if on_step is not None:
+            try:
+                on_step(step_key, message)
+            except Exception:
+                pass
+
+    while time.time() < deadline:
+        if payload and not filled and _reel_caption_input_usable(page, timeout_ms=500):
+            _fire("FILL_CAPTION", "Thấy ô nhập — đang nhập caption.")
+            if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
+                filled = True
+                logger.info("{} Caption đã nhập ({} ký tự).", stage, len(payload))
+            else:
+                logger.warning("{} Nhập caption thất bại — thử lại ở vòng sau.", stage)
+            page.wait_for_timeout(random.randint(500, 1100))
+            continue
+
+        if thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO and not thumb_done:
+            if _choose_first_reel_thumbnail_method1_best_effort(page):
+                thumb_done = True
+                page.wait_for_timeout(random.randint(400, 900))
+
+        if _reel_post_button_maybe_visible(page, timeout_ms=550):
+            if payload and not filled:
+                _fire("FILL_CAPTION", "Có Post nhưng chưa nhập — thử nhập trước khi đăng.")
+                if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
+                    filled = True
+            _fire("CLICK_POST", "Thấy nút Post/Publish — đăng.")
+            _click_reel_post_best_effort(page)
+            logger.info("{} Hoàn tất: Next×{} filled={}.", stage, next_clicks, filled)
+            return next_clicks, filled
+
+        if next_clicks >= max_next_clicks:
+            page.wait_for_timeout(450)
+            continue
+
+        if _meta_reel_next_clickable(page):
+            _fire("CLICK_NEXT", f"Bấm Next (lần {next_clicks + 1}) — tới caption/Post.")
+            if _click_meta_reel_next_best_effort(page):
+                next_clicks += 1
+                page.wait_for_timeout(random.randint(1100, 2200))
+            else:
+                page.wait_for_timeout(500)
+            continue
+
+        if _reel_still_on_edit_trim_screen(page):
+            page.wait_for_timeout(random.randint(700, 1400))
+            continue
+
+        page.wait_for_timeout(400)
+
+    if payload and not filled and _reel_caption_input_usable(page, timeout_ms=800):
+        filled = _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags)
+
+    if _reel_post_button_maybe_visible(page, timeout_ms=1200):
+        _fire("CLICK_POST", "Post (lần cuối trước timeout).")
+        _click_reel_post_best_effort(page)
+        return next_clicks, filled
+
+    _failure_screenshot(page, "reel_wizard_fill_next_post_timeout")
+    if payload and not filled:
+        raise PlaywrightTimeoutError(
+            f"Không nhập được caption sau {next_clicks} lần Next (có payload)."
+        )
+    raise PlaywrightTimeoutError(
+        f"Không thấy nút Post sau {next_clicks} lần Next. Xem logs/screenshots."
+    )
+
+
 def advance_reel_wizard_until_description_input(
     page: Page,
     *,
+    fill_fn: Callable[[], bool] | None = None,
     max_next_clicks: int = 10,
     total_timeout_sec: float = 180.0,
     wait_after_click_sec: float = 18.0,
-) -> int:
+) -> tuple[int, bool]:
     """
-    Bấm Next lặp cho đến khi thấy ô nhập nội dung (hoặc nút Post nếu không cần caption).
+    Bấm Next lặp đến ô caption; nếu ``fill_fn`` có — nhập ngay khi thấy ô text.
 
-    Xử lý các màn trung gian: Edit reel, trim, kiểm tra copyright, thumbnail...
+    Returns:
+        (số lần Next đã bấm, đã nhập caption thành công hay chưa)
     """
     stage = _reel_strict_prefix("Wizard")
     deadline = time.time() + max(30.0, float(total_timeout_sec))
     clicks = 0
+    filled = False
+
+    def _try_fill_now() -> bool:
+        nonlocal filled
+        if fill_fn is None:
+            return False
+        if not _reel_caption_input_usable(page, timeout_ms=500):
+            return False
+        if fill_fn():
+            filled = True
+            logger.info("{} Đã nhập caption ngay sau Next #{}.", stage, clicks)
+            return True
+        return False
 
     while time.time() < deadline:
-        if _reel_description_screen_ready(page, timeout_ms=550):
-            logger.info("{} Đã thấy ô nhập sau {} lần Next.", stage, clicks)
-            return clicks
+        if _reel_caption_input_usable(page, timeout_ms=550):
+            _try_fill_now()
+            logger.info("{} Ô caption sau {} lần Next (filled={}).", stage, clicks, filled)
+            return clicks, filled
         if _reel_post_button_maybe_visible(page, timeout_ms=450):
-            logger.info("{} Thấy Post (không cần ô mô tả) sau {} lần Next.", stage, clicks)
-            return clicks
+            logger.info("{} Thấy Post sau {} lần Next.", stage, clicks)
+            return clicks, filled
 
         if not _meta_reel_next_clickable(page):
-            if _reel_pre_text_wizard_screen(page):
+            if _reel_still_on_edit_trim_screen(page):
                 page.wait_for_timeout(random.randint(700, 1400))
                 continue
             page.wait_for_timeout(500)
@@ -4165,31 +4582,33 @@ def advance_reel_wizard_until_description_input(
         clicks += 1
         if _reel_edit_reel_header_visible(page, timeout_ms=400):
             screen = "Edit reel"
-        elif _reel_pre_text_wizard_screen(page):
-            screen = "pre-text wizard"
+        elif _reel_still_on_edit_trim_screen(page):
+            screen = "edit/trim/copyright"
         else:
             screen = _reel_active_step_label(page)
-        logger.info("{} advance_until_text: Next #{} (màn hiện tại: {}).", stage, clicks, screen)
+        logger.info("{} advance_until_text: Next #{} (màn: {}).", stage, clicks, screen)
         page.wait_for_timeout(random.randint(1100, 2200))
 
         inner_deadline = time.time() + max(4.0, float(wait_after_click_sec))
         while time.time() < inner_deadline:
-            if _reel_edit_reel_header_visible(page, timeout_ms=350):
+            if _reel_still_on_edit_trim_screen(page, timeout_ms=320):
                 break
-            if _reel_description_screen_ready(page, timeout_ms=420):
-                logger.info("{} Ô nhập caption sau Next #{}.", stage, clicks)
-                return clicks
+            if _reel_caption_input_usable(page, timeout_ms=420):
+                _try_fill_now()
+                logger.info("{} Ô caption sau Next #{} (filled={}).", stage, clicks, filled)
+                return clicks, filled
             if _reel_post_button_maybe_visible(page, timeout_ms=380):
-                return clicks
+                return clicks, filled
             page.wait_for_timeout(320)
 
-    if _reel_description_screen_ready(page, timeout_ms=900):
-        return clicks
+    if _reel_caption_input_usable(page, timeout_ms=900):
+        _try_fill_now()
+        return clicks, filled
     if _reel_post_button_maybe_visible(page, timeout_ms=700):
-        return clicks
+        return clicks, filled
 
     _failure_screenshot(page, "reel_textbox_not_visible_after_next_loop")
-    hint = "Edit reel / copyright" if _reel_pre_text_wizard_screen(page) else "wizard"
+    hint = "Edit reel / copyright" if _reel_still_on_edit_trim_screen(page) else "wizard"
     raise PlaywrightTimeoutError(
         f"Đã bấm Next {clicks} lần nhưng chưa thấy ô nhập nội dung ({hint}). "
         "Xem logs/screenshots — có thể cần chờ hết «Checking for copyrighted content»."
@@ -4271,11 +4690,7 @@ def post_reel_via_page_dashboard(
         "WAIT_REEL_POPUP",
         "UPLOAD_VIDEO",
         "DETECT_UI_WAY",
-        "CLICK_NEXT_TO_TEXT",
-        "INPUT_TITLE_CONTENT_HASHTAGS",
-        "CLICK_NEXT_3",
-        "WAIT_POST_BUTTON",
-        "CLICK_POST",
+        "WIZARD_FILL_NEXT_POST",
         "VERIFY_POST_SUBMITTED",
         "MARK_SUCCESS",
     )
@@ -4556,93 +4971,37 @@ def post_reel_via_page_dashboard(
     thumb_mode = normalize_reel_thumbnail_choice(reel_thumbnail_choice)
     payload_text = _build_reel_text_payload(title, content, hashtags)
 
-    if ui_way == "way2":
-        _step("INPUT_TITLE_CONTENT_HASHTAGS", "Cách 2: nhập caption/hashtag (Post details).")
-        if payload_text:
-            fill_content(page, payload_text)
-        _step_pause(700, 1500, label="sau INPUT (cách 2)")
-        dialog = _active_reel_dialog(page)
-        _step("WAIT_POST_BUTTON", "Cách 2: chờ Post/Publish.")
-        _step("CLICK_POST", "Cách 2: bấm Post/Publish.")
-        try:
-            click_post_button(page)
-        except Exception:
-            _click_post_strict_for_reel(page, dialog)
-        page.wait_for_timeout(1400)
-        if _env_reel_pause_after_post():
-            _step("VERIFY_POST_SUBMITTED", "FB_REEL_PAUSE_AFTER_POST=1 — giữ browser để kiểm tra.")
-            while True:
-                page.wait_for_timeout(5000)
-        _step("VERIFY_POST_SUBMITTED", "Đã bấm Post (cách 2), chờ 8 giây.")
-        page.wait_for_timeout(8000)
-        _step("MARK_SUCCESS", "Đăng thành công (cách 2).")
-        return
-
     _step(
-        "CLICK_NEXT_TO_TEXT",
-        "Cách 1: bấm Next lặp (Edit reel / trim / copyright…) đến khi có ô nhập nội dung.",
+        "WIZARD_FILL_NEXT_POST",
+        f"Luồng thống nhất ({way_labels.get(ui_way, ui_way)}): nhập khi có ô text → Next → Post.",
     )
-    try:
-        n_next = advance_reel_wizard_until_description_input(
-            page,
-            max_next_clicks=10,
-            total_timeout_sec=180.0,
-            wait_after_click_sec=18.0,
-        )
-        logger.info("{} [REEL DASHBOARD] Tổng {} lần Next trước màn nhập.", stage, n_next)
-    except PlaywrightTimeoutError:
-        raise
-    if thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
-        page.wait_for_timeout(random.randint(400, 900))
-        _choose_first_reel_thumbnail_method1_best_effort(page)
-    _step_pause(700, 1400, label="sau CLICK_NEXT_TO_TEXT")
 
-    dialog = _active_reel_dialog(page)
-    _step("INPUT_TITLE_CONTENT_HASHTAGS", "Nhập title/content/hashtags.")
-    if _reel_description_screen_ready(page, timeout_ms=500):
-        _input_reel_title_content_and_hashtags(
-            dialog,
+    def _wizard_on_step(sub_key: str, message: str) -> None:
+        _step(sub_key, message)
+
+    try:
+        n_next, filled = complete_reel_wizard_fill_next_and_post(
+            page,
             title=str(title or "").strip(),
             content=str(content or "").strip(),
             hashtags=hashtags,
+            reel_thumbnail_choice=reel_thumbnail_choice,
+            on_step=_wizard_on_step,
+            max_next_clicks=15,
+            total_timeout_sec=240.0,
         )
-    elif str(title or "").strip() or str(content or "").strip() or hashtags:
-        fill_meta_reel_description(page, _build_reel_text_payload(title, content, hashtags))
-    else:
-        logger.info("{} Không có nội dung và không thấy textbox — bỏ qua nhập.", stage)
-    _step_pause(700, 1500, label="sau INPUT_TITLE_CONTENT_HASHTAGS")
-
-    dialog = _active_reel_dialog(page)
-    # Nếu đã hiện Post sau khi nhập thì bấm luôn; nếu chưa, mới Next thêm 1 bước.
-    post_btn: Locator | None = None
-    try:
-        post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=2200)
-    except Exception:
-        post_btn = None
-    if post_btn is None:
-        _step("CLICK_NEXT_3", "Chưa thấy Post sau khi nhập -> bấm Next để sang màn Post.")
-        _click_next_in_dialog(page, dialog)
-        _step_pause(900, 1800, label="sau CLICK_NEXT_3 (sang màn Post)")
-        dialog = _active_reel_dialog(page)
-        post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
-    _step("WAIT_POST_BUTTON", "Chờ nút Post/Publish xuất hiện.")
-    if post_btn is None:
-        post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
-    _step("CLICK_POST", "Bấm Post.")
-    logger.info(
-        "{} [STRICT_FLOW] NEXT1 -> INPUT -> NEXT2 -> POST (khóa luồng thẳng)",
-        _reel_strict_prefix("Wizard"),
-    )
-    try:
-        _click_post_strict_for_reel(page, dialog)
-    except Exception:
-        # fallback cuối: dùng locator đã wait được trước đó
-        try:
-            post_btn.evaluate("el => el && el.click && el.click()")
-            logger.info("{} [POST_TARGET] fallback_post_btn_js_click", _reel_strict_prefix("Wizard"))
-        except Exception:
-            post_btn.click(timeout=1800, force=True, no_wait_after=True)
-            logger.info("{} [POST_TARGET] fallback_post_btn_force_click", _reel_strict_prefix("Wizard"))
+        logger.info(
+            "{} [REEL DASHBOARD] wizard done: way={} Next×{} filled={}.",
+            stage,
+            ui_way,
+            n_next,
+            filled,
+        )
+    except PlaywrightTimeoutError:
+        raise
+    if payload_text and not filled:
+        _failure_screenshot(page, "reel_caption_fill_failed")
+        raise PlaywrightTimeoutError("Có nội dung job nhưng không nhập được caption.")
     page.wait_for_timeout(1400)
     if _env_reel_pause_after_post():
         _step(
