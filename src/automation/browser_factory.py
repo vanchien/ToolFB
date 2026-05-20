@@ -511,6 +511,15 @@ class BrowserFactory:
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
             ]
+            use_bundled = (
+                getattr(sys, "frozen", False)
+                or _env_bool("TOOLFB_ENFORCE_BUNDLED_BROWSER", False)
+                or str(os.environ.get("FB_PLAYWRIGHT_CHROMIUM_CHANNEL", "")).strip().lower()
+                in {"0", "false", "off", "no", "bundled", "bundle", "playwright", "ms-playwright", "chromium"}
+            )
+            if use_bundled:
+                for extra in ("--disable-component-update",):
+                    _append_unique_arg(args, extra)
             raw_extra = os.environ.get("FB_CHROMIUM_EXTRA_LAUNCH_ARGS", "").strip()
             if raw_extra:
                 args.extend([p for p in raw_extra.split() if p])

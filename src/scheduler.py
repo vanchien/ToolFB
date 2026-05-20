@@ -1710,6 +1710,24 @@ def run_scheduled_post_for_account(
         q_post_type = ""
         pool.acquire_slot(account_id, engine=posting_engine)
         try:
+            try:
+                from src.utils.playwright_browser_lock import enforce_bundled_browser_policy
+
+                bundle_ok, bundle_msgs = enforce_bundled_browser_policy(project_root=_project_root())
+                for bm in bundle_msgs:
+                    if bundle_ok:
+                        logger.warning("[Đăng bài] Trình duyệt bundle: {}", bm)
+                    else:
+                        logger.error("[Đăng bài] Trình duyệt bundle: {}", bm)
+                if not bundle_ok:
+                    raise RuntimeError(
+                        "Trình duyệt Playwright không khớp bản build. "
+                        + " ".join(bundle_msgs[:3])
+                    )
+            except RuntimeError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Đăng bài] Không kiểm tra được bundle trình duyệt (bỏ qua): {}", exc)
             logger.info("[Đăng bài] {} — mở trình duyệt (headless={})...", account_id, use_headless)
             factory = BrowserFactory(headless=use_headless)
             ctx = factory.launch_persistent_context_from_account_dict(acc_runtime, headless=use_headless)

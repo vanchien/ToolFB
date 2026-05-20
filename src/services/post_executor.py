@@ -65,6 +65,26 @@ def _draft_has_video_attachment(media_paths: list[Path]) -> bool:
     return any(Path(mp).suffix.lower() in _VIDEO_SUFFIXES for mp in media_paths)
 
 
+def resolve_post_flow_id(
+    post_type: str,
+    *,
+    has_video_in_draft: bool = False,
+    meta_business_composer: bool = False,
+) -> str:
+    """
+    Xác định nhánh pipeline đăng theo ``post_type`` và ngữ cảnh composer.
+
+    Returns:
+        ``FLOW_REEL_DASHBOARD`` | ``FLOW_LEGACY_MB_REEL`` | ``FLOW_TEXT_IMAGE_LEGACY``
+    """
+    pt = str(post_type or "text").strip().lower()
+    if _is_reel_dashboard_post_type(pt):
+        return "FLOW_REEL_DASHBOARD"
+    if has_video_in_draft and meta_business_composer:
+        return "FLOW_LEGACY_MB_REEL"
+    return "FLOW_TEXT_IMAGE_LEGACY"
+
+
 _JOB_FLOW_CATALOG: tuple[str, ...] = (
     "FLOW_REEL_DASHBOARD: page_url -> Dashboard -> Create Reel -> upload -> Next/caption -> Post (video|text_video|reel)",
     "FLOW_LEGACY_MB_REEL: Meta Business composer + video đính kèm -> wizard Share (KHÔNG dùng cho video|text_video|reel)",
@@ -87,10 +107,20 @@ def _human_step_delay(*, label: str = "") -> None:
     human_pause(label=label, kind="step")
 
 
-def _log_job_flow_catalog(pt: str, *, tracker: JobRunTracker | None) -> None:
+def _log_job_flow_catalog(
+    pt: str,
+    *,
+    tracker: JobRunTracker | None,
+    has_video_in_draft: bool = False,
+) -> None:
     msg = " | ".join(_JOB_FLOW_CATALOG)
     logger.info("[FB pipeline] CÁC LUỒNG ĐĂNG JOB HIỆN TẠI: {}", msg)
-    active = "FLOW_REEL_DASHBOARD" if _is_reel_dashboard_post_type(pt) else "FLOW_TEXT_IMAGE_LEGACY"
+    active = resolve_post_flow_id(pt, has_video_in_draft=has_video_in_draft)
+    # meta_business chưa biết trước khi mở composer — legacy MB chỉ log gợi ý
+    if active == "FLOW_TEXT_IMAGE_LEGACY" and has_video_in_draft:
+        logger.info(
+            "[FB pipeline] Job có video đính kèm — có thể chuyển FLOW_LEGACY_MB_REEL sau khi mở Meta Business composer."
+        )
     logger.info("[FB pipeline] LUỒNG ĐANG CHẠY CHO JOB: {} (post_type={})", active, pt)
     if tracker is not None:
         tracker.set_step("FLOW_CATALOG", msg)
@@ -192,9 +222,9 @@ def _run_chromium_posting_flow(
     row = pages_json_row or {}
     page_display_name = str(row.get("page_name", "")).strip() or None
     pt = str(post_type or "text").strip().lower()
-    _log_job_flow_catalog(pt, tracker=tracker)
-    is_reel_dashboard_flow = _is_reel_dashboard_post_type(pt)
     has_video_in_draft = _draft_has_video_attachment(draft_media_paths)
+    _log_job_flow_catalog(pt, tracker=tracker, has_video_in_draft=has_video_in_draft)
+    is_reel_dashboard_flow = _is_reel_dashboard_post_type(pt)
     share_now_fb = bool(force_share_now)
     if not share_now_fb and job_scheduled_at_iso:
         try:
@@ -290,6 +320,13 @@ def _run_chromium_posting_flow(
         go_to_posting_target_and_open_composer(page, resolved, page_display_name=page_display_name)
         t0 = _perf_mark(perf_on, "open_composer", t0)
         _track(STEP_COMPOSER, "Composer sẵn sàng")
+        mb_composer = _is_meta_business_composer_context(page)
+        flow_id = resolve_post_flow_id(
+            pt, has_video_in_draft=has_video_in_draft, meta_business_composer=mb_composer
+        )
+        logger.info("[FB pipeline] Luồng composer sau mở trang: {} (post_type={})", flow_id, pt)
+        if tracker is not None:
+            tracker.set_step("FLOW_ACTIVE", f"{flow_id} | post_type={pt}")
 
         def _extra_image_if_not_dup(paths: list[Path], extra: Path | None) -> Path | None:
             """Bỏ ``page_extra_image`` nếu đã có trong ``draft_media_paths`` (so sánh path tuyệt đối)."""
@@ -319,7 +356,7 @@ def _run_chromium_posting_flow(
             not is_reel_dashboard_flow
             and has_video_in_draft
             and bool(draft_media_paths)
-            and _is_meta_business_composer_context(page)
+            and mb_composer
         )
         reel_upload_done = False
         if use_reel_wizard:

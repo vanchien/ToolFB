@@ -197,6 +197,7 @@ def enforce_bundled_browser_policy(*, project_root: Path) -> tuple[bool, list[st
     if bp is not None:
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bp)
         os.environ["FB_PLAYWRIGHT_CHROMIUM_CHANNEL"] = "bundled"
+        os.environ.setdefault("TOOLFB_ENFORCE_BUNDLED_BROWSER", "1")
         logger.info("Playwright browsers path (khóa bundle): {}", bp)
     elif frozen:
         os.environ["FB_PLAYWRIGHT_CHROMIUM_CHANNEL"] = "bundled"

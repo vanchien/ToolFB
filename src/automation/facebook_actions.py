@@ -2477,20 +2477,23 @@ def _reel_wizard_needs_next(
     *,
     payload: str,
     filled: bool,
+    next_clicks: int = 0,
 ) -> bool:
     """
     Cần bấm Next khi:
     - Chưa có ô caption (cần Next tới màn nhập), hoặc
     - Đã nhập caption nhưng chưa thấy Post.
     """
-    if _reel_wizard_ready_to_post(page, payload=payload, filled=filled, next_clicks=0):
+    if _reel_wizard_ready_to_post(
+        page, payload=payload, filled=filled, next_clicks=next_clicks
+    ):
         return False
     if payload and not filled:
         if _reel_caption_input_usable(page, timeout_ms=400):
             return False
         return True
     if payload and filled:
-        return True
+        return not _reel_strict_post_button_visible(page, timeout_ms=300)
     return not _reel_strict_post_button_visible(page, timeout_ms=300)
 
 
@@ -4178,7 +4181,7 @@ def _reel_wizard_ready_to_share(
     filled: bool,
     next_clicks: int,
 ) -> bool:
-    """Meta Business composer: Share sau ≥1 Next và đã nhập caption nếu có payload."""
+    """Meta Business composer: Share sau wizard (≥1 Next hoặc đã nhập caption trên màn cuối)."""
     if not _reel_share_button_visible(page, timeout_ms=400):
         return False
     if payload and not filled:
@@ -4187,7 +4190,9 @@ def _reel_wizard_ready_to_share(
         return True
     if filled:
         return True
-    return not payload and next_clicks >= 1
+    if not payload:
+        return True
+    return False
 
 
 def _resolve_reel_submit_action(
@@ -4222,9 +4227,11 @@ def _reel_wizard_ready_to_post(
     next_clicks: int,
 ) -> bool:
     """
-    Chỉ đăng khi nút Post thật (Reel settings) VÀ đã qua wizard:
+    Chỉ đăng khi nút Post/Publish strict VÀ đủ điều kiện wizard:
     - Màn «Reel settings», hoặc
-    - Đã bấm Next ≥1 và (đã nhập caption nếu có payload).
+    - Đã bấm Next ≥1 (way1), hoặc
+    - Đã nhập caption trên màn Post details (way2, next_clicks có thể = 0), hoặc
+    - Không có caption và Post đã hiện.
     """
     if not _reel_strict_post_button_visible(page, timeout_ms=400):
         return False
@@ -4232,9 +4239,11 @@ def _reel_wizard_ready_to_post(
         return True
     if payload and not filled:
         return False
-    if filled and next_clicks >= 1:
+    if next_clicks >= 1:
         return True
-    if not payload and next_clicks >= 1:
+    if filled:
+        return True
+    if not payload:
         return True
     return False
 
@@ -4771,7 +4780,7 @@ def complete_reel_wizard_fill_next_and_post(
                 page.wait_for_timeout(random.randint(400, 900))
 
         if next_clicks < max_next_clicks and _reel_wizard_needs_next(
-            page, payload=payload, filled=filled
+            page, payload=payload, filled=filled, next_clicks=next_clicks
         ):
             if _meta_reel_next_clickable(page) or _meta_reel_next_any_visible(page):
                 before = _reel_active_step_label(page)
@@ -5237,36 +5246,72 @@ def post_reel_via_page_dashboard(
 
     thumb_mode = normalize_reel_thumbnail_choice(reel_thumbnail_choice)
     payload_text = _build_reel_text_payload(title, content, hashtags)
-
-    _step(
-        "WIZARD_FILL_NEXT_POST",
-        f"Luồng thống nhất ({way_labels.get(ui_way, ui_way)}): nhập khi có ô text → Next → Post.",
-    )
+    filled = False
+    n_next = 0
 
     def _wizard_on_step(sub_key: str, message: str) -> None:
         _step(sub_key, message)
 
-    try:
-        n_next, filled = complete_reel_wizard_fill_next_and_post(
-            page,
-            title=str(title or "").strip(),
-            content=str(content or "").strip(),
-            hashtags=hashtags,
-            reel_thumbnail_choice=reel_thumbnail_choice,
-            on_step=_wizard_on_step,
-            max_next_clicks=18,
-            total_timeout_sec=300.0,
-            submit_mode="post",
+    if ui_way == "way2":
+        _step(
+            "WAY2_FILL_PUBLISH",
+            "Cách 2: nhập caption (nếu có) → Publish/Post (không wizard Next).",
         )
+        if payload_text:
+            _wizard_on_step("FILL_CAPTION", "Post details — nhập caption.")
+            filled = _fill_reel_dashboard_caption(
+                page,
+                title=str(title or "").strip(),
+                content=str(content or "").strip(),
+                hashtags=hashtags,
+            )
+            if not filled and _reel_caption_input_usable(page, timeout_ms=1200):
+                page.wait_for_timeout(800)
+                filled = _fill_reel_dashboard_caption(
+                    page,
+                    title=str(title or "").strip(),
+                    content=str(content or "").strip(),
+                    hashtags=hashtags,
+                )
+        if thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
+            _choose_first_reel_thumbnail_method1_best_effort(page)
+        _wizard_on_step("CLICK_POST", "Post details — bấm Publish/Post.")
+        try:
+            _click_reel_post_best_effort(page)
+        except Exception:
+            click_post_button(page)
         logger.info(
-            "{} [REEL DASHBOARD] wizard done: way={} Next×{} filled={}.",
+            "{} [REEL DASHBOARD] way2 done: filled={} payload_len={}.",
             stage,
-            ui_way,
-            n_next,
             filled,
+            len(payload_text),
         )
-    except PlaywrightTimeoutError:
-        raise
+    else:
+        _step(
+            "WIZARD_FILL_NEXT_POST",
+            f"Luồng thống nhất ({way_labels.get(ui_way, ui_way)}): nhập khi có ô text → Next → Post.",
+        )
+        try:
+            n_next, filled = complete_reel_wizard_fill_next_and_post(
+                page,
+                title=str(title or "").strip(),
+                content=str(content or "").strip(),
+                hashtags=hashtags,
+                reel_thumbnail_choice=reel_thumbnail_choice,
+                on_step=_wizard_on_step,
+                max_next_clicks=18,
+                total_timeout_sec=300.0,
+                submit_mode="post",
+            )
+            logger.info(
+                "{} [REEL DASHBOARD] wizard done: way={} Next×{} filled={}.",
+                stage,
+                ui_way,
+                n_next,
+                filled,
+            )
+        except PlaywrightTimeoutError:
+            raise
     if payload_text and not filled:
         _failure_screenshot(page, "reel_caption_fill_failed")
         raise PlaywrightTimeoutError("Có nội dung job nhưng không nhập được caption.")
