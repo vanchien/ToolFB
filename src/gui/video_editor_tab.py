@@ -3190,12 +3190,55 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     # Không giữ draft/_applied của nhóm clip khác — tránh «đã áp» sai hoặc áp nhầm thông số cũ.
                     _batch_edit_draft.clear()
                     _batch_edit_draft["_applied"] = {}
+
+                    def _uniform_clip_value(key: str) -> Any | None:
+                        vals: list[Any] = []
+                        for _cid_u, c_u in rows:
+                            if key in c_u:
+                                vals.append(c_u.get(key))
+                        if not vals:
+                            return None
+                        v0 = vals[0]
+                        for v in vals[1:]:
+                            if v != v0:
+                                return None
+                        return v0
+
+                    def _seed_if_uniform(draft_key: str, clip_key: str, *, stringify: bool = True) -> None:
+                        u = _uniform_clip_value(clip_key)
+                        if u is None:
+                            return
+                        if stringify:
+                            _batch_edit_draft[draft_key] = str(u)
+                        else:
+                            _batch_edit_draft[draft_key] = u
+
+                    _seed_if_uniform("volume", "volume")
+                    _seed_if_uniform("speed", "speed")
+                    _seed_if_uniform("fade_in", "fade_in")
+                    _seed_if_uniform("fade_out", "fade_out")
+                    _seed_if_uniform("brightness", "brightness")
+                    _seed_if_uniform("zoom", "zoom")
+                    _seed_if_uniform("rotation", "rotation")
+                    _seed_if_uniform("canvas_mode", "canvas_mode")
+                    le_u = _uniform_clip_value("light_effect")
+                    if le_u is not None:
+                        _batch_edit_draft["light_effect"] = VideoFilterManager.light_effect_normalize_to_label_ui(
+                            str(le_u)
+                        )
+                    fh_u = _uniform_clip_value("flip_horizontal")
+                    fv_u = _uniform_clip_value("flip_vertical")
+                    if fh_u is not None and fv_u is not None:
+                        _batch_edit_draft["flip_h"] = bool(fh_u)
+                        _batch_edit_draft["flip_v"] = bool(fv_u)
+                    mu_u = _uniform_clip_value("muted")
+                    if mu_u is not None:
+                        _batch_edit_draft["mute"] = bool(mu_u)
                 insp_grid.columnconfigure(0, weight=1, minsize=72)
                 insp_grid.columnconfigure(1, weight=1, minsize=72)
                 insp_grid.columnconfigure(2, minsize=68)
                 hdr_batch = ttk.Frame(insp_grid)
                 hdr_batch.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-                hdr_batch.columnconfigure(0, weight=1)
                 hdr_batch.columnconfigure(0, weight=1)
                 _bat_h0 = ttk.Label(
                     hdr_batch,
@@ -3260,18 +3303,32 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         foreground="#1a7f37" if changed else "#888888",
                     )
 
+                def _sig(v: Any) -> str:
+                    return str(v if v is not None else "")
+
+                def _status_pending(key: str, cur_sig: str) -> bool:
+                    """Chưa áp hoặc khác lần áp trước — tránh «Đã chỉnh» khi chỉ có giá trị mặc định."""
+                    s = str(cur_sig or "").strip()
+                    if not s:
+                        return False
+                    applied_raw = _batch_edit_draft.get("_applied")
+                    if isinstance(applied_raw, dict) and key in applied_raw:
+                        return str(applied_raw.get(key)) != s
+                    return True
+
                 def _bind_status_text(
                     key: str,
                     var: tk.StringVar,
                     lbl: ttk.Label,
                     changed_fn: Callable[[str], bool] | None = None,
                 ) -> None:
-                    fn = changed_fn or (lambda s: bool(str(s or "").strip()))
-
                     def _on_write(*_a: Any) -> None:
                         cur = str(var.get() or "")
                         _batch_edit_draft[key] = cur
-                        _set_field_status(lbl, fn(cur))
+                        pending = _status_pending(key, _sig(cur))
+                        if changed_fn is not None:
+                            pending = pending and bool(changed_fn(cur))
+                        _set_field_status(lbl, pending)
                         _persist_batch_draft(save_project_file=False)
 
                     var.trace_add("write", _on_write)
@@ -3283,12 +3340,13 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     lbl: ttk.Label,
                     changed_fn: Callable[[bool], bool] | None = None,
                 ) -> None:
-                    fn = changed_fn or (lambda v: bool(v))
-
                     def _on_write(*_a: Any) -> None:
                         cur = bool(var.get())
                         _batch_edit_draft[key] = cur
-                        _set_field_status(lbl, fn(cur))
+                        pending = _status_pending(key, _sig(cur))
+                        if changed_fn is not None:
+                            pending = pending and bool(changed_fn(cur))
+                        _set_field_status(lbl, pending)
                         _persist_batch_draft(save_project_file=False)
 
                     var.trace_add("write", _on_write)
@@ -3378,7 +3436,18 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 ).pack(side=tk.LEFT, padx=(8, 0))
                 st_flip = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
                 st_flip.grid(row=11, column=2, sticky="w", padx=(8, 0), pady=(2, 0))
-                _bind_status_bool("set_flip", var_b_set_flip, st_flip)
+                def _flip_pending() -> bool:
+                    if not bool(var_b_set_flip.get()):
+                        return False
+                    sig = f"{int(bool(var_b_flip_h.get()))}:{int(bool(var_b_flip_v.get()))}"
+                    return _status_pending("flip", sig)
+
+                def _on_flip_status(*_a: Any) -> None:
+                    _set_field_status(st_flip, _flip_pending())
+
+                for _fv in (var_b_set_flip, var_b_flip_h, var_b_flip_v):
+                    _fv.trace_add("write", _on_flip_status)
+                _on_flip_status()
                 ttk.Checkbutton(
                     rf,
                     text="Lật dọc",
@@ -3415,7 +3484,17 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 ).pack(side=tk.LEFT, padx=(8, 0))
                 st_mute = ttk.Label(insp_grid, text="Chưa chỉnh", foreground="#888888")
                 st_mute.grid(row=12, column=2, sticky="w", padx=(8, 0), pady=(2, 0))
-                _bind_status_bool("set_mute", var_b_set_mute, st_mute)
+                def _mute_pending() -> bool:
+                    if not bool(var_b_set_mute.get()):
+                        return False
+                    return _status_pending("mute", str(int(bool(var_b_mute.get()))))
+
+                def _on_mute_status(*_a: Any) -> None:
+                    _set_field_status(st_mute, _mute_pending())
+
+                for _mv in (var_b_set_mute, var_b_mute):
+                    _mv.trace_add("write", _on_mute_status)
+                _on_mute_status()
 
                 _lb_rot = ttk.Label(insp_grid, text="Xoay (để trống / 0 / 90 / 180 / 270)", justify=tk.LEFT)
                 _lb_rot.grid(row=13, column=0, sticky="ew", pady=2)
@@ -3466,8 +3545,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         fallback="audio",
                     )
                 )
-                var_b_audio_vol = tk.StringVar(value=str(_batch_edit_draft.get("audio_vol") or "1.0"))
-                var_b_audio_sp = tk.StringVar(value=str(_batch_edit_draft.get("audio_sp") or "1.0"))
+                var_b_audio_vol = tk.StringVar(value=str(_batch_edit_draft.get("audio_vol") or ""))
+                var_b_audio_sp = tk.StringVar(value=str(_batch_edit_draft.get("audio_sp") or ""))
 
                 _lm_d = str(_batch_edit_draft.get("logo_media") or "").strip()
                 try:
@@ -3514,10 +3593,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     except (NameError, tk.TclError):
                         pass
 
-                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=14, column=0, columnspan=3, sticky="ew", pady=6)
+                # Hàng 16–17: tách khỏi zoom (15) — tránh separator/âm phụ đè lên «Vào khung» / «Zoom».
+                ttk.Separator(insp_grid, orient=tk.HORIZONTAL).grid(row=16, column=0, columnspan=3, sticky="ew", pady=6)
 
                 batch_media_fr = ttk.Frame(insp_grid)
-                batch_media_fr.grid(row=15, column=0, columnspan=3, sticky="ew")
+                batch_media_fr.grid(row=17, column=0, columnspan=3, sticky="ew")
                 batch_media_fr.columnconfigure(0, weight=1)
 
                 ov_hint_b = ttk.Label(
@@ -3563,6 +3643,11 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                     justify=tk.LEFT,
                 )
                 _bat_scope.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(8, 6))
+                try:
+                    clip_tab_scroll_inner.update_idletasks()
+                    clip_tab_scroll_inner.event_generate("<Configure>")
+                except tk.TclError:
+                    pass
                 _bind_label_wrap_to_frame(_bat_scope, insp_grid, inset=8)
 
                 var_b_reset_mode = tk.StringVar(
