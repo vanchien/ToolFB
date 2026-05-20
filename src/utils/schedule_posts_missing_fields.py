@@ -114,11 +114,35 @@ def _first_media_of_kind(media_files: Any, suffixes: frozenset[str]) -> str:
     return ""
 
 
+_FILE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
+_FILE_EXISTS_CACHE_MAX = 8000
+
+
+def clear_file_exists_cache() -> None:
+    """Xóa cache ``is_file`` (gọi sau khi reload toàn bộ job)."""
+    _FILE_EXISTS_CACHE.clear()
+
+
 def _file_exists(path: str) -> bool:
     if not path:
         return False
     try:
-        return Path(path).is_file()
+        p = Path(path)
+        key = str(p)
+        try:
+            key = str(p.resolve())
+        except OSError:
+            pass
+        st = p.stat()
+        mtime = float(st.st_mtime)
+        cached = _FILE_EXISTS_CACHE.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        ok = p.is_file()
+        if len(_FILE_EXISTS_CACHE) >= _FILE_EXISTS_CACHE_MAX:
+            _FILE_EXISTS_CACHE.clear()
+        _FILE_EXISTS_CACHE[key] = (mtime, ok)
+        return ok
     except OSError:
         return False
 
@@ -254,7 +278,11 @@ def filter_jobs_by_missing_fields(
         return list(jobs)
     out: list[dict[str, Any]] = []
     for j in jobs:
-        miss = set(get_missing_fields(j))
+        cached = j.get("_missing_fields")
+        if isinstance(cached, list):
+            miss = set(str(x) for x in cached)
+        else:
+            miss = set(get_missing_fields(j))
         if mode == "all":
             if sel.issubset(miss):
                 out.append(j)

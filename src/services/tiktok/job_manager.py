@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterable
 
 from src.services.tiktok.json_io import read_json_list, write_json_resilient
 from src.services.tiktok.layout import ensure_tiktok_layout
@@ -80,6 +80,34 @@ class TikTokJobStore:
         if not found:
             out.append(dict(row))
         self.save_all(out)
+
+    def upsert_many(self, rows: Iterable[dict[str, Any]]) -> int:
+        """Upsert nhiều job TikTok một lần đọc/ghi file."""
+        incoming: list[dict[str, Any]] = []
+        for row in rows:
+            r = dict(row)
+            if not str(r.get("id", "")).strip():
+                r["id"] = f"tt_job_{uuid.uuid4().hex[:10]}"
+            incoming.append(r)
+        if not incoming:
+            return 0
+        by_id = {str(r["id"]).strip(): r for r in incoming}
+        cur = self.load_all()
+        out: list[dict[str, Any]] = []
+        applied: set[str] = set()
+        for r in cur:
+            rid = str(r.get("id", "")).strip()
+            if rid in by_id:
+                out.append(by_id[rid])
+                applied.add(rid)
+            else:
+                out.append(dict(r))
+        for r in incoming:
+            rid = str(r.get("id", "")).strip()
+            if rid not in applied:
+                out.append(r)
+        self.save_all(out)
+        return len(incoming)
 
     def delete(self, job_id: str) -> bool:
         jid = str(job_id or "").strip()

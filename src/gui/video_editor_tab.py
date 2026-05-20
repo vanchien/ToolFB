@@ -24,6 +24,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
 
+from src.gui.ui_responsiveness import (
+    ASYNC_PREP_MIN_ROWS,
+    DEFAULT_TREE_CHUNK,
+    run_background_then_main,
+    tree_delete_all,
+    tree_insert_chunked,
+)
+
 from loguru import logger
 
 from src.services.video_editor.overlay_utils import (
@@ -420,6 +428,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
     _main_thread_ui_q: queue.Queue[Callable[[], None]] = queue.Queue()
     _main_ui_pump_pending: dict[str, bool] = {"v": False}
+    _tl_tree_insert_gen: dict[str, int] = {"v": 0}
 
     def _schedule_on_main_thread(fn: Callable[[], None]) -> None:
         """Tkinter: không gọi root.after từ worker thread (Python 3.14+ có thể lỗi)."""
@@ -457,10 +466,27 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         except tk.TclError:
             _main_ui_pump_pending["v"] = False
 
+    _project_combo_busy = {"v": False}
+
     def refresh_project_combo() -> None:
         nonlocal project_ids
-        project_ids = [p["id"] for p in pm.list_projects()]
-        cb_projects["values"] = project_ids
+        if _project_combo_busy["v"]:
+            return
+        _project_combo_busy["v"] = True
+
+        def _worker() -> list[str]:
+            return [str(p["id"]) for p in pm.list_projects()]
+
+        def _done(ids: list[str]) -> None:
+            nonlocal project_ids
+            _project_combo_busy["v"] = False
+            project_ids = ids
+            cb_projects["values"] = project_ids
+
+        def _err(_exc: BaseException) -> None:
+            _project_combo_busy["v"] = False
+
+        run_background_then_main(root, _worker, _done, on_error=_err)
 
     var_project = tk.StringVar(value="")
     cb_projects = ttk.Combobox(top_project, textvariable=var_project, width=36, state="readonly")
@@ -660,59 +686,16 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             return ""
         return str(raw.get("job_id") or "").strip()
 
-    def refresh_download_job_combo() -> None:
-        keep_label = str(var_dl_job.get() or "").strip()
-        keep_current_jid = dl_job_map.get(keep_label, "").strip()
+    def _apply_download_job_combo_ui(
+        *,
+        vals: list[str],
+        new_map: dict[str, str],
+        keep_current_jid: str,
+        pending_jid: str,
+    ) -> None:
         dl_job_map.clear()
-        vals: list[str] = []
-        all_videos = dl_store.list_downloaded_videos()
-        count_by_job: dict[str, int] = {}
-        for r in all_videos:
-            jid = str(r.get("download_job_id") or "").strip()
-            if not jid:
-                continue
-            count_by_job[jid] = int(count_by_job.get(jid, 0)) + 1
-        def _parse_job_time(raw: Any) -> float:
-            s = str(raw or "").strip()
-            if not s:
-                return 0.0
-            try:
-                if s.endswith("Z"):
-                    s = s[:-1] + "+00:00"
-                return datetime.fromisoformat(s).timestamp()
-            except Exception:
-                return 0.0
-
-        jobs_raw = [j for j in dl_store.list_jobs() if isinstance(j, dict)]
-        jobs_sorted = sorted(
-            jobs_raw,
-            key=lambda j: (
-                int(count_by_job.get(str(j.get("id") or "").strip(), 0)),
-                _parse_job_time(j.get("updated_at")),
-                _parse_job_time(j.get("created_at")),
-            ),
-            reverse=True,
-        )
-
-        for j in jobs_sorted:
-            jid = str(j.get("id") or "").strip()
-            if not jid:
-                continue
-            plat = str(j.get("platform") or "").strip() or "unknown"
-            st = str(j.get("status") or "").strip() or "-"
-            jname = str(j.get("name") or "").strip()
-            vcount = int(count_by_job.get(jid, 0))
-            if vcount <= 0 and not bool(var_show_empty_jobs.get()):
-                continue
-            short_id = jid[-6:] if len(jid) > 6 else jid
-            if jname:
-                label = f"{jname} | {plat} | {vcount} video | {st} | #{short_id}"
-            else:
-                label = f"{plat} | {vcount} video | {st} | #{short_id}"
-            vals.append(label)
-            dl_job_map[label] = jid
+        dl_job_map.update(new_map)
         cb_dl_job.configure(values=vals)
-        pending_jid = _consume_pending_editor_job_id()
         if pending_jid:
             for label, jid in dl_job_map.items():
                 if jid == pending_jid:
@@ -735,8 +718,79 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             _auto_import_pending_job["armed"] = False
             root.after(80, import_from_download_job)
 
+    def refresh_download_job_combo() -> None:
+        keep_label = str(var_dl_job.get() or "").strip()
+        keep_current_jid = dl_job_map.get(keep_label, "").strip()
+        show_empty = bool(var_show_empty_jobs.get())
+
+        def _worker() -> None:
+            vals: list[str] = []
+            new_map: dict[str, str] = {}
+            all_videos = dl_store.list_downloaded_videos()
+            count_by_job: dict[str, int] = {}
+            for r in all_videos:
+                jid = str(r.get("download_job_id") or "").strip()
+                if not jid:
+                    continue
+                count_by_job[jid] = int(count_by_job.get(jid, 0)) + 1
+
+            def _parse_job_time(raw: Any) -> float:
+                s = str(raw or "").strip()
+                if not s:
+                    return 0.0
+                try:
+                    if s.endswith("Z"):
+                        s = s[:-1] + "+00:00"
+                    return datetime.fromisoformat(s).timestamp()
+                except Exception:
+                    return 0.0
+
+            jobs_raw = [j for j in dl_store.list_jobs() if isinstance(j, dict)]
+            jobs_sorted = sorted(
+                jobs_raw,
+                key=lambda j: (
+                    int(count_by_job.get(str(j.get("id") or "").strip(), 0)),
+                    _parse_job_time(j.get("updated_at")),
+                    _parse_job_time(j.get("created_at")),
+                ),
+                reverse=True,
+            )
+            for j in jobs_sorted:
+                jid = str(j.get("id") or "").strip()
+                if not jid:
+                    continue
+                plat = str(j.get("platform") or "").strip() or "unknown"
+                st = str(j.get("status") or "").strip() or "-"
+                jname = str(j.get("name") or "").strip()
+                vcount = int(count_by_job.get(jid, 0))
+                if vcount <= 0 and not show_empty:
+                    continue
+                short_id = jid[-6:] if len(jid) > 6 else jid
+                if jname:
+                    label = f"{jname} | {plat} | {vcount} video | {st} | #{short_id}"
+                else:
+                    label = f"{plat} | {vcount} video | {st} | #{short_id}"
+                vals.append(label)
+                new_map[label] = jid
+            pending_jid = _consume_pending_editor_job_id()
+            _schedule_on_main_thread(
+                lambda: _apply_download_job_combo_ui(
+                    vals=vals,
+                    new_map=new_map,
+                    keep_current_jid=keep_current_jid,
+                    pending_jid=pending_jid,
+                )
+            )
+
+        threading.Thread(target=_worker, name="ve_refresh_dl_jobs", daemon=True).start()
+
+    _import_dl_busy = {"v": False}
+
     def import_from_download_job() -> None:
         nonlocal project
+        if _import_dl_busy["v"]:
+            notify("Đang nạp video từ job — vui lòng chờ.")
+            return
         if not project:
             messagebox.showinfo("Video Editor", "Tạo hoặc chọn project trước.")
             return
@@ -749,11 +803,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         if not rows:
             messagebox.showwarning("Video Editor", "Job này chưa có video đã tải.", parent=root)
             return
-        existing = {str(m.get("path") or "") for m in (project.get("media") or []) if isinstance(m, dict)}
-        added = 0
-        failed = 0
-        source_video_ids: list[str] = []
-        source_video_meta_by_id: dict[str, dict[str, Any]] = {}
+        _import_dl_busy["v"] = True
+        notify(f"Đang nạp {len(rows)} video từ job (chạy nền)…")
+        proj_snapshot = project
 
         def _merge_hashtags_from_download_row(row: dict[str, Any], desc: str) -> list[str]:
             out: list[str] = []
@@ -777,66 +829,95 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                 add(s)
             return out
 
-        for r in rows:
-            src_vid = str(r.get("id") or "").strip()
-            vp = Path(str(r.get("video_path") or "")).expanduser().resolve()
-            if not vp.is_file():
-                continue
-            raw_t = str(r.get("title") or "").strip()
-            raw_d = str(r.get("description") or "").strip()
-            src_meta = {
-                "title": _normalize_post_caption_title(raw_t, description=raw_d),
-                "description": raw_d,
-                "hashtags": _merge_hashtags_from_download_row(r, raw_d),
-            }
-            if src_vid:
-                source_video_meta_by_id[src_vid] = src_meta
-            if str(vp) in existing:
+        def _worker() -> None:
+            existing = {str(m.get("path") or "") for m in (proj_snapshot.get("media") or []) if isinstance(m, dict)}
+            added = 0
+            failed = 0
+            source_video_ids: list[str] = []
+            source_video_meta_by_id: dict[str, dict[str, Any]] = {}
+            total = len(rows)
+            for idx, r in enumerate(rows, start=1):
+                src_vid = str(r.get("id") or "").strip()
+                vp = Path(str(r.get("video_path") or "")).expanduser().resolve()
+                if not vp.is_file():
+                    continue
+                raw_t = str(r.get("title") or "").strip()
+                raw_d = str(r.get("description") or "").strip()
+                src_meta = {
+                    "title": _normalize_post_caption_title(raw_t, description=raw_d),
+                    "description": raw_d,
+                    "hashtags": _merge_hashtags_from_download_row(r, raw_d),
+                }
+                if src_vid:
+                    source_video_meta_by_id[src_vid] = src_meta
+                if str(vp) in existing:
+                    if src_vid:
+                        source_video_ids.append(src_vid)
+                    continue
+                try:
+                    rec = mm.import_media(str(vp), "video", copy_to_library=False)
+                except Exception:
+                    failed += 1
+                    rec = {
+                        "id": f"media_{uuid.uuid4().hex[:10]}",
+                        "type": "video",
+                        "path": str(vp),
+                        "local_path": "",
+                        "original_name": vp.name,
+                        "duration": float(r.get("duration") or 0.0),
+                        "width": int(r.get("width") or 0),
+                        "height": int(r.get("height") or 0),
+                        "fps": float(r.get("fps") or 30.0),
+                        "has_audio": True,
+                        "created_at": datetime.now().replace(microsecond=0).isoformat(),
+                    }
+                rec["source_download_video_id"] = src_vid
+                rec["source_download_job_id"] = jid
+                rec["source_title"] = src_meta["title"]
+                rec["source_description"] = src_meta["description"]
+                rec["source_hashtags"] = list(src_meta["hashtags"])
+                proj_snapshot.setdefault("media", []).append(rec)
+                existing.add(str(vp))
                 if src_vid:
                     source_video_ids.append(src_vid)
-                continue
+                added += 1
+                if total >= VE_BATCH_SHOW_PROGRESS_MIN_CLIPS and idx % max(1, total // 40) == 0:
+                    _schedule_on_main_thread(
+                        lambda i=idx, t=total: notify(f"Nạp job tải: {i}/{t} video…")
+                    )
+            pipe = dict(proj_snapshot.get("pipeline") or {})
+            pipe["source_download_job_id"] = jid
+            job_label = next((k for k, v in dl_job_map.items() if v == jid), "")
+            pipe["source_download_job_label"] = job_label
+            pipe["source_download_video_ids"] = source_video_ids
+            pipe["source_download_video_meta_by_id"] = source_video_meta_by_id
+            pipe["source_download_video_count"] = len(source_video_ids)
+            proj_snapshot["pipeline"] = pipe
             try:
-                rec = mm.import_media(str(vp), "video", copy_to_library=False)
-            except Exception:
-                # Máy yếu có thể timeout ffprobe khi import nhiều file lớn.
-                # Fallback: vẫn nạp media record tối thiểu từ dữ liệu downloader.
-                failed += 1
-                rec = {
-                    "id": f"media_{uuid.uuid4().hex[:10]}",
-                    "type": "video",
-                    "path": str(vp),
-                    "local_path": "",
-                    "original_name": vp.name,
-                    "duration": float(r.get("duration") or 0.0),
-                    "width": int(r.get("width") or 0),
-                    "height": int(r.get("height") or 0),
-                    "fps": float(r.get("fps") or 30.0),
-                    "has_audio": True,
-                    "created_at": datetime.now().replace(microsecond=0).isoformat(),
-                }
-            rec["source_download_video_id"] = src_vid
-            rec["source_download_job_id"] = jid
-            rec["source_title"] = src_meta["title"]
-            rec["source_description"] = src_meta["description"]
-            rec["source_hashtags"] = list(src_meta["hashtags"])
-            project.setdefault("media", []).append(rec)
-            existing.add(str(vp))
-            if src_vid:
-                source_video_ids.append(src_vid)
-            added += 1
-        pipe = dict(project.get("pipeline") or {})
-        pipe["source_download_job_id"] = jid
-        job_label = next((k for k, v in dl_job_map.items() if v == jid), "")
-        pipe["source_download_job_label"] = job_label
-        pipe["source_download_video_ids"] = source_video_ids
-        pipe["source_download_video_meta_by_id"] = source_video_meta_by_id
-        pipe["source_download_video_count"] = len(source_video_ids)
-        project["pipeline"] = pipe
-        pm.save_project(project)
-        refresh_media_tree()
-        refresh_timeline()
-        tail = f" | fallback nhanh: {failed}" if failed else ""
-        notify(f"Đã nạp {added} video từ job tải {jid} vào project (tổng liên kết: {len(source_video_ids)}){tail}.")
+                pm.save_project(proj_snapshot)
+            except Exception as exc:
+
+                def _import_fail(err: BaseException = exc) -> None:
+                    _import_dl_busy["v"] = False
+                    messagebox.showerror("Import job", str(err), parent=root)
+
+                _schedule_on_main_thread(_import_fail)
+                return
+            tail = f" | fallback nhanh: {failed}" if failed else ""
+            msg = (
+                f"Đã nạp {added} video từ job tải {jid} "
+                f"(tổng liên kết: {len(source_video_ids)}){tail}."
+            )
+
+            def _done() -> None:
+                _import_dl_busy["v"] = False
+                refresh_media_tree()
+                root.after(30, refresh_timeline)
+                notify(msg)
+
+            _schedule_on_main_thread(_done)
+
+        threading.Thread(target=_worker, name="ve_import_dl_job", daemon=True).start()
 
     ttk.Button(top_job, text="2) Nạp danh sách job", command=refresh_download_job_combo).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(top_job, text="3) Import video vào Media", command=import_from_download_job).pack(side=tk.LEFT, padx=(0, 4))
@@ -846,7 +927,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         variable=var_show_empty_jobs,
         command=refresh_download_job_combo,
     ).pack(side=tk.LEFT, padx=(8, 0))
-    refresh_download_job_combo()
+    root.after_idle(refresh_download_job_combo)
 
     status_fr = ttk.Frame(parent, padding=(6, 2, 6, 4))
     status_fr.pack(fill=tk.X)
@@ -875,10 +956,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             text=f"Hàng loạt — {stage}: {done}/{total} ({pct}%)",
             foreground="#1a4480",
         )
-        try:
-            root.update_idletasks()
-        except tk.TclError:
-            pass
+        # Tránh update_idletasks() — dễ gây Not responding khi batch lớn.
 
     def _ve_batch_progress_step(total: int) -> int:
         """Khoảng cách cập nhật UI (~tối đa 100 lần cho cả job)."""
@@ -2713,7 +2791,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         tree_tl.delete(*tree_tl.get_children())
         tree_tl_grouped.delete(*tree_tl_grouped.get_children())
         grouped_video_to_clip.clear()
-        refresh_video_edit_summary()
+        root.after(20, refresh_video_edit_summary)
         if not project:
             _ve_apply_tree_heading_marks(tree_tl, cols_tl, heads_tl_base, "__none__", True)
             _ve_apply_tree_heading_marks(tree_tl_grouped, cols_tlg, heads_tlg_base, "__none__", True)
@@ -2834,25 +2912,29 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         detail_specs.sort(key=_detail_sort_key, reverse=not dasc)
         _ve_apply_tree_heading_marks(tree_tl, cols_tl, heads_tl_base, dcol, dasc)
 
+        _tl_tree_insert_gen["v"] += 1
+        tl_gen = _tl_tree_insert_gen["v"]
+
+        detail_insert_specs: list[dict[str, Any]] = []
         for d in detail_specs:
             cid = str(d["cid"])
-            tree_tl.insert(
-                "",
-                tk.END,
-                iid=cid,
-                values=(
-                    d["tname"],
-                    cid[:12] + "…",
-                    f"{float(d['ts']):.2f}",
-                    f"{float(d['du']):.2f}",
-                    f"{float(d['ss']):.2f}" if d["ss"] != "" else "",
-                    f"{float(d['se']):.2f}" if d["se"] != "" else "",
-                    d["kind"],
-                    d["lv"],
-                    d["av"],
-                    d["tv"],
-                ),
-                tags=d["row_tags"],
+            detail_insert_specs.append(
+                {
+                    "iid": cid,
+                    "values": (
+                        d["tname"],
+                        cid[:12] + "…",
+                        f"{float(d['ts']):.2f}",
+                        f"{float(d['du']):.2f}",
+                        f"{float(d['ss']):.2f}" if d["ss"] != "" else "",
+                        f"{float(d['se']):.2f}" if d["se"] != "" else "",
+                        d["kind"],
+                        d["lv"],
+                        d["av"],
+                        d["tv"],
+                    ),
+                    "tags": d["row_tags"],
+                }
             )
 
         needle_g = str(var_tlg_name_filter.get() or "").strip().lower()
@@ -2898,65 +2980,104 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         grouped_specs.sort(key=_grouped_sort_key, reverse=not gasc)
         _ve_apply_tree_heading_marks(tree_tl_grouped, cols_tlg, heads_tlg_base, gcol, gasc)
 
+        grouped_insert_specs: list[dict[str, Any]] = []
         for i, s in enumerate(grouped_specs, start=1):
             gid = f"g_{i}"
             grouped_video_to_clip[gid] = s["cid"]
             ts = float(s["ts"])
             te = float(s["te"])
-            tree_tl_grouped.insert(
-                "",
-                tk.END,
-                iid=gid,
-                values=(
-                    i,
-                    s["vname"],
-                    f"{ts:.2f}",
-                    f"{max(0.0, te - ts):.2f}",
-                    "Có" if s["has_audio"] else "Chưa",
-                    "Có" if s["has_logo"] else "Chưa",
-                    "Có" if s["has_text"] else "Chưa",
-                ),
+            grouped_insert_specs.append(
+                {
+                    "iid": gid,
+                    "values": (
+                        i,
+                        s["vname"],
+                        f"{ts:.2f}",
+                        f"{max(0.0, te - ts):.2f}",
+                        "Có" if s["has_audio"] else "Chưa",
+                        "Có" if s["has_logo"] else "Chưa",
+                        "Có" if s["has_text"] else "Chưa",
+                    ),
+                }
             )
 
-        restore_tl: list[str] = []
-        for cid in prev_tl_sel:
-            if tree_tl.exists(cid):
-                restore_tl.append(cid)
-        if not restore_tl and prev_grp_sel:
-            seen_gr: set[str] = set()
-            for g in prev_grp_sel:
-                cid = str(prev_grouped_map.get(str(g)) or "").strip()
-                if cid and tree_tl.exists(cid) and cid not in seen_gr:
-                    seen_gr.add(cid)
+        def _restore_tl_selection() -> None:
+            restore_tl: list[str] = []
+            for cid in prev_tl_sel:
+                if tree_tl.exists(cid):
                     restore_tl.append(cid)
-        if restore_tl:
-            try:
-                _suppress_tl_inspector_refresh["v"] = True
+            if not restore_tl and prev_grp_sel:
+                seen_gr: set[str] = set()
+                for g in prev_grp_sel:
+                    cid = str(prev_grouped_map.get(str(g)) or "").strip()
+                    if cid and tree_tl.exists(cid) and cid not in seen_gr:
+                        seen_gr.add(cid)
+                        restore_tl.append(cid)
+            if restore_tl:
                 try:
-                    tree_tl.selection_set(tuple(restore_tl))
-                    focus_tl = prev_focus_tl if prev_focus_tl in restore_tl else restore_tl[-1]
-                    tree_tl.focus(focus_tl)
-                except Exception:
-                    pass
-                if len(restore_tl) == 1:
-                    cid0 = restore_tl[0]
-                    for gid, cid in grouped_video_to_clip.items():
-                        if str(cid) == str(cid0):
-                            try:
-                                tree_tl_grouped.selection_set((gid,))
-                                tree_tl_grouped.focus(gid)
-                            except Exception:
-                                pass
-                            break
-            finally:
-                _suppress_tl_inspector_refresh["v"] = False
-            refresh_inspector()
-        elif prev_tl_sel or prev_grp_sel:
-            # Đã rebuild timeline nhưng không khôi phục được selection (clip mất / lọc) — tránh inspector treo clip cũ.
-            refresh_inspector()
+                    _suppress_tl_inspector_refresh["v"] = True
+                    try:
+                        tree_tl.selection_set(tuple(restore_tl))
+                        focus_tl = prev_focus_tl if prev_focus_tl in restore_tl else restore_tl[-1]
+                        tree_tl.focus(focus_tl)
+                    except Exception:
+                        pass
+                    if len(restore_tl) == 1:
+                        cid0 = restore_tl[0]
+                        for gid, cid in grouped_video_to_clip.items():
+                            if str(cid) == str(cid0):
+                                try:
+                                    tree_tl_grouped.selection_set((gid,))
+                                    tree_tl_grouped.focus(gid)
+                                except Exception:
+                                    pass
+                                break
+                finally:
+                    _suppress_tl_inspector_refresh["v"] = False
+                root.after(10, refresh_inspector)
+            elif prev_tl_sel or prev_grp_sel:
+                root.after(10, refresh_inspector)
+            if bool(var_media_only_timeline.get()):
+                root.after(15, refresh_media_tree)
 
-        if bool(var_media_only_timeline.get()):
-            refresh_media_tree()
+        def _insert_grouped_tl() -> None:
+            if tl_gen != _tl_tree_insert_gen["v"]:
+                return
+            if len(grouped_insert_specs) < ASYNC_PREP_MIN_ROWS:
+                for spec in grouped_insert_specs:
+                    tree_tl_grouped.insert("", tk.END, **spec)
+                _restore_tl_selection()
+                return
+            tree_insert_chunked(
+                root,
+                tree_tl_grouped,
+                grouped_insert_specs,
+                generation=tl_gen,
+                is_current=lambda g: g == _tl_tree_insert_gen["v"],
+                on_complete=_restore_tl_selection,
+            )
+
+        def _insert_detail_tl() -> None:
+            if tl_gen != _tl_tree_insert_gen["v"]:
+                return
+            if not detail_insert_specs:
+                _insert_grouped_tl()
+                return
+            if len(detail_insert_specs) < ASYNC_PREP_MIN_ROWS:
+                for spec in detail_insert_specs:
+                    tree_tl.insert("", tk.END, **spec)
+                _insert_grouped_tl()
+                return
+            tree_insert_chunked(
+                root,
+                tree_tl,
+                detail_insert_specs,
+                generation=tl_gen,
+                is_current=lambda g: g == _tl_tree_insert_gen["v"],
+                on_complete=_insert_grouped_tl,
+            )
+
+        _insert_detail_tl()
 
     _tl_filter_debounce_after: dict[str, Any] = {"id": None}
     _edit_sum_filter_debounce_after: dict[str, Any] = {"id": None}
@@ -4118,11 +4239,9 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         tm.refresh_project_duration(project)
                     pm.save_project(project)
                     if (quick_will_logo or quick_will_text) and n_batch >= VE_BATCH_SHOW_PROGRESS_MIN_CLIPS:
-                        lbl_status.configure(text="Hàng loạt — sửa nhanh logo/chữ…", foreground="#1a4480")
-                        try:
-                            root.update_idletasks()
-                        except tk.TclError:
-                            pass
+                        lbl_status.configure(
+                            text="Hàng loạt — sửa nhanh logo/chữ…", foreground="#1a4480"
+                        )
                     keys = list(effective_patch.keys())
                     msg = f"Hàng loạt: đã cập nhật {len(current_rows)} clip"
                     if keys:
@@ -4185,11 +4304,7 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
                         applied["text"] = _sig(text_val)
                     _persist_batch_draft(save_project_file=False)
                     refresh_timeline()
-                    refresh_inspector()
-                    try:
-                        root.update_idletasks()
-                    except tk.TclError:
-                        pass
+                    root.after(30, refresh_inspector)
                     if au_ops_b > 0:
                         notify(
                             "Đã áp dụng hàng loạt — bấm «Preview nháp» khi cần "
@@ -10410,76 +10525,123 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             except Exception as ex:
                 failures.append(f"Lỗi runtime export: {ex}")
 
+            def _done_ui_show_success(
+                managed_list: list[Path],
+                *,
+                saved_jid: str,
+                save_pending: bool,
+                open_jobs: bool,
+            ) -> None:
+                prog_exp.configure(value=100)
+                _set_export_status(f"Xuất xong {len(managed_list)} file.", log=True)
+                if save_pending and saved_jid:
+                    notify(f"Đã xuất {len(managed_list)} file + lưu job chờ đăng: {saved_jid}")
+                    if open_jobs:
+                        _open_schedule_jobs_tab(saved_jid)
+                else:
+                    notify(f"Đã xuất {len(managed_list)} file.")
+
             def done_ui() -> None:
                 _mark_export_finished()
                 if exports_done:
-                    managed_list: list[Path] = []
-                    for p0 in exports_done:
-                        try:
-                            managed_list.append(_ensure_output_in_renders(p0, export_dir=export_dir_ref))
-                        except Exception:
-                            managed_list.append(p0)
-                    items_for_job: list[dict[str, Any]] = []
-                    for i, mp in enumerate(managed_list):
-                        src_row = exported_meta_rows[i] if i < len(exported_meta_rows) else {}
-                        src_meta = dict(src_row.get("src_meta") or {})
-                        desc = str(src_meta.get("description") or "").strip()
-                        meta_title = str(src_meta.get("title") or mp.stem).strip()
-                        line = internal_post_title_from_body(desc, fallback="")
-                        if not line:
-                            line = internal_post_title_from_body(meta_title, fallback=meta_title)
-                        items_for_job.append(
-                            {
-                                "video_path": str(mp.resolve()),
-                                "title": line,
-                                "content": line,
-                                "hashtags": [str(x).strip() for x in (src_meta.get("hashtags") or []) if str(x).strip()],
-                                "source_download_video_id": str(src_meta.get("source_download_video_id") or ""),
-                            }
-                        )
-                    prog_exp.configure(value=100)
-                    _set_export_status(f"Xuất xong {len(managed_list)} file.", log=True)
-                    if bool(var_exp_save_pending.get()) and items_for_job:
-                        saved_jid = _append_saved_export_job(
-                            str(var_exp_saved_job_name.get() or "").strip(),
-                            items_for_job,
-                            ("multi_clip_custom" if len(items_for_job) > 1 else "single_export_custom"),
-                            publish_extra={
-                                "publish_target": "unspecified",
-                                "preset_fb_account_id": "",
-                                "preset_fb_page_id": "",
-                                "preset_tiktok_account_id": "",
-                            },
-                        )
-                        notify(f"Đã xuất {len(managed_list)} file + lưu job chờ đăng: {saved_jid}")
-                        if bool(var_exp_open_jobs_after_save.get()):
-                            _open_schedule_jobs_tab(saved_jid)
-                    else:
-                        notify(f"Đã xuất {len(managed_list)} file.")
-                    try:
-                        rdir = export_dir_ref
-                        lines = [
-                            f"Đã xuất {len(managed_list)} file.",
-                            "",
-                            f"Thư mục: {rdir.resolve()}",
-                        ]
-                        for mp in managed_list[:6]:
-                            lines.append(f"• {mp.name}")
-                        if len(managed_list) > 6:
-                            lines.append(f"… và {len(managed_list) - 6} file khác")
-                        messagebox.showinfo("Xuất MP4", "\n".join(lines), parent=root)
-                    except Exception:
-                        messagebox.showinfo(
-                            "Xuất MP4",
-                            f"Đã xuất {len(managed_list)} file.",
-                            parent=root,
-                        )
-                    if failures:
-                        messagebox.showwarning(
-                            "Export",
-                            "Có file lỗi:\n" + "\n".join(failures[:8]) + (f"\n… (+{len(failures)-8})" if len(failures) > 8 else ""),
-                            parent=root,
-                        )
+                    exports_snap = list(exports_done)
+                    meta_snap = list(exported_meta_rows)
+                    export_dir = export_dir_ref
+                    save_pending = bool(var_exp_save_pending.get())
+                    job_name = str(var_exp_saved_job_name.get() or "").strip()
+                    open_jobs = bool(var_exp_open_jobs_after_save.get())
+                    fail_snap = list(failures)
+
+                    def _post_export_bg() -> None:
+                        managed_list: list[Path] = []
+                        for p0 in exports_snap:
+                            try:
+                                managed_list.append(_ensure_output_in_renders(p0, export_dir=export_dir))
+                            except Exception:
+                                managed_list.append(p0)
+                        items_for_job: list[dict[str, Any]] = []
+                        for i, mp in enumerate(managed_list):
+                            src_row = meta_snap[i] if i < len(meta_snap) else {}
+                            src_meta = dict(src_row.get("src_meta") or {})
+                            desc = str(src_meta.get("description") or "").strip()
+                            meta_title = str(src_meta.get("title") or mp.stem).strip()
+                            line = internal_post_title_from_body(desc, fallback="")
+                            if not line:
+                                line = internal_post_title_from_body(meta_title, fallback=meta_title)
+                            items_for_job.append(
+                                {
+                                    "video_path": str(mp.resolve()),
+                                    "title": line,
+                                    "content": line,
+                                    "hashtags": [
+                                        str(x).strip()
+                                        for x in (src_meta.get("hashtags") or [])
+                                        if str(x).strip()
+                                    ],
+                                    "source_download_video_id": str(
+                                        src_meta.get("source_download_video_id") or ""
+                                    ),
+                                }
+                            )
+                        saved_jid = ""
+                        if save_pending and items_for_job:
+                            saved_jid = _append_saved_export_job(
+                                job_name,
+                                items_for_job,
+                                (
+                                    "multi_clip_custom"
+                                    if len(items_for_job) > 1
+                                    else "single_export_custom"
+                                ),
+                                publish_extra={
+                                    "publish_target": "unspecified",
+                                    "preset_fb_account_id": "",
+                                    "preset_fb_page_id": "",
+                                    "preset_tiktok_account_id": "",
+                                },
+                            )
+
+                        def _finish_light() -> None:
+                            _done_ui_show_success(
+                                managed_list,
+                                saved_jid=saved_jid,
+                                save_pending=save_pending,
+                                open_jobs=open_jobs,
+                            )
+                            try:
+                                rdir = export_dir
+                                lines = [
+                                    f"Đã xuất {len(managed_list)} file.",
+                                    "",
+                                    f"Thư mục: {rdir.resolve()}",
+                                ]
+                                for mp in managed_list[:6]:
+                                    lines.append(f"• {mp.name}")
+                                if len(managed_list) > 6:
+                                    lines.append(f"… và {len(managed_list) - 6} file khác")
+                                messagebox.showinfo("Xuất MP4", "\n".join(lines), parent=root)
+                            except Exception:
+                                messagebox.showinfo(
+                                    "Xuất MP4",
+                                    f"Đã xuất {len(managed_list)} file.",
+                                    parent=root,
+                                )
+                            if fail_snap:
+                                messagebox.showwarning(
+                                    "Export",
+                                    "Có file lỗi:\n"
+                                    + "\n".join(fail_snap[:8])
+                                    + (
+                                        f"\n… (+{len(fail_snap) - 8})"
+                                        if len(fail_snap) > 8
+                                        else ""
+                                    ),
+                                    parent=root,
+                                )
+
+                        _schedule_on_main_thread(_finish_light)
+
+                    threading.Thread(target=_post_export_bg, name="ve_export_post_io", daemon=True).start()
                     return
                 if export_worker.is_cancel_requested() or _export_user_abort_ref.get("v"):
                     _set_export_status("Đã dừng export theo yêu cầu.", log=True)

@@ -38,6 +38,13 @@ from src.gui.cookie_capture import account_cookie_path_field, cookie_storage_des
 from src.gui.page_management import PageFormDialog
 from src.gui.page_scan_dialog import PageScanDialog
 from src.gui.schedule_job_dialog import SchedulePostJobDialog
+from src.gui.ui_responsiveness import (
+    ASYNC_PREP_MIN_ROWS,
+    DEFAULT_TREE_CHUNK,
+    run_background_then_main,
+    tree_delete_all,
+    tree_insert_chunked,
+)
 from src.modules.browser_engine import BrowserEngine
 from src.services.app_updater import (
     TOOLFB_PUBLIC_REPO,
@@ -95,6 +102,7 @@ from src.utils.schedule_posts_filters import (
 )
 from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
 from src.utils.schedule_posts_missing_fields import (
+    clear_file_exists_cache,
     MISSING_FIELD_LABELS,
     filter_jobs_by_missing_fields,
     format_missing_fields_for_display,
@@ -290,6 +298,12 @@ class _ManagerWindow:
         self._jobs_sort_key: str = "scheduled_at"
         self._jobs_sort_asc: bool = True
         self._jobs_search_after_id: str | None = None
+        self._jobs_tree_render_gen: int = 0
+        self._schedule_jobs_load_busy: bool = False
+        self._accounts_tree_gen: int = 0
+        self._accounts_load_busy: bool = False
+        self._pages_tree_gen: int = 0
+        self._pages_load_busy: bool = False
         self._var_ve_pending_search = tk.StringVar(value="")
         self._ve_pending_sort_col: str = "created"
         self._ve_pending_sort_asc: bool = False
@@ -1203,9 +1217,7 @@ class _ManagerWindow:
         self._root.minsize(860 if self._compact_ui else 960, 560 if self._compact_ui else 620)
 
         self._attach_log_sink()
-        self._fill_tree(self._accounts.load_all())
-        self._fill_pages_tree()
-        self._fill_schedule_jobs_tree()
+        self._root.after_idle(self._defer_startup_data_load)
         self._refresh_openai_tab()
         self._refresh_gemini_tab()
         self._refresh_nanobanana_tab()
@@ -1460,16 +1472,8 @@ class _ManagerWindow:
             return
         logger.info("Đã xóa nội dung Nhật ký (INFO) trên giao diện.")
 
-    def _fill_tree(self, rows: list[AccountRecord]) -> None:
-        """
-        Xóa bảng và điền lại từ danh sách bản ghi đã có trong bộ nhớ.
-
-        Args:
-            rows: Danh sách dict tài khoản (cùng kiểu ``AccountRecord``).
-        """
-        prev_sel = set(self._selected_account_ids())
-        for i in self._tree_accounts.get_children():
-            self._tree_accounts.delete(i)
+    def _account_tree_insert_specs(self, rows: list[AccountRecord]) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
         for idx, acc in enumerate(rows):
             ck = str(acc.get("cookie_path", ""))
             if len(ck) > 40:
@@ -1490,44 +1494,90 @@ class _ManagerWindow:
             if not aid:
                 aid = f"__row_{idx}"
             tick_sym = "☑" if self._account_tick.get(aid, False) else "☐"
-            self._tree_accounts.insert(
-                "",
-                tk.END,
-                iid=aid,
-                values=(
-                    tick_sym,
-                    acc.get("id", ""),
-                    acc.get("name", ""),
-                    (
-                        "Chrome"
-                        if str(acc.get("browser_type", "")).lower() in ("chromium", "chrome")
-                        else "Firefox"
-                        if str(acc.get("browser_type", "")).lower() == "firefox"
-                        else str(acc.get("browser_type", ""))
+            specs.append(
+                {
+                    "iid": aid,
+                    "values": (
+                        tick_sym,
+                        acc.get("id", ""),
+                        acc.get("name", ""),
+                        (
+                            "Chrome"
+                            if str(acc.get("browser_type", "")).lower() in ("chromium", "chrome")
+                            else "Firefox"
+                            if str(acc.get("browser_type", "")).lower() == "firefox"
+                            else str(acc.get("browser_type", ""))
+                        ),
+                        port,
+                        proxy_s,
+                        ck,
                     ),
-                    port,
-                    proxy_s,
-                    ck,
-                ),
+                }
             )
-        kids = list(self._tree_accounts.get_children())
-        self._account_tick = {str(k): self._account_tick.get(str(k), False) for k in kids}
-        restore = [i for i in kids if i in prev_sel]
-        if restore:
-            self._tree_accounts.selection_set(restore)
+        return specs
+
+    def _fill_tree(self, rows: list[AccountRecord]) -> None:
+        """Điền bảng tài khoản — insert từng lô nếu danh sách dài."""
+        prev_sel = set(self._selected_account_ids())
+        specs = self._account_tree_insert_specs(rows)
+        self._accounts_tree_gen += 1
+        gen = self._accounts_tree_gen
+        tree_delete_all(self._tree_accounts)
+
+        def _after_insert() -> None:
+            if gen != self._accounts_tree_gen:
+                return
+            kids = list(self._tree_accounts.get_children())
+            self._account_tick = {str(k): self._account_tick.get(str(k), False) for k in kids}
+            restore = [i for i in kids if i in prev_sel]
+            if restore:
+                self._tree_accounts.selection_set(restore)
+
+        if len(specs) < ASYNC_PREP_MIN_ROWS:
+            for spec in specs:
+                self._tree_accounts.insert("", tk.END, **spec)
+            _after_insert()
+            return
+
+        tree_insert_chunked(
+            self._root,
+            self._tree_accounts,
+            specs,
+            generation=gen,
+            is_current=lambda g: g == self._accounts_tree_gen,
+            on_complete=_after_insert,
+            chunk=DEFAULT_TREE_CHUNK,
+        )
 
     def _refresh_tree(self) -> None:
-        """
-        Đọc lại ``accounts.json`` từ đĩa (bỏ cache) và cập nhật bảng Treeview.
-        """
-        try:
-            rows = self._accounts.reload_from_disk()
-        except Exception as exc:  # noqa: BLE001
+        """Đọc ``accounts.json`` nền rồi render bảng (không block UI)."""
+        if self._accounts_load_busy:
+            return
+        self._accounts_load_busy = True
+        self._set_ui_busy("Đọc accounts.json")
+
+        def _worker() -> list[AccountRecord] | None:
+            return self._accounts.reload_from_disk()
+
+        def _on_main(rows: list[AccountRecord] | None) -> None:
+            self._accounts_load_busy = False
+            self._clear_ui_busy()
+            if rows is None:
+                return
+            try:
+                self._fill_tree(rows)
+                logger.info("Đã làm mới danh sách từ đĩa: {} tài khoản.", len(rows))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Làm mới danh sách thất bại: {}", exc)
+                messagebox.showerror("Lỗi", f"Không hiển thị được bảng tài khoản:\n{exc}")
+
+        def _on_err(exc: BaseException) -> None:
+            self._accounts_load_busy = False
+            self._clear_ui_busy()
             logger.exception("Làm mới danh sách thất bại: {}", exc)
             messagebox.showerror("Lỗi", f"Không đọc được accounts.json:\n{exc}")
-            return
-        self._fill_tree(rows)
-        logger.info("Đã làm mới danh sách từ đĩa: {} tài khoản.", len(rows))
+
+        run_background_then_main(self._root, _worker, _on_main, on_error=_on_err)
 
     def _acc_tree_col_at_event_x(self, event_x: int) -> str | None:
         cid = self._tree_accounts.identify_column(event_x)
@@ -1758,19 +1808,33 @@ class _ManagerWindow:
                 pass
 
     def _fill_pages_tree(self) -> None:
-        """Đọc dữ liệu gốc vào ``self._all_pages`` rồi filter/sort và render."""
-        try:
-            rows = self._pages.load_all()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Đọc pages.json: {}", exc)
+        """Đọc ``pages.json`` nền rồi filter/sort/render."""
+        if self._pages_load_busy:
             return
-        self._all_pages = [dict(r) for r in rows]
-        self._refresh_pages_filter_choices()
-        self._render_pages_tree()
+        self._pages_load_busy = True
+        self._set_ui_busy("Đọc pages.json")
 
-    def _render_pages_tree(self) -> None:
-        for i in self._tree_pages.get_children():
-            self._tree_pages.delete(i)
+        def _worker() -> list[dict[str, Any]] | None:
+            rows = self._pages.load_all()
+            return [dict(r) for r in rows]
+
+        def _on_main(pages: list[dict[str, Any]] | None) -> None:
+            self._pages_load_busy = False
+            self._clear_ui_busy()
+            if pages is None:
+                return
+            self._all_pages = pages
+            self._refresh_pages_filter_choices()
+            self._render_pages_tree()
+
+        def _on_err(exc: BaseException) -> None:
+            self._pages_load_busy = False
+            self._clear_ui_busy()
+            logger.exception("Đọc pages.json: {}", exc)
+
+        run_background_then_main(self._root, _worker, _on_main, on_error=_on_err)
+
+    def _pages_filtered_sorted_rows(self) -> list[dict[str, Any]]:
         rows = list(getattr(self, "_all_pages", []) or [])
         q = (self._var_pages_search.get() if hasattr(self, "_var_pages_search") else "").strip().lower()
         owner_val = (
@@ -1837,7 +1901,10 @@ class _ManagerWindow:
             rows.sort(key=lambda r: str(r.get("page_kind", "")).strip().lower(), reverse=rev)
         elif sk == "post_style":
             rows.sort(key=lambda r: str(r.get("post_style", "")).strip().lower(), reverse=rev)
+        return rows
 
+    def _pages_tree_insert_specs(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
         for p in rows:
             url = str(p.get("page_url", ""))
             if len(url) > 36:
@@ -1860,33 +1927,78 @@ class _ManagerWindow:
                 if st_disp == "success"
                 else "pg_pending"
             )
-            self._tree_pages.insert(
-                "",
-                tk.END,
-                values=(
-                    p.get("id", ""),
-                    p.get("account_id", ""),
-                    p.get("page_kind", "") or "—",
-                    p.get("page_name", ""),
-                    top or "—",
-                    p.get("post_style", ""),
-                    p.get("schedule_time", "") or "—",
-                    st_disp,
-                    last_post or "—",
-                    fb_pid or "—",
-                    url,
-                ),
-                tags=(row_tag,),
+            specs.append(
+                {
+                    "values": (
+                        p.get("id", ""),
+                        p.get("account_id", ""),
+                        p.get("page_kind", "") or "—",
+                        p.get("page_name", ""),
+                        top or "—",
+                        p.get("post_style", ""),
+                        p.get("schedule_time", "") or "—",
+                        st_disp,
+                        last_post or "—",
+                        fb_pid or "—",
+                        url,
+                    ),
+                    "tags": (row_tag,),
+                }
             )
+        return specs
+
+    def _pages_tree_finish_render(self, rows: list[dict[str, Any]]) -> None:
         self._tree_pages.tag_configure("pg_pending", foreground="#6b6b6b")
         self._tree_pages.tag_configure("pg_success", foreground="#0a7a2e")
         self._tree_pages.tag_configure("pg_failed", foreground="#b00020")
         self._update_pages_heading_sort_indicator()
         if hasattr(self, "_lbl_pages_stats"):
             try:
-                self._lbl_pages_stats.configure(text=f"Hiển thị {len(rows)} / {len(getattr(self, '_all_pages', []))} Page")
+                self._lbl_pages_stats.configure(
+                    text=f"Hiển thị {len(rows)} / {len(getattr(self, '_all_pages', []))} Page"
+                )
             except Exception:
                 pass
+
+    def _render_pages_tree(self) -> None:
+        self._pages_tree_gen += 1
+        gen = self._pages_tree_gen
+        rows = self._pages_filtered_sorted_rows()
+        tree_delete_all(self._tree_pages)
+        if not rows:
+            self._pages_tree_finish_render(rows)
+            return
+
+        if len(rows) >= ASYNC_PREP_MIN_ROWS:
+            self._set_ui_busy("Làm mới bảng Page")
+
+            def _worker() -> list[dict[str, Any]]:
+                return self._pages_tree_insert_specs(rows)
+
+            def _on_main(specs: list[dict[str, Any]]) -> None:
+                self._clear_ui_busy()
+
+                def _done() -> None:
+                    if gen != self._pages_tree_gen:
+                        return
+                    self._pages_tree_finish_render(rows)
+
+                tree_insert_chunked(
+                    self._root,
+                    self._tree_pages,
+                    specs,
+                    generation=gen,
+                    is_current=lambda g: g == self._pages_tree_gen,
+                    on_complete=_done,
+                )
+
+            run_background_then_main(self._root, _worker, _on_main)
+            return
+
+        specs = self._pages_tree_insert_specs(rows)
+        for spec in specs:
+            self._tree_pages.insert("", tk.END, **spec)
+        self._pages_tree_finish_render(rows)
 
     def _pages_sort_label_to_key(self, label: str) -> str:
         mp = {
@@ -2093,6 +2205,12 @@ class _ManagerWindow:
             messagebox.showerror("AI Video", str(exc), parent=self._root)
 
 
+    def _defer_startup_data_load(self) -> None:
+        """Nạp tab Accounts / Pages / Jobs sau khi cửa sổ hiện — tránh Not Responding lúc mở app."""
+        self._refresh_tree()
+        self._fill_pages_tree()
+        self._fill_schedule_jobs_tree()
+
     def _refresh_all(self) -> None:
         self._refresh_tree()
         self._on_refresh_pages()
@@ -2164,71 +2282,49 @@ class _ManagerWindow:
         threading.Thread(target=_migrate_worker, name="migrate_user_data", daemon=True).start()
 
     def _fill_schedule_jobs_tree(self) -> None:
-        """Đọc dữ liệu gốc vào ``self._all_jobs`` rồi áp filter/sort và render."""
-        try:
-            rows = self._schedule_posts.load_all()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Không đọc schedule_posts: {}", exc)
-            try:
-                self._fill_ve_pending_export_jobs_tree()
-            except Exception:
-                pass
+        """Đọc dữ liệu gốc vào ``self._all_jobs`` rồi áp filter/sort và render (JSON ngoài main thread)."""
+        if self._schedule_jobs_load_busy:
             return
-        self._all_jobs = [dict(r) for r in rows]
-        self._refresh_job_page_name_map()
-        # Nạp lại danh sách Account/Page cho các combobox filter khi có thể.
-        self._refresh_job_filter_choices()
-        self._render_schedule_jobs_tree()
-        try:
-            self._fill_ve_pending_export_jobs_tree()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Không làm mới danh sách job Video Editor pending: {}", exc)
+        self._schedule_jobs_load_busy = True
+        self._set_ui_busy("Đọc schedule_posts.json")
 
-    def _fill_ve_pending_export_jobs_tree(self) -> None:
-        """Nạp danh sách job chờ vào combobox + làm mới chi tiết / bảng video."""
+        def _worker() -> None:
+            err: str | None = None
+            jobs: list[dict[str, Any]] | None = None
+            try:
+                rows = self._schedule_posts.load_all()
+                jobs = [dict(r) for r in rows]
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                logger.warning("Không đọc schedule_posts: {}", exc)
+
+            def _done() -> None:
+                self._schedule_jobs_load_busy = False
+                self._clear_ui_busy()
+                if err is not None or jobs is None:
+                    try:
+                        self._root.after(50, self._fill_ve_pending_export_jobs_tree)
+                    except Exception:
+                        pass
+                    return
+                clear_file_exists_cache()
+                self._all_jobs = jobs
+                self._refresh_job_page_name_map()
+                self._refresh_job_filter_choices()
+                self._render_schedule_jobs_tree()
+                self._root.after(50, self._fill_ve_pending_export_jobs_tree)
+
+            try:
+                self._root.after(0, _done)
+            except tk.TclError:
+                self._schedule_jobs_load_busy = False
+
+        threading.Thread(target=_worker, name="load_schedule_posts", daemon=True).start()
+
+    def _apply_ve_pending_export_jobs_ui(self, rows_out: list[dict[str, Any]]) -> None:
+        """Cập nhật combobox job chờ đăng (đã lọc/sort trên worker)."""
         if not hasattr(self, "_cb_ve_pending_jobs"):
             return
-        tgt_labels = {
-            "facebook": "Facebook + Page",
-            "tiktok": "TikTok",
-            "unspecified": "Chờ chọn",
-            "": "—",
-        }
-        needle = str(self._var_ve_pending_search.get() or "").strip().casefold()
-        rows_out: list[dict[str, Any]] = []
-        for r in self._load_saved_export_schedule_jobs():
-            if not isinstance(r, dict):
-                continue
-            st = str(r.get("status", "")).strip().lower()
-            if st not in {"", "saved", "pending"}:
-                continue
-            jid = str(r.get("id") or "").strip()
-            if not jid:
-                continue
-            jn = str(r.get("job_name") or jid).strip()
-            tgt = str(r.get("publish_target") or "").strip().lower()
-            tgt_disp = tgt_labels.get(tgt, tgt or "—")
-            try:
-                n = len(r.get("items") or [])
-            except TypeError:
-                n = 0
-            created = str(r.get("created_at") or "").strip()
-            st_disp = str(r.get("status") or "").strip() or "saved"
-            hay = f"{jid} {jn} {tgt_disp} {n} {created} {st_disp}".casefold()
-            if needle and needle not in hay:
-                continue
-            rows_out.append(
-                {
-                    "row": r,
-                    "jid": jid,
-                    "jn": jn,
-                    "tgt_disp": tgt_disp,
-                    "n": n,
-                    "created": created,
-                    "st_disp": st_disp,
-                }
-            )
-
         col = str(getattr(self, "_ve_pending_sort_col", "created") or "created")
         asc = bool(getattr(self, "_ve_pending_sort_asc", False))
 
@@ -2281,8 +2377,6 @@ class _ManagerWindow:
                         (lb for lb in labels if str(by_label[lb].get("id") or "").strip() == prev_id),
                         "",
                     )
-                else:
-                    picked = ""
                 if not picked:
                     picked = labels[0]
                 self._var_ve_pending_job.set(picked)
@@ -2292,7 +2386,64 @@ class _ManagerWindow:
             self._suppress_ve_pending_job_cb["v"] = False
 
         self._sync_ve_pending_selected_id_from_combo()
-        self._refresh_ve_pending_job_detail()
+        self._root.after(0, self._refresh_ve_pending_job_detail)
+
+    def _fill_ve_pending_export_jobs_tree(self) -> None:
+        """Nạp danh sách job chờ vào combobox (đọc JSON ngoài main thread)."""
+        if not hasattr(self, "_cb_ve_pending_jobs"):
+            return
+        needle = str(self._var_ve_pending_search.get() or "").strip().casefold()
+        tgt_labels = {
+            "facebook": "Facebook + Page",
+            "tiktok": "TikTok",
+            "unspecified": "Chờ chọn",
+            "": "—",
+        }
+
+        def _worker() -> None:
+            rows_out: list[dict[str, Any]] = []
+            for r in self._load_saved_export_schedule_jobs():
+                if not isinstance(r, dict):
+                    continue
+                st = str(r.get("status", "")).strip().lower()
+                if st not in {"", "saved", "pending"}:
+                    continue
+                jid = str(r.get("id") or "").strip()
+                if not jid:
+                    continue
+                jn = str(r.get("job_name") or jid).strip()
+                tgt = str(r.get("publish_target") or "").strip().lower()
+                tgt_disp = tgt_labels.get(tgt, tgt or "—")
+                try:
+                    n = len(r.get("items") or [])
+                except TypeError:
+                    n = 0
+                created = str(r.get("created_at") or "").strip()
+                st_disp = str(r.get("status") or "").strip() or "saved"
+                hay = f"{jid} {jn} {tgt_disp} {n} {created} {st_disp}".casefold()
+                if needle and needle not in hay:
+                    continue
+                rows_out.append(
+                    {
+                        "row": r,
+                        "jid": jid,
+                        "jn": jn,
+                        "tgt_disp": tgt_disp,
+                        "n": n,
+                        "created": created,
+                        "st_disp": st_disp,
+                    }
+                )
+
+            def _done() -> None:
+                self._apply_ve_pending_export_jobs_ui(rows_out)
+
+            try:
+                self._root.after(0, _done)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=_worker, name="ve_pending_jobs_load", daemon=True).start()
 
     def _sync_ve_pending_sort_ui_from_col(self) -> None:
         lab = _VE_PENDING_COL_TO_SORT_LABEL.get(str(getattr(self, "_ve_pending_sort_col", "") or ""), "Tạo lúc")
@@ -3807,56 +3958,173 @@ class _ManagerWindow:
             self._jobs_sort_asc = True
         self._render_schedule_jobs_tree()
 
-    def _render_schedule_jobs_tree(self) -> None:
-        for i in self._tree_jobs.get_children():
-            self._tree_jobs.delete(i)
-        # Gán chuỗi local + snapshot field thiếu cho search + hiển thị.
-        for j in self._all_jobs:
+    _JOBS_TREE_INSERT_CHUNK = 45
+    _JOBS_TREE_ASYNC_MIN = 35
+
+    def _job_tree_row_values(self, j: dict[str, Any]) -> tuple[Any, ...]:
+        tit = str(j.get("title", "") or "")
+        if len(tit) > 40:
+            tit = tit[:37] + "…"
+        img_prompt = str(j.get("image_prompt", "") or "")
+        if len(img_prompt) > 90:
+            img_prompt = img_prompt[:87] + "…"
+        miss_txt = format_missing_fields_for_display(j.get("_missing_fields") or [])
+        return (
+            j.get("id", ""),
+            self._job_page_display(str(j.get("page_id", "") or "")),
+            j.get("account_id", ""),
+            j.get("post_type", ""),
+            j.get("ai_language", ""),
+            tit,
+            img_prompt,
+            j.get("_display_scheduled_local", "—"),
+            self._job_status_with_retry(j),
+            self._schedule_job_error_display(j),
+            j.get("retry_count", 0),
+            miss_txt,
+        )
+
+    def _jobs_tree_missing_filter_preset(self) -> dict[str, Any]:
+        if not hasattr(self, "_var_jobs_filter_missing"):
+            return preset_by_label("")
+        return preset_by_label(self._var_jobs_filter_missing.get())
+
+    def _prepare_jobs_tree_render_pack(
+        self,
+        jobs: list[dict[str, Any]],
+        *,
+        filters: dict[str, Any],
+        sort_key: str,
+        sort_asc: bool,
+        missing_preset: dict[str, Any],
+    ) -> tuple[list[tuple[Any, ...]], list[dict[str, Any]]]:
+        for j in jobs:
             j["_display_scheduled_local"] = self._format_scheduled_for_ui(j)
             j["_missing_fields"] = get_missing_fields(j)
-        filters = self._current_jobs_filters()
-        filtered = apply_job_filters(self._all_jobs, **filters)
-        # Bộ lọc «Thiếu field» — áp sau filters cơ bản, AND-logic.
-        if hasattr(self, "_var_jobs_filter_missing"):
-            preset = preset_by_label(self._var_jobs_filter_missing.get())
-            if preset.get("match_mode") != "none" and preset.get("fields"):
-                filtered = filter_jobs_by_missing_fields(
-                    filtered,
-                    preset["fields"],
-                    match_mode=preset.get("match_mode", "any"),
-                )
-        filtered = sort_jobs(filtered, sort_key=self._jobs_sort_key, ascending=self._jobs_sort_asc)
-        self._filtered_jobs = filtered
-        for j in filtered:
-            tit = str(j.get("title", "") or "")
-            if len(tit) > 40:
-                tit = tit[:37] + "…"
-            img_prompt = str(j.get("image_prompt", "") or "")
-            if len(img_prompt) > 90:
-                img_prompt = img_prompt[:87] + "…"
-            miss_txt = format_missing_fields_for_display(j.get("_missing_fields") or [])
-            status_txt = self._job_status_with_retry(j)
-            err_txt = self._schedule_job_error_display(j)
-            self._tree_jobs.insert(
-                "",
-                tk.END,
-                values=(
-                    j.get("id", ""),
-                    self._job_page_display(str(j.get("page_id", "") or "")),
-                    j.get("account_id", ""),
-                    j.get("post_type", ""),
-                    j.get("ai_language", ""),
-                    tit,
-                    img_prompt,
-                    j.get("_display_scheduled_local", "—"),
-                    status_txt,
-                    err_txt,
-                    j.get("retry_count", 0),
-                    miss_txt,
-                ),
+        filtered = apply_job_filters(jobs, **filters)
+        if missing_preset.get("match_mode") != "none" and missing_preset.get("fields"):
+            filtered = filter_jobs_by_missing_fields(
+                filtered,
+                missing_preset["fields"],
+                match_mode=missing_preset.get("match_mode", "any"),
             )
+        filtered = sort_jobs(filtered, sort_key=sort_key, ascending=sort_asc)
+        rows = [self._job_tree_row_values(j) for j in filtered]
+        return rows, filtered
+
+    def _insert_job_tree_rows_chunked(
+        self,
+        rows: list[tuple[Any, ...]],
+        *,
+        token: int,
+        start: int = 0,
+    ) -> None:
+        if token != self._jobs_tree_render_gen:
+            return
+        chunk = self._JOBS_TREE_INSERT_CHUNK
+        end = min(start + chunk, len(rows))
+        for i in range(start, end):
+            self._tree_jobs.insert("", tk.END, values=rows[i])
+        if end < len(rows):
+            self._root.after(1, lambda t=token, n=end: self._insert_job_tree_rows_chunked(rows, token=t, start=n))
+            return
         self._update_schedule_jobs_sort_indicator()
         self._update_schedule_jobs_stats_label()
+        self._clear_ui_busy()
+
+    def _apply_jobs_tree_render_pack(
+        self,
+        *,
+        token: int,
+        rows: list[tuple[Any, ...]] | None,
+        filtered: list[dict[str, Any]] | None,
+        err: str | None = None,
+    ) -> None:
+        if token != self._jobs_tree_render_gen:
+            self._clear_ui_busy()
+            return
+        if err or rows is None or filtered is None:
+            logger.warning("Render job tree lỗi: {}", err or "unknown")
+            self._clear_ui_busy()
+            return
+        self._filtered_jobs = filtered
+        try:
+            children = self._tree_jobs.get_children()
+            if children:
+                self._tree_jobs.delete(*children)
+        except tk.TclError:
+            pass
+        if not rows:
+            self._update_schedule_jobs_sort_indicator()
+            self._update_schedule_jobs_stats_label()
+            self._clear_ui_busy()
+            return
+        self._insert_job_tree_rows_chunked(rows, token=token, start=0)
+
+    def _render_schedule_jobs_tree(self) -> None:
+        """Filter/sort + rebuild Treeview; tác vụ nặng chạy nền, insert từng lô trên main thread."""
+        self._jobs_tree_render_gen += 1
+        token = self._jobs_tree_render_gen
+        jobs = list(self._all_jobs)
+        if not jobs:
+            try:
+                children = self._tree_jobs.get_children()
+                if children:
+                    self._tree_jobs.delete(*children)
+            except tk.TclError:
+                pass
+            self._filtered_jobs = []
+            self._update_schedule_jobs_sort_indicator()
+            self._update_schedule_jobs_stats_label()
+            return
+
+        filters = self._current_jobs_filters()
+        sort_key = self._jobs_sort_key
+        sort_asc = self._jobs_sort_asc
+        missing_preset = self._jobs_tree_missing_filter_preset()
+
+        if len(jobs) < self._JOBS_TREE_ASYNC_MIN:
+            try:
+                rows, filtered = self._prepare_jobs_tree_render_pack(
+                    jobs,
+                    filters=filters,
+                    sort_key=sort_key,
+                    sort_asc=sort_asc,
+                    missing_preset=missing_preset,
+                )
+                self._apply_jobs_tree_render_pack(token=token, rows=rows, filtered=filtered)
+            except Exception as exc:  # noqa: BLE001
+                self._apply_jobs_tree_render_pack(token=token, rows=None, filtered=None, err=str(exc))
+            return
+
+        self._set_ui_busy("Làm mới bảng job")
+
+        def _worker() -> None:
+            err: str | None = None
+            rows: list[tuple[Any, ...]] | None = None
+            filtered: list[dict[str, Any]] | None = None
+            try:
+                rows, filtered = self._prepare_jobs_tree_render_pack(
+                    jobs,
+                    filters=filters,
+                    sort_key=sort_key,
+                    sort_asc=sort_asc,
+                    missing_preset=missing_preset,
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+
+            def _done() -> None:
+                self._apply_jobs_tree_render_pack(
+                    token=token, rows=rows, filtered=filtered, err=err
+                )
+
+            try:
+                self._root.after(0, _done)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=_worker, name="jobs_tree_render", daemon=True).start()
 
     def _schedule_job_error_display(self, job: dict[str, Any], *, max_len: int = 120) -> str:
         """Rút gọn ``error_note`` để hiện trên cây job."""
@@ -5166,6 +5434,39 @@ class _ManagerWindow:
         label = f"{core}{extra}  [{aid}]"
         return core.lower(), label, aid
 
+    def _ve_import_prepare_account_maps(self) -> tuple[dict[str, str], dict[str, str], str | None]:
+        """Đọc accounts Facebook/TikTok cho dialog nạp job Export (gọi từ thread nền)."""
+        fb_account_map: dict[str, str] = {}
+        try:
+            acc_rows: list[tuple[str, str, str]] = []
+            for a in self._accounts.load_all():
+                if not isinstance(a, dict):
+                    continue
+                sk, lb, aid = self._ve_import_fb_account_row(a)
+                if aid:
+                    acc_rows.append((sk, lb, aid))
+            acc_rows.sort(key=lambda x: x[0])
+            for _, lb, aid in acc_rows:
+                fb_account_map[lb] = aid
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Nạp job chờ đăng: đọc accounts.json")
+            return {}, {}, f"Không đọc được danh sách Facebook (accounts.json):\n{exc}"
+        tt_account_map: dict[str, str] = {}
+        try:
+            tt_rows: list[tuple[str, str, str]] = []
+            for a in TikTokAccountStore().load_all():
+                if not isinstance(a, dict):
+                    continue
+                sk, lb, aid = self._ve_import_tt_account_row(a)
+                if aid:
+                    tt_rows.append((sk, lb, aid))
+            tt_rows.sort(key=lambda x: x[0])
+            for _, lb, aid in tt_rows:
+                tt_account_map[lb] = aid
+        except Exception:
+            pass
+        return fb_account_map, tt_account_map, None
+
     @staticmethod
     def _load_saved_export_schedule_jobs() -> list[dict[str, Any]]:
         p = video_editor_schedule_jobs_json_path()
@@ -5184,57 +5485,44 @@ class _ManagerWindow:
         p.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _on_import_saved_export_job(self) -> None:
-        rows = self._load_saved_export_schedule_jobs()
-        if not rows:
-            messagebox.showinfo(
-                "Job chờ đăng",
-                "Chưa có job chờ đăng từ Video Editor.",
-                parent=self._root,
-            )
-            return
-        fb_account_map: dict[str, str] = {}
-        try:
-            raw_accs = list(self._accounts.load_all())
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Nạp job chờ đăng: đọc accounts.json")
-            messagebox.showerror(
-                "Lỗi tài khoản",
-                f"Không đọc được danh sách Facebook (accounts.json):\n{exc}",
-                parent=self._root,
-            )
-            return
-        acc_rows: list[tuple[str, str, str]] = []
-        for a in raw_accs:
-            if not isinstance(a, dict):
-                continue
-            sk, lb, aid = self._ve_import_fb_account_row(a)
-            if aid:
-                acc_rows.append((sk, lb, aid))
-        acc_rows.sort(key=lambda x: x[0])
-        for _, lb, aid in acc_rows:
-            fb_account_map[lb] = aid
-        tt_account_map: dict[str, str] = {}
-        try:
-            tt_rows: list[tuple[str, str, str]] = []
-            for a in TikTokAccountStore().load_all():
-                if not isinstance(a, dict):
-                    continue
-                sk, lb, aid = self._ve_import_tt_account_row(a)
-                if aid:
-                    tt_rows.append((sk, lb, aid))
-            tt_rows.sort(key=lambda x: x[0])
-            for _, lb, aid in tt_rows:
-                tt_account_map[lb] = aid
-        except Exception:
-            pass
-        if not fb_account_map and not tt_account_map:
-            messagebox.showwarning(
-                "Chưa có tài khoản",
-                "Chưa có tài khoản Facebook hoặc TikTok — không thể «Nạp» vào lịch cho đến khi thêm tài khoản (tab 1 / TikTok Manager).\n"
-                "Bạn vẫn có thể xem job chờ trong tab «7.Job chờ đăng từ Video Editor».",
-                parent=self._root,
-            )
+        def _worker() -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]] | None:
+            rows = self._load_saved_export_schedule_jobs()
+            if not rows:
+                return None
+            fb_map, tt_map, err = self._ve_import_prepare_account_maps()
+            if err:
+                raise RuntimeError(err)
+            return rows, fb_map, tt_map
 
+        def _on_main(data: tuple[list[dict[str, Any]], dict[str, str], dict[str, str]] | None) -> None:
+            if data is None:
+                messagebox.showinfo(
+                    "Job chờ đăng",
+                    "Chưa có job chờ đăng từ Video Editor.",
+                    parent=self._root,
+                )
+                return
+            rows, fb_account_map, tt_account_map = data
+            if not fb_account_map and not tt_account_map:
+                messagebox.showwarning(
+                    "Chưa có tài khoản",
+                    "Chưa có tài khoản Facebook hoặc TikTok — không thể «Nạp» vào lịch cho đến khi thêm tài khoản (tab 1 / TikTok Manager).\n"
+                    "Bạn vẫn có thể xem job chờ trong tab «7.Job chờ đăng từ Video Editor».",
+                    parent=self._root,
+                )
+            self._show_ve_import_saved_export_dialog(rows, fb_account_map, tt_account_map)
+
+        def _on_err(exc: BaseException) -> None:
+            messagebox.showerror("Lỗi tài khoản", str(exc), parent=self._root)
+
+        run_background_then_main(self._root, _worker, _on_main, on_error=_on_err)
+
+    def _show_ve_import_saved_export_dialog(
+        self,
+        rows: list[dict[str, Any]],
+        fb_account_map: dict[str, str],
+        tt_account_map: dict[str, str],
+    ) -> None:
         top = tk.Toplevel(self._root)
         top.title("Nạp job chờ đăng từ Export")
         top.transient(self._root)
@@ -5582,7 +5870,13 @@ class _ManagerWindow:
             aid = fb_account_map.get(str(var_acc.get() or "").strip(), "")
             rows_pg: list[tuple[str, str, str]] = []
             if aid:
-                for p in self._pages.load_all():
+                pages_src = list(getattr(self, "_all_pages", []) or [])
+                if not pages_src:
+                    try:
+                        pages_src = self._pages.load_all()
+                    except Exception:
+                        pages_src = []
+                for p in pages_src:
                     if not isinstance(p, dict):
                         continue
                     if str(p.get("account_id") or "").strip() != aid:
@@ -5608,36 +5902,22 @@ class _ManagerWindow:
             return "wait"
 
         def _reload_ve_import_maps() -> None:
-            fb_account_map.clear()
-            acc_rows2: list[tuple[str, str, str]] = []
-            try:
-                for a in self._accounts.load_all():
-                    if not isinstance(a, dict):
-                        continue
-                    sk, lb, aid = self._ve_import_fb_account_row(a)
-                    if aid:
-                        acc_rows2.append((sk, lb, aid))
-                acc_rows2.sort(key=lambda x: x[0])
-                for _, lb, aid in acc_rows2:
-                    fb_account_map[lb] = aid
-            except Exception:
-                pass
-            tt_account_map.clear()
-            try:
-                tt_rows2: list[tuple[str, str, str]] = []
-                for a in TikTokAccountStore().load_all():
-                    if not isinstance(a, dict):
-                        continue
-                    sk, lb, aid = self._ve_import_tt_account_row(a)
-                    if aid:
-                        tt_rows2.append((sk, lb, aid))
-                tt_rows2.sort(key=lambda x: x[0])
-                for _, lb, aid in tt_rows2:
-                    tt_account_map[lb] = aid
-            except Exception:
-                pass
-            _sync_kieu_dich_ui()
-            _refresh_preview()
+            def _worker() -> tuple[dict[str, str], dict[str, str], str | None]:
+                return self._ve_import_prepare_account_maps()
+
+            def _on_main(maps: tuple[dict[str, str], dict[str, str], str | None]) -> None:
+                fb_m, tt_m, err = maps
+                if err:
+                    messagebox.showerror("Lỗi tài khoản", err, parent=top)
+                    return
+                fb_account_map.clear()
+                fb_account_map.update(fb_m)
+                tt_account_map.clear()
+                tt_account_map.update(tt_m)
+                _sync_kieu_dich_ui()
+                _refresh_preview()
+
+            run_background_then_main(top, _worker, _on_main)
 
         def _sync_kieu_dich_ui(*_a: Any) -> None:
             kv = _kieu_key()
@@ -6037,134 +6317,178 @@ class _ManagerWindow:
                 )
                 return
 
-            job_store = TikTokJobStore()
-            pps = page_post_style_for_post_type("video")
-            created_fb = 0
-            created_tt = 0
-            last_fb_aid = ""
-            last_fb_pid = ""
-            last_tt_aid = ""
-            _ts_imp = datetime.now().isoformat(timespec="seconds")
-            for idx, (_orig_i, it) in enumerate(valid_entries):
-                vp = str(it.get("video_path") or "").strip()
-                plan = plans[idx]
-                plat_i = self._ve_resolve_item_publish(it, rec, dialog_plat)
-                if plat_i == "tiktok":
-                    aid_tt = self._ve_resolve_item_tt_account(it, rec, dlg_acc, tt_account_map)
-                    raw_c = str(it.get("content") or "").strip()
-                    line = internal_post_title_from_body(raw_c, fallback="")
-                    if not line:
-                        line = internal_post_title_from_body(
-                            str(it.get("title") or Path(vp).stem).strip(), fallback=Path(vp).stem
-                        )
-                    caption = line
-                    tags = [str(x).strip() for x in (it.get("hashtags") or []) if str(x).strip()]
-                    job_tt = default_job_dict(account_id=aid_tt, video_path=vp, caption=caption, hashtags=tags)
-                    job_tt["schedule_enabled"] = True
-                    job_tt["scheduled_at"] = plan["scheduled_at"]
-                    job_tt["schedule_time"] = plan["wall"]
-                    job_tt["created_by"] = "video_editor_saved_job_import"
-                    job_tt["source_project_id"] = str(rec.get("source_project_id") or "")
-                    job_tt["source_download_job_id"] = str(rec.get("source_download_job_id") or "")
-                    job_tt["source_download_job_label"] = str(rec.get("source_download_job_label") or "")
-                    job_tt["source_download_video_id"] = str(it.get("source_download_video_id") or "")
-                    job_store.upsert(job_tt)
-                    it["item_scheduled_platform"] = "tiktok"
-                    it["item_scheduled_job_id"] = str(job_tt.get("id") or "")
-                    it["item_scheduled_at"] = _ts_imp
-                    created_tt += 1
-                    last_tt_aid = aid_tt
-                else:
-                    aid_fb, pid_fb = self._ve_resolve_item_fb_ids(
-                        it, rec, dlg_acc, dlg_page, fb_account_map, page_map
-                    )
-                    raw_fb = str(it.get("content") or "").strip()
-                    line_fb = internal_post_title_from_body(raw_fb, fallback="")
-                    if not line_fb:
-                        line_fb = internal_post_title_from_body(
-                            str(it.get("title") or Path(vp).stem).strip(), fallback=Path(vp).stem
-                        )
-                    row_fb: dict[str, Any] = {
-                        "id": f"sched_{uuid.uuid4().hex[:10]}",
-                        "page_id": pid_fb,
-                        "account_id": aid_fb,
-                        "post_type": "video",
-                        "page_post_style": pps,
-                        "title": line_fb,
-                        "content": line_fb,
-                        "hashtags": [str(x).strip() for x in (it.get("hashtags") or []) if str(x).strip()],
-                        "media_files": [vp],
-                        "video_path": vp,
-                        "scheduled_at": plan["scheduled_at"],
-                        "timezone": tz_row,
-                        "schedule_recurrence": str(plan.get("schedule_recurrence") or ""),
-                        "schedule_slot": str(plan.get("schedule_slot") or ""),
-                        "status": "pending",
-                        "retry_count": 0,
-                        "max_retry": 3,
-                        "created_by": "video_editor_saved_job_import",
-                        "created_at": datetime.now().isoformat(timespec="seconds"),
-                        "source_project_id": str(rec.get("source_project_id") or ""),
-                        "source_download_job_id": str(rec.get("source_download_job_id") or ""),
-                        "source_download_job_label": str(rec.get("source_download_job_label") or ""),
-                        "source_download_video_id": str(it.get("source_download_video_id") or ""),
-                    }
-                    if plan.get("schedule_daily_slots"):
-                        row_fb["schedule_daily_slots"] = str(plan["schedule_daily_slots"])
-                        row_fb["schedule_delay_min"] = int(plan["schedule_delay_min"])
-                        row_fb["schedule_delay_max"] = int(plan["schedule_delay_max"])
-                        row_fb["schedule_start_date"] = str(plan["schedule_start_date"])
-                    sbl = str(plan.get("slot_base_local") or "").strip()
-                    if sbl:
-                        row_fb["slot_base_local"] = sbl[:80]
-                    if "delay_applied_min" in plan:
-                        row_fb["schedule_delay_applied_min"] = max(0, min(180, int(plan["delay_applied_min"])))
-                    self._schedule_posts.upsert(row_fb)  # type: ignore[arg-type]
-                    it["item_scheduled_platform"] = "facebook"
-                    it["item_scheduled_job_id"] = str(row_fb["id"])
-                    it["item_scheduled_at"] = _ts_imp
-                    created_fb += 1
-                    last_fb_aid, last_fb_pid = aid_fb, pid_fb
+            imp_btn = import_btn_ref.get("b")
+            if imp_btn is not None:
+                try:
+                    imp_btn.configure(state="disabled")
+                except tk.TclError:
+                    pass
+            n_clips = len(valid_entries)
+            var_preview.set(f"Đang nạp {n_clips} clip vào lịch…")
 
-            rec["status"] = "imported"
-            rec["imported_at"] = datetime.now().isoformat(timespec="seconds")
-            if created_fb and created_tt:
-                rec["imported_to_platform"] = "mixed"
-                rec["imported_to_account_id"] = f"fb:{last_fb_aid};tt:{last_tt_aid}"[:480]
-                rec["imported_to_page_id"] = last_fb_pid
-            elif created_tt:
-                rec["imported_to_platform"] = "tiktok"
-                rec["imported_to_account_id"] = last_tt_aid
-                rec["imported_to_page_id"] = ""
-            else:
-                rec["imported_to_platform"] = "facebook"
-                rec["imported_to_account_id"] = last_fb_aid
-                rec["imported_to_page_id"] = last_fb_pid
-            self._save_saved_export_schedule_jobs(rows)
-            top.destroy()
-            src_hint = str(rec.get("source_download_job_label") or rec.get("source_download_job_id") or "").strip()
-            if created_fb:
-                if hasattr(self, "_var_jobs_filter_status"):
-                    self._var_jobs_filter_status.set("pending")
-                if hasattr(self, "_var_jobs_filter_account"):
-                    self._var_jobs_filter_account.set(str(var_acc.get() or "Tất cả account"))
-                if hasattr(self, "_var_jobs_filter_page"):
-                    self._var_jobs_filter_page.set(str(var_page.get() or "Tất cả page"))
-                if hasattr(self, "_var_jobs_filter_retry"):
-                    self._var_jobs_filter_retry.set("Retry: tất cả")
-                if hasattr(self, "_var_jobs_search"):
-                    self._var_jobs_search.set(src_hint or "video_editor_saved_job_import")
-            self._fill_schedule_jobs_tree()
-            msg_done = (
-                f"Facebook: {created_fb} job lịch; TikTok: {created_tt} job (có lịch)."
-                if (created_fb and created_tt)
-                else (
-                    f"Đã nạp {created_tt} job TikTok (có lịch) vào TikTok Manager."
-                    if created_tt
-                    else f"Đã nạp {created_fb} job lịch Facebook từ job chờ đăng."
+            def _import_worker() -> dict[str, Any]:
+                job_store = TikTokJobStore()
+                pps = page_post_style_for_post_type("video")
+                fb_batch: list[dict[str, Any]] = []
+                tt_batch: list[dict[str, Any]] = []
+                created_fb = 0
+                created_tt = 0
+                last_fb_aid = ""
+                last_fb_pid = ""
+                last_tt_aid = ""
+                _ts_imp = datetime.now().isoformat(timespec="seconds")
+                for idx, (_orig_i, it) in enumerate(valid_entries):
+                    vp = str(it.get("video_path") or "").strip()
+                    plan = plans[idx]
+                    plat_i = self._ve_resolve_item_publish(it, rec, dialog_plat)
+                    if plat_i == "tiktok":
+                        aid_tt = self._ve_resolve_item_tt_account(it, rec, dlg_acc, tt_account_map)
+                        raw_c = str(it.get("content") or "").strip()
+                        line = internal_post_title_from_body(raw_c, fallback="")
+                        if not line:
+                            line = internal_post_title_from_body(
+                                str(it.get("title") or Path(vp).stem).strip(), fallback=Path(vp).stem
+                            )
+                        caption = line
+                        tags = [str(x).strip() for x in (it.get("hashtags") or []) if str(x).strip()]
+                        job_tt = default_job_dict(account_id=aid_tt, video_path=vp, caption=caption, hashtags=tags)
+                        job_tt["schedule_enabled"] = True
+                        job_tt["scheduled_at"] = plan["scheduled_at"]
+                        job_tt["schedule_time"] = plan["wall"]
+                        job_tt["created_by"] = "video_editor_saved_job_import"
+                        job_tt["source_project_id"] = str(rec.get("source_project_id") or "")
+                        job_tt["source_download_job_id"] = str(rec.get("source_download_job_id") or "")
+                        job_tt["source_download_job_label"] = str(rec.get("source_download_job_label") or "")
+                        job_tt["source_download_video_id"] = str(it.get("source_download_video_id") or "")
+                        tt_batch.append(job_tt)
+                        it["item_scheduled_platform"] = "tiktok"
+                        it["item_scheduled_job_id"] = str(job_tt.get("id") or "")
+                        it["item_scheduled_at"] = _ts_imp
+                        created_tt += 1
+                        last_tt_aid = aid_tt
+                    else:
+                        aid_fb, pid_fb = self._ve_resolve_item_fb_ids(
+                            it, rec, dlg_acc, dlg_page, fb_account_map, page_map
+                        )
+                        raw_fb = str(it.get("content") or "").strip()
+                        line_fb = internal_post_title_from_body(raw_fb, fallback="")
+                        if not line_fb:
+                            line_fb = internal_post_title_from_body(
+                                str(it.get("title") or Path(vp).stem).strip(), fallback=Path(vp).stem
+                            )
+                        row_fb: dict[str, Any] = {
+                            "id": f"sched_{uuid.uuid4().hex[:10]}",
+                            "page_id": pid_fb,
+                            "account_id": aid_fb,
+                            "post_type": "video",
+                            "page_post_style": pps,
+                            "title": line_fb,
+                            "content": line_fb,
+                            "hashtags": [str(x).strip() for x in (it.get("hashtags") or []) if str(x).strip()],
+                            "media_files": [vp],
+                            "video_path": vp,
+                            "scheduled_at": plan["scheduled_at"],
+                            "timezone": tz_row,
+                            "schedule_recurrence": str(plan.get("schedule_recurrence") or ""),
+                            "schedule_slot": str(plan.get("schedule_slot") or ""),
+                            "status": "pending",
+                            "retry_count": 0,
+                            "max_retry": 3,
+                            "created_by": "video_editor_saved_job_import",
+                            "created_at": datetime.now().isoformat(timespec="seconds"),
+                            "source_project_id": str(rec.get("source_project_id") or ""),
+                            "source_download_job_id": str(rec.get("source_download_job_id") or ""),
+                            "source_download_job_label": str(rec.get("source_download_job_label") or ""),
+                            "source_download_video_id": str(it.get("source_download_video_id") or ""),
+                        }
+                        if plan.get("schedule_daily_slots"):
+                            row_fb["schedule_daily_slots"] = str(plan["schedule_daily_slots"])
+                            row_fb["schedule_delay_min"] = int(plan["schedule_delay_min"])
+                            row_fb["schedule_delay_max"] = int(plan["schedule_delay_max"])
+                            row_fb["schedule_start_date"] = str(plan["schedule_start_date"])
+                        sbl = str(plan.get("slot_base_local") or "").strip()
+                        if sbl:
+                            row_fb["slot_base_local"] = sbl[:80]
+                        if "delay_applied_min" in plan:
+                            row_fb["schedule_delay_applied_min"] = max(0, min(180, int(plan["delay_applied_min"])))
+                        fb_batch.append(row_fb)
+                        it["item_scheduled_platform"] = "facebook"
+                        it["item_scheduled_job_id"] = str(row_fb["id"])
+                        it["item_scheduled_at"] = _ts_imp
+                        created_fb += 1
+                        last_fb_aid, last_fb_pid = aid_fb, pid_fb
+
+                if fb_batch:
+                    self._schedule_posts.upsert_many(fb_batch)  # type: ignore[arg-type]
+                if tt_batch:
+                    job_store.upsert_many(tt_batch)
+
+                rec["status"] = "imported"
+                rec["imported_at"] = datetime.now().isoformat(timespec="seconds")
+                if created_fb and created_tt:
+                    rec["imported_to_platform"] = "mixed"
+                    rec["imported_to_account_id"] = f"fb:{last_fb_aid};tt:{last_tt_aid}"[:480]
+                    rec["imported_to_page_id"] = last_fb_pid
+                elif created_tt:
+                    rec["imported_to_platform"] = "tiktok"
+                    rec["imported_to_account_id"] = last_tt_aid
+                    rec["imported_to_page_id"] = ""
+                else:
+                    rec["imported_to_platform"] = "facebook"
+                    rec["imported_to_account_id"] = last_fb_aid
+                    rec["imported_to_page_id"] = last_fb_pid
+                self._save_saved_export_schedule_jobs(rows)
+                src_hint = str(rec.get("source_download_job_label") or rec.get("source_download_job_id") or "").strip()
+                return {
+                    "created_fb": created_fb,
+                    "created_tt": created_tt,
+                    "src_hint": src_hint,
+                    "filter_acc": str(var_acc.get() or "Tất cả account"),
+                    "filter_page": str(var_page.get() or "Tất cả page"),
+                }
+
+            def _import_on_main(res: dict[str, Any]) -> None:
+                try:
+                    top.grab_release()
+                except tk.TclError:
+                    pass
+                top.destroy()
+                created_fb = int(res["created_fb"])
+                created_tt = int(res["created_tt"])
+                src_hint = str(res.get("src_hint") or "")
+                if created_fb:
+                    if hasattr(self, "_var_jobs_filter_status"):
+                        self._var_jobs_filter_status.set("pending")
+                    if hasattr(self, "_var_jobs_filter_account"):
+                        self._var_jobs_filter_account.set(str(res.get("filter_acc") or "Tất cả account"))
+                    if hasattr(self, "_var_jobs_filter_page"):
+                        self._var_jobs_filter_page.set(str(res.get("filter_page") or "Tất cả page"))
+                    if hasattr(self, "_var_jobs_filter_retry"):
+                        self._var_jobs_filter_retry.set("Retry: tất cả")
+                    if hasattr(self, "_var_jobs_search"):
+                        self._var_jobs_search.set(src_hint or "video_editor_saved_job_import")
+                self._fill_schedule_jobs_tree()
+                msg_done = (
+                    f"Facebook: {created_fb} job lịch; TikTok: {created_tt} job (có lịch)."
+                    if (created_fb and created_tt)
+                    else (
+                        f"Đã nạp {created_tt} job TikTok (có lịch) vào TikTok Manager."
+                        if created_tt
+                        else f"Đã nạp {created_fb} job lịch Facebook từ job chờ đăng."
+                    )
                 )
-            )
-            messagebox.showinfo("Hoàn tất", msg_done, parent=self._root)
+                messagebox.showinfo("Hoàn tất", msg_done, parent=self._root)
+
+            def _import_on_err(exc: BaseException) -> None:
+                if imp_btn is not None:
+                    try:
+                        imp_btn.configure(state="normal")
+                    except tk.TclError:
+                        pass
+                var_preview.set("Lỗi khi nạp — thử lại.")
+                messagebox.showerror("Lỗi nạp", str(exc), parent=top)
+
+            run_background_then_main(top, _import_worker, _import_on_main, on_error=_import_on_err)
 
         btns = ttk.Frame(frm)
         btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(10, 0))

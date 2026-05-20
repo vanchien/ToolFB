@@ -16,6 +16,13 @@ from typing import Any
 
 from loguru import logger
 
+from src.gui.ui_responsiveness import (
+    ASYNC_PREP_MIN_ROWS,
+    DEFAULT_TREE_CHUNK,
+    run_background_then_main,
+    tree_delete_all,
+    tree_insert_chunked,
+)
 from src.services.ai_video_store import AIVideoStore
 from src.services.tiktok.account_lock import try_run_for_account
 from src.services.tiktok.account_manager import TikTokAccountStore, default_account_dict
@@ -99,48 +106,102 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
         except tk.TclError:
             pass
 
+    _acc_tree_gen = {"v": 0}
+    _job_tree_gen = {"v": 0}
+
     def refresh_accounts() -> None:
-        tree_acc.delete(*tree_acc.get_children())
-        for r in acc_store.load_all():
-            prof_used = str(resolve_tiktok_profile_dir(r))
-            px = r.get("proxy") if isinstance(r.get("proxy"), dict) else {}
-            px_on = bool(px.get("enabled")) and str(px.get("server", "")).strip()
-            tree_acc.insert(
-                "",
-                "end",
-                iid=str(r.get("id")),
-                values=(
-                    str(r.get("name", "")),
-                    str(r.get("username", "")),
-                    prof_used,
-                    "có" if px_on else "không",
-                    str(r.get("status", "")),
-                ),
+        def _worker() -> tuple[list[dict[str, Any]], list[str]]:
+            rows = [dict(r) for r in acc_store.load_all()]
+            specs: list[dict[str, Any]] = []
+            ids: list[str] = []
+            for r in rows:
+                rid = str(r.get("id") or "").strip()
+                if rid:
+                    ids.append(rid)
+                prof_used = str(resolve_tiktok_profile_dir(r))
+                px = r.get("proxy") if isinstance(r.get("proxy"), dict) else {}
+                px_on = bool(px.get("enabled")) and str(px.get("server", "")).strip()
+                row_spec: dict[str, Any] = {
+                        "values": (
+                            str(r.get("name", "")),
+                            str(r.get("username", "")),
+                            prof_used,
+                            "có" if px_on else "không",
+                            str(r.get("status", "")),
+                        ),
+                }
+                if rid:
+                    row_spec["iid"] = rid
+                specs.append(row_spec)
+            return specs, ids
+
+        def _on_main(data: tuple[list[dict[str, Any]], list[str]]) -> None:
+            specs, ids = data
+            _acc_tree_gen["v"] += 1
+            gen = _acc_tree_gen["v"]
+            tree_delete_all(tree_acc)
+
+            def _done() -> None:
+                cb_acc["values"] = ids
+                if ids and var_acc.get() not in ids:
+                    var_acc.set(ids[0])
+
+            if len(specs) < ASYNC_PREP_MIN_ROWS:
+                for spec in specs:
+                    kw = {k: v for k, v in spec.items() if v is not None}
+                    tree_acc.insert("", "end", **kw)
+                _done()
+                return
+            tree_insert_chunked(
+                root,
+                tree_acc,
+                specs,
+                generation=gen,
+                is_current=lambda g: g == _acc_tree_gen["v"],
+                on_complete=_done,
             )
-        ids = [str(x.get("id")) for x in acc_store.load_all() if str(x.get("id", "")).strip()]
-        cb_acc["values"] = ids
-        if ids and var_acc.get() not in ids:
-            var_acc.set(ids[0])
+
+        run_background_then_main(root, _worker, _on_main)
 
     def refresh_jobs() -> None:
-        tree_job.delete(*tree_job.get_children())
-        for r in job_store.load_all():
-            vp = str(r.get("video_path", ""))[:80]
-            sat = str(r.get("scheduled_at") or r.get("schedule_time") or "").strip()
-            tree_job.insert(
-                "",
-                "end",
-                iid=str(r.get("id")),
-                values=(
-                    str(r.get("id", "")),
-                    str(r.get("account_id", "")),
-                    vp,
-                    (sat[:19] + "…") if len(sat) > 19 else (sat or "—"),
-                    str(r.get("status", "")),
-                    str(r.get("step", "")),
-                    str(r.get("error_message", ""))[:120],
-                ),
+        def _worker() -> list[dict[str, Any]]:
+            specs: list[dict[str, Any]] = []
+            for r in job_store.load_all():
+                vp = str(r.get("video_path", ""))[:80]
+                sat = str(r.get("scheduled_at") or r.get("schedule_time") or "").strip()
+                specs.append(
+                    {
+                        "iid": str(r.get("id")),
+                        "values": (
+                            str(r.get("id", "")),
+                            str(r.get("account_id", "")),
+                            vp,
+                            (sat[:19] + "…") if len(sat) > 19 else (sat or "—"),
+                            str(r.get("status", "")),
+                            str(r.get("step", "")),
+                            str(r.get("error_message", ""))[:120],
+                        ),
+                    }
+                )
+            return specs
+
+        def _on_main(specs: list[dict[str, Any]]) -> None:
+            _job_tree_gen["v"] += 1
+            gen = _job_tree_gen["v"]
+            tree_delete_all(tree_job)
+            if len(specs) < ASYNC_PREP_MIN_ROWS:
+                for spec in specs:
+                    tree_job.insert("", "end", **spec)
+                return
+            tree_insert_chunked(
+                root,
+                tree_job,
+                specs,
+                generation=gen,
+                is_current=lambda g: g == _job_tree_gen["v"],
             )
+
+        run_background_then_main(root, _worker, _on_main)
 
     cols_acc = ("name", "username", "profile_path", "proxy", "status")
     tree_acc = ttk.Treeview(acc_fr, columns=cols_acc, show="headings", height=10, selectmode="extended")

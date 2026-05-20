@@ -225,6 +225,38 @@ class SchedulePostsManager:
             new_list.append(d)  # type: ignore[arg-type]
         self.save_all(new_list)
 
+    def upsert_many(self, rows: Iterable[SchedulePostJob]) -> int:
+        """Upsert nhiều job trong một lần đọc/ghi file (tránh O(n²) khi nạp hàng loạt)."""
+        incoming: list[dict[str, Any]] = []
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        for row in rows:
+            d = dict(row)
+            if not str(d.get("id", "")).strip():
+                d["id"] = uuid.uuid4().hex[:16]
+            self._validate_row(d)
+            if not str(d.get("created_at", "")).strip():
+                d["created_at"] = now
+            incoming.append(d)
+        if not incoming:
+            return 0
+        by_id = {str(d["id"]): d for d in incoming}
+        cur = self.load_all()
+        out: list[SchedulePostJob] = []
+        applied: set[str] = set()
+        for x in cur:
+            xid = str(x.get("id", "")).strip()
+            if xid in by_id:
+                out.append(by_id[xid])  # type: ignore[arg-type]
+                applied.add(xid)
+            else:
+                out.append(x)
+        for d in incoming:
+            jid = str(d["id"])
+            if jid not in applied:
+                out.append(d)  # type: ignore[arg-type]
+        self.save_all(out)
+        return len(incoming)
+
     def delete_by_id(self, job_id: str) -> bool:
         jid = str(job_id).strip()
         cur = self.load_all()
