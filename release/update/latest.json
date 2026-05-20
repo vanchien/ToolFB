@@ -1,7 +1,7 @@
 {
-  "version": "1.0.60",
+  "version": "1.0.61",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "43a28727d00605aea22a677794bab654fedf6ee2251f1ec5a382a899ac1b5071",
-  "notes": "",
-  "generated_at": "2026-05-20T11:15:00"
+  "sha256": "8e8bc797bd46c70394707ad6eca37638462e6e14a9d35fca1d4f5395d62f5418",
+  "notes": "Sua luong dang bai: bam Post/Share dung sau Next/caption (way1+way2). Khoa Chromium bundle khi chay job.",
+  "generated_at": "2026-05-20T13:12:00"
 }
