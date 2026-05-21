@@ -20,9 +20,29 @@ def test_sidebar_hint_detects_take_more_actions() -> None:
     assert _page_switch_sidebar_hint_visible(page)
 
 
-def test_click_manage_page_prefers_cta_card() -> None:
+def test_click_manage_page_prefers_meta_exact() -> None:
     page = MagicMock()
     with (
+        patch(
+            "src.automation.facebook_actions._click_meta_switch_cta_exact",
+            return_value=True,
+        ) as exact,
+        patch(
+            "src.automation.facebook_actions._click_switch_in_sidebar_cta_card",
+            return_value=False,
+        ),
+    ):
+        assert _click_manage_page_sidebar_switch(page)
+    exact.assert_called()
+
+
+def test_click_manage_page_falls_back_to_cta_card() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._click_meta_switch_cta_exact",
+            return_value=False,
+        ),
         patch(
             "src.automation.facebook_actions._click_switch_in_sidebar_cta_card",
             return_value=True,

@@ -1,7 +1,7 @@
 {
-  "version": "1.0.68",
+  "version": "1.0.69",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
   "sha256": "0c4cd68994972148cf28664a425b908177330e5e48282373b3c001a62f9f0267",
-  "notes": "Chặn đăng Reel nếu chưa switch Page: không nhầm URL với vai trò Page; xác nhận CTA Switch biến mất.",
-  "generated_at": "2026-05-19T23:30:00"
+  "notes": "Fix click Switch sidebar: tat overlay data-visualcompletion=ignore, bam div.html-div + span Switch (Meta CTA).",
+  "generated_at": "2026-05-19T24:00:00"
 }

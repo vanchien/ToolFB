@@ -1980,13 +1980,13 @@ def _is_on_target_surface(page: Page, target_url: str) -> bool:
 
 _SWITCH_EXACT_LABEL_RE = re.compile(r"^\s*Switch\s*$", re.I)
 
-# Sidebar Manage Page — cùng pattern html-div / role=none / span như nút Post Reel
+# Sidebar Manage Page — HTML Meta: div[role=none] > div.html-div > span «Switch» (+ overlay ignore chặn click)
 _PAGE_SWITCH_STRICT_XPATHS: tuple[str, ...] = (
-    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x1j85h84') and normalize-space()='Switch']])[last()]",
+    "(//div[@role='none'][.//div[contains(@class,'html-div')]//span[normalize-space()='Switch']]"
+    "[not(@data-visualcompletion='ignore')])[last()]",
+    "(//div[contains(@class,'html-div')][.//span[contains(@class,'x6ikm8r') and normalize-space()='Switch']])[last()]",
     "(//div[contains(@class,'html-div')][.//div[@role='none']//span[normalize-space()='Switch']])[last()]",
-    "(//span[normalize-space()='Switch']/ancestor::div[contains(@class,'html-div')][1])[last()]",
-    "(//*[@role='none' and not(ancestor::*[@role='dialog'])][.//span[normalize-space()='Switch' and contains(@class,'x1j85h84')]])[last()]",
-    "(//*[@role='none' and not(ancestor::*[@role='dialog'])][.//span[normalize-space()='Switch']])[last()]",
+    "(//span[normalize-space()='Switch']/ancestor::div[@role='none'][not(@data-visualcompletion='ignore')][1])[last()]",
 )
 
 _PAGE_SWITCH_CLICK_JS = """(el) => {
@@ -2033,43 +2033,56 @@ _PAGE_SIDEBAR_SCROLL_JS = """
 }
 """
 
-_PAGE_SWITCH_CTA_CARD_JS = """
+_PAGE_SWITCH_META_EXACT_CLICK_JS = """
 () => {
-  const cards = [];
-  for (const el of document.querySelectorAll('div, section, aside')) {
+  const isIgnore = (el) => el && el.getAttribute('data-visualcompletion') === 'ignore';
+  let card = null;
+  for (const el of document.querySelectorAll('div')) {
     const raw = (el.innerText || '').replace(/\\s+/g, ' ').trim();
     const low = raw.toLowerCase();
     if (!low.includes('switch into') || !low.includes('take more actions')) continue;
-    if (raw.length > 200) continue;
+    if (raw.length > 240) continue;
     const r = el.getBoundingClientRect();
     if (r.left > window.innerWidth * 0.42) continue;
-    cards.push({ el, bottom: r.bottom, left: r.left });
+    if (!card || r.bottom > card.getBoundingClientRect().bottom) card = el;
   }
-  if (!cards.length) return false;
-  cards.sort((a, b) => b.bottom - a.bottom || a.left - b.left);
-  const card = cards[0].el;
-  const tryClick = (node) => {
-    if (!node || typeof node.click !== 'function') return false;
-    try { node.click(); return true; } catch (_) { return false; }
+  if (!card) return false;
+  let switchSpan = null;
+  for (const sp of card.querySelectorAll('span')) {
+    if (/^switch$/i.test((sp.textContent || '').trim())) { switchSpan = sp; break; }
+  }
+  if (!switchSpan) return false;
+  for (const ov of card.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
+    ov.style.display = 'none';
+  }
+  const htmlDiv = switchSpan.closest('div.html-div') || switchSpan.closest("[class*='html-div']");
+  const innerRole = switchSpan.closest("div[role='none']");
+  const outerRole = htmlDiv && htmlDiv.parentElement && htmlDiv.parentElement.getAttribute('role') === 'none'
+    ? htmlDiv.parentElement : null;
+  const fire = (node) => {
+    if (!node || isIgnore(node)) return false;
+    try {
+      const r = node.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+      }
+      if (typeof node.click === 'function') node.click();
+      return true;
+    } catch (_) { return false; }
   };
-  for (const h of card.querySelectorAll('[role="button"], [role="none"], span, a, div')) {
-    const t = (h.innerText || h.textContent || '').replace(/\\s+/g, ' ').trim();
-    if (!/^switch$/i.test(t)) continue;
-    for (const node of [
-      h.closest('[role="button"]'),
-      h.closest("[tabindex='0']"),
-      h.closest("[class*='html-div']"),
-      h.closest("[role='none']"),
-      h,
-    ]) {
-      if (tryClick(node)) return true;
-    }
-  }
-  return tryClick(card);
+  if (outerRole && fire(outerRole)) return true;
+  if (htmlDiv && fire(htmlDiv)) return true;
+  if (innerRole && fire(innerRole)) return true;
+  return fire(switchSpan);
 }
 """
 
-_PAGE_SIDEBAR_SWITCH_JS = _PAGE_SWITCH_CTA_CARD_JS
+_PAGE_SWITCH_CTA_CARD_JS = _PAGE_SWITCH_META_EXACT_CLICK_JS
+
+_PAGE_SIDEBAR_SWITCH_JS = _PAGE_SWITCH_META_EXACT_CLICK_JS
 
 
 def _view_only_guard_active_on_page(page: Page) -> bool:
@@ -2088,10 +2101,82 @@ def _scroll_manage_page_sidebar_switch_cta(page: Page) -> None:
     page.wait_for_timeout(450)
 
 
+def _click_meta_switch_cta_exact(page: Page, *, timeout_ms: int = 3000) -> bool:
+    """
+    Bấm đúng nút Switch Meta (div[role=none] > div.html-div > span «Switch»).
+
+    Facebook thêm ``div[data-visualcompletion='ignore']`` phủ ``inset:0`` — tắt overlay rồi dispatch click.
+    """
+    _scroll_manage_page_sidebar_switch_cta(page)
+    try:
+        page.evaluate(
+            """() => {
+              for (const ov of document.querySelectorAll('[data-visualcompletion="ignore"]')) {
+                ov.style.pointerEvents = 'none';
+              }
+            }"""
+        )
+    except Exception:
+        pass
+    locators = (
+        page.locator(
+            "xpath=(//div[@role='none'][.//div[contains(@class,'html-div')]"
+            "//span[normalize-space()='Switch']][not(@data-visualcompletion='ignore')])[last()]"
+        ),
+        page.locator(
+            "xpath=(//div[contains(@class,'html-div')]"
+            "[.//span[contains(@class,'x6ikm8r') and normalize-space()='Switch']])[last()]"
+        ),
+        page.locator("div.html-div").filter(
+            has=page.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE)
+        ).last,
+    )
+    for loc in locators:
+        try:
+            if loc.count() <= 0 or not loc.is_visible(timeout=1_200):
+                continue
+            loc.scroll_into_view_if_needed(timeout=2_500)
+            try:
+                loc.evaluate(_PAGE_SWITCH_META_EXACT_CLICK_JS)
+                logger.info("[FB] Đã bấm Switch CTA (evaluate trên html-div/role=none).")
+                page.wait_for_timeout(2200)
+                return True
+            except Exception:
+                pass
+            try:
+                box = loc.bounding_box()
+                if box:
+                    page.mouse.click(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2,
+                    )
+                    logger.info("[FB] Đã bấm Switch CTA (mouse tại tâm nút).")
+                    page.wait_for_timeout(2200)
+                    return True
+            except Exception:
+                pass
+            loc.click(timeout=timeout_ms, force=True, no_wait_after=True)
+            logger.info("[FB] Đã bấm Switch CTA (force click locator).")
+            page.wait_for_timeout(2200)
+            return True
+        except Exception:
+            continue
+    try:
+        if page.evaluate(_PAGE_SWITCH_META_EXACT_CLICK_JS):
+            logger.info("[FB] Đã bấm Switch CTA (JS Meta exact).")
+            page.wait_for_timeout(2200)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _click_switch_in_sidebar_cta_card(page: Page, *, timeout_ms: int = 2500) -> bool:
     """
     Bấm nút Switch trong thẻ CTA sidebar (ảnh Manage Page — khối xám «Switch into … Page»).
     """
+    if _click_meta_switch_cta_exact(page, timeout_ms=timeout_ms):
+        return True
     _scroll_manage_page_sidebar_switch_cta(page)
     card_pat = re.compile(r"Switch\s+into.+take\s+more\s+actions", re.I | re.S)
     try:
@@ -2109,9 +2194,14 @@ def _click_switch_in_sidebar_cta_card(page: Page, *, timeout_ms: int = 2500) -> 
             except Exception:
                 continue
             for loc in (
+                card.locator(
+                    "div[role='none']:not([data-visualcompletion='ignore'])"
+                ).filter(has=page.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE)),
+                card.locator("div.html-div").filter(
+                    has=page.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE)
+                ),
                 card.get_by_role("button", name=_SWITCH_EXACT_LABEL_RE),
                 card.locator("[role='button']").filter(has_text=_SWITCH_EXACT_LABEL_RE),
-                card.locator("[role='none']").filter(has_text=_SWITCH_EXACT_LABEL_RE),
                 card.get_by_text(_SWITCH_EXACT_LABEL_RE),
             ):
                 try:
@@ -2200,6 +2290,8 @@ def _click_manage_page_sidebar_switch(page: Page, *, timeout_ms: int = 2000) -> 
 
     Khác «Switch Now» trên banner và khác nút Switch trong popup ``role=dialog``.
     """
+    if _click_meta_switch_cta_exact(page, timeout_ms=max(timeout_ms, 2800)):
+        return True
     if _click_switch_in_sidebar_cta_card(page, timeout_ms=timeout_ms):
         return True
     if _click_sidebar_switch_role_button(page, timeout_ms=timeout_ms):
