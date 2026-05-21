@@ -1,7 +1,7 @@
 {
-  "version": "1.0.66",
+  "version": "1.0.67",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
   "sha256": "0c4cd68994972148cf28664a425b908177330e5e48282373b3c001a62f9f0267",
-  "notes": "Fix Switch Page: click dung the CTA sidebar (Switch into... take more actions), cuon sidebar, khong bat lai overlay chan click.",
-  "generated_at": "2026-05-19T22:00:00"
+  "notes": "Fix nhan dien Page: URL id so redirect sang vanity slug (G.Force.Ghoul) van tinh la dung Page.",
+  "generated_at": "2026-05-19T23:00:00"
 }

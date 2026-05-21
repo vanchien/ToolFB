@@ -218,6 +218,113 @@ def _facebook_url_points_at_surface(url: str) -> bool:
         return False
 
 
+_FB_RESERVED_PATH_SEGMENTS = frozenset({
+    "home",
+    "home.php",
+    "watch",
+    "gaming",
+    "marketplace",
+    "groups",
+    "events",
+    "ads",
+    "photo",
+    "photos",
+    "videos",
+    "reel",
+    "reels",
+    "stories",
+    "notifications",
+    "messages",
+    "friends",
+    "login",
+    "reg",
+    "help",
+    "privacy",
+    "policies",
+    "professional_dashboard",
+    "business",
+    "settings",
+    "search",
+    "l.php",
+    "share",
+    "dialog",
+})
+
+
+def _looks_like_facebook_page_profile_path(path: str) -> bool:
+    """Path dạng ``/PageSlug`` hoặc ``/pages/Name/123`` — không phải feed/home."""
+    parts = [x for x in (path or "").rstrip("/").split("/") if x]
+    if not parts or len(parts) > 3:
+        return False
+    seg0 = parts[0].lower()
+    if seg0 in _FB_RESERVED_PATH_SEGMENTS:
+        return False
+    if seg0 == "pages":
+        return len(parts) >= 2
+    return len(parts) == 1
+
+
+def _page_html_contains_facebook_id(page: Page, page_id: str) -> bool:
+    """Meta embed page id trong HTML — dùng xác nhận redirect slug vẫn đúng Page."""
+    pid = str(page_id or "").strip()
+    if not pid.isdigit() or len(pid) < 8:
+        return False
+    try:
+        return pid in (page.content() or "")
+    except Exception:
+        return False
+
+
+def _urls_refer_same_facebook_page(
+    target_url: str,
+    current_url: str,
+    *,
+    page: Page | None = None,
+) -> bool:
+    """
+    Hai URL có thể là cùng Page dù path khác (id số vs vanity slug).
+
+    Facebook thường redirect ``/103833422779877`` → ``/G.Force.Ghoul`` — vẫn đúng Page
+    nếu HTML trang chứa ``page_id`` (hoặc path/id trùng trực tiếp).
+    """
+    cur = str(current_url or "").strip()
+    tgt = str(target_url or "").strip()
+    if not cur or not tgt:
+        return False
+    try:
+        c = urlparse(cur)
+        t = urlparse(_fb_normalize_client_url(tgt))
+        if c.netloc and t.netloc and _fb_host_key(c.netloc) != _fb_host_key(t.netloc):
+            return False
+        cpath = (c.path or "/").rstrip("/").lower()
+        tpath = (t.path or "/").rstrip("/").lower()
+        if not tpath or tpath in ("/", "/home", "/home.php"):
+            return True
+        if cpath == tpath or cpath.startswith(tpath + "/"):
+            return True
+        tid = extract_facebook_numeric_id_from_url(tgt)
+        cid = extract_facebook_numeric_id_from_url(cur)
+        if tid and cid and tid == cid:
+            return True
+        t_parts = [x for x in tpath.split("/") if x]
+        c_parts = [x for x in cpath.split("/") if x]
+        # Job lưu /{page_id} — FB redirect sang /VanitySlug (cần xác nhận id trong HTML).
+        if tid and len(t_parts) == 1 and t_parts[0] == tid:
+            if _looks_like_facebook_page_profile_path(cpath) and cpath != tpath:
+                if page is not None and _page_html_contains_facebook_id(page, tid):
+                    return True
+        # Đích vanity slug, URL hiện tại là id số.
+        if len(t_parts) == 1 and not t_parts[0].isdigit() and len(t_parts[0]) >= 2:
+            if cid and len(c_parts) == 1 and c_parts[0] == cid:
+                return True
+        tslug = t_parts[-1] if t_parts else ""
+        if tslug and len(tslug) > 2 and tslug.lower() in cur.lower():
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def facebook_urls_align_as_target_surface(entity_url: str, job_page_url: str) -> bool:
     """
     True nếu hai URL Facebook (sau ``_fb_normalize_client_url``) cùng bề mặt Page/Group
@@ -419,20 +526,40 @@ def _wait_fb_path_matches(page: Page, normalized_url: str, *, timeout_ms: int | 
               const curPath = norm(window.location.pathname);
               const ep = norm(expectPath);
               const href = (location.href || '').toLowerCase();
+              const reserved = new Set([
+                'home','watch','gaming','marketplace','groups','events','ads',
+                'notifications','messages','friends','login','professional_dashboard',
+              ]);
               if (!ep || ep === '/' || ep === '/home' || ep === '/home.php') return true;
               if (curPath === ep || curPath.startsWith(ep + '/')) return true;
               if (expectSlug && expectSlug.length > 2 && href.includes(expectSlug.toLowerCase())) return true;
+              const parts = curPath.split('/').filter(Boolean);
+              const seg0 = parts[0] || '';
+              // Target page id số — redirect vanity slug; xác nhận id có trong HTML.
+              if (/^\\d{8,}$/.test(expectSlug) && parts.length === 1 && !reserved.has(seg0)) {
+                const html = document.documentElement.innerHTML || '';
+                if (html.includes(expectSlug)) return true;
+              }
+              if (/^\\d{8,}$/.test(expectSlug) && parts[0] === 'pages' && parts.length >= 2) return true;
               return false;
             }""",
             arg={"expectPath": path, "expectSlug": slug},
             timeout=timeout_ms,
         )
     except PlaywrightTimeoutError:
+        cur = str(page.url or "")
+        if _urls_refer_same_facebook_page(normalized_url, cur, page=page):
+            logger.info(
+                "[FB] URL redirect id/slug — coi là đúng Page (expect={!r} | now={})",
+                normalized_url,
+                cur,
+            )
+            return
         logger.warning(
             "[FB] Chờ path slug chưa khớp (expect path={!r} slug={!r}) — url hiện tại: {}",
             path,
             slug,
-            page.url,
+            cur,
         )
         raise
 
@@ -1106,10 +1233,17 @@ def navigate_to_url(page: Page, url: str) -> None:
             try:
                 _wait_fb_path_matches(page, u)
             except PlaywrightTimeoutError:
-                logger.warning("[FB] Thử goto lần 2 (load) tới {!r}", u)
-                page.goto(u, wait_until="load", timeout=90_000)
-                _force_www_facebook_if_mobile_redirect(page)
-                _wait_fb_path_matches(page, u)
+                if _urls_refer_same_facebook_page(u, str(page.url or ""), page=page):
+                    logger.info(
+                        "[FB] Đã ở đúng Page sau redirect (không goto lần 2): expect={!r} | now={}",
+                        u,
+                        page.url,
+                    )
+                else:
+                    logger.warning("[FB] Thử goto lần 2 (load) tới {!r}", u)
+                    page.goto(u, wait_until="load", timeout=90_000)
+                    _force_www_facebook_if_mobile_redirect(page)
+                    _wait_fb_path_matches(page, u)
         else:
             logger.info("[FB] Business composer: bỏ qua kiểm tra path cứng, chuyển sang kiểm tra composer.")
             _wait_meta_business_composer_ready(page, timeout_ms=400)
@@ -1832,21 +1966,14 @@ def _wait_meta_business_composer_ready(page: Page, *, timeout_ms: int = 35_000) 
 def _is_on_target_surface(page: Page, target_url: str) -> bool:
     """
     Kiểm tra URL hiện tại có khớp bề mặt Page/Group mục tiêu hay chưa.
+
+    Chấp nhận redirect id số → vanity slug (cùng Page).
     """
     try:
         cur = page.url or ""
         if not cur or not target_url:
             return False
-        c = urlparse(cur)
-        t = urlparse(_fb_normalize_client_url(target_url))
-        if c.netloc and t.netloc and _fb_host_key(c.netloc) != _fb_host_key(t.netloc):
-            return False
-        cpath = (c.path or "/").rstrip("/").lower()
-        tpath = (t.path or "/").rstrip("/").lower()
-        if not tpath or tpath == "/":
-            return True
-        # Cho phép current path bắt đầu bằng target path (vd /page/posts).
-        return cpath == tpath or cpath.startswith(tpath + "/")
+        return _urls_refer_same_facebook_page(target_url, cur, page=page)
     except Exception:
         return False
 
