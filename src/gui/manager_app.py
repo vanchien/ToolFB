@@ -2674,13 +2674,12 @@ class _ManagerWindow:
         return True
 
     def _on_ve_pending_add_video_files(self) -> None:
-        paths = filedialog.askopenfilenames(
-            parent=self._root,
-            title="Chọn một hoặc nhiều file video",
-            filetypes=[
-                ("Video", "*.mp4 *.mkv *.mov *.webm *.avi *.m4v"),
-                ("Tất cả", "*.*"),
-            ],
+        from src.gui.file_dialog_defaults import pick_video_media_files
+
+        paths = pick_video_media_files(
+            self._root,
+            title="Chọn video từ thư mục (renders hoặc nơi khác)",
+            multiple=True,
         )
         if not paths:
             return

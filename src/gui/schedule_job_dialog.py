@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import tkinter as tk
 from datetime import date, datetime, timezone
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,7 @@ from src.utils.schedule_job_content import (
     once_local_wall_to_utc_iso,
 )
 from src.utils.reel_thumbnail_choice import REEL_THUMBNAIL_METHOD1_FIRST_AUTO, normalize_reel_thumbnail_choice
+from src.gui.file_dialog_defaults import pick_video_media_files
 from src.utils.schedule_posts_manager import SchedulePostJob, SchedulePostsManager
 
 
@@ -423,9 +425,15 @@ class SchedulePostJobDialog:
         self._e_job_img.insert(0, str(self._init.get("job_post_image_path", "")))
         self._e_job_img.grid(row=7, column=1, sticky="ew", pady=2)
         ttk.Label(ai_fr, text="video_path (cho reel/video)").grid(row=8, column=0, sticky="nw", pady=2, padx=(0, 8))
-        self._e_video_path = ttk.Entry(ai_fr, width=48)
+        vp_fr = ttk.Frame(ai_fr)
+        vp_fr.grid(row=8, column=1, sticky="ew", pady=2)
+        vp_fr.columnconfigure(0, weight=1)
+        self._e_video_path = ttk.Entry(vp_fr, width=40)
         self._e_video_path.insert(0, str(self._init.get("video_path", "")))
-        self._e_video_path.grid(row=8, column=1, sticky="ew", pady=2)
+        self._e_video_path.grid(row=0, column=0, sticky="ew")
+        ttk.Button(vp_fr, text="Chọn file…", command=self._browse_video_path, width=11).grid(
+            row=0, column=1, padx=(6, 0)
+        )
         ttk.Label(ai_fr, text="hashtags (phẩy)").grid(row=9, column=0, sticky="nw", pady=2, padx=(0, 8))
         self._e_hashtags = ttk.Entry(ai_fr, width=48)
         ht = self._init.get("hashtags") or []
@@ -495,6 +503,19 @@ class SchedulePostJobDialog:
         self._top.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox("all"))
         self._top.wait_window()
+
+    def _browse_video_path(self) -> None:
+        """Chọn file video từ thư mục (mặc định renders) — chỉ ghi đường dẫn, không import vào VE."""
+        picked = pick_video_media_files(
+            self._top,
+            path_hint=self._e_video_path.get().strip(),
+            title="Chọn file video cho job lịch đăng",
+            multiple=False,
+        )
+        if not picked:
+            return
+        self._e_video_path.delete(0, tk.END)
+        self._e_video_path.insert(0, picked[0])
 
     def _sync_reel_thumbnail_visibility(self) -> None:
         pt = self._cb_pt.get().strip().lower()

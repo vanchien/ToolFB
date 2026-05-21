@@ -1,7 +1,7 @@
 {
-  "version": "1.0.63",
+  "version": "1.0.64",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
   "sha256": "0c4cd68994972148cf28664a425b908177330e5e48282373b3c001a62f9f0267",
-  "notes": "Post: switch Page co scroll trong Switch profiles; bam Post khi nut enable (khong bat buoc tieu de); 1 job/page tranh dang nham Page.",
-  "generated_at": "2026-05-21T12:11:19"
+  "notes": "Dang bai: import video tu dong (khong popup OS chon file); fallback upload Reel dashboard; Switch Page sidebar; GUI chon video job lich (filter Win32, thu muc renders).",
+  "generated_at": "2026-05-19T18:00:00"
 }

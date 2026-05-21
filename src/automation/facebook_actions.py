@@ -509,6 +509,20 @@ def _native_file_chooser_allowed() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
+def _dismiss_leaked_native_file_dialog(page: Page) -> None:
+    """
+    Đóng hộp thoại chọn file OS nếu click upload lọt ra ngoài ``expect_file_chooser``.
+
+    Chỉ best-effort (Escape) — luồng chuẩn vẫn phải bọc mọi click upload trong filechooser interception.
+    """
+    for _ in range(4):
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(180)
+        except Exception:
+            break
+
+
 def _enable_view_only_guard(page: Page) -> None:
     """
     Khóa thao tác chuột / cảm ứng trên vùng trang (overlay trong suốt).
@@ -1441,11 +1455,18 @@ def _accept_allows_image(accept: str) -> bool:
     return True
 
 
-def _set_file_via_existing_input(page: Page, file_path: Path, *, kind: Literal["image", "video"]) -> bool:
+def _set_file_via_existing_input(
+    page: Page,
+    file_path: Path,
+    *,
+    kind: Literal["image", "video"],
+    scope: Locator | None = None,
+) -> bool:
     """
     Thử set file trực tiếp vào input[type=file] đã có sẵn (không mở native picker).
 
     Meta đôi khi để ``accept`` rỗng hoặc MIME lạ — job sau cùng profile cần thử lỏng hơn.
+    ``scope`` (vd. ``[role=dialog]`` Reel) được quét trước — input thường ẩn nhưng vẫn ``set_input_files`` được.
     """
     def _try_one(loc: Locator) -> bool:
         try:
@@ -1458,6 +1479,44 @@ def _set_file_via_existing_input(page: Page, file_path: Path, *, kind: Literal["
             return True
         except Exception:
             return False
+
+    def _scan_inputs_container(container) -> bool:
+        try:
+            inputs = container.locator("input[type='file']")
+            n = inputs.count()
+        except Exception:
+            return False
+        if n <= 0:
+            return False
+        for i in range(n):
+            try:
+                loc = inputs.nth(i)
+                accept = str(loc.get_attribute("accept") or "").lower()
+                if kind == "image" and not _accept_allows_image(accept):
+                    continue
+                if kind == "video" and not _accept_allows_video(accept):
+                    continue
+                if _try_one(loc):
+                    return True
+            except Exception:
+                continue
+        if kind == "video":
+            for i in range(n):
+                try:
+                    loc = inputs.nth(i)
+                    accept = str(loc.get_attribute("accept") or "").lower()
+                    if accept and "image" in accept and "video" not in accept and "*" not in accept and "/" not in accept:
+                        continue
+                    if _try_one(loc):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    if scope is not None:
+        for cand in (scope.locator("input[type='file']").last, scope.locator("input[type='file']").first, scope):
+            if _scan_inputs_container(cand):
+                return True
 
     # Một số UI Business render input bên trong iframe/portal -> quét tất cả frame.
     for fr in [page.main_frame, *list(page.frames)]:
@@ -1494,7 +1553,7 @@ def _set_file_via_existing_input(page: Page, file_path: Path, *, kind: Literal["
     return False
 
 
-def _collect_add_media_button_locators(page: Page) -> list[Locator]:
+def _collect_add_media_button_locators(page: Page, *, scope: Locator | None = None) -> list[Locator]:
     """
     Trả danh sách các locator có khả năng mở filechooser cho media (khởi tạo + "Add more").
 
@@ -1506,6 +1565,7 @@ def _collect_add_media_button_locators(page: Page) -> list[Locator]:
     """
     out: list[Locator] = []
     seen_keys: set[str] = set()
+    search_roots: list[Any] = [scope] if scope is not None else [page]
 
     def _push(loc: Locator) -> None:
         try:
@@ -1530,23 +1590,37 @@ def _collect_add_media_button_locators(page: Page) -> list[Locator]:
             out.append(cand)
 
     # 1) role=button theo name (text hiển thị)
-    name_rx = re.compile(r"(add\s+photo|add\s+photos|photo\s*/\s*video|add\s+media|"
-                         r"thêm\s+ảnh|ảnh\s*/\s*video|add\s+more|thêm\s+nữa|add\s+video)", re.I)
-    try:
-        _push(page.get_by_role("button", name=name_rx))
-    except Exception:
-        pass
+    name_rx = re.compile(
+        r"(add\s+photo|add\s+photos|photo\s*/\s*video|add\s+media|"
+        r"thêm\s+ảnh|ảnh\s*/\s*video|add\s+more|thêm\s+nữa|add\s+video|"
+        r"^upload$|or drag and drop)",
+        re.I,
+    )
+    for root in search_roots:
+        if root is None:
+            continue
+        try:
+            _push(root.get_by_role("button", name=name_rx))
+        except Exception:
+            pass
+        try:
+            _push(root.get_by_text(re.compile(r"Add video|or drag and drop", re.I)))
+        except Exception:
+            pass
 
     # 2) [role=button] với aria-label chứa từ khóa media
     for aria_rx in (r"photo", r"video", r"media", r"image", r"ảnh"):
-        try:
-            _push(page.locator(f"[role='button'][aria-label*='{aria_rx}' i]"))
-        except Exception:
-            continue
-        try:
-            _push(page.locator(f"button[aria-label*='{aria_rx}' i]"))
-        except Exception:
-            continue
+        for root in search_roots:
+            if root is None:
+                continue
+            try:
+                _push(root.locator(f"[role='button'][aria-label*='{aria_rx}' i]"))
+            except Exception:
+                continue
+            try:
+                _push(root.locator(f"button[aria-label*='{aria_rx}' i]"))
+            except Exception:
+                continue
 
     # 3) selector text-based cho các biến thể phổ biến
     text_selectors = (
@@ -1558,17 +1632,27 @@ def _collect_add_media_button_locators(page: Page) -> list[Locator]:
         "[role='button']:has-text('Photo/video')",
         "[role='button']:has-text('Add more')",
         "[role='button']:has-text('Thêm nữa')",
+        "[role='button']:has-text('Upload')",
     )
-    for css in text_selectors:
-        try:
-            _push(page.locator(css))
-        except Exception:
+    for root in search_roots:
+        if root is None:
             continue
+        for css in text_selectors:
+            try:
+                _push(root.locator(css))
+            except Exception:
+                continue
 
     return out
 
 
-def _set_file_via_business_add_button(page: Page, file_path: Path, *, kind: Literal["image", "video"]) -> bool:
+def _set_file_via_business_add_button(
+    page: Page,
+    file_path: Path,
+    *,
+    kind: Literal["image", "video"],
+    scope: Locator | None = None,
+) -> bool:
     """
     Bấm candidate "Add media" trong context ``expect_file_chooser`` để set file tự động.
 
@@ -1579,7 +1663,7 @@ def _set_file_via_business_add_button(page: Page, file_path: Path, *, kind: Lite
     """
     for attempt in range(1, 4):
         # Thử input[type=file] hiện có trước mỗi vòng — đôi khi Meta render lại DOM.
-        if _set_file_via_existing_input(page, file_path, kind=kind):
+        if _set_file_via_existing_input(page, file_path, kind=kind, scope=scope):
             logger.info(
                 "[FB] Đã set file qua input[type=file] re-scan (attempt={}): {}",
                 attempt,
@@ -1587,14 +1671,14 @@ def _set_file_via_business_add_button(page: Page, file_path: Path, *, kind: Lite
             )
             return True
 
-        candidates = _collect_add_media_button_locators(page)
+        candidates = _collect_add_media_button_locators(page, scope=scope)
         if not candidates:
             page.wait_for_timeout(400)
             continue
         for cand in candidates:
             # Luôn bọc click trong expect_file_chooser để native dialog không thoát ra OS.
             try:
-                with page.expect_file_chooser(timeout=3_500) as fc_info:
+                with page.expect_file_chooser(timeout=6_500) as fc_info:
                     try:
                         cand.click(timeout=4_500, force=True, no_wait_after=True)
                     except Exception:
@@ -1607,12 +1691,13 @@ def _set_file_via_business_add_button(page: Page, file_path: Path, *, kind: Lite
                 )
                 return True
             except Exception:
+                _dismiss_leaked_native_file_dialog(page)
                 # Không phát filechooser → có thể chỉ render input mới; re-scan ngay.
                 try:
                     page.wait_for_timeout(350)
                 except Exception:
                     pass
-                if _set_file_via_existing_input(page, file_path, kind=kind):
+                if _set_file_via_existing_input(page, file_path, kind=kind, scope=scope):
                     logger.info(
                         "[FB] Đã set file qua input xuất hiện sau click Add media (attempt={}): {}",
                         attempt,
@@ -1622,6 +1707,62 @@ def _set_file_via_business_add_button(page: Page, file_path: Path, *, kind: Lite
                 continue
         # Không candidate nào phát filechooser hoặc render input — nghỉ ngắn rồi thử lại.
         page.wait_for_timeout(500)
+    return False
+
+
+def _attach_media_automatic(
+    page: Page,
+    file_path: str | Path,
+    *,
+    kind: Literal["image", "video"],
+    scope: Locator | None = None,
+    context: str = "",
+) -> bool:
+    """
+    Gắn media tự động — chỉ ``set_input_files`` / intercept filechooser, không hiện hộp chọn file OS.
+
+    Dùng cho Business Composer và popup Reel dashboard (``scope`` = dialog).
+    """
+    path = _resolve_path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    tag = f"[FB attach{(' ' + context) if context else ''}]"
+    in_business = _is_meta_business_composer_context(page)
+    if in_business and scope is None:
+        _dismiss_blocking_ui_before_business_media(page)
+
+    for round_i in range(3):
+        if _set_file_via_existing_input(page, path, kind=kind, scope=scope):
+            logger.info("{} OK input trực tiếp (round={}): {}", tag, round_i + 1, path)
+            return True
+        try:
+            page.wait_for_timeout(280)
+        except Exception:
+            pass
+
+    if _set_file_via_business_add_button(page, path, kind=kind, scope=scope):
+        logger.info("{} OK qua filechooser interception: {}", tag, path)
+        return True
+
+    if scope is not None:
+        return _attach_media_automatic(
+            page,
+            path,
+            kind=kind,
+            scope=None,
+            context=f"{context}_page" if context else "page",
+        )
+
+    if in_business and _native_file_chooser_allowed():
+        try:
+            with page.expect_file_chooser(timeout=10_000) as fc_info:
+                _open_business_add_photo_video(page)
+            fc_info.value.set_files(str(path))
+            logger.info("{} OK filechooser opt-in native: {}", tag, path)
+            return True
+        except Exception:
+            _dismiss_leaked_native_file_dialog(page)
+
     return False
 
 
@@ -1706,49 +1847,189 @@ def _is_on_target_surface(page: Page, target_url: str) -> bool:
         return False
 
 
+_SWITCH_EXACT_LABEL_RE = re.compile(r"^\s*Switch\s*$", re.I)
+
+_PAGE_SIDEBAR_SWITCH_JS = """
+() => {
+  const hints = [
+    'switch into', 'to take more actions', 'to start managing',
+    'chuyển sang', 'để bắt đầu quản lý', 'để thực hiện thêm'
+  ];
+  const low = (document.body.innerText || '').toLowerCase();
+  if (!hints.some(h => low.includes(h))) return false;
+  const nodes = Array.from(document.querySelectorAll('div[role="none"]'));
+  const candidates = [];
+  for (const el of nodes) {
+    const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+    if (!/^switch$/i.test(t)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 48 || r.height < 18 || r.width > 520) continue;
+    candidates.push({ el, top: r.top, left: r.left });
+  }
+  if (!candidates.length) return false;
+  candidates.sort((a, b) => (b.top - a.top) || (a.left - b.left));
+  const pick = candidates[0].el;
+  for (const node of [pick.closest('[role="button"]'), pick.closest('[tabindex="0"]'), pick]) {
+    if (node && typeof node.click === 'function') { node.click(); return true; }
+  }
+  return false;
+}
+"""
+
+
+def _page_switch_sidebar_hint_visible(page: Page, *, timeout_ms: int = 1500) -> bool:
+    """Manage Page: «Switch into … Page to take more actions» (sidebar trái)."""
+    for pat in (
+        r"Switch into",
+        r"to take more actions",
+        r"to start managing",
+        r"Chuyển sang",
+        r"để bắt đầu quản lý",
+        r"để thực hiện thêm",
+    ):
+        try:
+            if page.get_by_text(re.compile(pat, re.I)).first.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_manage_page_sidebar_switch(page: Page, *, timeout_ms: int = 1600) -> bool:
+    """
+    Bấm nút Switch sidebar (HTML Meta: ``div[role='none']`` > span > span «Switch»).
+
+    Khác «Switch Now» trên banner và khác nút ``role=button`` trong popup profiles.
+    """
+    locators = (
+        page.locator(
+            "xpath=(//div[@role='none'][.//span[normalize-space()='Switch'] "
+            "and not(.//*[normalize-space()='Switch Now'])])[last()]"
+        ),
+        page.locator("div[role='none']").filter(has=page.get_by_text(_SWITCH_EXACT_LABEL_RE)).last,
+        page.locator(
+            "xpath=(//*[contains(translate(normalize-space(.), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'take more actions')]"
+            "//div[@role='none'][.//span[normalize-space()='Switch']])[last()]"
+        ),
+        page.locator(
+            "xpath=(//*[contains(translate(normalize-space(.), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
+            "//div[@role='none'][.//span[normalize-space()='Switch']])[last()]"
+        ),
+    )
+    for loc in locators:
+        try:
+            if loc.count() <= 0:
+                continue
+            target = loc.last
+            if not target.is_visible(timeout=timeout_ms):
+                continue
+            try:
+                target.evaluate(
+                    """(el) => {
+                      for (const node of [el, el.closest('[role="button"]'), el.closest('[tabindex="0"]')]) {
+                        if (node && typeof node.click === 'function') { node.click(); return; }
+                      }
+                    }"""
+                )
+            except Exception:
+                target.click(timeout=timeout_ms, force=True, no_wait_after=True)
+            logger.info("[FB] Đã bấm Switch sidebar Manage Page (role=none).")
+            page.wait_for_timeout(1800)
+            return True
+        except Exception:
+            continue
+    if _page_switch_sidebar_hint_visible(page, timeout_ms=min(800, timeout_ms)):
+        try:
+            if page.evaluate(_PAGE_SIDEBAR_SWITCH_JS):
+                logger.info("[FB] Đã bấm Switch sidebar (JS fallback).")
+                page.wait_for_timeout(1800)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _confirm_switch_profiles_popup(page: Page, *, page_display_name: str = "", page_url: str = "") -> None:
+    """Popup «Switch profiles» sau khi bấm Switch — chọn Page hoặc nút Switch xác nhận."""
+    if _click_visible_enabled_button(
+        page.get_by_role("button", name=re.compile(r"^Switch$", re.I)),
+        timeout_ms=1700,
+    ):
+        page.wait_for_timeout(random.randint(1800, 3200))
+        return
+    if _click_visible_enabled_button(page.get_by_text(re.compile(r"^Switch$", re.I)), timeout_ms=1200):
+        page.wait_for_timeout(random.randint(1800, 3200))
+        return
+    pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
+    if pname or dest:
+        _select_page_in_switch_profiles_popup(page, page_display_name=pname, page_url=dest)
+
+
+def _ensure_page_role_switched(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    page_url: str = "",
+) -> bool:
+    """
+    Chuyển sang vai trò Page: Switch Now, sidebar role=none, hoặc khối «switch into …».
+
+    Returns:
+        True nếu đã thực hiện thao tác switch (hoặc không cần).
+    """
+    pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
+    sw_now = re.compile(r"Switch Now|Chuyển ngay", re.I)
+    if _click_visible_enabled_button(page.get_by_role("button", name=sw_now), timeout_ms=1500):
+        page.wait_for_timeout(random.randint(2600, 5200))
+        _confirm_switch_profiles_popup(page, page_display_name=pname, page_url=dest)
+        return True
+    if _click_manage_page_sidebar_switch(page):
+        page.wait_for_timeout(random.randint(2200, 4400))
+        _confirm_switch_profiles_popup(page, page_display_name=pname, page_url=dest)
+        return True
+    try:
+        sw_block = page.locator(
+            "xpath=(//*[contains(translate(normalize-space(.), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
+            "//*[self::div or self::span][normalize-space()='Switch'])[last()]"
+        )
+        if _click_visible_enabled_button(sw_block, timeout_ms=1500):
+            page.wait_for_timeout(2000)
+            _confirm_switch_profiles_popup(page, page_display_name=pname, page_url=dest)
+            return True
+    except Exception:
+        pass
+    if not _page_switch_sidebar_hint_visible(page, timeout_ms=600):
+        return False
+    logger.warning("[FB] Thấy gợi ý Switch Page nhưng chưa bấm được nút Switch.")
+    return False
+
+
 def _ensure_switched_into_page_if_needed(page: Page) -> None:
     """
-    Nếu Facebook hiển thị banner yêu cầu switch sang Page thì bấm "Switch Now".
+    Nếu Facebook hiển thị banner hoặc sidebar yêu cầu switch sang Page thì bấm Switch.
     """
     try:
-        switch_btn_selectors = (
-            "button:has-text('Switch Now')",
-            "[role='button']:has-text('Switch Now')",
-            "a:has-text('Switch Now')",
-            "button:has-text('Chuyển ngay')",
-            "[role='button']:has-text('Chuyển ngay')",
-            "a:has-text('Chuyển ngay')",
-        )
-        hint_selectors = (
-            "text=Switch into",
-            "text=to start managing it",
-            "text=Chuyển sang Trang",
-            "text=để bắt đầu quản lý",
-        )
-
-        saw_hint = False
-        for hs in hint_selectors:
-            try:
-                if page.locator(hs).first.is_visible(timeout=1500):  # type: ignore[call-arg]
-                    saw_hint = True
-                    break
-            except Exception:
-                continue
-        if not saw_hint:
-            return
-
-        for sel in switch_btn_selectors:
-            try:
-                btn = page.locator(sel).first
-                if not btn.is_visible():
+        need_switch = _page_switch_sidebar_hint_visible(page, timeout_ms=1200)
+        if not need_switch:
+            for hs in (
+                "text=Switch into",
+                "text=to start managing it",
+                "text=Chuyển sang Trang",
+                "text=để bắt đầu quản lý",
+            ):
+                try:
+                    if page.locator(hs).first.is_visible(timeout=800):  # type: ignore[call-arg]
+                        need_switch = True
+                        break
+                except Exception:
                     continue
-                btn.click(timeout=10_000, force=True)
-                logger.info("Đã bấm Switch Now để chuyển sang vai trò Page.")
-                # Chờ ngắn cho UI cập nhật role.
-                page.wait_for_timeout(1800)
-                return
-            except Exception:
-                continue
+        if need_switch:
+            _ensure_page_role_switched(page)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không xử lý được banner switch page: {}", exc)
 
@@ -1837,31 +2118,7 @@ def _ensure_reel_dashboard_page_context(
         raise ValueError("Thiếu page_url cho luồng Reel dashboard.")
     navigate_to_url(page, dest)
     page.wait_for_timeout(2800)
-    _ensure_switched_into_page_if_needed(page)
-    sw_pat = re.compile(r"Switch Now|Chuyển ngay", re.I)
-    if _click_visible_enabled_button(page.get_by_role("button", name=sw_pat), timeout_ms=1500):
-        page.wait_for_timeout(random.randint(2800, 5600))
-        if not _click_visible_enabled_button(
-            page.get_by_role("button", name=re.compile(r"^Switch$", re.I)),
-            timeout_ms=1700,
-        ):
-            _select_page_in_switch_profiles_popup(
-                page, page_display_name=pname, page_url=dest
-            )
-    else:
-        try:
-            sw_method2 = page.locator(
-                "xpath=(//*[contains(translate(normalize-space(.), "
-                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
-                "//*[self::div or self::span][normalize-space()='Switch'])[last()]"
-            )
-            if _click_visible_enabled_button(sw_method2, timeout_ms=1500):
-                page.wait_for_timeout(2000)
-        except Exception:
-            pass
-        _select_page_in_switch_profiles_popup(
-            page, page_display_name=pname, page_url=dest
-        )
+    _ensure_page_role_switched(page, page_display_name=pname, page_url=dest)
     if dest and not _is_on_target_surface(page, dest):
         navigate_to_url(page, dest)
         _ensure_switched_into_page_if_needed(page)
@@ -2285,34 +2542,11 @@ def upload_photo(page: Page, image_path: str | Path) -> None:
         _disable_view_only_guard(page)
     try:
         if _is_meta_business_composer_context(page):
-            _dismiss_blocking_ui_before_business_media(page)
-            if _set_file_via_existing_input(page, path, kind="image"):
-                logger.info("Đã gắn file ảnh qua input[type=file] có sẵn: {}", path)
+            if _attach_media_automatic(page, path, kind="image", context="composer_photo"):
+                logger.info("Đã gắn file ảnh (tự động, không popup OS): {}", path)
                 _human_pause()
                 _enable_view_only_guard(page)
                 return
-            if _set_file_via_business_add_button(page, path, kind="image"):
-                logger.info("Đã gắn file ảnh qua Add photo/video + filechooser interception: {}", path)
-                _human_pause()
-                _enable_view_only_guard(page)
-                return
-            if _set_file_via_existing_input(page, path, kind="image"):
-                logger.info("Đã gắn file ảnh qua input fallback: {}", path)
-                _human_pause()
-                _enable_view_only_guard(page)
-                return
-            # Fallback cuối (opt-in): chỉ bật khi thật sự muốn dùng popup native.
-            if _native_file_chooser_allowed():
-                try:
-                    with page.expect_file_chooser(timeout=10_000) as fc_info:
-                        _open_business_add_photo_video(page)
-                    fc_info.value.set_files(str(path))
-                    logger.info("Đã gắn file ảnh qua filechooser fallback: {}", path)
-                    _human_pause()
-                    _enable_view_only_guard(page)
-                    return
-                except Exception:
-                    pass
             raise RuntimeError("Không tìm được input upload ảnh trong Business Composer.")
         sel = _wait_first_selector(
             page,
@@ -2352,50 +2586,18 @@ def upload_video(page: Page, video_path: str | Path) -> None:
         _disable_view_only_guard(page)
     try:
         if _is_meta_business_composer_context(page):
-            _dismiss_blocking_ui_before_business_media(page)
-            if _set_file_via_existing_input(page, path, kind="video"):
-                logger.info("{} Đã gắn file video qua input[type=file] có sẵn: {}", _reel_strict_prefix("Upload"), path)
+            if _attach_media_automatic(page, path, kind="video", context="composer_video"):
+                logger.info("{} Đã gắn file video (tự động, không popup OS): {}", _reel_strict_prefix("Upload"), path)
                 try:
                     page.locator("video").first.wait_for(state="visible", timeout=22_000)
                 except PlaywrightTimeoutError:
-                    logger.warning("{} Không thấy thẻ video sau upload input — tiếp tục bước tiếp theo, chờ wizard xác nhận.", _reel_strict_prefix("Upload"))
+                    logger.warning(
+                        "{} Không thấy thẻ video sau upload — tiếp tục bước tiếp theo, chờ wizard xác nhận.",
+                        _reel_strict_prefix("Upload"),
+                    )
                 _human_pause()
                 _enable_view_only_guard(page)
                 return
-            if _set_file_via_business_add_button(page, path, kind="video"):
-                logger.info("{} Đã gắn file video qua Add photo/video + filechooser interception: {}", _reel_strict_prefix("Upload"), path)
-                try:
-                    page.locator("video").first.wait_for(state="visible", timeout=22_000)
-                except PlaywrightTimeoutError:
-                    logger.warning("{} Không thấy thẻ video sau Add photo/video interception — tiếp tục bước tiếp theo, chờ wizard xác nhận.", _reel_strict_prefix("Upload"))
-                _human_pause()
-                _enable_view_only_guard(page)
-                return
-            if _set_file_via_existing_input(page, path, kind="video"):
-                logger.info("{} Đã gắn file video qua input fallback: {}", _reel_strict_prefix("Upload"), path)
-                try:
-                    page.locator("video").first.wait_for(state="visible", timeout=22_000)
-                except PlaywrightTimeoutError:
-                    logger.warning("{} Không thấy thẻ video sau upload input fallback — tiếp tục bước tiếp theo, chờ wizard xác nhận.", _reel_strict_prefix("Upload"))
-                _human_pause()
-                _enable_view_only_guard(page)
-                return
-            # Fallback cuối (opt-in): chỉ bật khi thật sự muốn dùng popup native.
-            if _native_file_chooser_allowed():
-                try:
-                    with page.expect_file_chooser(timeout=10_000) as fc_info:
-                        _open_business_add_photo_video(page)
-                    fc_info.value.set_files(str(path))
-                    logger.info("{} Đã gắn file video qua filechooser fallback: {}", _reel_strict_prefix("Upload"), path)
-                    try:
-                        page.locator("video").first.wait_for(state="visible", timeout=22_000)
-                    except PlaywrightTimeoutError:
-                        logger.warning("{} Không thấy thẻ video sau upload filechooser fallback — tiếp tục bước tiếp theo, chờ wizard xác nhận.", _reel_strict_prefix("Upload"))
-                    _human_pause()
-                    _enable_view_only_guard(page)
-                    return
-                except Exception:
-                    pass
             raise RuntimeError("Không tìm được input upload video trong Business Composer.")
         sel = _wait_first_selector(
             page,
@@ -5260,60 +5462,21 @@ def post_reel_via_page_dashboard(
     _step_pause(900, 1700, label="sau WAIT_REEL_POPUP")
 
     _step("UPLOAD_VIDEO", f"Upload video: {video_path}")
-    abs_video = str(video_path.resolve())
-
-    def _try_set_input_direct() -> bool:
-        # Ưu tiên input trong dialog hiện tại; không yêu cầu visible.
-        for cand in (
-            dialog.locator("input[type='file']").last,
-            dialog.locator("input[type='file']").first,
-            page.locator("input[type='file']").last,
-        ):
-            try:
-                if cand.count() <= 0:
-                    continue
-                cand.set_input_files(abs_video)
-                return True
-            except Exception:
-                continue
-        return False
-
-    def _try_set_via_filechooser(trigger: Locator, *, label: str) -> bool:
-        try:
-            if trigger.count() <= 0:
-                return False
-            with page.expect_file_chooser(timeout=5_000) as fc_info:
-                if not _click_visible_enabled_button(trigger, timeout_ms=1800):
-                    return False
-            fc = fc_info.value
-            fc.set_files(abs_video)
-            logger.info("{} Đã set video qua file chooser ({})", stage, label)
-            return True
-        except Exception:
-            return False
-
-    uploaded = _try_set_input_direct()
-    if not uploaded:
-        # Theo HTML bạn gửi: khu Add video + nút Upload trong popup Create reel.
-        uploaded = _try_set_via_filechooser(
-            dialog.get_by_text(re.compile(r"Add video|or drag and drop", re.I)),
-            label="Add video",
-        )
-    if not uploaded:
-        uploaded = _try_set_via_filechooser(
-            dialog.get_by_role("button", name=re.compile(r"Upload", re.I)),
-            label="Upload button",
-        )
-    if not uploaded:
-        uploaded = _try_set_via_filechooser(
-            dialog.get_by_text(re.compile(r"^Upload$", re.I)),
-            label="Upload text",
-        )
+    uploaded = _attach_media_automatic(
+        page,
+        video_path,
+        kind="video",
+        scope=dialog,
+        context="reel_dashboard",
+    )
     if not uploaded:
         _failure_screenshot(page, "reel_file_input_missing")
         raise PlaywrightTimeoutError(
-            "Không import được video: không tìm thấy input[type=file] usable hoặc trigger Add video/Upload."
+            "Không import được video tự động: không set được input[type=file] "
+            "và không intercept được filechooser (Add video/Upload). "
+            "Không dùng hộp thoại chọn file Windows — kiểm tra quyền Page và đường dẫn video."
         )
+    logger.info("{} Đã import video tự động (không popup OS chọn file)", stage)
 
     page.wait_for_timeout(1800)
     # Chờ upload thực sự được nhận trước khi Next.

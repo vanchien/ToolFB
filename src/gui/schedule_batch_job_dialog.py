@@ -45,6 +45,7 @@ from src.utils.schedule_batch_preview import (
 )
 from src.utils.schedule_posts_manager import SchedulePostsManager
 from src.utils.ffmpeg_paths import portable_ffmpeg_bin_dir, resolve_ffmpeg_ffprobe_paths
+from src.gui.file_dialog_defaults import default_video_media_initialdir, pick_video_media_files
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 
 _FFMPEG_INSTALL_ATTEMPTED = False
@@ -1104,7 +1105,12 @@ class ScheduleBatchJobDialog:
         self._build_video_caption_inner()
 
     def _browse_video_folder(self) -> None:
-        p = filedialog.askdirectory(parent=self._top, title="Thư mục chứa video")
+        initial = default_video_media_initialdir(path_hint=self._v_folder.get().strip())
+        p = filedialog.askdirectory(
+            parent=self._top,
+            title="Chọn thư mục chứa video",
+            initialdir=initial,
+        )
         if p:
             self._v_folder.delete(0, tk.END)
             self._v_folder.insert(0, p)
@@ -1164,7 +1170,11 @@ class ScheduleBatchJobDialog:
             messagebox.showwarning("ffmpeg", detail, parent=self._top)
 
     def _manual_add_media(self) -> None:
-        paths = filedialog.askopenfilenames(parent=self._top, title="Chọn file media")
+        paths = pick_video_media_files(
+            self._top,
+            title="Chọn file video cho batch job lịch đăng",
+            multiple=True,
+        )
         for p in paths:
             self._m_media_lb.insert(tk.END, p)
 
