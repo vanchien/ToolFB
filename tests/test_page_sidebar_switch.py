@@ -39,6 +39,22 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
     page = MagicMock()
     with (
         patch(
+            "src.automation.facebook_actions._view_only_mode_enabled",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_switch_ui_visible",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_switch_sidebar_hint_visible",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._is_on_target_surface",
+            return_value=True,
+        ),
+        patch(
             "src.automation.facebook_actions._click_visible_enabled_button",
             return_value=False,
         ),
@@ -47,15 +63,39 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
             return_value=True,
         ) as sidebar,
         patch(
+            "src.automation.facebook_actions._wait_after_page_switch_click",
+        ),
+        patch(
             "src.automation.facebook_actions._confirm_switch_profiles_popup",
         ) as confirm,
-        patch(
-            "src.automation.facebook_actions._page_switch_sidebar_hint_visible",
-            return_value=False,
-        ),
     ):
         assert _ensure_page_role_switched(
             page, page_display_name="Best News US", page_url="https://www.facebook.com/123"
         )
-        sidebar.assert_called_once()
-        confirm.assert_called_once()
+        sidebar.assert_called()
+        confirm.assert_called()
+
+
+def test_ensure_switched_passes_page_name() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._page_switch_ui_visible",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._ensure_page_role_switched",
+        ) as role_sw,
+    ):
+        from src.automation.facebook_actions import _ensure_switched_into_page_if_needed
+
+        _ensure_switched_into_page_if_needed(
+            page,
+            page_display_name="My Page",
+            page_url="https://www.facebook.com/999",
+        )
+        role_sw.assert_called_once_with(
+            page,
+            page_display_name="My Page",
+            page_url="https://www.facebook.com/999",
+        )
