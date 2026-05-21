@@ -1,7 +1,7 @@
 {
-  "version": "1.0.62",
+  "version": "1.0.63",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "e20001f381ac442fd742a4695d6c37dc6d3eb0aa1d4778f3c2749284349b0ef2",
-  "notes": "UI: tranh Not Responding khi nap/xuat job so luong lon; dialog Nap job Export ghi batch schedule_posts/TikTok.",
-  "generated_at": "2026-05-20T21:54:27"
+  "sha256": "0c4cd68994972148cf28664a425b908177330e5e48282373b3c001a62f9f0267",
+  "notes": "Post: switch Page co scroll trong Switch profiles; bam Post khi nut enable (khong bat buoc tieu de); 1 job/page tranh dang nham Page.",
+  "generated_at": "2026-05-21T12:11:19"
 }
