@@ -310,7 +310,10 @@ def _run_chromium_posting_flow(
                         logger.info("[FB lock-ui] Đã khóa lại browser sau Reel dashboard.")
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("[FB lock-ui] Không khóa lại UI: {}", exc)
-            _track(STEP_VERIFY_RESULT, "Xác nhận đã đăng (Reel Dashboard)")
+            _track(
+                STEP_VERIFY_RESULT,
+                "Xác nhận Post + video trên Page (chờ 5s, kiểm tra Published)",
+            )
             _perf_mark(perf_on, "reel_dashboard_posted", t0)
             return
         logger.info(

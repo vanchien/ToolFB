@@ -421,6 +421,17 @@ def default_meta_business_composer_url(asset_id: str) -> str:
     )
 
 
+def default_meta_published_posts_url(asset_id: str) -> str:
+    """URL danh sách bài đã đăng (Posts & reels → Published) trên Business Suite."""
+    aid = str(asset_id).strip()
+    if not aid.isdigit():
+        raise ValueError("asset_id Meta phải là chuỗi số.")
+    return (
+        "https://business.facebook.com/latest/posts/published_posts"
+        f"?asset_id={aid}&nav_ref=internal_nav&ref=biz_web_content_manager_published_posts"
+    )
+
+
 def merge_asset_id_into_business_composer_url(url: str, asset_id: str) -> str:
     """Ghi đè / bổ sung ``asset_id`` trên URL composer (giữ các query khác)."""
     aid = str(asset_id).strip()
@@ -3583,7 +3594,11 @@ def _reel_wizard_needs_next(
             return False
         return True
     if payload and filled:
-        return not _reel_strict_post_button_visible(page, timeout_ms=300)
+        if _reel_strict_post_button_visible(page, timeout_ms=350):
+            return False
+        if _reel_settings_screen_visible(page, timeout_ms=280):
+            return False
+        return True
     return not _reel_strict_post_button_visible(page, timeout_ms=300)
 
 
@@ -5029,6 +5044,47 @@ _REEL_POST_CSS_SELECTORS: tuple[str, ...] = (
     "div.html-div [role='none'] span.x1j85h84:has-text('Đăng')",
 )
 
+_REEL_POST_FOOTER_CLICK_JS = """
+() => {
+  const dlg = document.querySelector('[role="dialog"]');
+  if (!dlg) return false;
+  const minBottom = window.innerHeight * 0.55;
+  const hits = [];
+  for (const el of dlg.querySelectorAll('[role="button"], div[role="none"], span, div[tabindex="0"]')) {
+    const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!/^post$/i.test(t) && !/^đăng$/i.test(t)) continue;
+    if (el.closest('[role="listbox"], [role="option"], [role="menu"]')) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 40 || r.height < 20) continue;
+    if (r.top < minBottom) continue;
+    hits.push({ el, bottom: r.bottom, left: r.left });
+  }
+  if (!hits.length) return false;
+  hits.sort((a, b) => b.bottom - a.bottom || b.left - a.left);
+  const pick = hits[0].el;
+  for (const node of [
+    pick.closest('[role="button"]'),
+    pick.closest("[tabindex='0']"),
+    pick.closest("[class*='html-div']"),
+    pick.closest("[role='none']"),
+    pick,
+  ]) {
+    if (!node) continue;
+    try {
+      const r = node.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+      }
+      if (typeof node.click === 'function') node.click();
+      return true;
+    } catch (_) {}
+  }
+  return false;
+}
+"""
+
 _REEL_POST_CLICK_JS = """(el) => {
   if (!el) return;
   const pick = [
@@ -5064,6 +5120,29 @@ def _reel_post_label_text(loc: Locator) -> str:
         return ""
 
 
+def _dismiss_reel_hashtag_suggestion(page: Page) -> None:
+    """Đóng dropdown gợi ý hashtag sau nhập caption — tránh chặn bấm Post."""
+    for _ in range(3):
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(180)
+        except Exception:
+            break
+    try:
+        hdr = page.get_by_text(re.compile(r"^\s*Reel settings\s*$", re.I)).first
+        if hdr.is_visible(timeout=500):
+            hdr.click(timeout=800, force=True)
+            page.wait_for_timeout(280)
+    except Exception:
+        pass
+    try:
+        if page.get_by_text(re.compile(r"safe to publish", re.I)).first.is_visible(timeout=400):
+            page.get_by_text(re.compile(r"safe to publish", re.I)).first.click(timeout=600, force=True)
+            page.wait_for_timeout(200)
+    except Exception:
+        pass
+
+
 def _reel_locator_is_post_submit(loc: Locator) -> bool:
     """Xác minh locator là nút Post/Đăng thật (không phải «Posts», «Create post»…)."""
     try:
@@ -5071,11 +5150,17 @@ def _reel_locator_is_post_submit(loc: Locator) -> bool:
             return False
     except Exception:
         return False
+    try:
+        aria = (loc.get_attribute("aria-label") or "").strip()
+        if aria and _REEL_POST_LABEL_RE.match(aria):
+            return True
+    except Exception:
+        pass
     txt = _reel_post_label_text(loc)
     if txt and _REEL_POST_LABEL_RE.match(txt):
         return True
     try:
-        span = loc.locator("span.x1j85h84").first
+        span = loc.locator("span.x1j85h84, span").filter(has_text=_REEL_POST_LABEL_RE).first
         if span.count() > 0 and span.is_visible(timeout=200):
             inner = _reel_post_label_text(span)
             return bool(inner and _REEL_POST_LABEL_RE.match(inner))
@@ -5142,6 +5227,30 @@ def _reel_strict_post_button_locators(page: Page, *, dialog: Locator | None = No
                         'div[role="none"] span.x1j85h84',
                         has_text=_REEL_POST_LABEL_RE,
                     )
+                ).last
+            )
+        except Exception:
+            pass
+        try:
+            _add(scope.get_by_role("button", name=_REEL_POST_LABEL_RE))
+        except Exception:
+            pass
+        try:
+            _add(
+                scope.locator(
+                    "xpath=.//*[normalize-space()='Save']/following::*"
+                    "[self::div or self::span or self::button]"
+                    "[normalize-space()='Post' or normalize-space()='Đăng'][1]"
+                )
+            )
+        except Exception:
+            pass
+        try:
+            _add(
+                scope.locator(
+                    "xpath=.//*[not(ancestor::*[@role='listbox'])]"
+                    "[not(ancestor::*[@role='option'])]"
+                    "[normalize-space()='Post' or normalize-space()='Đăng']"
                 ).last
             )
         except Exception:
@@ -5345,10 +5454,26 @@ def _reel_wizard_ready_to_post(
     - Không có caption/tiêu đề trong job, hoặc
     - Post đã enable (Meta cho phép đăng không bắt buộc mô tả).
     """
+    on_settings = _reel_settings_screen_visible(page, timeout_ms=280)
+    if on_settings and filled and str(payload or "").strip():
+        try:
+            if page.get_by_text(re.compile(r"safe to publish", re.I)).first.is_visible(timeout=450):
+                return True
+        except Exception:
+            pass
+        try:
+            if page.locator("xpath=.//*[normalize-space()='Save']").first.is_visible(timeout=450):
+                return True
+        except Exception:
+            pass
     if not _reel_strict_post_button_visible(page, timeout_ms=400):
+        if on_settings and filled:
+            return True
         return False
     post_usable = _reel_strict_post_button_usable(page, timeout_ms=350)
-    if _reel_settings_screen_visible(page, timeout_ms=280):
+    if on_settings:
+        if filled and str(payload or "").strip():
+            return True
         return post_usable
     if not post_usable:
         return False
@@ -5685,6 +5810,7 @@ def _fill_reel_dashboard_caption(
         try:
             fn()
             logger.info("{} Đã nhập caption Reel qua {} ({} ký tự).", stage, label, len(payload))
+            _dismiss_reel_hashtag_suggestion(page)
             human_pause(kind="input", label="sau nhập caption dashboard")
             return True
         except Exception as exc:
@@ -5772,8 +5898,45 @@ def _click_meta_reel_next_best_effort(page: Page) -> bool:
     return False
 
 
-def _click_reel_post_best_effort(page: Page) -> None:
-    """Bấm Post/Publish trong popup Reel (strict → click_post_button)."""
+def _reel_post_submit_acknowledged(page: Page, *, timeout_ms: int = 8_000) -> bool:
+    """Sau khi gọi click Post: wizard đóng, processing modal, hoặc về Published."""
+    deadline = time.time() + max(1.0, timeout_ms / 1000.0)
+    while time.time() < deadline:
+        try:
+            u = str(page.url or "").strip().lower()
+            if "published_posts" in u:
+                return True
+        except Exception:
+            pass
+        try:
+            if page.get_by_text(re.compile(r"Video\s+post\s+processing", re.I)).first.is_visible(timeout=280):
+                return True
+        except Exception:
+            pass
+        try:
+            if page.get_by_text(re.compile(r"finishes processing", re.I)).first.is_visible(timeout=280):
+                return True
+        except Exception:
+            pass
+        try:
+            if page.get_by_text(re.compile(r"Publishing|Đang đăng|Your reel is being", re.I)).first.is_visible(timeout=280):
+                return True
+        except Exception:
+            pass
+        settings_open = _reel_settings_screen_visible(page, timeout_ms=220)
+        post_still = _reel_strict_post_button_usable(page, timeout_ms=220)
+        if not settings_open and not post_still:
+            return True
+        if settings_open and not post_still:
+            return True
+        page.wait_for_timeout(320)
+    return False
+
+
+def _click_reel_post_best_effort(page: Page) -> bool:
+    """Bấm Post/Publish trong popup Reel. Trả về True nếu đã gửi click và UI bắt đầu phản hồi."""
+    stage = _reel_strict_prefix("Wizard")
+    _dismiss_reel_hashtag_suggestion(page)
     wait_deadline = time.time() + 28.0
     while time.time() < wait_deadline:
         if _reel_strict_post_button_usable(page, timeout_ms=400):
@@ -5781,20 +5944,62 @@ def _click_reel_post_best_effort(page: Page) -> None:
         page.wait_for_timeout(320)
     dialog = _active_reel_dialog(page)
     try:
-        _click_post_strict_for_reel(page, dialog)
-        return
+        dialog.locator("xpath=.//*[normalize-space()='Save']").last.scroll_into_view_if_needed(timeout=2_000)
     except Exception:
         pass
+    clicked = False
     try:
-        click_post_button(page)
-        return
+        if page.evaluate(_REEL_POST_FOOTER_CLICK_JS):
+            logger.info("{} Đã bấm Post footer Reel settings (JS).", stage)
+            clicked = True
     except Exception:
         pass
-    post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
-    try:
-        post_btn.evaluate("el => el && el.click && el.click()")
-    except Exception:
-        post_btn.click(timeout=1800, force=True, no_wait_after=True)
+    if not clicked:
+        for loc in _reel_strict_post_button_locators(page, dialog=dialog):
+            try:
+                if not _reel_locator_post_usable(loc):
+                    continue
+                loc.scroll_into_view_if_needed(timeout=2_000)
+                _click_reel_post_locator(page, loc)
+                logger.info("{} Đã bấm Post (footer locator).", stage)
+                clicked = True
+                break
+            except Exception:
+                continue
+    if not clicked:
+        try:
+            _click_post_strict_for_reel(page, dialog)
+            clicked = True
+        except Exception:
+            pass
+    if not clicked:
+        try:
+            click_post_button(page)
+            clicked = True
+        except Exception:
+            pass
+    if not clicked:
+        try:
+            post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
+            try:
+                post_btn.evaluate("el => el && el.click && el.click()")
+            except Exception:
+                post_btn.click(timeout=1800, force=True, no_wait_after=True)
+            clicked = True
+        except Exception:
+            pass
+    if not clicked:
+        logger.error("{} Không bấm được nút Post trong Reel wizard.", stage)
+        return False
+    page.wait_for_timeout(max(400, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 900)))
+    if _reel_post_submit_acknowledged(page, timeout_ms=6_000):
+        logger.info("{} UI xác nhận đã gửi Post (wizard đóng / processing / Published).", stage)
+        return True
+    logger.warning(
+        "{} Đã gọi click Post nhưng chưa thấy phản hồi UI trong 6s — bước verify sẽ kiểm tra tiếp.",
+        stage,
+    )
+    return True
 
 
 def complete_reel_wizard_fill_next_and_post(
@@ -5808,7 +6013,7 @@ def complete_reel_wizard_fill_next_and_post(
     max_next_clicks: int = 18,
     total_timeout_sec: float = 300.0,
     submit_mode: Literal["post", "share", "auto"] = "auto",
-) -> tuple[int, bool]:
+) -> tuple[int, bool, bool]:
     """
     Luồng thống nhất: Next tới ô text → nhập → Next tiếp → submit.
 
@@ -5816,12 +6021,16 @@ def complete_reel_wizard_fill_next_and_post(
     - ``post``: Professional Dashboard (chỉ nút Post strict)
     - ``share``: Meta Business composer legacy (chỉ Share + Done)
     - ``auto``: ưu tiên Post, fallback Share
+
+    Returns:
+        (số lần Next, đã nhập caption, đã bấm Post/Share submit)
     """
     stage = _reel_strict_prefix("Wizard")
     payload = _build_reel_text_payload(title, content, hashtags)
     thumb_mode = normalize_reel_thumbnail_choice(reel_thumbnail_choice)
     thumb_done = False
     filled = False
+    post_clicked = False
     next_clicks = 0
     deadline = time.time() + max(60.0, float(total_timeout_sec))
     mode = submit_mode or "auto"
@@ -5840,7 +6049,7 @@ def complete_reel_wizard_fill_next_and_post(
                 pass
 
     def _try_submit() -> bool:
-        nonlocal filled
+        nonlocal filled, post_clicked
         action = _resolve_reel_submit_action(
             page,
             payload=payload,
@@ -5854,7 +6063,10 @@ def complete_reel_wizard_fill_next_and_post(
                 if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
                     filled = True
             _fire("CLICK_POST", "Reel settings — bấm Post.")
-            _click_reel_post_best_effort(page)
+            if not _click_reel_post_best_effort(page):
+                logger.error("{} Bấm Post thất bại.", stage)
+                return False
+            post_clicked = True
             logger.info("{} Hoàn tất (Post): Next×{} filled={}.", stage, next_clicks, filled)
             return True
         if action == "share":
@@ -5881,17 +6093,25 @@ def complete_reel_wizard_fill_next_and_post(
 
     while time.time() < deadline:
         if _try_submit():
-            return next_clicks, filled
+            return next_clicks, filled, post_clicked
 
         if payload and not filled and _reel_caption_input_usable(page, timeout_ms=550):
             _fire("FILL_CAPTION", "Thấy ô nhập — đang nhập caption.")
             if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
                 filled = True
                 logger.info("{} Caption đã nhập ({} ký tự).", stage, len(payload))
+                _dismiss_reel_hashtag_suggestion(page)
+                if _try_submit():
+                    return next_clicks, filled, post_clicked
             else:
                 logger.warning("{} Nhập caption thất bại — thử lại.", stage)
             page.wait_for_timeout(random.randint(500, 1100))
             continue
+
+        if filled and _reel_settings_screen_visible(page, timeout_ms=400):
+            _dismiss_reel_hashtag_suggestion(page)
+            if _reel_strict_post_button_usable(page, timeout_ms=500) and _try_submit():
+                return next_clicks, filled, post_clicked
 
         if thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO and not thumb_done:
             if _choose_first_reel_thumbnail_method1_best_effort(page):
@@ -5915,7 +6135,7 @@ def complete_reel_wizard_fill_next_and_post(
             continue
 
         if _reel_strict_post_button_usable(page, timeout_ms=450) and _try_submit():
-            return next_clicks, filled
+            return next_clicks, filled, post_clicked
 
         if next_clicks >= max_next_clicks:
             page.wait_for_timeout(500)
@@ -5927,7 +6147,7 @@ def complete_reel_wizard_fill_next_and_post(
         filled = _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags)
 
     if _try_submit():
-        return next_clicks, filled
+        return next_clicks, filled, post_clicked
 
     _failure_screenshot(page, "reel_wizard_fill_next_post_timeout")
     if payload and not filled:
@@ -6295,6 +6515,7 @@ def post_reel_via_page_dashboard(
     thumb_mode = normalize_reel_thumbnail_choice(reel_thumbnail_choice)
     payload_text = _build_reel_text_payload(title, content, hashtags)
     filled = False
+    post_clicked = False
     n_next = 0
 
     def _wizard_on_step(sub_key: str, message: str) -> None:
@@ -6324,15 +6545,19 @@ def post_reel_via_page_dashboard(
         if thumb_mode == REEL_THUMBNAIL_METHOD1_FIRST_AUTO:
             _choose_first_reel_thumbnail_method1_best_effort(page)
         _wizard_on_step("CLICK_POST", "Post details — bấm Publish/Post.")
-        try:
-            _click_reel_post_best_effort(page)
-        except Exception:
-            click_post_button(page)
+        post_clicked = _click_reel_post_best_effort(page)
+        if not post_clicked:
+            try:
+                click_post_button(page)
+                post_clicked = True
+            except Exception as exc:
+                raise PlaywrightTimeoutError(f"Không bấm được Post (way2): {exc}") from exc
         logger.info(
-            "{} [REEL DASHBOARD] way2 done: filled={} payload_len={}.",
+            "{} [REEL DASHBOARD] way2 done: filled={} payload_len={} post_clicked={}.",
             stage,
             filled,
             len(payload_text),
+            post_clicked,
         )
     else:
         _step(
@@ -6340,7 +6565,7 @@ def post_reel_via_page_dashboard(
             f"Luồng thống nhất ({way_labels.get(ui_way, ui_way)}): nhập khi có ô text → Next → Post.",
         )
         try:
-            n_next, filled = complete_reel_wizard_fill_next_and_post(
+            n_next, filled, post_clicked = complete_reel_wizard_fill_next_and_post(
                 page,
                 title=str(title or "").strip(),
                 content=str(content or "").strip(),
@@ -6352,32 +6577,47 @@ def post_reel_via_page_dashboard(
                 submit_mode="post",
             )
             logger.info(
-                "{} [REEL DASHBOARD] wizard done: way={} Next×{} filled={}.",
+                "{} [REEL DASHBOARD] wizard done: way={} Next×{} filled={} post_clicked={}.",
                 stage,
                 ui_way,
                 n_next,
                 filled,
+                post_clicked,
             )
         except PlaywrightTimeoutError:
             raise
+    if not post_clicked:
+        raise PlaywrightTimeoutError(
+            "Reel dashboard: wizard kết thúc nhưng chưa bấm được Post/Publish."
+        )
     if payload_text and not filled:
         logger.warning(
             "{} Có nội dung job nhưng không nhập được caption — có thể vẫn đăng được nếu Meta không bắt buộc mô tả.",
             stage,
         )
-    page.wait_for_timeout(1400)
     if _env_reel_pause_after_post():
         _step(
             "VERIFY_POST_SUBMITTED",
             "Đã bấm Post. TẠM DỪNG để bạn kiểm tra (FB_REEL_PAUSE_AFTER_POST=1), browser sẽ không tự đóng.",
         )
-        # Giữ để người dùng kiểm tra thủ công. Có thể tắt bằng cách unset env rồi chạy lại.
         while True:
             page.wait_for_timeout(5000)
 
-    _step("VERIFY_POST_SUBMITTED", "Đã bấm Post, chờ 8 giây theo cấu hình rồi kết thúc job.")
-    page.wait_for_timeout(8000)
-    _step("MARK_SUCCESS", "Đăng thành công (sau delay 8 giây hậu Post).")
+    snippet = (payload_text or "").strip()[:200] or None
+    delay_ms = max(5000, _env_int("FB_REEL_POST_VERIFY_DELAY_MS", 5000))
+    _step(
+        "VERIFY_POST_SUBMITTED",
+        f"Đã bấm Post — chờ {delay_ms}ms load rồi xác nhận video trên Page.",
+    )
+    verify_reel_dashboard_post_submitted(
+        page,
+        post_clicked=True,
+        text_snippet=snippet,
+        page_url=purl,
+        post_verify_delay_ms=delay_ms,
+        timeout_ms=120_000,
+    )
+    _step("MARK_SUCCESS", "Đăng Reel thành công — đã xác nhận Post và video trên Page.")
     return
 
 
@@ -6624,6 +6864,121 @@ def dismiss_meta_more_posts_prompt_best_effort(
         except Exception:
             break
     return False
+
+
+def _meta_published_posts_has_video_row(page: Page, *, timeout_ms: int = 4_000) -> bool:
+    """Có ít nhất một hàng bài đăng dạng video/reel trên màn Published (duration hoặc nhãn Reel)."""
+    try:
+        rows = page.locator("[role='grid'] [role='row'], [role='table'] [role='row']")
+        n = min(int(rows.count()), 8)
+        for i in range(n):
+            try:
+                txt = str(rows.nth(i).inner_text(timeout=min(800, timeout_ms)) or "")
+            except Exception:
+                continue
+            if re.search(r"\b\d{1,2}:\d{2}\b", txt):
+                return True
+            if re.search(r"\b(reel|reels|video|thước phim)\b", txt, re.I):
+                return True
+    except Exception:
+        pass
+    for sel in (
+        "a[href*='reel']",
+        "[aria-label*='Reel' i]",
+        "[aria-label*='video' i]",
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=min(1200, timeout_ms)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _navigate_meta_published_posts_best_effort(page: Page, *, page_url: str = "") -> None:
+    """Mở tab Published Posts để kiểm tra video/reel vừa đăng."""
+    aid = extract_facebook_numeric_id_from_url(str(page_url or "").strip())
+    if not aid:
+        try:
+            aid = extract_facebook_numeric_id_from_url(str(page.url or ""))
+        except Exception:
+            aid = None
+    if not aid:
+        return
+    target = default_meta_published_posts_url(aid)
+    try:
+        assert_safe_facebook_navigation_url(target, label="published_posts")
+        page.goto(target, wait_until="domcontentloaded", timeout=90_000)
+        page.wait_for_timeout(2200)
+    except Exception as exc:
+        logger.debug("{} Không mở được published_posts: {}", _reel_strict_prefix("Verify"), exc)
+
+
+def verify_reel_dashboard_post_submitted(
+    page: Page,
+    *,
+    post_clicked: bool,
+    text_snippet: str | None = None,
+    page_url: str = "",
+    post_verify_delay_ms: int | None = None,
+    timeout_ms: int = 120_000,
+) -> None:
+    """
+    Sau Reel dashboard: bắt buộc đã bấm Post, chờ load (mặc định 5s), xác nhận video/reel trên Page.
+
+    Raises:
+        RuntimeError: Thiếu tín hiệu Post hoặc không thấy video mới — ``need_manual_check``.
+    """
+    stage = _reel_strict_prefix("Verify")
+    if not post_clicked:
+        raise RuntimeError(
+            "VERIFY_REEL: Chưa xác nhận được đã bấm nút Post trong wizard. need_manual_check"
+        )
+    delay_ms = max(5000, int(post_verify_delay_ms or _env_int("FB_REEL_POST_VERIFY_DELAY_MS", 5000)))
+    logger.info("{} Chờ {} ms sau Post trước khi xác nhận đăng.", stage, delay_ms)
+    page.wait_for_timeout(delay_ms)
+
+    verify_post_submitted(
+        page,
+        text_snippet=text_snippet,
+        timeout_ms=timeout_ms,
+        require_submit_signal=True,
+        submit_clicked=True,
+    )
+
+    if _meta_published_posts_has_video_row(page, timeout_ms=5_000):
+        logger.info("{} Đã thấy video/reel trên màn Published hiện tại.", stage)
+        return
+    if text_snippet:
+        frag = text_snippet.strip().replace("\n", " ")[:160]
+        if len(frag) >= 8:
+            try:
+                if page.get_by_text(frag, exact=False).first.is_visible(timeout=6_000):
+                    logger.info("{} Đã thấy caption trên trang sau Post.", stage)
+                    return
+            except Exception:
+                pass
+
+    _navigate_meta_published_posts_best_effort(page, page_url=page_url)
+    page.wait_for_timeout(max(3000, delay_ms // 2))
+    if _meta_published_posts_has_video_row(page, timeout_ms=8_000):
+        logger.info("{} Đã thấy video/reel trong danh sách Published của Page.", stage)
+        return
+    if text_snippet:
+        frag = text_snippet.strip().replace("\n", " ")[:160]
+        if len(frag) >= 8:
+            try:
+                if page.get_by_text(frag, exact=False).first.is_visible(timeout=8_000):
+                    logger.info("{} Đã thấy caption trong danh sách Published.", stage)
+                    return
+            except Exception:
+                pass
+
+    _failure_screenshot(page, "reel_verify_no_video_on_page")
+    raise RuntimeError(
+        "VERIFY_REEL: Đã bấm Post nhưng không thấy video/reel mới trên Page (Published). need_manual_check"
+    )
 
 
 def verify_post_submitted(

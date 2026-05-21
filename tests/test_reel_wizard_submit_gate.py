@@ -133,3 +133,47 @@ def test_ready_to_share_filled_zero_next() -> None:
         assert _reel_wizard_ready_to_share(
             page, payload="x", filled=True, next_clicks=0
         )
+
+
+def test_ready_to_post_reel_settings_filled_without_strict_post() -> None:
+    """Reel settings: caption đã nhập, Post xanh có thể không khớp xpath strict."""
+    page = MagicMock()
+    page.get_by_text.return_value.first.is_visible.return_value = True
+    with (
+        patch(
+            "src.automation.facebook_actions._reel_strict_post_button_visible",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_strict_post_button_usable",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_settings_screen_visible",
+            return_value=True,
+        ),
+    ):
+        assert _reel_wizard_ready_to_post(
+            page, payload="caption text", filled=True, next_clicks=2
+        )
+
+
+def test_needs_next_false_on_reel_settings_after_fill() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._reel_wizard_ready_to_post",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_strict_post_button_visible",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_settings_screen_visible",
+            return_value=True,
+        ),
+    ):
+        assert not _reel_wizard_needs_next(
+            page, payload="x", filled=True, next_clicks=2
+        )
