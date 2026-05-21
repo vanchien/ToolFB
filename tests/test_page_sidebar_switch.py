@@ -107,14 +107,15 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
             return_value=True,
         ),
         patch(
-            "src.automation.facebook_actions._confirm_switch_profiles_popup",
-        ) as confirm,
+            "src.automation.facebook_actions._handle_switch_profiles_popup_if_present",
+            return_value=True,
+        ) as popup,
     ):
         assert _ensure_page_role_switched(
             page, page_display_name="Best News US", page_url="https://www.facebook.com/123"
         )
         sidebar.assert_called()
-        confirm.assert_called()
+        popup.assert_called()
 
 
 def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
@@ -148,6 +149,30 @@ def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
         patch("src.automation.facebook_actions._failure_screenshot"),
     ):
         assert not _ensure_page_role_switched(page, page_url="https://www.facebook.com/103833422779877")
+
+
+def test_handle_switch_profiles_popup_confirm() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._switch_profiles_dialog_visible",
+            side_effect=[True, False, False],
+        ),
+        patch(
+            "src.automation.facebook_actions._click_switch_profiles_popup_confirm",
+            return_value=True,
+        ) as confirm,
+        patch(
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            return_value=True,
+        ),
+    ):
+        from src.automation.facebook_actions import _handle_switch_profiles_popup_if_present
+
+        assert _handle_switch_profiles_popup_if_present(
+            page, page_display_name="G-Force Ghoul", appear_wait_ms=800, settle_ms=2000
+        )
+    confirm.assert_called_once()
 
 
 def test_ensure_switched_passes_page_name() -> None:

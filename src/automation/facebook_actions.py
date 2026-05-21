@@ -2349,58 +2349,230 @@ def _click_manage_page_sidebar_switch(page: Page, *, timeout_ms: int = 2000) -> 
     return False
 
 
-def _switch_profiles_dialog_visible(page: Page, *, timeout_ms: int = 1200) -> bool:
-    for pat in (r"Switch profiles", r"Chuyển hồ sơ", r"Switch profile"):
+def _switch_profiles_dialog_scope(page: Page) -> Locator:
+    """Modal «Switch profiles» / «Switch to … for more features»."""
+    for pat in (
+        r"Switch profiles",
+        r"Switch to",
+        r"Chuyển hồ sơ",
+        r"for more features, tools and settings",
+    ):
         try:
-            dlg = page.get_by_role("dialog").filter(has_text=re.compile(pat, re.I)).first
-            if dlg.is_visible(timeout=timeout_ms):
-                return True
+            dlg = page.get_by_role("dialog").filter(has_text=re.compile(pat, re.I)).last
+            if dlg.count() > 0:
+                return dlg
         except Exception:
             continue
+    return page.locator("[role='dialog']").last
+
+
+def _switch_profiles_dialog_visible(page: Page, *, timeout_ms: int = 1200) -> bool:
     try:
-        if page.locator("[role='dialog']").filter(has_text=_SWITCH_EXACT_LABEL_RE).count() > 0:
-            return page.locator("[role='dialog']").last.is_visible(timeout=timeout_ms)
+        dlg = _switch_profiles_dialog_scope(page)
+        if dlg.count() > 0 and dlg.is_visible(timeout=timeout_ms):
+            return True
     except Exception:
         pass
     return False
 
 
-def _wait_after_page_switch_click(page: Page, *, timeout_ms: int = 12_000) -> None:
-    """Chờ popup Switch profiles hoặc biến mất gợi ý sidebar."""
+_PAGE_SWITCH_POPUP_CONFIRM_JS = """
+() => {
+  const dlg = document.querySelector('[role="dialog"]');
+  if (!dlg) return false;
+  const low = (dlg.innerText || '').toLowerCase();
+  if (!low.includes('switch') && !low.includes('chuyển')) return false;
+  for (const ov of dlg.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
+  }
+  const spans = Array.from(dlg.querySelectorAll('span')).filter(sp =>
+    /^switch$/i.test((sp.textContent || '').trim())
+  );
+  if (!spans.length) return false;
+  const switchSpan = spans[spans.length - 1];
+  const fire = (node) => {
+    if (!node) return false;
+    try {
+      const r = node.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+      }
+      if (typeof node.click === 'function') node.click();
+      return true;
+    } catch (_) { return false; }
+  };
+  let node = switchSpan;
+  for (let i = 0; i < 10 && node; i++) {
+    if (node.getAttribute && node.getAttribute('role') === 'none') {
+      if (fire(node)) return true;
+    }
+    node = node.parentElement;
+  }
+  return fire(switchSpan);
+}
+"""
+
+
+def _click_switch_profiles_popup_confirm(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    timeout_ms: int = 8_000,
+) -> bool:
+    """
+    Bấm nút Switch xanh trong popup «Switch profiles» (role=none > span «Switch»).
+
+    HTML giống sidebar: ``div[role='none']`` > ``span.x6ikm8r`` > «Switch».
+    """
+    if not _switch_profiles_dialog_visible(page, timeout_ms=min(2_500, timeout_ms)):
+        return False
+    pname = str(page_display_name or "").strip()
+    dlg = _switch_profiles_dialog_scope(page)
+    try:
+        dlg.wait_for(state="visible", timeout=min(4_000, timeout_ms))
+    except Exception:
+        pass
+    if pname:
+        try:
+            if not dlg.get_by_text(re.compile(re.escape(pname[:80]), re.I)).first.is_visible(timeout=1_500):
+                logger.warning(
+                    "[FB] Popup Switch profiles không thấy tên Page {!r} — vẫn thử bấm Switch.",
+                    pname,
+                )
+        except Exception:
+            pass
+    try:
+        page.evaluate(
+            """() => {
+              const dlg = document.querySelector('[role="dialog"]');
+              if (!dlg) return;
+              for (const ov of dlg.querySelectorAll('[data-visualcompletion="ignore"]')) {
+                ov.style.pointerEvents = 'none';
+              }
+            }"""
+        )
+    except Exception:
+        pass
+    locators = (
+        dlg.locator(
+            "xpath=.//div[@role='none'][.//span[contains(@class,'x6ikm8r') and normalize-space()='Switch']][last()]"
+        ),
+        dlg.locator("div[role='none']").filter(
+            has=page.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE)
+        ).last,
+        dlg.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE).last,
+    )
+    for loc in locators:
+        try:
+            if loc.count() <= 0 or not loc.is_visible(timeout=1_200):
+                continue
+            loc.scroll_into_view_if_needed(timeout=2_000)
+            try:
+                dlg.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS)
+                logger.info("[FB] Đã bấm Switch trong popup Switch profiles (JS).")
+                page.wait_for_timeout(2_200)
+                return True
+            except Exception:
+                pass
+            try:
+                box = loc.bounding_box()
+                if box:
+                    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    logger.info("[FB] Đã bấm Switch trong popup (mouse).")
+                    page.wait_for_timeout(2_200)
+                    return True
+            except Exception:
+                pass
+            loc.click(timeout=timeout_ms, force=True, no_wait_after=True)
+            logger.info("[FB] Đã bấm Switch trong popup (force click).")
+            page.wait_for_timeout(2_200)
+            return True
+        except Exception:
+            continue
+    try:
+        if page.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS):
+            logger.info("[FB] Đã bấm Switch popup (JS toàn trang).")
+            page.wait_for_timeout(2_200)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _handle_switch_profiles_popup_if_present(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    page_url: str = "",
+    appear_wait_ms: int = 4_500,
+    settle_ms: int = 22_000,
+) -> bool:
+    """
+    Sau khi bấm Switch sidebar: nếu có popup thì bấm Switch xanh, chờ đóng + xác nhận vai trò Page.
+    """
+    _ = page_url  # giữ API; chọn Page trong popup chỉ khi cần danh sách
+    pname = str(page_display_name or "").strip()
+    popup_seen = False
+    appear_deadline = time.time() + max(1.5, appear_wait_ms / 1000.0)
+    while time.time() < appear_deadline:
+        if _switch_profiles_dialog_visible(page, timeout_ms=450):
+            popup_seen = True
+            break
+        page.wait_for_timeout(280)
+    if not popup_seen:
+        logger.info("[FB] Không có popup Switch profiles (switch trực tiếp hoặc đã đóng).")
+        return True
+
+    logger.info("[FB] Popup Switch profiles — bấm nút Switch xác nhận.")
+    if not _click_switch_profiles_popup_confirm(page, page_display_name=pname):
+        _failure_screenshot(page, "switch_profiles_popup_confirm_fail")
+        return False
+
+    settle_deadline = time.time() + max(5.0, settle_ms / 1000.0)
+    while time.time() < settle_deadline:
+        if _switch_profiles_dialog_visible(page, timeout_ms=350):
+            page.wait_for_timeout(400)
+            continue
+        if _page_role_acting_as_page(page, timeout_ms=600):
+            logger.info("[FB] Popup đã đóng — xác nhận vai trò Page sau Switch profiles.")
+            return True
+        page.wait_for_timeout(450)
+    if _switch_profiles_dialog_visible(page, timeout_ms=500):
+        return False
+    return _page_role_acting_as_page(page, timeout_ms=900)
+
+
+def _wait_after_page_switch_click(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    page_url: str = "",
+    timeout_ms: int = 12_000,
+) -> None:
+    """Chờ popup Switch profiles (và xử lý) hoặc sidebar CTA biến mất."""
+    _handle_switch_profiles_popup_if_present(
+        page,
+        page_display_name=page_display_name,
+        page_url=page_url,
+        appear_wait_ms=min(5_000, timeout_ms),
+        settle_ms=timeout_ms,
+    )
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
-        if _switch_profiles_dialog_visible(page, timeout_ms=400):
-            return
         if not _page_switch_sidebar_hint_visible(page, timeout_ms=400):
             return
         page.wait_for_timeout(350)
 
 
-def _confirm_switch_profiles_popup(page: Page, *, page_display_name: str = "", page_url: str = "") -> None:
-    """Popup «Switch profiles» sau khi bấm Switch — chọn Page hoặc nút Switch xác nhận."""
-    pname = str(page_display_name or "").strip()
-    dest = str(page_url or "").strip()
-    if not _switch_profiles_dialog_visible(page, timeout_ms=2_500):
-        return
-    if pname or dest:
-        if _select_page_in_switch_profiles_popup(page, page_display_name=pname, page_url=dest):
-            page.wait_for_timeout(random.randint(2000, 3600))
-            return
-    dlg = page.locator("[role='dialog']").last
-    if _click_visible_enabled_button(
-        dlg.get_by_role("button", name=re.compile(r"^Switch$", re.I)),
-        timeout_ms=2_000,
-    ):
-        page.wait_for_timeout(random.randint(2000, 3600))
-        return
-    if _click_visible_enabled_button(dlg.get_by_text(_SWITCH_EXACT_LABEL_RE), timeout_ms=1_500):
-        page.wait_for_timeout(random.randint(2000, 3600))
-        return
-    if _click_visible_enabled_button(
-        page.get_by_role("button", name=re.compile(r"^Switch$", re.I)),
-        timeout_ms=1_200,
-    ):
-        page.wait_for_timeout(random.randint(1800, 3200))
+def _confirm_switch_profiles_popup(page: Page, *, page_display_name: str = "", page_url: str = "") -> bool:
+    """Popup «Switch profiles» — bấm Switch xanh; trả True nếu không popup hoặc đã xử lý xong."""
+    return _handle_switch_profiles_popup_if_present(
+        page,
+        page_display_name=page_display_name,
+        page_url=page_url,
+    )
 
 
 def _page_switch_ui_visible(page: Page, *, timeout_ms: int = 900) -> bool:
@@ -2537,13 +2709,16 @@ def _ensure_page_role_switched(
             _scroll_manage_page_sidebar_switch_cta(page)
             if sidebar_hint and _click_manage_page_sidebar_switch(page):
                 clicked = True
-                _wait_after_page_switch_click(page)
+                _wait_after_page_switch_click(page, page_display_name=pname, page_url=dest)
             elif _click_visible_enabled_button(page.get_by_role("button", name=sw_now), timeout_ms=1_800):
                 clicked = True
                 page.wait_for_timeout(random.randint(2600, 4800))
+                _handle_switch_profiles_popup_if_present(
+                    page, page_display_name=pname, page_url=dest
+                )
             elif _click_manage_page_sidebar_switch(page):
                 clicked = True
-                _wait_after_page_switch_click(page)
+                _wait_after_page_switch_click(page, page_display_name=pname, page_url=dest)
             else:
                 try:
                     sw_block = page.locator(
@@ -2554,14 +2729,19 @@ def _ensure_page_role_switched(
                     )
                     if _click_visible_enabled_button(sw_block, timeout_ms=1_500):
                         clicked = True
-                        _wait_after_page_switch_click(page)
+                        _wait_after_page_switch_click(page, page_display_name=pname, page_url=dest)
                 except Exception:
                     pass
 
             if clicked:
-                _confirm_switch_profiles_popup(page, page_display_name=pname, page_url=dest)
-                page.wait_for_timeout(random.randint(1500, 2800))
-                if _wait_page_role_switch_complete(page, timeout_ms=22_000):
+                if not _handle_switch_profiles_popup_if_present(
+                    page, page_display_name=pname, page_url=dest
+                ):
+                    logger.warning(
+                        "[FB] Popup Switch profiles chưa xử lý (attempt={}) — thử lại vòng sau.",
+                        attempt,
+                    )
+                elif _wait_page_role_switch_complete(page, timeout_ms=22_000):
                     logger.info("[FB] Switch Page OK — xác nhận vai trò Page (attempt={}).", attempt)
                     return True
                 logger.warning(
