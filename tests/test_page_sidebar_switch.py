@@ -60,15 +60,15 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
             return_value=False,
         ),
         patch(
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            side_effect=[False, True],
+        ),
+        patch(
             "src.automation.facebook_actions._page_switch_ui_visible",
             return_value=True,
         ),
         patch(
             "src.automation.facebook_actions._page_switch_sidebar_hint_visible",
-            return_value=True,
-        ),
-        patch(
-            "src.automation.facebook_actions._is_on_target_surface",
             return_value=True,
         ),
         patch(
@@ -83,6 +83,10 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
             "src.automation.facebook_actions._wait_after_page_switch_click",
         ),
         patch(
+            "src.automation.facebook_actions._wait_page_role_switch_complete",
+            return_value=True,
+        ),
+        patch(
             "src.automation.facebook_actions._confirm_switch_profiles_popup",
         ) as confirm,
     ):
@@ -91,6 +95,39 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
         )
         sidebar.assert_called()
         confirm.assert_called()
+
+
+def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
+    """Không coi đúng URL là đã switch."""
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._view_only_guard_active_on_page",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_switch_ui_visible",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._manage_page_switch_cta_still_visible",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._click_manage_page_sidebar_switch",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._click_visible_enabled_button",
+            return_value=False,
+        ),
+        patch("src.automation.facebook_actions._failure_screenshot"),
+    ):
+        assert not _ensure_page_role_switched(page, page_url="https://www.facebook.com/103833422779877")
 
 
 def test_ensure_switched_passes_page_name() -> None:

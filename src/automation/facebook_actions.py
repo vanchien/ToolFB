@@ -2323,6 +2323,98 @@ def _page_switch_ui_visible(page: Page, *, timeout_ms: int = 900) -> bool:
     return False
 
 
+def _manage_page_switch_cta_still_visible(page: Page, *, timeout_ms: int = 450) -> bool:
+    """Thẻ «Switch into … to take more actions» + nút Switch ở sidebar = chưa vào vai trò Page."""
+    card_pat = re.compile(r"Switch\s+into.+take\s+more\s+actions", re.I | re.S)
+    try:
+        vp_w = float((page.viewport_size or {}).get("width") or 1280)
+        cards = page.locator("div").filter(has_text=card_pat)
+        n = min(cards.count(), 6)
+        for i in range(n):
+            card = cards.nth(i)
+            try:
+                if not card.is_visible(timeout=timeout_ms):
+                    continue
+                box = card.bounding_box()
+                if box and float(box.get("x", 9999)) > vp_w * 0.45:
+                    continue
+                if card.get_by_text(_SWITCH_EXACT_LABEL_RE).first.is_visible(timeout=250):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return _page_switch_sidebar_hint_visible(page, timeout_ms=timeout_ms)
+
+
+def _page_role_acting_as_page(page: Page, *, timeout_ms: int = 700) -> bool:
+    """
+    Đã switch sang vai trò Page — không chỉ mở đúng URL (vẫn xem bằng profile cá nhân).
+
+    Không được đăng Reel nếu hàm này trả False.
+    """
+    if _page_switch_ui_visible(page, timeout_ms=timeout_ms):
+        return False
+    if _manage_page_switch_cta_still_visible(page, timeout_ms=timeout_ms):
+        return False
+    try:
+        dash = page.get_by_role("link", name=re.compile(r"Professional\s+dashboard", re.I)).first
+        if dash.is_visible(timeout=timeout_ms):
+            if (dash.get_attribute("aria-disabled") or "").strip().lower() == "true":
+                return False
+            return True
+    except Exception:
+        pass
+    try:
+        insights = page.get_by_role("link", name=re.compile(r"Insights", re.I)).first
+        if insights.is_visible(timeout=timeout_ms):
+            if (insights.get_attribute("aria-disabled") or "").strip().lower() == "true":
+                return False
+            return True
+    except Exception:
+        pass
+    return not _page_switch_sidebar_hint_visible(page, timeout_ms=timeout_ms)
+
+
+def _wait_page_role_switch_complete(
+    page: Page,
+    *,
+    timeout_ms: int = 28_000,
+    stable_hits: int = 3,
+) -> bool:
+    """Chờ xác nhận ổn định đã switch (không còn CTA Switch sidebar)."""
+    need = max(2, int(stable_hits))
+    deadline = time.time() + max(3.0, timeout_ms / 1000.0)
+    hits = 0
+    while time.time() < deadline:
+        if _page_role_acting_as_page(page, timeout_ms=500):
+            hits += 1
+            if hits >= need:
+                return True
+        else:
+            hits = 0
+        page.wait_for_timeout(450)
+    return False
+
+
+def _require_page_role_switched(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    page_url: str = "",
+    context: str = "reel",
+) -> None:
+    """Chặn pipeline nếu chưa switch — tránh đăng nhầm profile cá nhân."""
+    if _page_role_acting_as_page(page, timeout_ms=900):
+        logger.info("[FB] Xác nhận đã switch vai trò Page ({})", context)
+        return
+    _failure_screenshot(page, f"page_role_not_switched_{context}")
+    raise RuntimeError(
+        f"[FB] Chưa switch vào vai trò Page ({context}) — vẫn thấy «Switch into …» hoặc "
+        f"menu Manage Page bị khóa. Không được đăng video. url={page.url!r}"
+    )
+
+
 def _ensure_page_role_switched(
     page: Page,
     *,
@@ -2333,7 +2425,7 @@ def _ensure_page_role_switched(
     Chuyển sang vai trò Page: sidebar Switch (html-div), Switch Now, popup profiles.
 
     Returns:
-        True nếu đã thực hiện thao tác switch (hoặc không còn UI yêu cầu switch).
+        True chỉ khi **đã switch vai trò Page** (không còn CTA Switch / menu bị khóa).
     """
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
@@ -2341,7 +2433,8 @@ def _ensure_page_role_switched(
     if guard_was_blocking:
         _disable_view_only_guard(page)
     try:
-        if not _page_switch_ui_visible(page, timeout_ms=700):
+        if _page_role_acting_as_page(page, timeout_ms=900):
+            logger.info("[FB] Đã ở vai trò Page (không cần bấm Switch).")
             return True
 
         sw_now = re.compile(r"Switch Now|Chuyển ngay", re.I)
@@ -2376,21 +2469,22 @@ def _ensure_page_role_switched(
             if clicked:
                 _confirm_switch_profiles_popup(page, page_display_name=pname, page_url=dest)
                 page.wait_for_timeout(random.randint(1500, 2800))
-
-            if not _page_switch_ui_visible(page, timeout_ms=700):
-                logger.info("[FB] Switch Page OK (attempt={}).", attempt)
-                return True
-            if dest and _is_on_target_surface(page, dest):
-                logger.info("[FB] Đã vào bề mặt Page sau switch (attempt={}).", attempt)
-                return True
+                if _wait_page_role_switch_complete(page, timeout_ms=22_000):
+                    logger.info("[FB] Switch Page OK — xác nhận vai trò Page (attempt={}).", attempt)
+                    return True
+                logger.warning(
+                    "[FB] Đã click Switch nhưng chưa xác nhận vai trò Page (attempt={}) | url={}",
+                    attempt,
+                    page.url,
+                )
             sidebar_hint = _page_switch_sidebar_hint_visible(page, timeout_ms=600)
             page.wait_for_timeout(900)
 
-        if _page_switch_ui_visible(page, timeout_ms=500):
-            logger.warning("[FB] Vẫn thấy UI yêu cầu Switch Page sau 3 lần thử.")
+        ok = _page_role_acting_as_page(page, timeout_ms=1_000)
+        if not ok:
+            logger.warning("[FB] Vẫn chưa switch vào vai trò Page sau 4 lần thử.")
             _failure_screenshot(page, "page_switch_still_visible")
-            return False
-        return True
+        return ok
     finally:
         # Không bật lại overlay nếu caller (post_executor) đã tắt — tránh chặn retry switch.
         if guard_was_blocking:
@@ -2504,36 +2598,28 @@ def _ensure_reel_dashboard_page_context(
         _disable_view_only_guard(page)
     navigate_to_url(page, dest)
     page.wait_for_timeout(2800)
-    switched = _ensure_page_role_switched(page, page_display_name=pname, page_url=dest)
-    if not switched:
-        logger.warning("[FB] Switch Page chưa hoàn tất sau lần đầu — thử lại navigate + switch.")
-    for retry in range(2):
-        if dest and _is_on_target_surface(page, dest) and not _page_switch_ui_visible(page, timeout_ms=600):
-            break
+    if not _ensure_page_role_switched(page, page_display_name=pname, page_url=dest):
         navigate_to_url(page, dest)
         page.wait_for_timeout(2200)
-        _ensure_switched_into_page_if_needed(
-            page, page_display_name=pname, page_url=dest
-        )
-    if dest and not _is_on_target_surface(page, dest) and pname:
-        _try_navigate_via_page_name_link(page, pname, dest)
-        _ensure_switched_into_page_if_needed(
-            page, page_display_name=pname, page_url=dest
-        )
-    if dest and not _is_on_target_surface(page, dest):
-        if _page_switch_ui_visible(page, timeout_ms=800):
+        if not _ensure_page_role_switched(page, page_display_name=pname, page_url=dest):
             _failure_screenshot(page, "reel_page_switch_failed")
             raise RuntimeError(
-                f"Không switch được sang vai trò Page (còn banner/sidebar Switch). "
+                f"Không switch được sang vai trò Page sau 2 lần thử. "
                 f"dest={dest!r} | url={page.url}"
             )
+    _require_page_role_switched(
+        page,
+        page_display_name=pname,
+        page_url=dest,
+        context="reel_open_page",
+    )
+    if dest and not _urls_refer_same_facebook_page(dest, str(page.url or ""), page=page):
         logger.warning(
-            "[FB] Chưa xác nhận URL Page sau switch (dest={!r}, url={}). Vẫn thử dashboard.",
+            "[FB] URL sau switch khác đích job (có thể redirect slug): dest={!r} | url={}",
             dest,
             page.url,
         )
-    else:
-        logger.info("[FB] Bề mặt Page đích: {}", page.url)
+    logger.info("[FB] Bề mặt Page + vai trò Page: {}", page.url)
 
 
 def open_post_box(page: Page) -> None:
@@ -5775,6 +5861,13 @@ def post_reel_via_page_dashboard(
     except Exception:
         pass
     _step_pause(900, 1800, label="sau OPEN_PAGE_CONTEXT")
+
+    _require_page_role_switched(
+        page,
+        page_display_name=str(page_display_name or "").strip(),
+        page_url=purl,
+        context="reel_before_dashboard",
+    )
 
     _step("OPEN_CONTENT_LIBRARY", "Mở Professional Dashboard Content Library.")
     dash_url = "https://www.facebook.com/professional_dashboard/content/content_library/"
