@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from src.automation.facebook_actions import (
     _click_manage_page_sidebar_switch,
+    _click_switch_in_sidebar_cta_card,
     _ensure_page_role_switched,
     _page_switch_sidebar_hint_visible,
 )
@@ -17,6 +18,22 @@ def test_sidebar_hint_detects_take_more_actions() -> None:
     loc.first.is_visible.return_value = True
     page.get_by_text.return_value = loc
     assert _page_switch_sidebar_hint_visible(page)
+
+
+def test_click_manage_page_prefers_cta_card() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._click_switch_in_sidebar_cta_card",
+            return_value=True,
+        ) as cta,
+        patch(
+            "src.automation.facebook_actions._click_sidebar_switch_role_button",
+            return_value=False,
+        ),
+    ):
+        assert _click_manage_page_sidebar_switch(page)
+    cta.assert_called_once()
 
 
 def test_click_sidebar_switch_role_none() -> None:
@@ -39,7 +56,7 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
     page = MagicMock()
     with (
         patch(
-            "src.automation.facebook_actions._view_only_mode_enabled",
+            "src.automation.facebook_actions._view_only_guard_active_on_page",
             return_value=False,
         ),
         patch(

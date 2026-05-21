@@ -1879,41 +1879,174 @@ _PAGE_SWITCH_CLICK_JS = """(el) => {
   }
 }"""
 
-_PAGE_SIDEBAR_SWITCH_JS = """
+_PAGE_SIDEBAR_SCROLL_JS = """
 () => {
-  const hints = [
-    'switch into', 'to take more actions', 'to start managing',
-    'chuyển sang', 'để bắt đầu quản lý', 'để thực hiện thêm'
-  ];
-  const low = (document.body.innerText || '').toLowerCase();
-  if (!hints.some(h => low.includes(h))) return false;
-  const spans = Array.from(document.querySelectorAll('span'));
-  const picks = [];
-  for (const span of spans) {
-    const t = (span.textContent || '').replace(/\\s+/g, ' ').trim();
-    if (!/^switch$/i.test(t)) continue;
-    if (span.closest('[role="dialog"]')) continue;
-    const box = span.closest("[role='none']") || span.closest("div[class*='html-div']");
-    if (!box) continue;
-    const r = box.getBoundingClientRect();
-    if (r.width < 36 || r.height < 14 || r.width > 640) continue;
-    picks.push({ span, box, left: r.left, top: r.top });
+  let card = null;
+  for (const el of document.querySelectorAll('div, section, aside')) {
+    const raw = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+    const low = raw.toLowerCase();
+    if (!low.includes('switch into') || !low.includes('take more actions')) continue;
+    if (raw.length > 200) continue;
+    const r = el.getBoundingClientRect();
+    if (r.left > window.innerWidth * 0.42) continue;
+    if (!card || r.bottom > card.getBoundingClientRect().bottom) card = el;
   }
-  if (!picks.length) return false;
-  picks.sort((a, b) => (a.left - b.left) || (b.top - a.top));
-  const { span, box } = picks[0];
-  for (const node of [
-    box.closest("[class*='html-div']"),
-    box.closest('[role="button"]'),
-    box.closest('[tabindex="0"]'),
-    box,
-    span,
-  ]) {
-    if (node && typeof node.click === 'function') { node.click(); return true; }
+  if (!card) return false;
+  let p = card;
+  for (let i = 0; i < 10 && p; i++) {
+    const s = getComputedStyle(p);
+    if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && p.scrollHeight > p.clientHeight + 24) {
+      p.scrollTop = p.scrollHeight;
+      return true;
+    }
+    p = p.parentElement;
   }
-  return false;
+  try { card.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+  return true;
 }
 """
+
+_PAGE_SWITCH_CTA_CARD_JS = """
+() => {
+  const cards = [];
+  for (const el of document.querySelectorAll('div, section, aside')) {
+    const raw = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+    const low = raw.toLowerCase();
+    if (!low.includes('switch into') || !low.includes('take more actions')) continue;
+    if (raw.length > 200) continue;
+    const r = el.getBoundingClientRect();
+    if (r.left > window.innerWidth * 0.42) continue;
+    cards.push({ el, bottom: r.bottom, left: r.left });
+  }
+  if (!cards.length) return false;
+  cards.sort((a, b) => b.bottom - a.bottom || a.left - b.left);
+  const card = cards[0].el;
+  const tryClick = (node) => {
+    if (!node || typeof node.click !== 'function') return false;
+    try { node.click(); return true; } catch (_) { return false; }
+  };
+  for (const h of card.querySelectorAll('[role="button"], [role="none"], span, a, div')) {
+    const t = (h.innerText || h.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!/^switch$/i.test(t)) continue;
+    for (const node of [
+      h.closest('[role="button"]'),
+      h.closest("[tabindex='0']"),
+      h.closest("[class*='html-div']"),
+      h.closest("[role='none']"),
+      h,
+    ]) {
+      if (tryClick(node)) return true;
+    }
+  }
+  return tryClick(card);
+}
+"""
+
+_PAGE_SIDEBAR_SWITCH_JS = _PAGE_SWITCH_CTA_CARD_JS
+
+
+def _view_only_guard_active_on_page(page: Page) -> bool:
+    try:
+        return bool(page.evaluate("() => Boolean(window.__toolfb_view_guard_active)"))
+    except Exception:
+        return False
+
+
+def _scroll_manage_page_sidebar_switch_cta(page: Page) -> None:
+    """Cuộn sidebar trái tới khối «Switch into … to take more actions» (nút Switch ở đáy)."""
+    try:
+        page.evaluate(_PAGE_SIDEBAR_SCROLL_JS)
+    except Exception:
+        pass
+    page.wait_for_timeout(450)
+
+
+def _click_switch_in_sidebar_cta_card(page: Page, *, timeout_ms: int = 2500) -> bool:
+    """
+    Bấm nút Switch trong thẻ CTA sidebar (ảnh Manage Page — khối xám «Switch into … Page»).
+    """
+    _scroll_manage_page_sidebar_switch_cta(page)
+    card_pat = re.compile(r"Switch\s+into.+take\s+more\s+actions", re.I | re.S)
+    try:
+        cards = page.locator("div").filter(has_text=card_pat)
+        n = min(cards.count(), 8)
+        for i in range(n):
+            card = cards.nth(i)
+            try:
+                if not card.is_visible(timeout=600):
+                    continue
+                box = card.bounding_box()
+                vp_w = float((page.viewport_size or {}).get("width") or 1280)
+                if box and float(box.get("x", 9999)) > vp_w * 0.45:
+                    continue
+            except Exception:
+                continue
+            for loc in (
+                card.get_by_role("button", name=_SWITCH_EXACT_LABEL_RE),
+                card.locator("[role='button']").filter(has_text=_SWITCH_EXACT_LABEL_RE),
+                card.locator("[role='none']").filter(has_text=_SWITCH_EXACT_LABEL_RE),
+                card.get_by_text(_SWITCH_EXACT_LABEL_RE),
+            ):
+                try:
+                    if loc.count() <= 0:
+                        continue
+                    target = loc.first
+                    if not target.is_visible(timeout=800):
+                        continue
+                    target.scroll_into_view_if_needed(timeout=2_000)
+                    try:
+                        target.evaluate(_PAGE_SWITCH_CLICK_JS)
+                    except Exception:
+                        target.click(timeout=timeout_ms, force=True, no_wait_after=True)
+                    logger.info("[FB] Đã bấm Switch trong thẻ CTA sidebar (card index={}).", i)
+                    page.wait_for_timeout(2000)
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    try:
+        if page.evaluate(_PAGE_SWITCH_CTA_CARD_JS):
+            logger.info("[FB] Đã bấm Switch trong thẻ CTA sidebar (JS).")
+            page.wait_for_timeout(2000)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _click_sidebar_switch_role_button(page: Page, *, timeout_ms: int = 2000) -> bool:
+    """Nút ``role=button`` tên Switch ở cột trái (< 45% chiều ngang viewport)."""
+    _scroll_manage_page_sidebar_switch_cta(page)
+    try:
+        vp = page.viewport_size or {"width": 1280}
+        max_x = float(vp.get("width", 1280)) * 0.45
+    except Exception:
+        max_x = 576.0
+    try:
+        buttons = page.get_by_role("button", name=_SWITCH_EXACT_LABEL_RE)
+        n = min(buttons.count(), 12)
+    except Exception:
+        return False
+    for i in range(n):
+        b = buttons.nth(i)
+        try:
+            if not b.is_visible(timeout=700):
+                continue
+            box = b.bounding_box()
+            if box and float(box.get("x", 9999)) > max_x:
+                continue
+            b.scroll_into_view_if_needed(timeout=2_000)
+            try:
+                b.evaluate(_PAGE_SWITCH_CLICK_JS)
+            except Exception:
+                b.click(timeout=timeout_ms, force=True, no_wait_after=True)
+            logger.info("[FB] Đã bấm Switch sidebar (role=button, index={}).", i)
+            page.wait_for_timeout(2000)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def _page_switch_sidebar_hint_visible(page: Page, *, timeout_ms: int = 1500) -> bool:
@@ -1940,6 +2073,11 @@ def _click_manage_page_sidebar_switch(page: Page, *, timeout_ms: int = 2000) -> 
 
     Khác «Switch Now» trên banner và khác nút Switch trong popup ``role=dialog``.
     """
+    if _click_switch_in_sidebar_cta_card(page, timeout_ms=timeout_ms):
+        return True
+    if _click_sidebar_switch_role_button(page, timeout_ms=timeout_ms):
+        return True
+    _scroll_manage_page_sidebar_switch_cta(page)
     locators: list[Locator] = []
     for xp in _PAGE_SWITCH_STRICT_XPATHS:
         locators.append(page.locator(f"xpath={xp}"))
@@ -2072,8 +2210,8 @@ def _ensure_page_role_switched(
     """
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
-    unlock = _view_only_mode_enabled()
-    if unlock:
+    guard_was_blocking = _view_only_guard_active_on_page(page)
+    if guard_was_blocking:
         _disable_view_only_guard(page)
     try:
         if not _page_switch_ui_visible(page, timeout_ms=700):
@@ -2082,8 +2220,9 @@ def _ensure_page_role_switched(
         sw_now = re.compile(r"Switch Now|Chuyển ngay", re.I)
         sidebar_hint = _page_switch_sidebar_hint_visible(page, timeout_ms=800)
 
-        for attempt in range(1, 4):
+        for attempt in range(1, 5):
             clicked = False
+            _scroll_manage_page_sidebar_switch_cta(page)
             if sidebar_hint and _click_manage_page_sidebar_switch(page):
                 clicked = True
                 _wait_after_page_switch_click(page)
@@ -2126,7 +2265,8 @@ def _ensure_page_role_switched(
             return False
         return True
     finally:
-        if unlock:
+        # Không bật lại overlay nếu caller (post_executor) đã tắt — tránh chặn retry switch.
+        if guard_was_blocking:
             _enable_view_only_guard(page)
 
 
@@ -2233,6 +2373,8 @@ def _ensure_reel_dashboard_page_context(
     pname = str(page_display_name or "").strip()
     if not dest:
         raise ValueError("Thiếu page_url cho luồng Reel dashboard.")
+    if _view_only_guard_active_on_page(page):
+        _disable_view_only_guard(page)
     navigate_to_url(page, dest)
     page.wait_for_timeout(2800)
     switched = _ensure_page_role_switched(page, page_display_name=pname, page_url=dest)
