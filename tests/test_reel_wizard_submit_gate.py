@@ -19,6 +19,10 @@ def test_ready_to_post_after_next_with_filled_caption() -> None:
             return_value=True,
         ),
         patch(
+            "src.automation.facebook_actions._reel_strict_post_button_usable",
+            return_value=True,
+        ),
+        patch(
             "src.automation.facebook_actions._reel_settings_screen_visible",
             return_value=False,
         ),
@@ -28,7 +32,8 @@ def test_ready_to_post_after_next_with_filled_caption() -> None:
         )
 
 
-def test_not_ready_to_post_before_caption_filled() -> None:
+def test_ready_to_post_when_post_enabled_without_caption_fill() -> None:
+    """Post đã enable — không bắt buộc nhập tiêu đề/mô tả."""
     page = MagicMock()
     with (
         patch(
@@ -36,13 +41,36 @@ def test_not_ready_to_post_before_caption_filled() -> None:
             return_value=True,
         ),
         patch(
+            "src.automation.facebook_actions._reel_strict_post_button_usable",
+            return_value=True,
+        ),
+        patch(
             "src.automation.facebook_actions._reel_settings_screen_visible",
             return_value=False,
         ),
     ):
-        assert not _reel_wizard_ready_to_post(
-            page, payload="hello", filled=False, next_clicks=2
+        assert _reel_wizard_ready_to_post(
+            page, payload="hello", filled=False, next_clicks=0
         )
+
+
+def test_ready_to_post_empty_payload_no_title() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._reel_strict_post_button_visible",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_strict_post_button_usable",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_settings_screen_visible",
+            return_value=False,
+        ),
+    ):
+        assert _reel_wizard_ready_to_post(page, payload="", filled=False, next_clicks=0)
 
 
 def test_needs_next_false_when_ready_after_next_clicks() -> None:
@@ -80,6 +108,10 @@ def test_ready_to_post_way2_filled_zero_next() -> None:
     with (
         patch(
             "src.automation.facebook_actions._reel_strict_post_button_visible",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_strict_post_button_usable",
             return_value=True,
         ),
         patch(

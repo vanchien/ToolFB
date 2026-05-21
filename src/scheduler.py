@@ -72,6 +72,8 @@ _queue_idle_probe_after_utc: datetime | None = None
 _queue_hint_refresh_after_utc: datetime | None = None
 _account_run_lock = threading.Lock()
 _account_run_inflight: dict[str, int] = {}
+_page_run_lock = threading.Lock()
+_page_run_inflight: dict[str, int] = {}
 
 
 def _cpu_count_safe() -> int:
@@ -936,6 +938,16 @@ def _per_account_parallel_limit() -> int:
     return max(1, min(8, n))
 
 
+def _per_page_parallel_limit() -> int:
+    """Giới hạn job đồng thời trên cùng một page_id (mặc định 1 — tránh lẫn Page khi đăng)."""
+    raw = os.environ.get("SCHEDULE_PER_PAGE_MAX_PARALLEL", "1").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 1
+    return max(1, min(4, n))
+
+
 def _runtime_profile_root() -> Path:
     p = _project_root() / "data" / "runtime" / "parallel_profiles"
     p.mkdir(parents=True, exist_ok=True)
@@ -961,6 +973,36 @@ def _release_account_run_slot(account_id: str) -> None:
             _account_run_inflight.pop(account_id, None)
         else:
             _account_run_inflight[account_id] = cur
+
+
+def _page_inflight_count(page_id: str) -> int:
+    pid = str(page_id or "").strip()
+    if not pid:
+        return 0
+    with _page_run_lock:
+        return int(_page_run_inflight.get(pid, 0))
+
+
+def _acquire_page_run_slot(page_id: str) -> int:
+    pid = str(page_id or "").strip()
+    if not pid:
+        return 1
+    with _page_run_lock:
+        cur = _page_run_inflight.get(pid, 0) + 1
+        _page_run_inflight[pid] = cur
+        return cur
+
+
+def _release_page_run_slot(page_id: str) -> None:
+    pid = str(page_id or "").strip()
+    if not pid:
+        return
+    with _page_run_lock:
+        cur = max(0, _page_run_inflight.get(pid, 0) - 1)
+        if cur <= 0:
+            _page_run_inflight.pop(pid, None)
+        else:
+            _page_run_inflight[pid] = cur
 
 
 def _prepare_account_for_parallel_run(
@@ -1022,7 +1064,9 @@ def tick_schedule_post_jobs() -> None:
             return
         next_due: datetime | None = None
         account_planned: dict[str, int] = {}
+        page_planned: dict[str, int] = {}
         per_acc_limit = _per_account_parallel_limit()
+        per_page_limit = _per_page_parallel_limit()
         queued_due_count = 0
         for job in jobs:
             if str(job.get("status", "")).strip().lower() != "pending":
@@ -1059,6 +1103,11 @@ def tick_schedule_post_jobs() -> None:
             if (inflight + planned) >= per_acc_limit:
                 queued_due_count += 1
                 continue
+            page_inflight = _page_inflight_count(pid)
+            page_plan = page_planned.get(pid, 0)
+            if (page_inflight + page_plan) >= per_page_limit:
+                queued_due_count += 1
+                continue
             fresh = sp.get_by_id(jid)
             if not fresh or str(fresh.get("status", "")).strip().lower() != "pending":
                 continue
@@ -1072,6 +1121,7 @@ def tick_schedule_post_jobs() -> None:
             waited_seconds = max(0.0, (now - when).total_seconds())
             jobs_to_dispatch.append((jid, aid, pid, did or None, engine, waited_seconds))
             account_planned[aid] = planned + 1
+            page_planned[pid] = page_plan + 1
         _queue_next_due_hint_utc = next_due
         if next_due is None:
             _queue_idle_probe_after_utc = now + timedelta(seconds=_idle_probe_seconds())
@@ -1472,6 +1522,8 @@ def run_scheduled_post_for_account(
     err_msg = ""
     runtime_profile_dir: Path | None = None
     account_run_slot = 0
+    page_run_slot = 0
+    page_slot_id = ""
     try:
         mgr = accounts or AccountsDatabaseManager()
         pool = browser_pool or get_default_browser_pool()
@@ -1581,6 +1633,15 @@ def run_scheduled_post_for_account(
             except Exception:  # noqa: BLE001
                 queue_job = None
         content_page_row = merge_queue_job_content_into_page_row(page_row, queue_job)
+        page_slot_id = str((page_row or content_page_row or {}).get("id") or pid_raw or "").strip()
+        if page_slot_id:
+            page_run_slot = _acquire_page_run_slot(page_slot_id)
+            logger.info(
+                "[Page slot] account={} page_id={} slot={}",
+                account_id,
+                page_slot_id,
+                page_run_slot,
+            )
 
         if queue_job:
             if str(queue_job.get("post_type", "")).strip().lower() == "reel":
@@ -1856,6 +1917,8 @@ def run_scheduled_post_for_account(
             _finalize_schedule_post_job_record(schedule_post_job_id, outcome_ok, err_msg)
         if account_run_slot > 0:
             _release_account_run_slot(account_id)
+        if page_run_slot > 0 and page_slot_id:
+            _release_page_run_slot(page_slot_id)
         if runtime_profile_dir is not None:
             try:
                 shutil.rmtree(runtime_profile_dir, ignore_errors=True)

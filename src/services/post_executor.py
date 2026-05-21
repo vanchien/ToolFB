@@ -295,6 +295,7 @@ def _run_chromium_posting_flow(
                 post_reel_via_page_dashboard(
                     page,
                     page_url=page_url,
+                    page_display_name=page_display_name or "",
                     video_path=video_path,
                     title=str(reel_title or "").strip(),
                     content=str(reel_content or reel_description_override or text_body or "").strip(),

@@ -1208,7 +1208,11 @@ def go_to_posting_target_and_open_composer(
             _ensure_switched_into_page_if_needed(page)
         if dest and not _is_on_target_surface(page, dest):
             pname = (page_display_name or "").strip()
-            if pname and _try_navigate_via_page_name_link(page, pname, dest):
+            if pname and _select_page_in_switch_profiles_popup(
+                page, page_display_name=pname, page_url=dest
+            ):
+                logger.info("[FB] Fallback UI: chọn Page trong Switch profiles {!r}.", pname)
+            elif pname and _try_navigate_via_page_name_link(page, pname, dest):
                 logger.info("[FB] Fallback UI: vào Page qua tên hiển thị {!r}.", pname)
         if dest and not _is_on_target_surface(page, dest):
             _failure_screenshot(page, f"go_to_posting_target: chưa vào đúng page đích {dest}")
@@ -1747,6 +1751,130 @@ def _ensure_switched_into_page_if_needed(page: Page) -> None:
                 continue
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không xử lý được banner switch page: {}", exc)
+
+
+_SWITCH_PROFILES_LIST_SCROLL_JS = """
+() => {
+  const root = document.querySelector('[role="dialog"]') || document.body;
+  const nodes = Array.from(root.querySelectorAll('*')).filter(el => {
+    try {
+      const s = getComputedStyle(el);
+      const oy = s.overflowY;
+      return (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 48;
+    } catch (e) { return false; }
+  });
+  nodes.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+  const el = nodes[0] || root;
+  const step = Math.max(180, Math.floor((el.clientHeight || 320) * 0.72));
+  el.scrollTop = Math.min(el.scrollTop + step, el.scrollHeight);
+  return true;
+}
+"""
+
+
+def _scroll_switch_profiles_list(page: Page) -> None:
+    """Cuộn danh sách Page/profile trong popup Switch profiles (lazy list)."""
+    try:
+        page.evaluate(_SWITCH_PROFILES_LIST_SCROLL_JS)
+    except Exception:
+        pass
+    page.wait_for_timeout(220)
+
+
+def _select_page_in_switch_profiles_popup(
+    page: Page,
+    *,
+    page_display_name: str,
+    page_url: str,
+) -> bool:
+    """Chọn đúng Page trong popup Switch profiles — có cuộn để tìm mục."""
+    pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
+    expect_id = extract_facebook_numeric_id_from_url(dest)
+    if len(pname) < 2 and not expect_id:
+        return False
+    pat_name = re.compile(re.escape(pname[:80]), re.I) if len(pname) >= 2 else None
+    for _ in range(34):
+        if pat_name is not None:
+            for factory in (
+                lambda: page.get_by_role("button", name=pat_name),
+                lambda: page.get_by_role("link", name=pat_name),
+                lambda: page.locator("[role='dialog']").get_by_text(pat_name).last,
+            ):
+                try:
+                    if _click_visible_enabled_button(factory(), timeout_ms=950):
+                        logger.info("[FB] Đã chọn Page trong Switch profiles: {!r}", pname)
+                        page.wait_for_timeout(1200)
+                        return True
+                except Exception:
+                    continue
+        if expect_id:
+            try:
+                href_loc = page.locator(f"a[href*='{expect_id}']").first
+                if _click_visible_enabled_button(href_loc, timeout_ms=850):
+                    logger.info("[FB] Đã chọn Page theo id {} trong Switch profiles.", expect_id)
+                    page.wait_for_timeout(1200)
+                    return True
+            except Exception:
+                pass
+        _scroll_switch_profiles_list(page)
+    return False
+
+
+def _ensure_reel_dashboard_page_context(
+    page: Page,
+    *,
+    page_url: str,
+    page_display_name: str = "",
+) -> None:
+    """
+    Mở đúng ``page_url``, switch sang vai trò Page (banner / Switch profiles + cuộn),
+    xác minh bề mặt trước khi vào Professional Dashboard.
+    """
+    dest = _fb_normalize_client_url(str(page_url or "").strip())
+    pname = str(page_display_name or "").strip()
+    if not dest:
+        raise ValueError("Thiếu page_url cho luồng Reel dashboard.")
+    navigate_to_url(page, dest)
+    page.wait_for_timeout(2800)
+    _ensure_switched_into_page_if_needed(page)
+    sw_pat = re.compile(r"Switch Now|Chuyển ngay", re.I)
+    if _click_visible_enabled_button(page.get_by_role("button", name=sw_pat), timeout_ms=1500):
+        page.wait_for_timeout(random.randint(2800, 5600))
+        if not _click_visible_enabled_button(
+            page.get_by_role("button", name=re.compile(r"^Switch$", re.I)),
+            timeout_ms=1700,
+        ):
+            _select_page_in_switch_profiles_popup(
+                page, page_display_name=pname, page_url=dest
+            )
+    else:
+        try:
+            sw_method2 = page.locator(
+                "xpath=(//*[contains(translate(normalize-space(.), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
+                "//*[self::div or self::span][normalize-space()='Switch'])[last()]"
+            )
+            if _click_visible_enabled_button(sw_method2, timeout_ms=1500):
+                page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        _select_page_in_switch_profiles_popup(
+            page, page_display_name=pname, page_url=dest
+        )
+    if dest and not _is_on_target_surface(page, dest):
+        navigate_to_url(page, dest)
+        _ensure_switched_into_page_if_needed(page)
+    if dest and not _is_on_target_surface(page, dest) and pname:
+        _try_navigate_via_page_name_link(page, pname, dest)
+    if dest and not _is_on_target_surface(page, dest):
+        logger.warning(
+            "[FB] Chưa xác nhận URL Page sau switch (dest={!r}, url={}). Vẫn thử dashboard.",
+            dest,
+            page.url,
+        )
+    else:
+        logger.info("[FB] Bề mặt Page đích: {}", page.url)
 
 
 def open_post_box(page: Page) -> None:
@@ -3994,6 +4122,28 @@ def _reel_locator_is_post_submit(loc: Locator) -> bool:
     return False
 
 
+def _reel_locator_post_usable(loc: Locator) -> bool:
+    """Post/Publish visible, đúng nhãn và không bị aria-disabled."""
+    if not _reel_locator_is_post_submit(loc):
+        return False
+    try:
+        if (loc.get_attribute("aria-disabled") or "").strip().lower() == "true":
+            return False
+        if loc.get_attribute("disabled") is not None:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _reel_strict_post_button_usable(page: Page, *, timeout_ms: int = 450) -> bool:
+    dialog = _active_reel_dialog(page)
+    for loc in _reel_strict_post_button_locators(page, dialog=dialog):
+        if _reel_locator_post_usable(loc):
+            return True
+    return False
+
+
 def _reel_strict_post_button_locators(page: Page, *, dialog: Locator | None = None) -> list[Locator]:
     """Chỉ nút Post Reel settings — trong dialog Reel, xpath/css chặt."""
     scopes: list[Locator] = []
@@ -4184,15 +4334,14 @@ def _reel_wizard_ready_to_share(
     """Meta Business composer: Share sau wizard (≥1 Next hoặc đã nhập caption trên màn cuối)."""
     if not _reel_share_button_visible(page, timeout_ms=400):
         return False
-    if payload and not filled:
-        return False
     if next_clicks >= 1:
         return True
     if filled:
         return True
-    if not payload:
+    if not str(payload or "").strip():
         return True
-    return False
+    # Share đã enable — caption/tiêu đề không bắt buộc.
+    return True
 
 
 def _resolve_reel_submit_action(
@@ -4227,25 +4376,28 @@ def _reel_wizard_ready_to_post(
     next_clicks: int,
 ) -> bool:
     """
-    Chỉ đăng khi nút Post/Publish strict VÀ đủ điều kiện wizard:
+    Chỉ đăng khi nút Post/Publish strict, enabled VÀ đủ điều kiện wizard:
     - Màn «Reel settings», hoặc
     - Đã bấm Next ≥1 (way1), hoặc
     - Đã nhập caption trên màn Post details (way2, next_clicks có thể = 0), hoặc
-    - Không có caption và Post đã hiện.
+    - Không có caption/tiêu đề trong job, hoặc
+    - Post đã enable (Meta cho phép đăng không bắt buộc mô tả).
     """
     if not _reel_strict_post_button_visible(page, timeout_ms=400):
         return False
+    post_usable = _reel_strict_post_button_usable(page, timeout_ms=350)
     if _reel_settings_screen_visible(page, timeout_ms=280):
-        return True
-    if payload and not filled:
+        return post_usable
+    if not post_usable:
         return False
     if next_clicks >= 1:
         return True
     if filled:
         return True
-    if not payload:
+    if not str(payload or "").strip():
         return True
-    return False
+    # Có payload nhưng chưa fill — vẫn đăng nếu Meta đã bật nút Post (không bắt buộc tiêu đề).
+    return True
 
 
 def _reel_post_button_locators(page: Page, *, dialog: Locator | None = None) -> list[Locator]:
@@ -4287,7 +4439,7 @@ def _click_post_strict_for_reel(page: Page, dialog: Locator) -> None:
     """Click nút Post Reel (html-div / role=none / span.x1j85h84), tránh nhầm Share to groups."""
     for c in _reel_post_button_locators(page, dialog=dialog):
         try:
-            if not _reel_locator_is_post_submit(c):
+            if not _reel_locator_post_usable(c):
                 continue
             _click_reel_post_locator(page, c)
             return
@@ -4660,6 +4812,11 @@ def _click_meta_reel_next_best_effort(page: Page) -> bool:
 
 def _click_reel_post_best_effort(page: Page) -> None:
     """Bấm Post/Publish trong popup Reel (strict → click_post_button)."""
+    wait_deadline = time.time() + 28.0
+    while time.time() < wait_deadline:
+        if _reel_strict_post_button_usable(page, timeout_ms=400):
+            break
+        page.wait_for_timeout(320)
     dialog = _active_reel_dialog(page)
     try:
         _click_post_strict_for_reel(page, dialog)
@@ -4794,6 +4951,9 @@ def complete_reel_wizard_fill_next_and_post(
         if _reel_wizard_processing(page, timeout_ms=350):
             page.wait_for_timeout(random.randint(900, 1800))
             continue
+
+        if _reel_strict_post_button_usable(page, timeout_ms=450) and _try_submit():
+            return next_clicks, filled
 
         if next_clicks >= max_next_clicks:
             page.wait_for_timeout(500)
@@ -4942,6 +5102,7 @@ def post_reel_via_page_dashboard(
     page: Page,
     *,
     page_url: str,
+    page_display_name: str = "",
     video_path: Path,
     title: str = "",
     content: str = "",
@@ -4956,10 +5117,7 @@ def post_reel_via_page_dashboard(
     stage = _reel_strict_prefix("Wizard")
     current_step = "INIT"
     _ordered_steps = (
-        "OPEN_PAGE_URL",
-        "SCROLL_PAGE",
-        "CLICK_SWITCH_NOW",
-        "CLICK_SWITCH_CONFIRM",
+        "OPEN_PAGE_CONTEXT",
         "OPEN_CONTENT_LIBRARY",
         "CLICK_CREATE",
         "SELECT_REEL",
@@ -4999,60 +5157,20 @@ def post_reel_via_page_dashboard(
     if not video_path.is_file():
         raise FileNotFoundError(f"video_path không tồn tại: {video_path}")
 
-    _step("OPEN_PAGE_URL", f"Mở page_url: {purl}")
-    page.goto(purl, wait_until="domcontentloaded")
-    page.wait_for_timeout(3000)
-    _step_pause(800, 1600, label="sau OPEN_PAGE_URL")
-    _step("SCROLL_PAGE", "Scroll nhẹ để kích hoạt UI page.")
+    _step(
+        "OPEN_PAGE_CONTEXT",
+        f"Mở Page, switch đúng vai trò (cuộn danh sách nếu cần): {purl!r}",
+    )
+    _ensure_reel_dashboard_page_context(
+        page,
+        page_url=purl,
+        page_display_name=str(page_display_name or "").strip(),
+    )
     try:
-        page.mouse.wheel(0, 500)
+        page.mouse.wheel(0, 420)
     except Exception:
         pass
-    page.wait_for_timeout(1400)
-    _step_pause(700, 1400, label="sau SCROLL_PAGE")
-
-    _step("CLICK_SWITCH_NOW", "Tìm và bấm Switch (cách 1: Switch Now, cách 2: từ panel Page).")
-    sw_pat = re.compile(r"Switch Now|Chuyển ngay|Switch", re.I)
-    sw_btns = page.get_by_role("button", name=sw_pat)
-    clicked_switch = _click_visible_enabled_button(sw_btns, timeout_ms=1300)
-    if not clicked_switch:
-        # Cách 2: từ trang Page có block "Switch into ... Page ..." và nút/label "Switch" dạng div.
-        try:
-            sw_method2 = page.locator(
-                "xpath=(//*[contains(translate(normalize-space(.), "
-                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
-                "//*[self::div or self::span][normalize-space()='Switch'])[last()]"
-            )
-            clicked_switch = _click_visible_enabled_button(sw_method2, timeout_ms=1500)
-        except Exception:
-            clicked_switch = False
-    if not clicked_switch:
-        # Fallback nhẹ: text "Switch" visible đầu tiên (chỉ dùng khi 2 cách trên không match).
-        try:
-            sw_text_any = page.get_by_text(re.compile(r"^Switch$", re.I))
-            clicked_switch = _click_visible_enabled_button(sw_text_any, timeout_ms=1000)
-        except Exception:
-            clicked_switch = False
-
-    if clicked_switch:
-        logger.info("{} Đã bấm Switch (cách 1/2).", stage)
-        page.wait_for_timeout(random.randint(3200, 7800))
-        _step_pause(1000, 2200, label="sau CLICK_SWITCH_NOW")
-        _step("CLICK_SWITCH_CONFIRM", "Nếu có popup Switch profiles thì bấm nút Switch để xác nhận.")
-        sw_confirm = page.get_by_role("button", name=re.compile(r"^Switch$", re.I))
-        if _click_visible_enabled_button(sw_confirm, timeout_ms=1600):
-            logger.info("{} Đã bấm Switch trong popup Switch profiles.", stage)
-            page.wait_for_timeout(random.randint(2200, 4200))
-            _step_pause(1000, 2200, label="sau CLICK_SWITCH_CONFIRM(button)")
-        else:
-            # Fallback theo HTML user cung cấp: text span "Switch" trong popup.
-            sw_text = page.get_by_text(re.compile(r"^Switch$", re.I))
-            if _click_visible_enabled_button(sw_text, timeout_ms=1200):
-                logger.info("{} Đã bấm Switch (fallback text) trong popup.", stage)
-                page.wait_for_timeout(random.randint(2200, 4200))
-                _step_pause(1000, 2200, label="sau CLICK_SWITCH_CONFIRM(text)")
-    else:
-        logger.info("{} Không thấy Switch Now, tiếp tục kiểm tra dashboard.", stage)
+    _step_pause(900, 1800, label="sau OPEN_PAGE_CONTEXT")
 
     _step("OPEN_CONTENT_LIBRARY", "Mở Professional Dashboard Content Library.")
     dash_url = "https://www.facebook.com/professional_dashboard/content/content_library/"
@@ -5313,8 +5431,10 @@ def post_reel_via_page_dashboard(
         except PlaywrightTimeoutError:
             raise
     if payload_text and not filled:
-        _failure_screenshot(page, "reel_caption_fill_failed")
-        raise PlaywrightTimeoutError("Có nội dung job nhưng không nhập được caption.")
+        logger.warning(
+            "{} Có nội dung job nhưng không nhập được caption — có thể vẫn đăng được nếu Meta không bắt buộc mô tả.",
+            stage,
+        )
     page.wait_for_timeout(1400)
     if _env_reel_pause_after_post():
         _step(
