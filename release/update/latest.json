@@ -1,7 +1,7 @@
 {
-  "version": "1.0.73",
+  "version": "1.0.74",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "2bc80e1a77c4c7ab1e5892b5b6eef295e20845afefc76b6dd8ecf1a7544e2463",
-  "notes": "Ban DAY DU v1.0.73: kem trinh duyet Playwright trong zip. Fix Create/Reel, Switch profiles, xac nhan Post+video. May khach: giai nen ca thu muc exe_gui, khong chay playwright install.",
-  "generated_at": "2026-05-22T12:13:27"
+  "sha256": "e8659856e98db0a0fa0774a5ae4b6d9963d525d07a7e3669f82ed09904c1ca5b",
+  "notes": "v1.0.74: Sua bam Post Reel settings (html-div x6ikm8r+x1j85h84), chan bao da Post gia, click 3 lan + xac nhan UI. Zip day du kem trinh duyet Playwright.",
+  "generated_at": "2026-05-22T13:24:36"
 }
