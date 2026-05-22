@@ -5372,53 +5372,97 @@ def _click_next_in_dialog(page: Page, dialog: Locator) -> None:
 
 _REEL_POST_LABEL_RE = re.compile(r"^(Post|Đăng|Publish)$", re.I)
 
-_REEL_POST_STRICT_ONLY_XPATHS: tuple[str, ...] = (
-    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[@dir='auto']//span[contains(@class,'x1j85h84') and normalize-space()='Post']])[last()]",
-    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x1j85h84') and normalize-space()='Post']])[last()]",
-    "(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x1j85h84') and normalize-space()='Đăng']])[last()]",
-    "(//span[contains(@class,'x1j85h84') and normalize-space()='Post']/ancestor::div[contains(@class,'html-div')][1])[last()]",
-    "(//span[contains(@class,'x1j85h84') and normalize-space()='Đăng']/ancestor::div[contains(@class,'html-div')][1])[last()]",
-    "(//div[contains(@class,'html-div')][.//span[normalize-space()='Save']]/following::div[contains(@class,'html-div')][.//span[contains(@class,'x1j85h84') and normalize-space()='Post']])[last()]",
-    "(//div[@role='none' and .//span[normalize-space()='Post' and contains(@class,'x1j85h84')]])[last()]",
-    "(//div[@role='none' and .//span[normalize-space()='Đăng' and contains(@class,'x1j85h84')]])[last()]",
+_REEL_POST_SPAN_CLASS = "contains(@class,'x6ikm8r') or contains(@class,'x1j85h84')"
+
+_REEL_POST_STRICT_ONLY_XPATHS: tuple[str, ...] = tuple(
+    xp.format(_span=_REEL_POST_SPAN_CLASS)
+    for xp in (
+        "(//div[contains(@class,'html-div')]/div[@role='none'][.//span[contains(@class,'x6ikm8r') and contains(@class,'x1j85h84') and normalize-space()='Post'])[last()]",
+        "(//div[contains(@class,'html-div')]/div[@role='none'][.//span[@dir='auto']//span[contains(@class,'x6ikm8r') and contains(@class,'x1j85h84') and normalize-space()='Post'])[last()]",
+        "(//div[@role='none' and .//span[{_span}] and normalize-space()='Post'])[last()]",
+        "(//div[@role='none' and .//span[{_span}] and normalize-space()='Đăng'])[last()]",
+        "(//div[contains(@class,'html-div')][.//div[@role='none']//span[@dir='auto']//span[{_span}] and normalize-space()='Post'])[last()]",
+        "(//div[contains(@class,'html-div')][.//div[@role='none']//span[{_span}] and normalize-space()='Post'])[last()]",
+        "(//div[contains(@class,'html-div')][.//div[@role='none']//span[{_span}] and normalize-space()='Đăng'])[last()]",
+        "(//span[{_span}] and normalize-space()='Post']/ancestor::div[contains(@class,'html-div')][1])[last()]",
+        "(//span[{_span}] and normalize-space()='Đăng']/ancestor::div[contains(@class,'html-div')][1])[last()]",
+        "(//div[contains(@class,'html-div')][.//span[normalize-space()='Save']]/following::div[contains(@class,'html-div')][.//span[{_span}] and normalize-space()='Post'])[last()]",
+    )
 )
 
 # Giữ alias cũ — chỉ xpath chặt (không match «Posts», menu Create…)
 _REEL_POST_STRICT_XPATHS = _REEL_POST_STRICT_ONLY_XPATHS
 _REEL_POST_CSS_SELECTORS: tuple[str, ...] = (
+    "div.html-div > div[role='none']:has(span.x6ikm8r.x1j85h84)",
+    "div.html-div > div[role='none'] span.x6ikm8r.x1j85h84",
+    "div.html-div:has(div[role='none'] span.x6ikm8r.x1j85h84)",
+    "div.html-div:has(div[role='none'] span.x6ikm8r)",
     "div.html-div:has(div[role='none'] span.x1j85h84)",
+    "div.html-div div[role='none'] span.x6ikm8r",
     "div.html-div div[role='none'] span.x1j85h84",
+    "div.html-div [role='none'] span.x6ikm8r:has-text('Post')",
     "div.html-div [role='none'] span.x1j85h84:has-text('Post')",
+    "div.html-div [role='none'] span.x6ikm8r:has-text('Đăng')",
     "div.html-div [role='none'] span.x1j85h84:has-text('Đăng')",
 )
 
-_REEL_POST_FOOTER_CLICK_JS = """
+_REEL_DIALOG_POST_CLICK_JS = """
 () => {
   const dlg = document.querySelector('[role="dialog"]');
   if (!dlg) return false;
-  const minBottom = window.innerHeight * 0.55;
-  const hits = [];
-  for (const el of dlg.querySelectorAll('[role="button"], div[role="none"], span, div[tabindex="0"]')) {
-    const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-    if (!/^post$/i.test(t) && !/^đăng$/i.test(t)) continue;
-    if (el.closest('[role="listbox"], [role="option"], [role="menu"]')) continue;
-    const r = el.getBoundingClientRect();
-    if (r.width < 40 || r.height < 20) continue;
-    if (r.top < minBottom) continue;
-    hits.push({ el, bottom: r.bottom, left: r.left });
+  for (const ov of dlg.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
   }
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const isPost = (t) => /^(post|đăng|publish)$/i.test(t);
+  const minBottom = window.innerHeight * 0.42;
+  const hits = [];
+  const scan = (nodes, role) => {
+    for (const el of nodes) {
+      if (el.getAttribute && el.getAttribute('data-visualcompletion') === 'ignore') continue;
+      const t = norm(el.textContent);
+      if (!isPost(t)) continue;
+      if (el.closest('[role="listbox"], [role="option"], [role="menu"]')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 36 || r.height < 14) continue;
+      const hasOverlay = !!el.querySelector('[data-visualcompletion="ignore"]');
+      let nearSave = false;
+      for (const s of dlg.querySelectorAll('*')) {
+        if (norm(s.textContent) !== 'Save') continue;
+        const sr = s.getBoundingClientRect();
+        if (Math.abs(sr.bottom - r.bottom) < 90 && sr.left <= r.left + 40) {
+          nearSave = true;
+          break;
+        }
+      }
+      hits.push({
+        el,
+        bottom: r.bottom,
+        left: r.left,
+        area: r.width * r.height,
+        hasOverlay,
+        nearSave,
+        nearFooter: r.top >= minBottom,
+        role,
+      });
+    }
+  };
+  scan(dlg.querySelectorAll("div[role='none']"), 'none');
+  scan(dlg.querySelectorAll("[role='button']"), 'button');
   if (!hits.length) return false;
-  hits.sort((a, b) => b.bottom - a.bottom || b.left - a.left);
-  const pick = hits[0].el;
-  for (const node of [
-    pick.closest('[role="button"]'),
-    pick.closest("[tabindex='0']"),
-    pick.closest("[class*='html-div']"),
-    pick.closest("[role='none']"),
-    pick,
-  ]) {
-    if (!node) continue;
+  const score = (h) =>
+    (h.nearSave ? 2_000_000 : 0) +
+    (h.hasOverlay ? 1_000_000 : 0) +
+    (h.nearFooter ? 500_000 : 0) +
+    (h.role === 'none' ? 80_000 : 20_000) +
+    h.bottom * 1000 + h.left * 10 + h.area;
+  hits.sort((a, b) => score(b) - score(a));
+  const fire = (node) => {
+    if (!node) return false;
     try {
+      for (const ov of node.querySelectorAll('[data-visualcompletion="ignore"]')) {
+        ov.style.pointerEvents = 'none';
+      }
       const r = node.getBoundingClientRect();
       const x = r.left + r.width / 2;
       const y = r.top + r.height / 2;
@@ -5427,27 +5471,39 @@ _REEL_POST_FOOTER_CLICK_JS = """
       }
       if (typeof node.click === 'function') node.click();
       return true;
-    } catch (_) {}
-  }
-  return false;
+    } catch (_) { return false; }
+  };
+  return fire(hits[0].el);
 }
 """
 
-_REEL_POST_CLICK_JS = """(el) => {
+_REEL_SETTINGS_POST_CLICK_JS = _REEL_DIALOG_POST_CLICK_JS
+_REEL_POST_FOOTER_CLICK_JS = _REEL_DIALOG_POST_CLICK_JS
+
+_REEL_POST_DISABLE_OVERLAY_JS = """(el) => {
   if (!el) return;
-  const pick = [
-    el.closest("[class*='html-div']"),
-    el.closest("[role='button']"),
-    el.closest("[tabindex='0']"),
-    el.closest("[role='none']"),
-    el,
-  ];
-  for (const node of pick) {
-    if (node && typeof node.click === "function") {
-      node.click();
-      return;
-    }
+  const root = el.closest("[role='none']") || el;
+  for (const ov of root.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
   }
+}"""
+
+_REEL_POST_CLICK_JS = """(el) => {
+  if (!el) return false;
+  const root = el.closest("[role='none']") || el.closest("[role='button']") || el;
+  for (const ov of root.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
+  }
+  try {
+    const r = root.getBoundingClientRect();
+    const x = r.left + r.width / 2;
+    const y = r.top + r.height / 2;
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      root.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+    }
+    if (typeof root.click === 'function') root.click();
+    return true;
+  } catch (_) { return false; }
 }"""
 
 
@@ -5466,6 +5522,63 @@ def _reel_post_label_text(loc: Locator) -> str:
         return str(loc.inner_text(timeout=400) or "").strip()
     except Exception:
         return ""
+
+
+def _reel_post_label_matches(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t or not _REEL_POST_LABEL_RE.match(t):
+        return False
+    if re.search(r"\bposts\b", t, re.I):
+        return False
+    return True
+
+
+def _reel_locator_near_footer(loc: Locator, *, min_ratio: float = 0.42) -> bool:
+    """Tránh bấm nhầm «Post» ở sidebar khi đang ở Reel settings."""
+    try:
+        box = loc.bounding_box()
+        if not box:
+            return True
+        vp = loc.page.viewport_size or {"height": 900}
+        return float(box["y"]) >= float(vp.get("height", 900)) * min_ratio
+    except Exception:
+        return True
+
+
+def _resolve_reel_post_click_target(loc: Locator) -> Locator:
+    """Chọn wrapper clickable ngoài cùng (role=none có overlay hoặc role=button)."""
+    try:
+        outer = loc.locator(
+            "xpath=ancestor::div[@role='none']"
+            "[.//span[normalize-space()='Post' or normalize-space()='Đăng' or normalize-space()='Publish']]"
+        ).last
+        if outer.count() > 0:
+            return outer
+    except Exception:
+        pass
+    try:
+        btn = loc.locator(
+            "xpath=ancestor::*[@role='button']"
+            "[.//*[normalize-space()='Post' or normalize-space()='Đăng' or normalize-space()='Publish']]"
+        ).last
+        if btn.count() > 0:
+            return btn
+    except Exception:
+        pass
+    return loc
+
+
+def _reel_locator_post_usable_in_context(
+    loc: Locator,
+    page: Page,
+    *,
+    require_footer: bool = False,
+) -> bool:
+    if not _reel_locator_post_usable(loc):
+        return False
+    if require_footer and _reel_settings_screen_visible(page, timeout_ms=120):
+        return _reel_locator_near_footer(loc)
+    return True
 
 
 def _dismiss_reel_hashtag_suggestion(page: Page) -> None:
@@ -5505,13 +5618,13 @@ def _reel_locator_is_post_submit(loc: Locator) -> bool:
     except Exception:
         pass
     txt = _reel_post_label_text(loc)
-    if txt and _REEL_POST_LABEL_RE.match(txt):
+    if _reel_post_label_matches(txt):
         return True
     try:
-        span = loc.locator("span.x1j85h84, span").filter(has_text=_REEL_POST_LABEL_RE).first
+        span = loc.locator("span.x6ikm8r, span.x1j85h84, span").filter(has_text=_REEL_POST_LABEL_RE).first
         if span.count() > 0 and span.is_visible(timeout=200):
             inner = _reel_post_label_text(span)
-            return bool(inner and _REEL_POST_LABEL_RE.match(inner))
+            return _reel_post_label_matches(inner)
     except Exception:
         pass
     return False
@@ -5531,12 +5644,64 @@ def _reel_locator_post_usable(loc: Locator) -> bool:
     return True
 
 
-def _reel_strict_post_button_usable(page: Page, *, timeout_ms: int = 450) -> bool:
-    dialog = _active_reel_dialog(page)
-    for loc in _reel_strict_post_button_locators(page, dialog=dialog):
+def _locator_reel_settings_post_html_div(scope: Locator) -> Locator:
+    """
+    Footer Reel settings — ``div.html-div`` > ``div[role=none]`` > span[dir=auto] > span (x6ikm8r+x1j85h84).
+    """
+    return scope.locator(
+        "xpath=.//div[contains(@class,'html-div')]/div[@role='none']"
+        "[.//span[contains(@class,'x6ikm8r') and contains(@class,'x1j85h84') "
+        "and (normalize-space()='Post' or normalize-space()='Đăng')]][last()]"
+    )
+
+
+def _reel_footer_post_visible(
+    page: Page,
+    *,
+    dialog: Locator | None = None,
+    timeout_ms: int = 350,
+) -> bool:
+    """Nút Post footer còn hiển thị — strict + html-div (span dual-class)."""
+    dlg = dialog if dialog is not None else _active_reel_dialog(page)
+    for loc in _reel_strict_post_button_locators(page, dialog=dlg):
         if _reel_locator_post_usable(loc):
             return True
+    try:
+        html_post = _locator_reel_settings_post_html_div(dlg)
+        if html_post.count() > 0 and html_post.is_visible(timeout=timeout_ms):
+            return True
+    except Exception:
+        pass
+    try:
+        save = dlg.locator("xpath=.//*[normalize-space()='Save']").last
+        post = dlg.get_by_text("Post", exact=True).last
+        if (
+            save.is_visible(timeout=timeout_ms)
+            and post.is_visible(timeout=timeout_ms)
+            and _reel_locator_near_footer(post)
+        ):
+            return True
+    except Exception:
+        pass
     return False
+
+
+def _reel_strict_post_button_usable(page: Page, *, timeout_ms: int = 450) -> bool:
+    return _reel_footer_post_visible(page, timeout_ms=timeout_ms)
+
+
+def _locator_reel_settings_post_primary(scope: Locator) -> Locator:
+    """Nút Post xanh footer Reel settings — ưu tiên html-div + dual-class span."""
+    return _locator_reel_settings_post_html_div(scope)
+
+
+def _locator_reel_post_footer_button(scope: Locator) -> Locator:
+    """``role=button`` footer — Post / Đăng / Publish (Meta Business + Reel settings)."""
+    return scope.locator(
+        "xpath=.//*[@role='button' and @tabindex='0' and @aria-busy='false']"
+        "[.//*[normalize-space()='Post' or normalize-space()='Đăng' or normalize-space()='Publish']]"
+        "[last()]"
+    )
 
 
 def _reel_strict_post_button_locators(page: Page, *, dialog: Locator | None = None) -> list[Locator]:
@@ -5561,6 +5726,33 @@ def _reel_strict_post_button_locators(page: Page, *, dialog: Locator | None = No
         out.append(loc)
 
     for scope in scopes:
+        try:
+            _add(_locator_reel_settings_post_html_div(scope))
+        except Exception:
+            pass
+        try:
+            _add(_locator_reel_settings_post_primary(scope))
+        except Exception:
+            pass
+        try:
+            _add(
+                scope.locator("div.html-div > div[role='none']").filter(
+                    has=scope.locator(
+                        "span.x6ikm8r.x1j85h84",
+                        has_text=_REEL_POST_LABEL_RE,
+                    )
+                ).last
+            )
+        except Exception:
+            pass
+        try:
+            _add(_locator_reel_post_footer_button(scope))
+        except Exception:
+            pass
+        try:
+            _add(scope.get_by_role("button", name=_REEL_POST_LABEL_RE).last)
+        except Exception:
+            pass
         for xp in _REEL_POST_STRICT_ONLY_XPATHS:
             _add(scope.locator(f"xpath={xp}"))
         for css in _REEL_POST_CSS_SELECTORS:
@@ -5572,7 +5764,7 @@ def _reel_strict_post_button_locators(page: Page, *, dialog: Locator | None = No
             _add(
                 scope.locator("div.html-div").filter(
                     has=scope.locator(
-                        'div[role="none"] span.x1j85h84',
+                        'div[role="none"] span.x6ikm8r, div[role="none"] span.x1j85h84',
                         has_text=_REEL_POST_LABEL_RE,
                     )
                 ).last
@@ -5580,26 +5772,12 @@ def _reel_strict_post_button_locators(page: Page, *, dialog: Locator | None = No
         except Exception:
             pass
         try:
-            _add(scope.get_by_role("button", name=_REEL_POST_LABEL_RE))
-        except Exception:
-            pass
-        try:
             _add(
                 scope.locator(
                     "xpath=.//*[normalize-space()='Save']/following::*"
                     "[self::div or self::span or self::button]"
-                    "[normalize-space()='Post' or normalize-space()='Đăng'][1]"
+                    "[normalize-space()='Post' or normalize-space()='Đăng' or normalize-space()='Publish'][1]"
                 )
-            )
-        except Exception:
-            pass
-        try:
-            _add(
-                scope.locator(
-                    "xpath=.//*[not(ancestor::*[@role='listbox'])]"
-                    "[not(ancestor::*[@role='option'])]"
-                    "[normalize-space()='Post' or normalize-space()='Đăng']"
-                ).last
             )
         except Exception:
             pass
@@ -5840,14 +6018,158 @@ def _reel_post_button_locators(page: Page, *, dialog: Locator | None = None) -> 
     return _reel_strict_post_button_locators(page, dialog=dialog)
 
 
-def _click_reel_post_locator(page: Page, loc: Locator) -> None:
+def _click_reel_post_locator(
+    page: Page,
+    loc: Locator,
+    *,
+    prefer_mouse: bool = False,
+    tag: str = "",
+) -> None:
+    stage = _reel_strict_prefix("Wizard")
+    loc.scroll_into_view_if_needed(timeout=2_000)
+    target = _resolve_reel_post_click_target(loc)
     try:
-        loc.evaluate(_REEL_POST_CLICK_JS)
-        logger.info("{} [POST_TARGET] reel_post_js_click", _reel_strict_prefix("Wizard"))
+        target.evaluate(_REEL_POST_DISABLE_OVERLAY_JS)
     except Exception:
-        loc.click(timeout=1400, force=True, no_wait_after=True)
-        logger.info("{} [POST_TARGET] reel_post_force_click", _reel_strict_prefix("Wizard"))
-    page.wait_for_timeout(900)
+        pass
+    guard_on = _view_only_mode_enabled()
+    if guard_on:
+        _disable_view_only_guard(page)
+    try:
+        if not prefer_mouse and _js_click_submit_button_locator(
+            target, label=tag or "Post/Reel"
+        ):
+            logger.info("{} [POST_TARGET] reel_post_js_direct {}", stage, tag)
+            page.wait_for_timeout(max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 500)))
+            return
+        if not prefer_mouse:
+            try:
+                if target.evaluate(_REEL_POST_CLICK_JS):
+                    logger.info("{} [POST_TARGET] reel_post_js_click {}", stage, tag)
+                    page.wait_for_timeout(max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 500)))
+                    return
+            except Exception:
+                pass
+        box = target.bounding_box()
+        if box:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            logger.info("{} [POST_TARGET] reel_post_mouse_click {}", stage, tag)
+            page.wait_for_timeout(max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 500)))
+            return
+        target.click(timeout=1400, force=True, no_wait_after=True)
+        logger.info("{} [POST_TARGET] reel_post_force_click {}", stage, tag)
+        page.wait_for_timeout(max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 500)))
+    finally:
+        if guard_on:
+            _enable_view_only_guard(page)
+
+
+def _reel_dialog_post_js_click(page: Page, dialog: Locator) -> bool:
+    stage = _reel_strict_prefix("Wizard")
+    for fn, label in (
+        (lambda: dialog.evaluate(_REEL_DIALOG_POST_CLICK_JS), "dialog"),
+        (lambda: page.evaluate(_REEL_DIALOG_POST_CLICK_JS), "page"),
+    ):
+        try:
+            if fn():
+                logger.info("{} [POST_TARGET] reel_dialog_post_js ({})", stage, label)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_reel_post_locators_batch(
+    page: Page,
+    dialog: Locator,
+    *,
+    prefer_mouse: bool,
+    require_footer: bool,
+) -> bool:
+    """Thử lần lượt mọi locator Post trong dialog — dừng khi gửi được click."""
+    stage = _reel_strict_prefix("Wizard")
+    for idx, loc in enumerate(_reel_strict_post_button_locators(page, dialog=dialog)):
+        try:
+            if not _reel_locator_post_usable_in_context(
+                loc, page, require_footer=require_footer
+            ):
+                continue
+            _click_reel_post_locator(
+                page,
+                loc,
+                prefer_mouse=prefer_mouse,
+                tag=f"loc#{idx}",
+            )
+            logger.info("{} Đã gửi click Post (locator #{}).", stage, idx)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_reel_publish_button_in_dialog(page: Page, dialog: Locator) -> bool:
+    """Meta Business: chờ Publish enable rồi bấm trong dialog."""
+    stage = _reel_strict_prefix("Wizard")
+    try:
+        pub = _locator_reel_post_footer_button(dialog)
+        if pub.count() <= 0:
+            pub = dialog.get_by_role("button", name=re.compile(r"^Publish$", re.I)).last
+        if pub.count() <= 0 or not pub.is_visible(timeout=2_500):
+            return False
+        try:
+            page.wait_for_function(_submit_button_is_enabled_js(), timeout=8_000)
+        except Exception:
+            pass
+        if (pub.get_attribute("aria-disabled") or "").strip().lower() == "true":
+            return False
+        _click_reel_post_locator(page, pub, prefer_mouse=True, tag="publish")
+        logger.info("{} Đã gửi click Publish trong dialog.", stage)
+        return True
+    except Exception:
+        return False
+
+
+def _dispatch_reel_post_click(page: Page, dialog: Locator, *, attempt: int = 1) -> bool:
+    """Gửi click Post/Publish — chiến lược khác nhau theo attempt (1→3)."""
+    stage = _reel_strict_prefix("Wizard")
+    if attempt == 1:
+        human_pause(kind="click", label="trước Post (Reel settings)")
+    require_footer = _reel_settings_screen_visible(page, timeout_ms=200)
+    if attempt == 1:
+        if _reel_dialog_post_js_click(page, dialog):
+            return True
+        if _click_reel_post_locators_batch(
+            page, dialog, prefer_mouse=False, require_footer=require_footer
+        ):
+            return True
+        if _click_reel_publish_button_in_dialog(page, dialog):
+            return True
+        return False
+    if attempt == 2:
+        _dismiss_reel_hashtag_suggestion(page)
+        if _click_reel_post_locators_batch(
+            page, dialog, prefer_mouse=True, require_footer=require_footer
+        ):
+            return True
+        if _reel_dialog_post_js_click(page, dialog):
+            return True
+        return False
+    # attempt 3 — fallback rộng trong dialog, không scroll toàn trang
+    _dismiss_reel_hashtag_suggestion(page)
+    if _click_reel_publish_button_in_dialog(page, dialog):
+        return True
+    try:
+        _click_post_strict_for_reel(page, dialog)
+        return True
+    except Exception:
+        pass
+    try:
+        post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=6_000)
+        _click_reel_post_locator(page, post_btn, prefer_mouse=True, tag="wait_post")
+        return True
+    except Exception:
+        logger.warning("{} Attempt {}: hết locator trong dialog.", stage, attempt)
+        return False
 
 
 def _wait_post_button_in_dialog(dialog: Locator, *, timeout_ms: int = 20_000) -> Locator:
@@ -6246,108 +6568,98 @@ def _click_meta_reel_next_best_effort(page: Page) -> bool:
     return False
 
 
+def _reel_post_submit_strong_signal(page: Page, *, timeout_ms: int = 280) -> bool:
+    """Tín hiệu chắc chắn đã gửi Post — không suy ra từ «không thấy nút Post»."""
+    try:
+        if "published_posts" in str(page.url or "").strip().lower():
+            return True
+    except Exception:
+        pass
+    for pat in (
+        r"Video\s+post\s+processing",
+        r"finishes processing",
+        r"Publishing|Đang đăng|Your reel is being",
+        r"Posting your reel|Đang đăng thước phim",
+    ):
+        try:
+            if page.get_by_text(re.compile(pat, re.I)).first.is_visible(timeout=timeout_ms):
+                return True
+        except Exception:
+            continue
+    try:
+        busy = page.locator(
+            "[role='button'][aria-busy='true'], [role='none'][aria-busy='true']"
+        ).filter(has_text=_REEL_POST_LABEL_RE)
+        if busy.count() > 0 and busy.first.is_visible(timeout=timeout_ms):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _reel_post_submit_acknowledged(page: Page, *, timeout_ms: int = 8_000) -> bool:
-    """Sau khi gọi click Post: wizard đóng, processing modal, hoặc về Published."""
+    """Sau khi gọi click Post: processing / wizard đóng và không còn Post footer."""
+    dialog = _active_reel_dialog(page)
     deadline = time.time() + max(1.0, timeout_ms / 1000.0)
     while time.time() < deadline:
-        try:
-            u = str(page.url or "").strip().lower()
-            if "published_posts" in u:
-                return True
-        except Exception:
-            pass
-        try:
-            if page.get_by_text(re.compile(r"Video\s+post\s+processing", re.I)).first.is_visible(timeout=280):
-                return True
-        except Exception:
-            pass
-        try:
-            if page.get_by_text(re.compile(r"finishes processing", re.I)).first.is_visible(timeout=280):
-                return True
-        except Exception:
-            pass
-        try:
-            if page.get_by_text(re.compile(r"Publishing|Đang đăng|Your reel is being", re.I)).first.is_visible(timeout=280):
-                return True
-        except Exception:
-            pass
-        settings_open = _reel_settings_screen_visible(page, timeout_ms=220)
-        post_still = _reel_strict_post_button_usable(page, timeout_ms=220)
-        if not settings_open and not post_still:
+        if _reel_post_submit_strong_signal(page, timeout_ms=220):
             return True
-        if settings_open and not post_still:
+        settings_open = _reel_settings_screen_visible(page, timeout_ms=200)
+        post_footer = _reel_footer_post_visible(page, dialog=dialog, timeout_ms=200)
+        if settings_open and post_footer:
+            page.wait_for_timeout(280)
+            continue
+        if not settings_open and not post_footer:
             return True
-        page.wait_for_timeout(320)
+        page.wait_for_timeout(280)
     return False
 
 
 def _click_reel_post_best_effort(page: Page) -> bool:
-    """Bấm Post/Publish trong popup Reel. Trả về True nếu đã gửi click và UI bắt đầu phản hồi."""
+    """Bấm Post/Publish trong popup Reel. True chỉ khi UI xác nhận đã submit."""
     stage = _reel_strict_prefix("Wizard")
+    if _reel_post_submit_strong_signal(page, timeout_ms=350):
+        logger.info("{} Post đã được xác nhận trước (đang xử lý / Published).", stage)
+        return True
     _dismiss_reel_hashtag_suggestion(page)
-    wait_deadline = time.time() + 28.0
+    wait_deadline = time.time() + 24.0
     while time.time() < wait_deadline:
-        if _reel_strict_post_button_usable(page, timeout_ms=400):
+        if _reel_strict_post_button_usable(page, timeout_ms=350):
             break
-        page.wait_for_timeout(320)
+        if _reel_settings_screen_visible(page, timeout_ms=250):
+            break
+        page.wait_for_timeout(280)
     dialog = _active_reel_dialog(page)
     try:
         dialog.locator("xpath=.//*[normalize-space()='Save']").last.scroll_into_view_if_needed(timeout=2_000)
     except Exception:
         pass
-    clicked = False
-    try:
-        if page.evaluate(_REEL_POST_FOOTER_CLICK_JS):
-            logger.info("{} Đã bấm Post footer Reel settings (JS).", stage)
-            clicked = True
-    except Exception:
-        pass
-    if not clicked:
-        for loc in _reel_strict_post_button_locators(page, dialog=dialog):
-            try:
-                if not _reel_locator_post_usable(loc):
-                    continue
-                loc.scroll_into_view_if_needed(timeout=2_000)
-                _click_reel_post_locator(page, loc)
-                logger.info("{} Đã bấm Post (footer locator).", stage)
-                clicked = True
-                break
-            except Exception:
-                continue
-    if not clicked:
-        try:
-            _click_post_strict_for_reel(page, dialog)
-            clicked = True
-        except Exception:
-            pass
-    if not clicked:
-        try:
-            click_post_button(page)
-            clicked = True
-        except Exception:
-            pass
-    if not clicked:
-        try:
-            post_btn = _wait_post_button_in_dialog(dialog, timeout_ms=20_000)
-            try:
-                post_btn.evaluate("el => el && el.click && el.click()")
-            except Exception:
-                post_btn.click(timeout=1800, force=True, no_wait_after=True)
-            clicked = True
-        except Exception:
-            pass
-    if not clicked:
-        logger.error("{} Không bấm được nút Post trong Reel wizard.", stage)
-        return False
-    page.wait_for_timeout(max(400, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 900)))
-    if _reel_post_submit_acknowledged(page, timeout_ms=6_000):
-        logger.info("{} UI xác nhận đã gửi Post (wizard đóng / processing / Published).", stage)
-        return True
-    logger.warning(
-        "{} Đã gọi click Post nhưng chưa thấy phản hồi UI trong 6s — bước verify sẽ kiểm tra tiếp.",
+    ack_ms = max(4_000, _env_int("FB_REEL_POST_ACK_MS", 6_000))
+    settle_ms = max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 700))
+    for attempt in (1, 2, 3):
+        if not _dispatch_reel_post_click(page, dialog, attempt=attempt):
+            logger.warning("{} Không gửi được click Post (attempt {}).", stage, attempt)
+            page.wait_for_timeout(_reel_inter_click_wait_ms())
+            continue
+        page.wait_for_timeout(settle_ms)
+        if _reel_post_submit_acknowledged(page, timeout_ms=ack_ms):
+            logger.info(
+                "{} UI xác nhận đã gửi Post (attempt {}).",
+                stage,
+                attempt,
+            )
+            return True
+        logger.warning(
+            "{} Đã gửi click Post nhưng chưa thấy phản hồi UI (attempt {}).",
+            stage,
+            attempt,
+        )
+        page.wait_for_timeout(_reel_inter_click_wait_ms())
+    logger.error(
+        "{} Post không được Facebook xác nhận sau 3 lần thử.",
         stage,
     )
-    return True
+    return False
 
 
 def complete_reel_wizard_fill_next_and_post(
@@ -6869,11 +7181,9 @@ def post_reel_via_page_dashboard(
         _wizard_on_step("CLICK_POST", "Post details — bấm Publish/Post.")
         post_clicked = _click_reel_post_best_effort(page)
         if not post_clicked:
-            try:
-                click_post_button(page)
-                post_clicked = True
-            except Exception as exc:
-                raise PlaywrightTimeoutError(f"Không bấm được Post (way2): {exc}") from exc
+            raise PlaywrightTimeoutError(
+                "Không xác nhận được Post (way2): UI vẫn ở Reel settings hoặc nút Post chưa phản hồi."
+            )
         logger.info(
             "{} [REEL DASHBOARD] way2 done: filled={} payload_len={} post_clicked={}.",
             stage,
@@ -7034,8 +7344,11 @@ def click_post_button(page: Page) -> None:
         sel = _wait_first_selector(
             page,
             (
+                "div.html-div:has(div[role='none'] span.x6ikm8r)",
                 "div.html-div:has(div[role='none'] span.x1j85h84)",
+                "xpath=(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x6ikm8r') and normalize-space()='Post']])[last()]",
                 "xpath=(//div[contains(@class,'html-div')][.//div[@role='none']//span[contains(@class,'x1j85h84') and normalize-space()='Post']])[last()]",
+                "xpath=(//div[@role='none' and .//span[contains(@class,'x6ikm8r') and normalize-space()='Post']])[last()]",
                 "xpath=(//div[@role='button' and @tabindex='0' and @aria-busy='false' and .//div[normalize-space()='Publish']])[last()]",
                 "[aria-label='Post'][role='button']",
                 "[aria-label='Đăng'][role='button']",
