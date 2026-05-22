@@ -8,7 +8,10 @@ from src.automation.facebook_actions import (
     _click_manage_page_sidebar_switch,
     _click_switch_in_sidebar_cta_card,
     _ensure_page_role_switched,
+    _normalize_compact_page_name,
+    _page_switch_name_aliases,
     _page_switch_sidebar_hint_visible,
+    _switch_profiles_dialog_mentions_page,
 )
 
 
@@ -101,21 +104,18 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
         ) as sidebar,
         patch(
             "src.automation.facebook_actions._wait_after_page_switch_click",
-        ),
+            return_value=True,
+        ) as wait_sw,
         patch(
             "src.automation.facebook_actions._wait_page_role_switch_complete",
             return_value=True,
         ),
-        patch(
-            "src.automation.facebook_actions._handle_switch_profiles_popup_if_present",
-            return_value=True,
-        ) as popup,
     ):
         assert _ensure_page_role_switched(
             page, page_display_name="Best News US", page_url="https://www.facebook.com/123"
         )
         sidebar.assert_called()
-        popup.assert_called()
+        wait_sw.assert_called()
 
 
 def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
@@ -151,12 +151,27 @@ def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
         assert not _ensure_page_role_switched(page, page_url="https://www.facebook.com/103833422779877")
 
 
+def test_slug_alias_matches_display_name_in_popup() -> None:
+    """Slug job khớp «Xabre Owners Bandung» trong popup (so sánh compact)."""
+    aliases = _page_switch_name_aliases(
+        "xabreownersbandung",
+        "https://www.facebook.com/xabreownersbandung",
+    )
+    assert "xabreownersbandung" in aliases
+    dlg = MagicMock()
+    dlg.inner_text.return_value = (
+        "Switch profiles\nSwitch to Xabre Owners Bandung for more features, tools and settings"
+    )
+    assert _switch_profiles_dialog_mentions_page(dlg, aliases)
+    assert _normalize_compact_page_name("Xabre Owners Bandung") == "xabreownersbandung"
+
+
 def test_handle_switch_profiles_popup_confirm() -> None:
     page = MagicMock()
     with (
         patch(
             "src.automation.facebook_actions._switch_profiles_dialog_visible",
-            side_effect=[True, False, False],
+            side_effect=[True, False, False, False],
         ),
         patch(
             "src.automation.facebook_actions._click_switch_profiles_popup_confirm",

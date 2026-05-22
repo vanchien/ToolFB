@@ -2360,6 +2360,85 @@ def _click_manage_page_sidebar_switch(page: Page, *, timeout_ms: int = 2000) -> 
     return False
 
 
+def _normalize_compact_page_name(value: str) -> str:
+    """So sánh slug «xabreownersbandung» với «Xabre Owners Bandung» trong popup."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _page_switch_name_aliases(page_display_name: str, page_url: str) -> list[str]:
+    """Các nhãn có thể xuất hiện trong popup Switch profiles."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        t = str(raw or "").strip()
+        if len(t) < 2:
+            return
+        key = t.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(t)
+
+    _add(page_display_name)
+    dest = str(page_url or "").strip()
+    if dest:
+        try:
+            p = urlparse(dest)
+            for seg in (x for x in (p.path or "").split("/") if x):
+                if seg.lower() in ("pages", "people", "profile.php"):
+                    continue
+                _add(seg)
+        except Exception:
+            pass
+        pid = extract_facebook_numeric_id_from_url(dest)
+        if pid:
+            _add(pid)
+    return out
+
+
+def _infer_page_title_from_switch_dialog(page: Page) -> str:
+    """Đọc tên Page in đậm trong popup: «Switch to Xabre Owners Bandung for more features»."""
+    try:
+        dlg = _switch_profiles_dialog_scope(page)
+        blob = str(dlg.inner_text(timeout=2_000) or "")
+        for pat in (
+            r"Switch to\s+(.+?)\s+for more features",
+            r"Switch to\s+(.+?)\s+for more",
+            r"Chuyển sang\s+(.+?)\s+để",
+        ):
+            m = re.search(pat, blob, re.I | re.DOTALL)
+            if m:
+                title = re.sub(r"\s+", " ", m.group(1)).strip()
+                if len(title) >= 2:
+                    return title
+    except Exception:
+        pass
+    return ""
+
+
+def _switch_profiles_dialog_mentions_page(
+    dlg: Locator,
+    aliases: list[str],
+) -> bool:
+    try:
+        blob = str(dlg.inner_text(timeout=2_000) or "")
+    except Exception:
+        return False
+    if not blob.strip():
+        return False
+    compact_blob = _normalize_compact_page_name(blob)
+    for alias in aliases:
+        if len(alias) < 2:
+            continue
+        if alias.lower() in blob.lower():
+            return True
+        compact_alias = _normalize_compact_page_name(alias)
+        if len(compact_alias) >= 4 and compact_alias in compact_blob:
+            return True
+    return False
+
+
 def _switch_profiles_dialog_scope(page: Page) -> Locator:
     """Modal «Switch profiles» / «Switch to … for more features»."""
     for pat in (
@@ -2392,15 +2471,26 @@ _PAGE_SWITCH_POPUP_CONFIRM_JS = """
   const dlg = document.querySelector('[role="dialog"]');
   if (!dlg) return false;
   const low = (dlg.innerText || '').toLowerCase();
-  if (!low.includes('switch') && !low.includes('chuyển')) return false;
+  if (!low.includes('switch profiles') && !low.includes('switch to') && !low.includes('chuyển')) {
+    if (!low.includes('switch')) return false;
+  }
   for (const ov of dlg.querySelectorAll('[data-visualcompletion="ignore"]')) {
     ov.style.pointerEvents = 'none';
   }
-  const spans = Array.from(dlg.querySelectorAll('span')).filter(sp =>
-    /^switch$/i.test((sp.textContent || '').trim())
-  );
-  if (!spans.length) return false;
-  const switchSpan = spans[spans.length - 1];
+  const hits = [];
+  for (const el of dlg.querySelectorAll('[role="button"], div[role="none"], span, a')) {
+    const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!/^switch$/i.test(t)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 36 || r.height < 16) continue;
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    hits.push({ el, bottom: r.bottom, left: r.left, role });
+  }
+  if (!hits.length) return false;
+  hits.sort((a, b) => {
+    const score = (h) => (h.role === 'button' ? 1_000_000 : h.role === 'none' ? 100_000 : 0) + h.bottom * 100 + h.left;
+    return score(b) - score(a);
+  });
   const fire = (node) => {
     if (!node) return false;
     try {
@@ -2414,14 +2504,17 @@ _PAGE_SWITCH_POPUP_CONFIRM_JS = """
       return true;
     } catch (_) { return false; }
   };
-  let node = switchSpan;
-  for (let i = 0; i < 10 && node; i++) {
-    if (node.getAttribute && node.getAttribute('role') === 'none') {
-      if (fire(node)) return true;
+  for (const h of hits) {
+    let node = h.el;
+    for (let i = 0; i < 8 && node; i++) {
+      if (node.getAttribute && (node.getAttribute('role') === 'button' || node.getAttribute('role') === 'none')) {
+        if (fire(node)) return true;
+      }
+      node = node.parentElement;
     }
-    node = node.parentElement;
+    if (fire(h.el)) return true;
   }
-  return fire(switchSpan);
+  return false;
 }
 """
 
@@ -2430,30 +2523,44 @@ def _click_switch_profiles_popup_confirm(
     page: Page,
     *,
     page_display_name: str = "",
+    page_url: str = "",
     timeout_ms: int = 8_000,
 ) -> bool:
     """
-    Bấm nút Switch xanh trong popup «Switch profiles» (role=none > span «Switch»).
+    Bấm nút Switch xanh trong popup «Switch profiles» (ưu tiên ``role=button`` footer).
 
-    HTML giống sidebar: ``div[role='none']`` > ``span.x6ikm8r`` > «Switch».
+    Khớp tên Page: slug URL (xabreownersbandung) hoặc tên hiển thị (Xabre Owners Bandung).
     """
     if not _switch_profiles_dialog_visible(page, timeout_ms=min(2_500, timeout_ms)):
         return False
-    pname = str(page_display_name or "").strip()
     dlg = _switch_profiles_dialog_scope(page)
     try:
         dlg.wait_for(state="visible", timeout=min(4_000, timeout_ms))
     except Exception:
         pass
-    if pname:
-        try:
-            if not dlg.get_by_text(re.compile(re.escape(pname[:80]), re.I)).first.is_visible(timeout=1_500):
-                logger.warning(
-                    "[FB] Popup Switch profiles không thấy tên Page {!r} — vẫn thử bấm Switch.",
-                    pname,
-                )
-        except Exception:
-            pass
+
+    aliases = _page_switch_name_aliases(page_display_name, page_url)
+    inferred = _infer_page_title_from_switch_dialog(page)
+    if inferred:
+        aliases = [*aliases, inferred]
+    if _switch_profiles_dialog_mentions_page(dlg, aliases):
+        logger.info(
+            "[FB] Popup Switch profiles khớp Page: {}.",
+            ", ".join(aliases[:4]),
+        )
+    elif aliases:
+        logger.warning(
+            "[FB] Popup Switch profiles không khớp alias {} — vẫn bấm Switch (có thể đúng Page).",
+            aliases[0],
+        )
+
+    def _popup_closed() -> bool:
+        return not _switch_profiles_dialog_visible(page, timeout_ms=450)
+
+    def _after_click_pause() -> bool:
+        page.wait_for_timeout(2_400)
+        return _popup_closed()
+
     try:
         page.evaluate(
             """() => {
@@ -2466,14 +2573,18 @@ def _click_switch_profiles_popup_confirm(
         )
     except Exception:
         pass
+
     locators = (
+        dlg.get_by_role("button", name=_SWITCH_EXACT_LABEL_RE).last,
         dlg.locator(
-            "xpath=.//div[@role='none'][.//span[contains(@class,'x6ikm8r') and normalize-space()='Switch']][last()]"
+            "xpath=.//*[@role='button'][.//span[normalize-space()='Switch'] or normalize-space()='Switch'][last()]"
+        ),
+        dlg.locator(
+            "xpath=.//div[@role='none'][.//span[normalize-space()='Switch']][last()]"
         ),
         dlg.locator("div[role='none']").filter(
-            has=page.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE)
+            has=dlg.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE)
         ).last,
-        dlg.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE).last,
     )
     for loc in locators:
         try:
@@ -2481,35 +2592,38 @@ def _click_switch_profiles_popup_confirm(
                 continue
             loc.scroll_into_view_if_needed(timeout=2_000)
             try:
-                dlg.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS)
-                logger.info("[FB] Đã bấm Switch trong popup Switch profiles (JS).")
-                page.wait_for_timeout(2_200)
-                return True
-            except Exception:
-                pass
-            try:
                 box = loc.bounding_box()
                 if box:
                     page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                    logger.info("[FB] Đã bấm Switch trong popup (mouse).")
-                    page.wait_for_timeout(2_200)
-                    return True
+                    logger.info("[FB] Đã bấm Switch popup (mouse, role=button).")
+                    if _after_click_pause():
+                        return True
             except Exception:
                 pass
-            loc.click(timeout=timeout_ms, force=True, no_wait_after=True)
-            logger.info("[FB] Đã bấm Switch trong popup (force click).")
-            page.wait_for_timeout(2_200)
-            return True
+            loc.click(timeout=min(timeout_ms, 5_000), force=True, no_wait_after=True)
+            logger.info("[FB] Đã bấm Switch popup (force, role=button).")
+            if _after_click_pause():
+                return True
         except Exception:
             continue
-    try:
-        if page.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS):
-            logger.info("[FB] Đã bấm Switch popup (JS toàn trang).")
-            page.wait_for_timeout(2_200)
-            return True
-    except Exception:
-        pass
-    return False
+
+    for attempt in (1, 2):
+        try:
+            if dlg.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS):
+                logger.info("[FB] Đã bấm Switch popup (JS, attempt={}).", attempt)
+                if _after_click_pause():
+                    return True
+        except Exception:
+            pass
+        try:
+            if page.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS) and _after_click_pause():
+                logger.info("[FB] Đã bấm Switch popup (JS page, attempt={}).", attempt)
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+
+    return _popup_closed()
 
 
 def _handle_switch_profiles_popup_if_present(
@@ -2537,14 +2651,29 @@ def _handle_switch_profiles_popup_if_present(
         return True
 
     logger.info("[FB] Popup Switch profiles — bấm nút Switch xác nhận.")
-    if not _click_switch_profiles_popup_confirm(page, page_display_name=pname):
+    dest = str(page_url or "").strip()
+    for popup_click_try in range(1, 4):
+        if _click_switch_profiles_popup_confirm(
+            page,
+            page_display_name=pname,
+            page_url=dest,
+        ):
+            if not _switch_profiles_dialog_visible(page, timeout_ms=600):
+                break
+        elif not _switch_profiles_dialog_visible(page, timeout_ms=400):
+            break
+        page.wait_for_timeout(600)
+    if _switch_profiles_dialog_visible(page, timeout_ms=500):
         _failure_screenshot(page, "switch_profiles_popup_confirm_fail")
         return False
 
     settle_deadline = time.time() + max(5.0, settle_ms / 1000.0)
     while time.time() < settle_deadline:
         if _switch_profiles_dialog_visible(page, timeout_ms=350):
-            page.wait_for_timeout(400)
+            _click_switch_profiles_popup_confirm(
+                page, page_display_name=pname, page_url=dest
+            )
+            page.wait_for_timeout(500)
             continue
         if _page_role_acting_as_page(page, timeout_ms=600):
             logger.info("[FB] Popup đã đóng — xác nhận vai trò Page sau Switch profiles.")
@@ -2561,9 +2690,9 @@ def _wait_after_page_switch_click(
     page_display_name: str = "",
     page_url: str = "",
     timeout_ms: int = 12_000,
-) -> None:
+) -> bool:
     """Chờ popup Switch profiles (và xử lý) hoặc sidebar CTA biến mất."""
-    _handle_switch_profiles_popup_if_present(
+    ok = _handle_switch_profiles_popup_if_present(
         page,
         page_display_name=page_display_name,
         page_url=page_url,
@@ -2573,8 +2702,9 @@ def _wait_after_page_switch_click(
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
         if not _page_switch_sidebar_hint_visible(page, timeout_ms=400):
-            return
+            return ok
         page.wait_for_timeout(350)
+    return ok
 
 
 def _confirm_switch_profiles_popup(page: Page, *, page_display_name: str = "", page_url: str = "") -> bool:
@@ -2720,16 +2850,11 @@ def _ensure_page_role_switched(
             _scroll_manage_page_sidebar_switch_cta(page)
             if sidebar_hint and _click_manage_page_sidebar_switch(page):
                 clicked = True
-                _wait_after_page_switch_click(page, page_display_name=pname, page_url=dest)
             elif _click_visible_enabled_button(page.get_by_role("button", name=sw_now), timeout_ms=1_800):
                 clicked = True
                 page.wait_for_timeout(random.randint(2600, 4800))
-                _handle_switch_profiles_popup_if_present(
-                    page, page_display_name=pname, page_url=dest
-                )
             elif _click_manage_page_sidebar_switch(page):
                 clicked = True
-                _wait_after_page_switch_click(page, page_display_name=pname, page_url=dest)
             else:
                 try:
                     sw_block = page.locator(
@@ -2740,14 +2865,14 @@ def _ensure_page_role_switched(
                     )
                     if _click_visible_enabled_button(sw_block, timeout_ms=1_500):
                         clicked = True
-                        _wait_after_page_switch_click(page, page_display_name=pname, page_url=dest)
                 except Exception:
                     pass
 
             if clicked:
-                if not _handle_switch_profiles_popup_if_present(
-                    page, page_display_name=pname, page_url=dest
-                ):
+                popup_ok = _wait_after_page_switch_click(
+                    page, page_display_name=pname, page_url=dest, timeout_ms=24_000
+                )
+                if not popup_ok:
                     logger.warning(
                         "[FB] Popup Switch profiles chưa xử lý (attempt={}) — thử lại vòng sau.",
                         attempt,
@@ -4704,6 +4829,49 @@ _REEL_UPLOAD_READY_RE = re.compile(
     re.I,
 )
 
+# Professional Dashboard Content Library — hai nút Create (không gộp chung để tránh bấm nhầm).
+_CREATE_SIDEBAR_POST_RE = re.compile(r"^Create a post$|^Tạo bài viết$", re.I)
+_CREATE_MAIN_BUTTON_RE = re.compile(r"^\+?\s*Create$|^Tạo$", re.I)
+
+_REEL_MENUITEM_CLICK_JS = """
+() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const isReel = (t) => /^reels?$/i.test(t) || /^thước phim$/i.test(t) || /^video$/i.test(t);
+  let scope = document.body;
+  const menus = Array.from(document.querySelectorAll('[role="menu"], [role="listbox"]'))
+    .filter((m) => m.getBoundingClientRect().width > 20);
+  if (menus.length) scope = menus[menus.length - 1];
+  for (const ov of scope.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
+  }
+  const items = scope.querySelectorAll('[role="menuitem"], [role="option"]');
+  for (const el of items) {
+    const t = norm(el.textContent);
+    if (!isReel(t)) continue;
+    const spans = el.querySelectorAll('span');
+    let label = t;
+    for (const sp of spans) {
+      const st = norm(sp.textContent);
+      if (isReel(st)) { label = st; break; }
+    }
+    for (const node of [el, el.querySelector('[tabindex="0"]'), el.closest('[role="menuitem"]')]) {
+      if (!node) continue;
+      try {
+        const r = node.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+        }
+        if (typeof node.click === 'function') node.click();
+        return { ok: true, label };
+      } catch (_) {}
+    }
+  }
+  return { ok: false };
+}
+"""
+
 
 def _reel_scope_upload_ready(scope: Locator) -> bool:
     try:
@@ -4755,8 +4923,139 @@ def _locate_create_post_menu(page: Page) -> Locator:
     return page.locator("body")
 
 
+def _create_post_menu_visible(page: Page, *, timeout_ms: int = 500) -> bool:
+    try:
+        return page.locator("[role='menuitem'], [role='option']").first.is_visible(timeout=timeout_ms)
+    except Exception:
+        return False
+
+
+def _locator_sidebar_create_a_post(page: Page) -> Locator:
+    """Nút xanh «Create a post» ở cột trái (Professional Dashboard)."""
+    return page.locator(
+        "xpath=(//*[@role='button' or @role='none']"
+        "[.//span[normalize-space()='Create a post' or normalize-space()='Tạo bài viết']]"
+        " | //*[@aria-label and (contains(@aria-label, 'Create a post') or contains(@aria-label, 'Tạo bài viết'))]"
+        ")[last()]"
+    )
+
+
+def _locator_main_content_create(page: Page) -> Locator:
+    """Nút «+ Create» / «Create» trên vùng Content Library (không phải Create a post)."""
+    return page.locator(
+        "xpath=(//*[@role='button' or @role='none']"
+        "[.//span[normalize-space()='Create' or normalize-space()='Tạo' or normalize-space()='+ Create']"
+        " and not(.//span[contains(., 'Create a post')]) and not(.//span[contains(., 'Tạo bài viết')])]"
+        ")[1]"
+    )
+
+
+def _click_create_entry_locator(page: Page, loc: Locator, *, timeout_ms: int = 1600) -> bool:
+    """Click nút Create — tắt overlay visualcompletion trên nút."""
+    try:
+        if loc.count() <= 0:
+            return False
+        btn = loc.last
+        if not btn.is_visible(timeout=timeout_ms):
+            return False
+        try:
+            btn.evaluate(
+                """(el) => {
+                  if (!el) return;
+                  for (const ov of el.querySelectorAll('[data-visualcompletion="ignore"]')) {
+                    ov.style.pointerEvents = 'none';
+                  }
+                  const root = el.closest('[role="button"], [tabindex="0"]') || el;
+                  if (root && typeof root.click === 'function') root.click();
+                }"""
+            )
+            return True
+        except Exception:
+            return _click_visible_enabled_button(loc, timeout_ms=timeout_ms)
+    except Exception:
+        return False
+
+
+def _click_dashboard_create_entry(
+    page: Page,
+    *,
+    prefer: Literal["sidebar", "main", "auto"] = "auto",
+) -> Literal["sidebar", "main", ""]:
+    """
+    Bấm một trong hai nút Create trên Content Library.
+
+    - ``sidebar``: «Create a post» (cột trái)
+    - ``main``: «+ Create» / «Create» (vùng bài đăng)
+    - ``auto``: sidebar trước, rồi main (không bấm cả hai nếu menu đã mở)
+    """
+    if _reel_composer_already_visible(page):
+        return ""
+    if _create_post_menu_visible(page, timeout_ms=400):
+        return ""
+
+    order: tuple[Literal["sidebar", "main"], ...]
+    if prefer == "sidebar":
+        order = ("sidebar", "main")
+    elif prefer == "main":
+        order = ("main", "sidebar")
+    else:
+        order = ("sidebar", "main")
+
+    locators: dict[str, tuple[Locator, ...]] = {
+        "sidebar": (
+            page.get_by_role("button", name=_CREATE_SIDEBAR_POST_RE),
+            _locator_sidebar_create_a_post(page),
+        ),
+        "main": (
+            page.get_by_role("button", name=_CREATE_MAIN_BUTTON_RE),
+            _locator_main_content_create(page),
+        ),
+    }
+    for kind in order:
+        for loc in locators[kind]:
+            if _click_create_entry_locator(page, loc):
+                page.wait_for_timeout(random.randint(650, 1200))
+                if _create_post_menu_visible(page, timeout_ms=1200) or _reel_composer_already_visible(page):
+                    return kind
+        if _create_post_menu_visible(page, timeout_ms=500):
+            return kind
+    return ""
+
+
+def _click_reel_menuitem_strict(page: Page) -> bool:
+    """Bấm ``role=menuitem`` có span «Reel» + icon (DOM Meta dashboard)."""
+    stage = _reel_strict_prefix("Wizard")
+    try:
+        result = page.evaluate(_REEL_MENUITEM_CLICK_JS)
+        if isinstance(result, dict) and result.get("ok"):
+            logger.info("{} Đã bấm menuitem Reel (JS): {!r}.", stage, result.get("label"))
+            page.wait_for_timeout(random.randint(700, 1300))
+            return True
+    except Exception as exc:
+        logger.debug("{} JS menuitem Reel: {}", stage, exc)
+
+    menu = _locate_create_post_menu(page)
+    for loc in (
+        menu.locator(
+            "xpath=.//*[@role='menuitem'][.//span[normalize-space()='Reel' or normalize-space()='Reels']]"
+        ),
+        menu.locator(
+            "xpath=.//*[@role='menuitem'][.//span[normalize-space()='Reel']][.//svg]"
+        ),
+        menu.get_by_role("menuitem", name=_REEL_MENU_LABEL_RE),
+        page.get_by_role("menuitem", name=_REEL_MENU_LABEL_RE),
+    ):
+        try:
+            if _click_visible_enabled_button(loc, timeout_ms=1100):
+                page.wait_for_timeout(random.randint(700, 1300))
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _click_reel_in_create_menu(page: Page, *, timeout_ms: int = 14_000) -> bool:
-    """Chọn Reel/Reels/Thước phim/Video trong menu Create; True nếu composer Reel đã sẵn sàng."""
+    """Chọn Reel trong menu sau Create; True nếu composer Reel đã sẵn sàng."""
     if _reel_composer_already_visible(page):
         return True
 
@@ -4766,19 +5065,16 @@ def _click_reel_in_create_menu(page: Page, *, timeout_ms: int = 14_000) -> bool:
     except Exception:
         pass
 
-    labels = ("Reel", "Reels", "Thước phim", "Video", "Short video")
     while time.time() < deadline:
+        if _click_reel_menuitem_strict(page):
+            if _reel_composer_already_visible(page):
+                return True
+
         menu = _locate_create_post_menu(page)
         for factory in (
             lambda m=menu: m.get_by_role("menuitem", name=_REEL_MENU_NAME_RE),
             lambda m=menu: m.get_by_role("option", name=_REEL_MENU_NAME_RE),
-            lambda m=menu: m.get_by_role("link", name=_REEL_MENU_NAME_RE),
-            lambda m=menu: m.get_by_role("button", name=_REEL_MENU_NAME_RE),
             lambda: page.get_by_role("menuitem", name=_REEL_MENU_NAME_RE),
-            lambda: page.get_by_role("option", name=_REEL_MENU_NAME_RE),
-            lambda: page.locator(
-                "[aria-label*='Reel'], [aria-label*='reel'], [aria-label*='Thước phim'], [aria-label*='thước phim']"
-            ),
         ):
             try:
                 if _click_visible_enabled_button(factory(), timeout_ms=1100):
@@ -4788,11 +5084,11 @@ def _click_reel_in_create_menu(page: Page, *, timeout_ms: int = 14_000) -> bool:
             except Exception:
                 continue
 
-        for label in labels:
+        for label in ("Reel", "Reels", "Thước phim", "Video"):
             try:
                 item = menu.locator(
                     f"xpath=.//*[normalize-space()='{label}']/ancestor::*"
-                    f"[@role='menuitem' or @role='option' or @role='button' or @role='link'][1]"
+                    f"[@role='menuitem' or @role='option'][1]"
                 )
                 if _click_visible_enabled_button(item, timeout_ms=1100):
                     page.wait_for_timeout(random.randint(700, 1400))
@@ -4801,18 +5097,70 @@ def _click_reel_in_create_menu(page: Page, *, timeout_ms: int = 14_000) -> bool:
             except Exception:
                 continue
 
-        try:
-            txt = page.get_by_text(_REEL_MENU_LABEL_RE)
-            if _click_visible_enabled_button(txt, timeout_ms=900):
-                page.wait_for_timeout(random.randint(700, 1400))
-                if _reel_composer_already_visible(page):
-                    return True
-        except Exception:
-            pass
-
         page.wait_for_timeout(320)
 
     return _reel_composer_already_visible(page)
+
+
+def _open_reel_composer_from_content_library(page: Page) -> str:
+    """
+    Mở wizard Reel từ Content Library: Create (sidebar hoặc main) → menuitem Reel.
+
+    Returns:
+        ``sidebar`` | ``main`` | ``direct`` | ``already`` — cách đã mở thành công.
+    """
+    stage = _reel_strict_prefix("Wizard")
+    if _reel_composer_already_visible(page):
+        logger.info("{} Reel composer đã mở — bỏ qua Create.", stage)
+        return "already"
+
+    create_kind = _click_dashboard_create_entry(page, prefer="auto")
+    if create_kind:
+        logger.info("{} Đã bấm Create ({}) — chờ menu Reel.", stage, create_kind)
+    elif not _create_post_menu_visible(page, timeout_ms=800):
+        create_kind = _click_dashboard_create_entry(page, prefer="main")
+        if create_kind:
+            logger.info("{} Retry Create (main): {}.", stage, create_kind)
+        if not create_kind:
+            create_kind = _click_dashboard_create_entry(page, prefer="sidebar")
+            if create_kind:
+                logger.info("{} Retry Create (sidebar): {}.", stage, create_kind)
+
+    if _reel_composer_already_visible(page):
+        return create_kind or "main"
+
+    if _click_reel_in_create_menu(page, timeout_ms=14_000):
+        return create_kind or "main"
+
+    def _try_alternate_create() -> str:
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(350)
+        except Exception:
+            pass
+        return ""
+
+    if create_kind == "sidebar":
+        _try_alternate_create()
+        alt = _click_dashboard_create_entry(page, prefer="main")
+        if alt and _click_reel_in_create_menu(page, timeout_ms=10_000):
+            return alt
+    elif create_kind == "main":
+        _try_alternate_create()
+        alt = _click_dashboard_create_entry(page, prefer="sidebar")
+        if alt and _click_reel_in_create_menu(page, timeout_ms=10_000):
+            return alt
+    else:
+        for prefer in ("sidebar", "main"):
+            _try_alternate_create()
+            alt = _click_dashboard_create_entry(page, prefer=prefer)
+            if alt and _click_reel_in_create_menu(page, timeout_ms=10_000):
+                return alt
+
+    if _open_reel_composer_direct(page):
+        return "direct"
+
+    return ""
 
 
 def _open_reel_composer_direct(page: Page) -> bool:
@@ -6371,44 +6719,18 @@ def post_reel_via_page_dashboard(
         _failure_screenshot(page, "reel_dashboard_not_reachable")
         raise RuntimeError("Không vào được Professional Dashboard Content Library (có thể chưa switch đúng quyền Page).")
 
-    _step("CLICK_CREATE", "Tìm và bấm Create / Create a post.")
-    create_pat = re.compile(r"Create|Tạo|Create a post|Tạo bài viết", re.I)
-    create_btns = page.get_by_role("button", name=create_pat)
-    clicked_create = _click_visible_enabled_button(create_btns, timeout_ms=1800)
-    if not clicked_create:
-        create_menu = page.get_by_role("menuitem", name=create_pat)
-        clicked_create = _click_visible_enabled_button(create_menu, timeout_ms=1400)
-    if not clicked_create:
-        create_link = page.get_by_role("link", name=create_pat)
-        clicked_create = _click_visible_enabled_button(create_link, timeout_ms=1200)
-    if not clicked_create:
-        create_aria = page.locator(
-            "[role='button'][aria-label*='Create'], [role='button'][aria-label*='Tạo bài']"
-        )
-        clicked_create = _click_visible_enabled_button(create_aria, timeout_ms=1200)
-    if not clicked_create:
-        create_xpath = page.locator(
-            "xpath=(//div[@role='button' or @role='none']"
-            "//span[normalize-space()='Create' or normalize-space()='Tạo' or contains(., 'Create a post')])[last()]"
-        )
-        clicked_create = _click_visible_enabled_button(create_xpath, timeout_ms=1200)
-    if not clicked_create:
+    _step("CLICK_CREATE", "Bấm Create a post (sidebar) hoặc + Create (vùng bài đăng).")
+    open_via = _open_reel_composer_from_content_library(page)
+    if not open_via:
         _failure_screenshot(page, "reel_create_not_found")
-        raise PlaywrightTimeoutError("Không thấy nút Create/Create a post trong Content Library.")
-    page.wait_for_timeout(1200)
+        raise PlaywrightTimeoutError(
+            "Không mở được Reel từ Content Library (Create a post / + Create → Reel). "
+            "Kiểm tra quyền Page và ngôn ngữ UI (English/Việt)."
+        )
+    logger.info("{} Mở Reel composer qua: {}.", stage, open_via)
     _step_pause(900, 1900, label="sau CLICK_CREATE")
 
-    _step("SELECT_REEL", "Chọn mục Reel trong menu tạo bài.")
-    if _reel_composer_already_visible(page):
-        logger.info("{} Create đã mở thẳng Reel composer — bỏ qua menu.", stage)
-    elif not _click_reel_in_create_menu(page, timeout_ms=14_000):
-        if not _open_reel_composer_direct(page):
-            _failure_screenshot(page, "reel_menu_item_not_clickable")
-            raise PlaywrightTimeoutError(
-                "Không chọn được mục Reel trong menu Create. "
-                "Xem ảnh logs/screenshots; thử đổi ngôn ngữ Facebook sang English hoặc kiểm tra quyền Page."
-            )
-
+    _step("SELECT_REEL", "Đã chọn Reel trong menu (hoặc composer mở sẵn).")
     _step_pause(1400, 2600, label="sau SELECT_REEL")
     _step("WAIT_REEL_POPUP", "Chờ popup Reel xuất hiện.")
     dialog = page.locator("[role='dialog']").last

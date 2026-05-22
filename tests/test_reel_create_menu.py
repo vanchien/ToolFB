@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from src.automation.facebook_actions import (
+    _CREATE_MAIN_BUTTON_RE,
+    _CREATE_SIDEBAR_POST_RE,
     _REEL_LEXICAL_TEXTBOX_SELECTORS,
     _REEL_NEXT_STRICT_XPATHS,
     _REEL_POST_CSS_SELECTORS,
     _REEL_POST_STRICT_XPATHS,
     _REEL_MENU_LABEL_RE,
     _REEL_MENU_NAME_RE,
+    _REEL_MENUITEM_CLICK_JS,
     _REEL_UPLOAD_READY_RE,
     _build_reel_text_payload,
     _reel_caption_screen_markers_visible,
@@ -30,6 +33,19 @@ def test_reel_menu_label_regex_matches_common_labels() -> None:
 def test_reel_menu_name_regex_partial() -> None:
     assert _REEL_MENU_NAME_RE.search("Reel")
     assert _REEL_MENU_NAME_RE.search("Thước phim")
+
+
+def test_create_sidebar_vs_main_regex_do_not_overlap() -> None:
+    assert _CREATE_SIDEBAR_POST_RE.match("Create a post")
+    assert _CREATE_MAIN_BUTTON_RE.match("Create")
+    assert _CREATE_MAIN_BUTTON_RE.match("+ Create")
+    assert not _CREATE_MAIN_BUTTON_RE.match("Create a post")
+
+
+def test_reel_menuitem_js_targets_role_menuitem() -> None:
+    assert "role=\"menuitem\"" in _REEL_MENUITEM_CLICK_JS
+    assert "data-visualcompletion" in _REEL_MENUITEM_CLICK_JS
+    assert "Reel" in _REEL_MENUITEM_CLICK_JS
 
 
 def test_reel_upload_ready_markers() -> None:
