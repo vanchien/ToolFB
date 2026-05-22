@@ -736,6 +736,18 @@ class BrowserFactory:
             ua or "(default browser UA)",
         )
 
+        try:
+            from src.utils.playwright_browser_lock import assert_browsers_ready_for_launch
+
+            assert_browsers_ready_for_launch(
+                project_root=_project_root(),
+                browser_key=browser_key,
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("assert_browsers_ready_for_launch: {}", exc)
+
         exe = str(acc.get("browser_exe_path", "")).strip()
         has_exe = False
         if exe:
@@ -760,6 +772,15 @@ class BrowserFactory:
             context = browser_type.launch_persistent_context(**launch_kwargs)
         except Exception as exc:
             msg = str(exc).lower()
+            if "executable doesn't exist" in msg or "executable does not exist" in msg:
+                from src.utils.playwright_browser_lock import browser_executable_missing_message
+
+                raise RuntimeError(
+                    browser_executable_missing_message(
+                        browser_key=browser_key,
+                        project_root=_project_root(),
+                    )
+                ) from exc
             # Firefox thỉnh thoảng launch xong rồi thoát ngay (exitCode=0) do lock/profile state.
             if browser_key == "firefox" and "process did exit: exitcode=0" in msg:
                 logger.warning(

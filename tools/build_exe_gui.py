@@ -34,10 +34,16 @@ def _bundle_playwright_browsers(*, project_root: Path, dist_dir: Path) -> None:
     if skip in {"1", "true", "yes", "on"}:
         print("TOOLFB_SKIP_BROWSER_BUNDLE — bỏ qua playwright install + copy trình duyệt.", file=sys.stderr)
         return
+    # Phiên bản trình duyệt khóa theo gói playwright Python (không playwright install --force trên máy khách).
     subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium", "firefox", "webkit"],
         cwd=str(project_root),
         check=True,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install-deps"],
+        cwd=str(project_root),
+        check=False,
     )
     src = _default_playwright_browser_cache()
     if not src.is_dir() or not any(src.iterdir()):

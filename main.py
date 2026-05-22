@@ -40,14 +40,15 @@ def _configure_frozen_runtime() -> None:
     """
     if not getattr(sys, "frozen", False):
         return
+    from src.utils.playwright_browser_lock import bundled_browsers_dir_near_exe
+
     exe_dir = Path(sys.executable).resolve().parent
-    for rel in ("_internal/ms-playwright", "ms-playwright"):
-        p = exe_dir / rel
-        if p.is_dir() and any(p.iterdir()):
-            os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(p.resolve()))
-            break
-    os.environ.setdefault("FB_PLAYWRIGHT_CHROMIUM_CHANNEL", "bundled")
-    os.environ.setdefault("TOOLFB_ENFORCE_BUNDLED_BROWSER", "1")
+    os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+    bundled = bundled_browsers_dir_near_exe(exe_dir)
+    if bundled is not None:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
+    os.environ["FB_PLAYWRIGHT_CHROMIUM_CHANNEL"] = "bundled"
+    os.environ["TOOLFB_ENFORCE_BUNDLED_BROWSER"] = "1"
 
 
 _configure_frozen_runtime()

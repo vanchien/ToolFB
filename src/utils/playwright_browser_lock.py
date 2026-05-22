@@ -92,25 +92,67 @@ def load_browser_manifest(project_root: Path) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
-def resolve_playwright_browsers_path(project_root: Path | None = None) -> Path | None:
-    """Đường dẫn thư mục trình duyệt đang dùng (env hoặc bundle cạnh EXE)."""
+def bundled_browsers_dir_near_exe(exe_dir: Path | None = None) -> Path | None:
+    """Thư mục ``ms-playwright`` cạnh EXE (không phụ thuộc máy người dùng / cache hệ thống)."""
+    base = Path(exe_dir) if exe_dir else Path(sys.executable).resolve().parent
+    for rel in ("_internal/ms-playwright", "ms-playwright"):
+        cand = (base / rel).resolve()
+        if cand.is_dir() and any(cand.iterdir()):
+            return cand
+    return None
+
+
+def _sanitize_playwright_browsers_path_env(*, app_root: Path) -> None:
+    """
+    Bỏ ``PLAYWRIGHT_BROWSERS_PATH`` nếu trỏ cache máy khác / đường dẫn không tồn tại.
+
+    Tránh lỗi «Executable doesn't exist» khi env còn từ máy dev hoặc ``playwright install`` cũ.
+    """
     raw = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
-    if raw:
-        p = Path(raw).expanduser()
-        if p.is_dir():
-            return p.resolve()
+    if not raw:
+        return
+    p = Path(raw).expanduser()
+    if not p.is_dir():
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        logger.warning(
+            "Đã xóa PLAYWRIGHT_BROWSERS_PATH (không tồn tại): {} — dùng trình duyệt đi kèm app.",
+            raw,
+        )
+        return
+    if getattr(sys, "frozen", False) and not _is_under_app_dir(p, app_root):
+        bundled = bundled_browsers_dir_near_exe(app_root)
+        if bundled is not None:
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+            logger.warning(
+                "Đã xóa PLAYWRIGHT_BROWSERS_PATH trỏ ngoài thư mục cài ({}) — khóa bundle: {}.",
+                p,
+                bundled,
+            )
+
+
+def resolve_playwright_browsers_path(project_root: Path | None = None) -> Path | None:
+    """Đường dẫn thư mục trình duyệt (ưu tiên bundle cạnh EXE, không dùng cache máy lạ)."""
     root = Path(project_root) if project_root else None
     if root is None:
         from src.utils.paths import project_root as _pr
 
         root = _pr()
+    _sanitize_playwright_browsers_path_env(app_root=root)
     if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        for rel in ("_internal/ms-playwright", "ms-playwright"):
-            cand = (exe_dir / rel).resolve()
-            if cand.is_dir() and any(cand.iterdir()):
-                return cand
-    return None
+        bundled = bundled_browsers_dir_near_exe(root)
+        if bundled is not None:
+            return bundled
+    raw = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            if getattr(sys, "frozen", False) and _is_under_app_dir(p, root):
+                return p.resolve()
+            if not getattr(sys, "frozen", False):
+                return p.resolve()
+    if getattr(sys, "frozen", False):
+        return bundled_browsers_dir_near_exe(root)
+    return bundled_browsers_dir_near_exe(root) if (root / "_internal" / "ms-playwright").is_dir() else None
 
 
 def _is_under_app_dir(path: Path, app_root: Path) -> bool:
@@ -175,6 +217,67 @@ def validate_browser_bundle(
     return errors
 
 
+def browser_executable_missing_message(
+    *,
+    browser_key: str,
+    project_root: Path | None = None,
+) -> str:
+    """Thông báo lỗi tiếng Việt khi thiếu firefox/chromium trong bundle."""
+    from src.utils.paths import project_root as _pr
+
+    proot = project_root or _pr()
+    bp = resolve_playwright_browsers_path(proot)
+    mf = load_browser_manifest(proot)
+    exp = ""
+    if mf and isinstance(mf.get("browsers"), dict):
+        exp = str(mf["browsers"].get(browser_key) or "").strip()
+    lines = [
+        f"Thiếu trình duyệt {browser_key} trong bản cài ToolFB.",
+        f"Thư mục cài: {proot}",
+    ]
+    if bp:
+        lines.append(f"Đã tìm: {bp}")
+    else:
+        lines.append("Không có _internal/ms-playwright cạnh ToolFB_GUI.exe.")
+    if exp:
+        lines.append(f"Cần gói: {exp} (khóa theo manifest — không tự cập nhật).")
+    lines.extend(
+        [
+            "→ Tải bản release ĐẦY ĐỦ từ GitHub (zip có kèm trình duyệt, ~hàng trăm MB).",
+            "→ Giải nén cả thư mục exe_gui, không chỉ copy file .exe.",
+            "→ Không chạy «playwright install» trên máy khách (sẽ lệch phiên bản).",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def assert_browsers_ready_for_launch(*, project_root: Path, browser_key: str) -> None:
+    """Ném ``RuntimeError`` nếu bundle thiếu hoặc lệch manifest trước khi mở browser."""
+    ok, msgs = enforce_bundled_browser_policy(project_root=project_root)
+    if not ok:
+        raise RuntimeError("\n".join(msgs) or browser_executable_missing_message(browser_key=browser_key))
+    bp = resolve_playwright_browsers_path(project_root)
+    mf = load_browser_manifest(project_root)
+    if not bp or not mf:
+        if getattr(sys, "frozen", False):
+            raise RuntimeError(browser_executable_missing_message(browser_key=browser_key))
+        return
+    folder = str((mf.get("browsers") or {}).get(browser_key) or "").strip()
+    if not folder:
+        return
+    exe_name = "firefox.exe" if browser_key == "firefox" else "chrome.exe"
+    if browser_key == "chromium":
+        cand = bp / folder / "chrome-win64" / exe_name
+        if not cand.is_file():
+            cand = bp / folder / "chrome-win" / exe_name
+    elif browser_key == "firefox":
+        cand = bp / folder / "firefox" / exe_name
+    else:
+        return
+    if not cand.is_file():
+        raise RuntimeError(browser_executable_missing_message(browser_key=browser_key))
+
+
 def enforce_bundled_browser_policy(*, project_root: Path) -> tuple[bool, list[str]]:
     """
     Ép dùng Chromium bundle (không Chrome/Edge tự cập nhật) và kiểm tra khớp manifest.
@@ -184,6 +287,7 @@ def enforce_bundled_browser_policy(*, project_root: Path) -> tuple[bool, list[st
     """
     messages: list[str] = []
     frozen = getattr(sys, "frozen", False)
+    _sanitize_playwright_browsers_path_env(app_root=project_root)
     bp = resolve_playwright_browsers_path(project_root)
 
     if frozen and bp is None:

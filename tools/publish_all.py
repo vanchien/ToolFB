@@ -83,12 +83,29 @@ def main() -> int:
     parser.add_argument(
         "--skip-browser-bundle",
         action="store_true",
-        help="Dat TOOLFB_SKIP_BROWSER_BUNDLE: build nhe, khong dong goi Chromium/FF/WebKit vao zip.",
+        help="CHỈ dev nội bộ: build nhẹ không kèm trình duyệt (KHÔNG phát hành máy khách).",
+    )
+    parser.add_argument(
+        "--allow-incomplete-browser-bundle",
+        action="store_true",
+        help="Cho phép --skip-browser-bundle khi publish (mặc định: từ chối).",
     )
     args = parser.parse_args()
 
     if args.skip_browser_bundle:
+        if not args.allow_incomplete_browser_bundle:
+            print(
+                "ERROR: --skip-browser-bundle chỉ dùng dev. "
+                "Máy khách cần zip ĐẦY ĐỦ (_internal/ms-playwright). "
+                "Bỏ --skip-browser-bundle hoặc thêm --allow-incomplete-browser-bundle (không khuyến nghị).",
+                file=sys.stderr,
+            )
+            return 1
         os.environ["TOOLFB_SKIP_BROWSER_BUNDLE"] = "1"
+        print(
+            "WARN: Release thiếu trình duyệt — máy cập nhật sẽ lỗi Playwright.",
+            file=sys.stderr,
+        )
 
     root = _project_root()
     ensure_gh_authenticated(root)

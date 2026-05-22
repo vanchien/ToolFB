@@ -49,6 +49,43 @@ def _prune_veo3studio_node_caches(veo_root: Path) -> int:
     return removed
 
 
+def _verify_release_browser_bundle(exe_dir: Path) -> None:
+    """Release phân phối máy khách: bắt buộc có ms-playwright khớp manifest (không skip bundle)."""
+    skip = os.environ.get("TOOLFB_SKIP_BROWSER_BUNDLE", "").strip().lower()
+    if skip in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "TOOLFB_SKIP_BROWSER_BUNDLE=1 — bản zip KHÔNG dùng cho máy khách. "
+            "Bỏ biến này rồi build lại để đóng gói Chromium/Firefox/WebKit."
+        )
+    bp = exe_dir / "_internal" / "ms-playwright"
+    if not bp.is_dir() or not any(bp.iterdir()):
+        raise RuntimeError(
+            f"Thiếu {bp} sau build — máy khách sẽ lỗi «Executable doesn't exist». "
+            "Chạy lại build (không đặt TOOLFB_SKIP_BROWSER_BUNDLE)."
+        )
+    root = _project_root()
+    mf_path = root / "release" / "browser_bundle_manifest.json"
+    expected: dict[str, str] = {}
+    if mf_path.is_file():
+        try:
+            raw = json.loads(mf_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and isinstance(raw.get("browsers"), dict):
+                expected = {str(k): str(v) for k, v in raw["browsers"].items()}
+        except Exception:
+            pass
+    for key, folder in (("firefox", expected.get("firefox", "firefox-1509")), ("chromium", expected.get("chromium", "chromium-1208"))):
+        if not folder:
+            continue
+        if key == "firefox":
+            exe = bp / folder / "firefox" / "firefox.exe"
+        else:
+            exe = bp / folder / "chrome-win64" / "chrome.exe"
+            if not exe.is_file():
+                exe = bp / folder / "chrome-win" / "chrome.exe"
+        if not exe.is_file():
+            raise RuntimeError(f"Thiếu {key} trong bundle: {exe}")
+
+
 def _read_local_version(root: Path) -> str:
     vf = root / "version.json"
     if vf.is_file():
@@ -114,6 +151,7 @@ def build_release_bundle() -> tuple[Path, Path, Path]:
 
     # 2) Build GUI exe package
     _run([sys.executable, str(root / "tools" / "build_exe_gui.py")], cwd=root)
+    _verify_release_browser_bundle(root / "dist" / "ToolFB_GUI")
 
     # 3) Compose unified bundle
     bundle_dir = dist / "ToolFB_release_bundle"

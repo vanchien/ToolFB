@@ -7,6 +7,7 @@ from pathlib import Path
 
 from src.utils.playwright_browser_lock import (
     build_browser_manifest,
+    bundled_browsers_dir_near_exe,
     scan_browser_folders,
     validate_browser_bundle,
     write_browser_manifest_file,
@@ -44,3 +45,11 @@ def test_scan_and_validate_browser_folders(tmp_path: Path) -> None:
         browsers_path=root,
     )
     assert any("chromium" in e.lower() for e in errs2)
+
+
+def test_bundled_browsers_dir_near_exe(tmp_path: Path) -> None:
+    internal = tmp_path / "_internal" / "ms-playwright" / "firefox-1509"
+    internal.mkdir(parents=True)
+    found = bundled_browsers_dir_near_exe(tmp_path)
+    assert found is not None
+    assert found.name == "ms-playwright"
