@@ -1,7 +1,7 @@
 {
-  "version": "1.0.72",
+  "version": "1.0.73",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "186d7239198f7c5b01cf1e0023dcd1e929f77faaf0cd227d192ff919f6481776",
-  "notes": "FIX trinh duyet: zip DAY DU kem _internal/ms-playwright (Firefox/Chromium/WebKit). Khong dung playwright install tren may khach. Khoa phien ban theo manifest - khong tu cap nhat.",
-  "generated_at": "2026-05-22T10:18:40"
+  "sha256": "2bc80e1a77c4c7ab1e5892b5b6eef295e20845afefc76b6dd8ecf1a7544e2463",
+  "notes": "Ban DAY DU v1.0.73: kem trinh duyet Playwright trong zip. Fix Create/Reel, Switch profiles, xac nhan Post+video. May khach: giai nen ca thu muc exe_gui, khong chay playwright install.",
+  "generated_at": "2026-05-22T12:13:27"
 }
