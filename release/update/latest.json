@@ -1,7 +1,7 @@
 {
-  "version": "1.0.71",
+  "version": "1.0.72",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "8470ca303c4912797319ee4c6bbf287cceaef1f89ce98b9197581cf35051fa9c",
-  "notes": "Reel dashboard: bam Post (dong hashtag, footer JS), xac nhan da bam Post + video tren Page Published, cho 5s truoc bao thanh cong. Switch Page popup (v1.0.70).",
-  "generated_at": "2026-05-21T20:34:12"
+  "sha256": "186d7239198f7c5b01cf1e0023dcd1e929f77faaf0cd227d192ff919f6481776",
+  "notes": "FIX trinh duyet: zip DAY DU kem _internal/ms-playwright (Firefox/Chromium/WebKit). Khong dung playwright install tren may khach. Khoa phien ban theo manifest - khong tu cap nhat.",
+  "generated_at": "2026-05-22T10:18:40"
 }
