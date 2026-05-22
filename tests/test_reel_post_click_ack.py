@@ -76,6 +76,10 @@ def test_click_reel_post_fails_without_ui_ack() -> None:
             "src.automation.facebook_actions._dispatch_reel_post_click",
             return_value=True,
         ),
+        patch(
+            "src.automation.facebook_actions._reel_post_likely_submitted",
+            return_value=False,
+        ),
         patch("src.automation.facebook_actions._env_int", return_value=500),
         patch(
             "src.automation.facebook_actions._reel_inter_click_wait_ms",
@@ -83,6 +87,50 @@ def test_click_reel_post_fails_without_ui_ack() -> None:
         ),
     ):
         assert not _click_reel_post_best_effort(page)
+
+
+def test_click_reel_post_succeeds_on_likely_submitted_grace() -> None:
+    page = MagicMock()
+    dialog = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._reel_post_submit_strong_signal",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_post_likely_submitted",
+            side_effect=[False, False, True],
+        ),
+        patch(
+            "src.automation.facebook_actions._dismiss_reel_hashtag_suggestion",
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_strict_post_button_usable",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_settings_screen_visible",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._active_reel_dialog",
+            return_value=dialog,
+        ),
+        patch(
+            "src.automation.facebook_actions._dispatch_reel_post_click",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_post_submit_acknowledged",
+            return_value=False,
+        ),
+        patch("src.automation.facebook_actions._env_int", return_value=500),
+        patch(
+            "src.automation.facebook_actions._reel_inter_click_wait_ms",
+            return_value=50,
+        ),
+    ):
+        assert _click_reel_post_best_effort(page)
 
 
 def test_click_reel_post_succeeds_with_ui_ack() -> None:

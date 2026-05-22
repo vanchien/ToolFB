@@ -6568,6 +6568,26 @@ def _click_meta_reel_next_best_effort(page: Page) -> bool:
     return False
 
 
+def _reel_wizard_upload_step_visible(page: Page, *, timeout_ms: int = 320) -> bool:
+    """Màn «Create reel» / Add video — chưa tới Reel settings (không coi là đã đăng)."""
+    try:
+        dlg = page.locator("[role='dialog']").last
+        if dlg.count() <= 0 or not dlg.is_visible(timeout=timeout_ms):
+            return False
+        if _reel_scope_upload_ready(dlg):
+            return True
+    except Exception:
+        pass
+    for pat in (r"^\s*Create reel\s*$", r"Add video or drag and drop", r"Thêm video"):
+        try:
+            if page.get_by_text(re.compile(pat, re.I)).first.is_visible(timeout=timeout_ms):
+                if _reel_scope_upload_ready(page.locator("[role='dialog']").last):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def _reel_post_submit_strong_signal(page: Page, *, timeout_ms: int = 280) -> bool:
     """Tín hiệu chắc chắn đã gửi Post — không suy ra từ «không thấy nút Post»."""
     try:
@@ -6580,6 +6600,10 @@ def _reel_post_submit_strong_signal(page: Page, *, timeout_ms: int = 280) -> boo
         r"finishes processing",
         r"Publishing|Đang đăng|Your reel is being",
         r"Posting your reel|Đang đăng thước phim",
+        r"Your reel is on its way",
+        r"Reel published|reel was published",
+        r"more posts you want to publish",
+        r"bài viết khác.*muốn đăng",
     ):
         try:
             if page.get_by_text(re.compile(pat, re.I)).first.is_visible(timeout=timeout_ms):
@@ -6597,29 +6621,62 @@ def _reel_post_submit_strong_signal(page: Page, *, timeout_ms: int = 280) -> boo
     return False
 
 
+def _reel_post_likely_submitted(page: Page, *, timeout_ms: int = 600) -> bool:
+    """
+    FB đã nhận Post nhưng ack nhanh có thể bỏ lỡ (về Content Library, dialog đóng chậm).
+    Không True khi vẫn ở màn upload «Create reel» hoặc Reel settings + nút Post.
+    """
+    if _reel_post_submit_strong_signal(page, timeout_ms=timeout_ms):
+        return True
+    if _reel_wizard_upload_step_visible(page, timeout_ms=220):
+        return False
+    try:
+        if dismiss_meta_more_posts_prompt_best_effort(
+            page, probe_timeout_ms=min(2_500, max(400, timeout_ms))
+        ):
+            return True
+    except Exception:
+        pass
+    try:
+        if dismiss_meta_video_post_processing_modal_best_effort(
+            page,
+            timeout_ms=min(8_000, max(2_000, timeout_ms)),
+            give_up_if_never_seen_ms=600,
+        ):
+            return True
+    except Exception:
+        pass
+    settings_open = _reel_settings_screen_visible(page, timeout_ms=220)
+    post_footer = _reel_footer_post_visible(page, timeout_ms=220)
+    if settings_open and post_footer:
+        return False
+    if not settings_open and not post_footer:
+        return True
+    if settings_open and not post_footer:
+        return True
+    return False
+
+
 def _reel_post_submit_acknowledged(page: Page, *, timeout_ms: int = 8_000) -> bool:
     """Sau khi gọi click Post: processing / wizard đóng và không còn Post footer."""
-    dialog = _active_reel_dialog(page)
     deadline = time.time() + max(1.0, timeout_ms / 1000.0)
     while time.time() < deadline:
         if _reel_post_submit_strong_signal(page, timeout_ms=220):
             return True
-        settings_open = _reel_settings_screen_visible(page, timeout_ms=200)
-        post_footer = _reel_footer_post_visible(page, dialog=dialog, timeout_ms=200)
-        if settings_open and post_footer:
-            page.wait_for_timeout(280)
-            continue
-        if not settings_open and not post_footer:
+        if _reel_post_likely_submitted(page, timeout_ms=400):
             return True
         page.wait_for_timeout(280)
     return False
 
 
 def _click_reel_post_best_effort(page: Page) -> bool:
-    """Bấm Post/Publish trong popup Reel. True chỉ khi UI xác nhận đã submit."""
+    """Bấm Post/Publish trong popup Reel. True khi UI xác nhận hoặc có dấu hiệu đã gửi."""
     stage = _reel_strict_prefix("Wizard")
     if _reel_post_submit_strong_signal(page, timeout_ms=350):
         logger.info("{} Post đã được xác nhận trước (đang xử lý / Published).", stage)
+        return True
+    if _reel_post_likely_submitted(page, timeout_ms=400):
+        logger.info("{} Post có vẻ đã gửi trước khi bấm (wizard đã đóng).", stage)
         return True
     _dismiss_reel_hashtag_suggestion(page)
     wait_deadline = time.time() + 24.0
@@ -6634,13 +6691,16 @@ def _click_reel_post_best_effort(page: Page) -> bool:
         dialog.locator("xpath=.//*[normalize-space()='Save']").last.scroll_into_view_if_needed(timeout=2_000)
     except Exception:
         pass
-    ack_ms = max(4_000, _env_int("FB_REEL_POST_ACK_MS", 6_000))
+    ack_ms = max(6_000, _env_int("FB_REEL_POST_ACK_MS", 10_000))
+    grace_ms = max(8_000, _env_int("FB_REEL_POST_ACK_GRACE_MS", 14_000))
     settle_ms = max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 700))
+    post_dispatched = False
     for attempt in (1, 2, 3):
         if not _dispatch_reel_post_click(page, dialog, attempt=attempt):
             logger.warning("{} Không gửi được click Post (attempt {}).", stage, attempt)
             page.wait_for_timeout(_reel_inter_click_wait_ms())
             continue
+        post_dispatched = True
         page.wait_for_timeout(settle_ms)
         if _reel_post_submit_acknowledged(page, timeout_ms=ack_ms):
             logger.info(
@@ -6650,14 +6710,25 @@ def _click_reel_post_best_effort(page: Page) -> bool:
             )
             return True
         logger.warning(
-            "{} Đã gửi click Post nhưng chưa thấy phản hồi UI (attempt {}).",
+            "{} Đã gửi click Post nhưng chưa thấy phản hồi UI ngay (attempt {}).",
             stage,
             attempt,
         )
         page.wait_for_timeout(_reel_inter_click_wait_ms())
+    if post_dispatched:
+        if _reel_post_submit_acknowledged(page, timeout_ms=grace_ms):
+            logger.info("{} UI xác nhận Post sau grace period.", stage)
+            return True
+        if _reel_post_likely_submitted(page, timeout_ms=grace_ms):
+            logger.warning(
+                "{} Ack chậm nhưng UI giống đã đăng Reel (grace) — coi thành công.",
+                stage,
+            )
+            return True
     logger.error(
-        "{} Post không được Facebook xác nhận sau 3 lần thử.",
+        "{} Post không được xác nhận sau 3 lần thử (và grace {}).",
         stage,
+        grace_ms,
     )
     return False
 
@@ -6722,13 +6793,21 @@ def complete_reel_wizard_fill_next_and_post(
                 _fire("FILL_CAPTION", "Có Post — nhập caption trước khi đăng.")
                 if _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags):
                     filled = True
-            _fire("CLICK_POST", "Reel settings — bấm Post.")
-            if not _click_reel_post_best_effort(page):
-                logger.error("{} Bấm Post thất bại.", stage)
-                return False
-            post_clicked = True
-            logger.info("{} Hoàn tất (Post): Next×{} filled={}.", stage, next_clicks, filled)
-            return True
+            if _click_reel_post_best_effort(page):
+                post_clicked = True
+                _fire("CLICK_POST", "Reel settings — đã bấm Post.")
+                logger.info("{} Hoàn tất (Post): Next×{} filled={}.", stage, next_clicks, filled)
+                return True
+            if _reel_post_likely_submitted(page, timeout_ms=5_000):
+                post_clicked = True
+                _fire("CLICK_POST", "Reel settings — Post có thể đã gửi (ack chậm).")
+                logger.warning(
+                    "{} Post có dấu hiệu đã gửi dù ack click chưa kịp — coi thành công.",
+                    stage,
+                )
+                return True
+            logger.error("{} Bấm Post thất bại.", stage)
+            return False
         if action == "share":
             if payload and not filled and _reel_caption_input_usable(page, timeout_ms=500):
                 _fire("FILL_CAPTION", "Có Share — nhập caption trước khi đăng.")
@@ -6807,6 +6886,17 @@ def complete_reel_wizard_fill_next_and_post(
         filled = _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags)
 
     if _try_submit():
+        return next_clicks, filled, post_clicked
+
+    if _reel_post_likely_submitted(page, timeout_ms=4_000) or _reel_post_submit_strong_signal(
+        page, timeout_ms=2_000
+    ):
+        post_clicked = True
+        logger.warning(
+            "{} Wizard timeout nhưng có dấu hiệu Reel đã đăng — coi thành công (Next×{}).",
+            stage,
+            next_clicks,
+        )
         return next_clicks, filled, post_clicked
 
     _failure_screenshot(page, "reel_wizard_fill_next_post_timeout")
@@ -7574,13 +7664,25 @@ def verify_reel_dashboard_post_submitted(
     logger.info("{} Chờ {} ms sau Post trước khi xác nhận đăng.", stage, delay_ms)
     page.wait_for_timeout(delay_ms)
 
-    verify_post_submitted(
-        page,
-        text_snippet=text_snippet,
-        timeout_ms=timeout_ms,
-        require_submit_signal=True,
-        submit_clicked=True,
-    )
+    try:
+        verify_post_submitted(
+            page,
+            text_snippet=text_snippet,
+            timeout_ms=timeout_ms,
+            require_submit_signal=True,
+            submit_clicked=True,
+        )
+    except RuntimeError as exc:
+        if _reel_post_likely_submitted(page, timeout_ms=3_000) or _reel_post_submit_strong_signal(
+            page, timeout_ms=2_000
+        ):
+            logger.warning(
+                "{} verify_post_submitted chặt — nhưng UI giống đã đăng: {}",
+                stage,
+                exc,
+            )
+        else:
+            raise
 
     if _meta_published_posts_has_video_row(page, timeout_ms=5_000):
         logger.info("{} Đã thấy video/reel trên màn Published hiện tại.", stage)
@@ -7609,6 +7711,15 @@ def verify_reel_dashboard_post_submitted(
                     return
             except Exception:
                 pass
+
+    if _reel_post_likely_submitted(page, timeout_ms=2_500) or _reel_post_submit_strong_signal(
+        page, timeout_ms=1_500
+    ):
+        logger.warning(
+            "{} Không thấy video trên Published ngay — nhưng Post có vẻ đã gửi (processing/đóng wizard).",
+            stage,
+        )
+        return
 
     _failure_screenshot(page, "reel_verify_no_video_on_page")
     raise RuntimeError(
@@ -7678,9 +7789,14 @@ def verify_post_submitted(
         try:
             cur_step = _reel_active_step_label(page)
             if cur_step == "create" and _meta_reel_next_any_visible(page):
-                raise RuntimeError(
-                    "VERIFY_POST: Vẫn còn ở bước Create của Reel wizard, chưa qua submit cuối. need_manual_check"
-                )
+                if _reel_wizard_upload_step_visible(page, timeout_ms=400):
+                    if not (
+                        _reel_post_likely_submitted(page, timeout_ms=600)
+                        or _reel_post_submit_strong_signal(page, timeout_ms=400)
+                    ):
+                        raise RuntimeError(
+                            "VERIFY_POST: Vẫn còn ở bước Create/upload Reel, chưa qua submit cuối. need_manual_check"
+                        )
         except RuntimeError:
             raise
         except Exception:
