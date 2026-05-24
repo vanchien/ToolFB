@@ -1,7 +1,7 @@
 {
-  "version": "1.0.75",
+  "version": "1.0.76",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "583ae1286457a4e4f03d7b112f5a0acb5db2bf1929250a45069b201587b63dd6",
-  "notes": "v1.0.75: Sua check sau Post Reel - ack grace 14s, nhan da dang thanh cong (processing/Content Library), khong bao Sai khi FB da nhan Post. Zip day du kem Playwright.",
-  "generated_at": "2026-05-22T14:33:35"
+  "sha256": "5b18917c8eb5a114e12df24f3f680c00ed1863051bd376eeb386707714bcbbf2",
+  "notes": "Lich dang queue theo schedule_time: poll 10s, ready_queue, 1 browser/account, max 2 lien tiep/account, crash recovery, monitor realtime (data/runtime/schedule_queue_monitor.json). Tat cron Page/Account mac dinh (SCHEDULE_LEGACY_PAGE_CRON=1 de bat lai).",
+  "generated_at": "2026-05-24T13:12:20"
 }
