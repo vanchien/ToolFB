@@ -82,6 +82,7 @@ class SchedulePostsManager:
     POST_TYPES: tuple[str, ...] = ("text", "image", "video", "text_image", "text_video", "reel")
     STATUSES: tuple[str, ...] = (
         "pending",
+        "ready_queue",
         "processing",
         "running",
         "success",

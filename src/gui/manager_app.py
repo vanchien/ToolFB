@@ -3840,6 +3840,7 @@ class _ManagerWindow:
             values=(
                 "Tất cả trạng thái",
                 "pending",
+                "ready_queue",
                 "running",
                 "success",
                 "failed",
@@ -4190,12 +4191,15 @@ class _ManagerWindow:
         shown = len(self._filtered_jobs)
         sel = len(self._tree_jobs.selection())
         pending = sum(1 for j in self._all_jobs if str(j.get("status", "")).lower() == "pending")
+        ready = sum(1 for j in self._all_jobs if str(j.get("status", "")).lower() == "ready_queue")
+        running = sum(1 for j in self._all_jobs if str(j.get("status", "")).lower() == "running")
         failed = sum(1 for j in self._all_jobs if str(j.get("status", "")).lower() == "failed")
         success = sum(1 for j in self._all_jobs if str(j.get("status", "")).lower() == "success")
         self._lbl_jobs_stats.configure(
             text=(
                 f"Tổng: {total}  |  Đang hiển thị: {shown}  |  Đang chọn: {sel}  "
-                f"|  pending: {pending}  failed: {failed}  success: {success}"
+                f"|  pending: {pending}  ready: {ready}  running: {running}  "
+                f"failed: {failed}  success: {success}"
             )
         )
 

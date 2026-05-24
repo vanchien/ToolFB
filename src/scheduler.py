@@ -60,6 +60,16 @@ from src.utils.reel_thumbnail_choice import normalize_reel_thumbnail_choice
 from src.utils.schedule_job_content import compute_next_daily_scheduled_utc_iso, merge_queue_job_content_into_page_row
 from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
 from src.services.cross_platform_schedule_ctx import unified_chain_is_active
+from src.services.schedule_queue_dispatcher import (
+    compute_smart_delay_ms,
+    count_pending_due,
+    ensure_schedule_queue_recovery,
+    note_job_dispatched,
+    promote_due_pending_to_ready,
+    select_dispatch_batch,
+    sort_queue_jobs,
+    write_queue_monitor,
+)
 
 _schedule_posts_tick_lock = threading.Lock()
 _schedule_dispatch_lock = threading.Lock()
@@ -924,18 +934,20 @@ def _draft_id_for_queue_job(job: dict[str, Any]) -> str:
 
 def _parallel_same_account_enabled() -> bool:
     """Cho phép chạy nhiều job cùng account bằng profile runtime tách biệt."""
-    raw = os.environ.get("SCHEDULE_ALLOW_SAME_ACCOUNT_PARALLEL", "1").strip().lower()
+    raw = os.environ.get("SCHEDULE_ALLOW_SAME_ACCOUNT_PARALLEL", "0").strip().lower()
+    if _per_account_parallel_limit() <= 1:
+        return False
     return raw in {"1", "true", "yes", "on"}
 
 
 def _per_account_parallel_limit() -> int:
-    """Giới hạn số job chạy đồng thời cho mỗi account."""
-    raw = os.environ.get("SCHEDULE_PER_ACCOUNT_MAX_PARALLEL", "2").strip()
+    """Giới hạn số job đồng thời cho mỗi account (mặc định 1 browser/account)."""
+    raw = os.environ.get("SCHEDULE_PER_ACCOUNT_MAX_PARALLEL", "1").strip()
     try:
         n = int(raw)
     except ValueError:
-        n = 2
-    return max(1, min(8, n))
+        n = 1
+    return max(1, min(4, n))
 
 
 def _per_page_parallel_limit() -> int:
@@ -1033,83 +1045,84 @@ def _prepare_account_for_parallel_run(
 
 def tick_schedule_post_jobs() -> None:
     """
-    Quét ``schedule_posts.json``: job ``pending`` đến hạn → ``running`` → đăng (draft/AI).
+    Quét ``schedule_posts.json`` mỗi ``SCHEDULE_POSTS_POLL_SEC`` (mặc định 10s):
 
-    Chu kỳ gọi bởi APScheduler (``SCHEDULE_POSTS_POLL_SEC``). Dùng lock để tránh hai tick cùng chiếm một job.
+    1. Load jobs từ disk
+    2. ``pending`` + đến ``scheduled_at`` → ``ready_queue`` (job trễ không bỏ)
+    3. Sort ``ready_queue``: ``scheduled_at``, ``created_at``
+    4. Dispatch: 1 browser/account; account busy → chờ tick sau
     """
     global _queue_next_due_hint_utc, _queue_idle_probe_after_utc, _queue_hint_refresh_after_utc
-    jobs_to_dispatch: list[tuple[str, str, str, str | None, str, float]] = []
     accounts_mgr = AccountsDatabaseManager()
     now = datetime.now(timezone.utc)
     prefetch_sec = _prefetch_window_seconds()
-    hint = _queue_next_due_hint_utc
-    idle_probe = _queue_idle_probe_after_utc
-    hint_refresh = _queue_hint_refresh_after_utc
-    if idle_probe is not None and now < idle_probe:
-        return
-    # Nếu còn xa lịch tiếp theo thì bỏ qua tick này để giảm I/O/CPU.
-    if (
-        hint is not None
-        and now + timedelta(seconds=prefetch_sec) < hint
-        and hint_refresh is not None
-        and now < hint_refresh
-    ):
-        return
+    per_acc_limit = _per_account_parallel_limit()
+    jobs_to_dispatch: list[tuple[str, str, str, str | None, str, float]] = []
+    queued_waiting = 0
+    smart_ms = 0
+
     with _schedule_posts_tick_lock:
         try:
             sp = get_default_schedule_posts_manager()
-            jobs = sp.load_all()
+            ensure_schedule_queue_recovery(sp)
+            jobs = sp.reload_from_disk()
         except Exception as exc:  # noqa: BLE001
             logger.debug("schedule_posts tick: không đọc được: {}", exc)
             return
         next_due: datetime | None = None
-        account_planned: dict[str, int] = {}
-        page_planned: dict[str, int] = {}
-        per_acc_limit = _per_account_parallel_limit()
-        per_page_limit = _per_page_parallel_limit()
-        queued_due_count = 0
         for job in jobs:
-            if str(job.get("status", "")).strip().lower() != "pending":
+            st = str(job.get("status", "")).strip().lower()
+            if st not in {"pending", "ready_queue"}:
                 continue
             when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
             if next_due is None or when < next_due:
                 next_due = when
+            if st != "pending":
+                continue
             jid = str(job.get("id", "")).strip()
             if (
                 jid
                 and now < when <= now + timedelta(seconds=prefetch_sec)
                 and _queue_prefetched_until_iso_by_job.get(jid) != str(job.get("scheduled_at", ""))
             ):
-                # Prefetch trước giờ chạy: dựng draft/cache media để đến giờ chỉ cần mở browser và đăng.
                 try:
                     _draft_id_for_queue_job(dict(job))
                     _queue_prefetched_until_iso_by_job[jid] = str(job.get("scheduled_at", ""))
-                    logger.debug(
-                        "[Queue prefetch] job={} prefetch trước lịch {} ({}s).",
-                        jid,
-                        when.isoformat(),
-                        prefetch_sec,
-                    )
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("[Queue prefetch] job={} lỗi prefetch: {}", jid, exc)
-            if when > now:
-                continue
+                    logger.debug("[Queue prefetch] job={} lỗi: {}", jid, exc)
+
+        promote_due_pending_to_ready(sp, now=now)
+        jobs = sp.reload_from_disk()
+
+        ready_jobs = [
+            dict(j)
+            for j in jobs
+            if str(j.get("status", "")).strip().lower() == "ready_queue"
+        ]
+        running_jobs = [
+            dict(j)
+            for j in jobs
+            if str(j.get("status", "")).strip().lower() == "running"
+        ]
+        pending_due = count_pending_due(jobs, now=now)
+        sorted_ready = sort_queue_jobs(ready_jobs)  # type: ignore[arg-type]
+
+        batch = select_dispatch_batch(
+            sorted_ready,  # type: ignore[arg-type]
+            account_inflight=_account_inflight_count,
+            per_account_limit=per_acc_limit,
+        )
+
+        jobs_to_dispatch = []
+        queued_waiting = max(0, len(sorted_ready) - len(batch))
+        for job in batch:
+            jid = str(job.get("id", "")).strip()
             aid = str(job.get("account_id", "")).strip()
             pid = str(job.get("page_id", "")).strip()
             if not jid or not aid or not pid:
                 continue
-            inflight = _account_inflight_count(aid)
-            planned = account_planned.get(aid, 0)
-            if (inflight + planned) >= per_acc_limit:
-                queued_due_count += 1
-                continue
-            page_inflight = _page_inflight_count(pid)
-            page_plan = page_planned.get(pid, 0)
-            if (page_inflight + page_plan) >= per_page_limit:
-                queued_due_count += 1
-                continue
             fresh = sp.get_by_id(jid)
-            if not fresh or str(fresh.get("status", "")).strip().lower() != "pending":
+            if not fresh or str(fresh.get("status", "")).strip().lower() != "ready_queue":
                 continue
             try:
                 sp.update_job_fields(jid, status="running")
@@ -1118,33 +1131,44 @@ def tick_schedule_post_jobs() -> None:
                 continue
             did = _draft_id_for_queue_job(dict(job))
             engine = _resolve_engine_for_account(aid, accounts=accounts_mgr)
+            when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
             waited_seconds = max(0.0, (now - when).total_seconds())
             jobs_to_dispatch.append((jid, aid, pid, did or None, engine, waited_seconds))
-            account_planned[aid] = planned + 1
-            page_planned[pid] = page_plan + 1
+            note_job_dispatched(aid)
+
+        inflight_map = {aid: _account_inflight_count(aid) for aid in {str(j.get("account_id", "")) for j in jobs if j.get("account_id")}}
+        smart_ms = compute_smart_delay_ms(
+            ready_count=len(sorted_ready),
+            running_count=len(running_jobs) + len(jobs_to_dispatch),
+        )
+        write_queue_monitor(
+            ready_jobs=sorted_ready,  # type: ignore[arg-type]
+            running_jobs=running_jobs + [{"id": x[0], "account_id": x[1], "page_id": x[2]} for x in jobs_to_dispatch],  # type: ignore[arg-type]
+            pending_due=pending_due,
+            dispatched_ids=[x[0] for x in jobs_to_dispatch],
+            account_inflight=inflight_map,
+            smart_delay_ms=smart_ms,
+            extra={"queued_waiting_account": queued_waiting},
+        )
+
         _queue_next_due_hint_utc = next_due
         if next_due is None:
             _queue_idle_probe_after_utc = now + timedelta(seconds=_idle_probe_seconds())
         else:
             _queue_idle_probe_after_utc = None
         _queue_hint_refresh_after_utc = now + timedelta(seconds=_hint_refresh_seconds())
-    if queued_due_count > 0:
+
+    if queued_waiting > 0:
         logger.info(
-            "[Queue dispatcher] Có {} job đến hạn đang chờ slot (không bỏ qua). Sẽ tự đẩy tiếp khi có job hoàn tất.",
-            queued_due_count,
+            "[Queue dispatcher] {} job ready_queue chờ account rảnh (không bỏ qua).",
+            queued_waiting,
         )
     if not jobs_to_dispatch:
         return
-    # Ưu tiên engine đang có backlog thấp hơn để giảm nghẽn cục bộ.
-    jobs_to_dispatch.sort(
-        key=lambda item: _dispatch_priority_key(
-            item[4],
-            waited_seconds=item[5],
-        )
-    )
+
     pool = get_schedule_posts_dispatch_pool()
     logger.info(
-        "[Queue dispatcher] Dispatch {} job(s) đến hạn (song song, ưu tiên engine rảnh).",
+        "[Queue dispatcher] Dispatch {} job(s) từ ready_queue (sort schedule_time+created_at).",
         len(jobs_to_dispatch),
     )
     for jid, aid, pid, did, engine, waited_seconds in jobs_to_dispatch:
@@ -1157,6 +1181,8 @@ def tick_schedule_post_jobs() -> None:
             engine,
             waited_seconds,
         )
+        if smart_ms > 0 and len(jobs_to_dispatch) > 1:
+            time.sleep(min(smart_ms, 3000) / 1000.0)
         fut = pool.submit(
             run_scheduled_post_for_account,
             aid,
@@ -1180,16 +1206,18 @@ def _peek_facebook_due_pending() -> bool:
     try:
         sp = get_default_schedule_posts_manager()
         for job in sp.load_all():
-            if str(job.get("status", "")).strip().lower() != "pending":
+            st = str(job.get("status", "")).strip().lower()
+            if st == "ready_queue":
+                return True
+            if st != "pending":
                 continue
             when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
-            if when > now:
-                continue
-            jid = str(job.get("id", "")).strip()
-            aid = str(job.get("account_id", "")).strip()
-            pid = str(job.get("page_id", "")).strip()
-            if jid and aid and pid:
-                return True
+            if when <= now:
+                jid = str(job.get("id", "")).strip()
+                aid = str(job.get("account_id", "")).strip()
+                pid = str(job.get("page_id", "")).strip()
+                if jid and aid and pid:
+                    return True
     except Exception as exc:  # noqa: BLE001
         logger.debug("peek facebook due: {}", exc)
     return False
@@ -1251,18 +1279,21 @@ def _tick_merged_serial_facebook_tiktok() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("merged tick: không đọc schedule_posts: {}", exc)
                 return
+            promote_due_pending_to_ready(sp, now=now)
+            jobs = sp.reload_from_disk()
             next_due: datetime | None = None
-            account_planned: dict[str, int] = {}
             per_acc_limit = _per_account_parallel_limit()
             for job in jobs:
-                if str(job.get("status", "")).strip().lower() != "pending":
+                st = str(job.get("status", "")).strip().lower()
+                if st not in ("pending", "ready_queue"):
                     continue
                 when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
                 if next_due is None or when < next_due:
                     next_due = when
                 jid = str(job.get("id", "")).strip()
                 if (
-                    jid
+                    st == "pending"
+                    and jid
                     and now < when <= now + timedelta(seconds=prefetch_sec)
                     and _queue_prefetched_until_iso_by_job.get(jid) != str(job.get("scheduled_at", ""))
                 ):
@@ -1271,25 +1302,58 @@ def _tick_merged_serial_facebook_tiktok() -> None:
                         _queue_prefetched_until_iso_by_job[jid] = str(job.get("scheduled_at", ""))
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("[Queue prefetch merged] job={} lỗi: {}", jid, exc)
-                if when > now:
-                    continue
+
+            ready_jobs = [
+                dict(j)
+                for j in jobs
+                if str(j.get("status", "")).strip().lower() == "ready_queue"
+            ]
+            sorted_ready = sort_queue_jobs(ready_jobs)  # type: ignore[arg-type]
+            batch = select_dispatch_batch(
+                sorted_ready,  # type: ignore[arg-type]
+                account_inflight=_account_inflight_count,
+                per_account_limit=per_acc_limit,
+            )
+            queued_due_count = max(0, len(sorted_ready) - len(batch))
+            for job in batch:
+                jid = str(job.get("id", "")).strip()
                 aid = str(job.get("account_id", "")).strip()
                 pid = str(job.get("page_id", "")).strip()
                 if not jid or not aid or not pid:
                     continue
-                inflight = _account_inflight_count(aid)
-                planned = account_planned.get(aid, 0)
-                if (inflight + planned) >= per_acc_limit:
-                    queued_due_count += 1
-                    continue
                 fresh = sp.get_by_id(jid)
-                if not fresh or str(fresh.get("status", "")).strip().lower() != "pending":
+                if not fresh or str(fresh.get("status", "")).strip().lower() != "ready_queue":
                     continue
+                when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
                 did = _draft_id_for_queue_job(dict(job))
                 engine = _resolve_engine_for_account(aid, accounts=accounts_mgr)
                 waited_seconds = max(0.0, (now - when).total_seconds())
                 fb_batch.append((when, jid, aid, pid, did or None, engine, waited_seconds))
-                account_planned[aid] = planned + 1
+                note_job_dispatched(aid)
+
+            running_jobs = [
+                dict(j)
+                for j in jobs
+                if str(j.get("status", "")).strip().lower() == "running"
+            ]
+            pending_due = count_pending_due(jobs, now=now)
+            smart_ms = compute_smart_delay_ms(
+                ready_count=len(sorted_ready),
+                running_count=len(running_jobs) + len(fb_batch),
+            )
+            inflight_map = {
+                aid: _account_inflight_count(aid)
+                for aid in {str(j.get("account_id", "")) for j in jobs if j.get("account_id")}
+            }
+            write_queue_monitor(
+                ready_jobs=sorted_ready,  # type: ignore[arg-type]
+                running_jobs=running_jobs,
+                pending_due=pending_due,
+                dispatched_ids=[x[1] for x in fb_batch],
+                account_inflight=inflight_map,
+                smart_delay_ms=smart_ms,
+                extra={"queued_waiting_account": queued_due_count, "mode": "merged_cross_platform"},
+            )
 
             job_store = TikTokJobStore()
             try:
@@ -2071,57 +2135,69 @@ def build_scheduler(
     )
     cron_tz = _cron_timezone()
     page_jobs = 0
-    try:
-        page_rows = get_default_pages_manager().load_all()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Không đọc pages.json khi build scheduler: {}", exc)
-        page_rows = []
-    for p in page_rows:
-        sch = str(p.get("schedule_time", "")).strip()
-        if not sch:
-            continue
+    legacy_cron = os.environ.get("SCHEDULE_LEGACY_PAGE_CRON", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if legacy_cron:
         try:
-            spec = parse_page_schedule_for_apscheduler(sch, tz=cron_tz)
-        except ValueError:
-            logger.warning("Bỏ qua page id={} — schedule_time không hợp lệ: {!r}", p.get("id"), sch)
-            continue
-        aid = str(p.get("account_id", "")).strip()
-        pid = str(p.get("id", "")).strip()
-        if not aid or not pid:
-            continue
-        if spec[0] == "cron":
-            hh, mm = spec[1], spec[2]
-            trigger = CronTrigger(hour=hh, minute=mm, timezone=cron_tz)
-            logger.info("Đã đăng ký lịch {}:{} hàng ngày cho page_id={} (owner={})", hh, mm, pid, aid)
-        else:
-            run_at = spec[1]
-            now = datetime.now(run_at.tzinfo) if run_at.tzinfo else datetime.now(timezone.utc)
-            if run_at <= now:
-                logger.warning(
-                    "Bỏ qua page id={} — lịch một lần đã qua ({}) so với hiện tại ({})",
-                    p.get("id"),
-                    run_at.isoformat(),
-                    now.isoformat(),
-                )
+            page_rows = get_default_pages_manager().load_all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không đọc pages.json khi build scheduler: {}", exc)
+            page_rows = []
+        for p in page_rows:
+            sch = str(p.get("schedule_time", "")).strip()
+            if not sch:
                 continue
-            trigger = DateTrigger(run_date=run_at)
-            logger.info(
-                "Đã đăng ký lịch một lần {} cho page_id={} (owner={})",
-                run_at.isoformat(),
-                pid,
-                aid,
+            try:
+                spec = parse_page_schedule_for_apscheduler(sch, tz=cron_tz)
+            except ValueError:
+                logger.warning("Bỏ qua page id={} — schedule_time không hợp lệ: {!r}", p.get("id"), sch)
+                continue
+            aid = str(p.get("account_id", "")).strip()
+            pid = str(p.get("id", "")).strip()
+            if not aid or not pid:
+                continue
+            if spec[0] == "cron":
+                hh, mm = spec[1], spec[2]
+                trigger = CronTrigger(hour=hh, minute=mm, timezone=cron_tz)
+                logger.info("Đã đăng ký lịch {}:{} hàng ngày cho page_id={} (owner={})", hh, mm, pid, aid)
+            else:
+                run_at = spec[1]
+                now = datetime.now(run_at.tzinfo) if run_at.tzinfo else datetime.now(timezone.utc)
+                if run_at <= now:
+                    logger.warning(
+                        "Bỏ qua page id={} — lịch một lần đã qua ({}) so với hiện tại ({})",
+                        p.get("id"),
+                        run_at.isoformat(),
+                        now.isoformat(),
+                    )
+                    continue
+                trigger = DateTrigger(run_date=run_at)
+                logger.info(
+                    "Đã đăng ký lịch một lần {} cho page_id={} (owner={})",
+                    run_at.isoformat(),
+                    pid,
+                    aid,
+                )
+            scheduler.add_job(
+                fn,
+                trigger,
+                id=f"fb_post_page_{pid}",
+                kwargs={"account_id": aid, "page_id": pid},
+                replace_existing=True,
             )
-        scheduler.add_job(
-            fn,
-            trigger,
-            id=f"fb_post_page_{pid}",
-            kwargs={"account_id": aid, "page_id": pid},
-            replace_existing=True,
+            page_jobs += 1
+    else:
+        logger.info(
+            "Lịch theo Page/Account cron tắt — chỉ chạy job schedule_posts theo scheduled_at "
+            "(bật lại: SCHEDULE_LEGACY_PAGE_CRON=1)."
         )
-        page_jobs += 1
 
-    if page_jobs == 0:
-        logger.info("Không có Page nào có schedule_time — dùng lịch theo tài khoản (tương thích cũ).")
+    if legacy_cron and page_jobs == 0:
+        logger.info("Không có Page nào có schedule_time — dùng lịch theo tài khoản (legacy).")
         for acc in mgr.load_all():
             aid = str(acc.get("id", "")).strip()
             if not aid:
@@ -2135,9 +2211,10 @@ def build_scheduler(
                 kwargs={"account_id": aid},
                 replace_existing=True,
             )
-            logger.info("Đã đăng ký lịch {}:{} hàng ngày cho account id={}", hh, mm, aid)
-    poll_sec = int(os.environ.get("SCHEDULE_POSTS_POLL_SEC", "60"))
-    if poll_sec >= 15:
+            logger.info("Đã đăng ký lịch {}:{} hàng ngày cho account id={} (legacy)", hh, mm, aid)
+    poll_sec = int(os.environ.get("SCHEDULE_POSTS_POLL_SEC", "10"))
+    min_poll = 5
+    if poll_sec >= min_poll:
         scheduler.add_job(
             tick_cross_platform_schedule_jobs,
             IntervalTrigger(seconds=poll_sec),
@@ -2145,11 +2222,12 @@ def build_scheduler(
             replace_existing=True,
         )
         logger.info(
-            "Đã đăng ký quét lịch gộp (schedule_posts + TikTok) mỗi {} giây — trùng giờ hai nền tảng sẽ xếp hàng tuần tự.",
+            "Đã đăng ký quét lịch job queue (schedule_posts + TikTok) mỗi {} giây — "
+            "pending→ready_queue→dispatch theo schedule_time.",
             poll_sec,
         )
     else:
-        logger.info("Bỏ qua quét schedule_posts (SCHEDULE_POSTS_POLL_SEC={} < 15).", poll_sec)
+        logger.info("Bỏ qua quét schedule_posts (SCHEDULE_POSTS_POLL_SEC={} < {}).", poll_sec, min_poll)
     return scheduler
 
 
@@ -2172,6 +2250,10 @@ def run_forever(
     if interval < 10:
         interval = 10
     sched = build_scheduler(mgr)
+    try:
+        ensure_schedule_queue_recovery(get_default_schedule_posts_manager())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Schedule queue recovery lỗi: {}", exc)
     log_accounts_overview(mgr)
     sched.start()
     logger.info(
