@@ -1,7 +1,7 @@
 {
-  "version": "1.0.76",
+  "version": "1.0.77",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "5b18917c8eb5a114e12df24f3f680c00ed1863051bd376eeb386707714bcbbf2",
-  "notes": "Lich dang queue theo schedule_time: poll 10s, ready_queue, 1 browser/account, max 2 lien tiep/account, crash recovery, monitor realtime (data/runtime/schedule_queue_monitor.json). Tat cron Page/Account mac dinh (SCHEDULE_LEGACY_PAGE_CRON=1 de bat lai).",
-  "generated_at": "2026-05-24T13:12:20"
+  "sha256": "7d57a6ec8eb891d14804540443e403366cc81a99ca038d485d687ec5043ffc3c",
+  "notes": "Dedupe title/content/hashtag job lich dang: prepare_queue_job_post_fields mot lan, hashtag trung tu khoa giu 1, Reel khong lap caption.",
+  "generated_at": "2026-05-25T09:41:17"
 }
