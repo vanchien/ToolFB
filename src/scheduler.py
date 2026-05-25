@@ -57,7 +57,12 @@ from src.utils.entities_manager import get_default_entities_manager
 from src.utils.page_schedule import parse_page_schedule_for_apscheduler
 from src.utils.pages_manager import get_default_pages_manager
 from src.utils.reel_thumbnail_choice import normalize_reel_thumbnail_choice
-from src.utils.schedule_job_content import compute_next_daily_scheduled_utc_iso, merge_queue_job_content_into_page_row
+from src.utils.schedule_job_content import (
+    compute_next_daily_scheduled_utc_iso,
+    merge_queue_job_content_into_page_row,
+    prepare_queue_job_post_fields,
+    strip_image_note_from_text,
+)
 from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
 from src.services.cross_platform_schedule_ctx import unified_chain_is_active
 from src.services.schedule_queue_dispatcher import (
@@ -697,104 +702,31 @@ def _build_body_and_draft_media(
 
 def _strip_image_note_from_text(text: str) -> str:
     """Loại bỏ dòng chú thích ảnh dạng ``(Ảnh: ...)`` / ``(Image: ...)`` khỏi caption."""
-    raw = str(text or "").strip()
-    if not raw:
-        return raw
-    out_lines: list[str] = []
-    for ln in raw.splitlines():
-        s = ln.strip().lower()
-        if s.startswith("(ảnh:") or s.startswith("(anh:") or s.startswith("(image:"):
-            continue
-        out_lines.append(ln)
-    cleaned = "\n".join(out_lines).strip()
-    return cleaned or raw
+    return strip_image_note_from_text(text)
 
 
 def _compose_job_text_payload(text_body: str, queue_job: dict[str, Any] | None) -> str:
-    """Tạo payload text cuối cùng để paste: title + body + hashtags."""
-    base = _strip_image_note_from_text(str(text_body or ""))
-    if not queue_job:
-        return base
-    pt = str(queue_job.get("post_type", "")).strip().lower()
-    if pt in {"video", "text_video", "reel"}:
-        # Job video thuần: không fallback caption AI từ Page nếu job không có nội dung.
-        # Chỉ dùng caption user nhập trực tiếp trong queue job (title/content).
-        base = _strip_image_note_from_text(str(queue_job.get("content") or ""))
-    title = str(queue_job.get("title") or "").strip()
-    if title:
-        # Tránh lặp title nếu body đã bắt đầu bằng title.
-        if not base.lower().startswith(title.lower()):
-            base = (title + "\n\n" + base).strip()
-    # Với job video/reel, tags được nhập vào ô Tags riêng trong wizard -> không append vào mô tả.
-    if pt in {"video", "text_video", "reel"}:
-        return base
-    raw = queue_job.get("hashtags")
-    if not isinstance(raw, list):
-        return base
-    tags: list[str] = []
-    for h in raw:
-        s = str(h or "").strip()
-        if not s:
-            continue
-        if not s.startswith("#"):
-            s = "#" + s.lstrip("#")
-        # Bỏ khoảng trắng trong hashtag để tránh FB tách sai.
-        s = s.replace(" ", "")
-        if s and s not in tags:
-            tags.append(s)
-    if not tags:
-        return base
-    joined = " ".join(tags)
-    if joined.lower() in base.lower():
-        return base
-    return (base + "\n\n" + joined).strip()
+    """Tạo payload text cuối cùng để paste — dedupe title/content/hashtag một lần."""
+    return prepare_queue_job_post_fields(queue_job, fallback_body=text_body)["caption_text"]
 
 
 def _extract_reel_tags_from_queue_job(queue_job: dict[str, Any] | None, *, limit: int = 12) -> list[str]:
-    """Ưu tiên field `tags`; fallback `hashtags` để tương thích dữ liệu cũ."""
+    """Tags Reel đã dedupe từ job queue."""
     if not queue_job:
         return []
-    raw = queue_job.get("tags")
-    if not isinstance(raw, list):
-        raw = queue_job.get("hashtags")
-    if isinstance(raw, str):
-        raw = [x.strip() for x in raw.split(",") if x.strip()]
-    if not isinstance(raw, list):
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for x in raw:
-        s = str(x or "").strip().lstrip("#").strip()
-        if not s:
-            continue
-        k = s.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(s[:80])
-        if len(out) >= limit:
-            break
-    return out
+    tags = prepare_queue_job_post_fields(queue_job).get("reel_tags") or []
+    return list(tags)[:limit]
 
 
 def _extract_reel_description_from_queue_job(queue_job: dict[str, Any] | None, fallback: str) -> str:
-    """
-    Với job video/reel, ưu tiên đúng tiêu đề + nội dung đã lưu trong job.
-    Không ghép hashtag vào mô tả.
-    """
+    """Mô tả Reel (title+content dedupe, không hashtag)."""
     if not queue_job:
         return str(fallback or "").strip()
-    pt = str(queue_job.get("post_type", "")).strip().lower()
-    if pt not in {"video", "text_video", "reel"}:
-        return str(fallback or "").strip()
-    title = str(queue_job.get("title") or "").strip()
-    content = _strip_image_note_from_text(str(queue_job.get("content") or ""))
-    if title and content:
-        return f"{title}\n\n{content}".strip()
-    if title:
-        return title
-    if content:
-        return content
+    prepared = prepare_queue_job_post_fields(queue_job, fallback_body=fallback)
+    if prepared.get("post_type") in {"video", "text_video", "reel"}:
+        desc = str(prepared.get("reel_description") or "").strip()
+        if desc:
+            return desc
     return str(fallback or "").strip()
 
 
@@ -1795,11 +1727,13 @@ def run_scheduled_post_for_account(
             (resolved_draft_id or "AI"),
         )
 
+        prepared: dict[str, Any] = {}
         try:
             text_body, draft_media_paths = _build_body_and_draft_media(
                 acc_runtime, resolved_draft_id or None, page_row=content_page_row
             )
-            text_body = _compose_job_text_payload(text_body, queue_job)
+            prepared = prepare_queue_job_post_fields(queue_job, fallback_body=text_body)
+            text_body = str(prepared.get("caption_text") or "").strip()
         except Exception as exc:  # noqa: BLE001
             append_failed_account_log(account_id, f"Nội dung: {exc!r}")
             logger.exception("Tài khoản {} — lỗi chuẩn bị nội dung.", account_id)
@@ -1872,13 +1806,13 @@ def run_scheduled_post_for_account(
             if schedule_post_job_id:
                 tracker = JobRunTracker(schedule_post_job_id)
                 tracker.set_step(STEP_OPEN_BROWSER, "Đã mở trình duyệt / context")
-            q_post_type = str((queue_job or {}).get("post_type", "text")).strip().lower()
+            q_post_type = str(prepared.get("post_type") or "text").strip().lower()
             job_sched = str((queue_job or {}).get("scheduled_at", "")).strip() or None
-            reel_tags = _extract_reel_tags_from_queue_job(queue_job, limit=12) if q_post_type in {"video", "text_video", "reel"} else []
-            reel_description = _extract_reel_description_from_queue_job(queue_job, text_body)
+            reel_title = str(prepared.get("title") or "").strip()
+            reel_content = str(prepared.get("content") or "").strip()
+            reel_tags = list(prepared.get("reel_tags") or [])
+            reel_description = str(prepared.get("reel_description") or "").strip()
             reel_thumb_choice = normalize_reel_thumbnail_choice((queue_job or {}).get("reel_thumbnail_choice"))
-            reel_title = str((queue_job or {}).get("title") or "").strip()
-            reel_content = str((queue_job or {}).get("content") or "").strip()
             reel_video_path = str((queue_job or {}).get("video_path") or "").strip()
             execute_facebook_post_sequence(
                 page,

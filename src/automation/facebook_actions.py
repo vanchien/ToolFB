@@ -27,6 +27,10 @@ from src.utils.reel_thumbnail_choice import (
     REEL_THUMBNAIL_METHOD1_FIRST_AUTO,
     normalize_reel_thumbnail_choice,
 )
+from src.utils.schedule_job_content import (
+    dedupe_post_title_content_hashtags,
+    _normalize_hashtag_list,
+)
 
 _REEL_STRICT_JOB_ID: ContextVar[str] = ContextVar("_REEL_STRICT_JOB_ID", default="")
 
@@ -6206,22 +6210,10 @@ def _click_post_strict_for_reel(page: Page, dialog: Locator) -> None:
 
 
 def _build_reel_text_payload(title: str, content: str, hashtags: list[str] | str | None) -> str:
-    t = str(title or "").strip()
-    c = str(content or "").strip()
-    htxt = ""
-    if isinstance(hashtags, list):
-        vals: list[str] = []
-        for h in hashtags:
-            s = str(h or "").strip()
-            if not s:
-                continue
-            if not s.startswith("#"):
-                s = "#" + s.lstrip("#")
-            vals.append(s.replace(" ", ""))
-        htxt = " ".join(vals).strip()
-    else:
-        htxt = str(hashtags or "").strip()
-    parts = [x for x in (t, c, htxt) if x]
+    title, content, tags = dedupe_post_title_content_hashtags(title, content, hashtags)
+    parts = [x for x in (title, content) if x]
+    if tags:
+        parts.append(" ".join(tags))
     return "\n\n".join(parts).strip()
 
 
@@ -6254,23 +6246,7 @@ def _input_reel_text_in_dialog(dialog: Locator, text: str) -> None:
 
 
 def _normalize_hashtags_for_input(hashtags: list[str] | str | None) -> list[str]:
-    if isinstance(hashtags, str):
-        raw_items = [x.strip() for x in hashtags.split() if x.strip()]
-    elif isinstance(hashtags, list):
-        raw_items = [str(x or "").strip() for x in hashtags if str(x or "").strip()]
-    else:
-        raw_items = []
-    out: list[str] = []
-    seen: set[str] = set()
-    for x in raw_items:
-        tag = x if x.startswith("#") else "#" + x.lstrip("#")
-        tag = tag.replace(" ", "")
-        key = tag.lower()
-        if not tag or key in seen:
-            continue
-        seen.add(key)
-        out.append(tag)
-    return out
+    return _normalize_hashtag_list(hashtags)
 
 
 def _input_reel_title_content_and_hashtags(
@@ -6292,11 +6268,7 @@ def _input_reel_title_content_and_hashtags(
     except Exception:
         tb.click(timeout=1200, force=True)
 
-    title_s = str(title or "").strip()
-    content_s = str(content or "").strip()
-    # Tránh lặp title khi content đã bắt đầu bằng title.
-    if title_s and content_s.lower().startswith(title_s.lower()):
-        content_s = content_s[len(title_s) :].lstrip(" \n\r\t-:|")
+    title_s, content_s, hashtags = dedupe_post_title_content_hashtags(title, content, hashtags)
     base_parts = [title_s, content_s]
     base_text = "\n\n".join([p for p in base_parts if p]).strip()
     if base_text:

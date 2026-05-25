@@ -185,6 +185,21 @@ def capture_failure_screenshot(page: Any | None, account_id: str) -> Optional[Pa
         return None
 
 
+def _reel_dashboard_caption_text(
+    *,
+    reel_title: str | None,
+    reel_content: str | None,
+    reel_description_override: str | None,
+    text_body: str,
+) -> str:
+    """Caption Reel dashboard — ưu tiên title/content đã dedupe, không fallback trùng ``text_body``."""
+    parts = [str(reel_title or "").strip(), str(reel_content or "").strip()]
+    merged = "\n\n".join(p for p in parts if p).strip()
+    if merged:
+        return merged
+    return str(reel_description_override or text_body or "").strip()
+
+
 def _run_chromium_posting_flow(
     page: Any,
     *,
@@ -298,7 +313,12 @@ def _run_chromium_posting_flow(
                     page_display_name=page_display_name or "",
                     video_path=video_path,
                     title=str(reel_title or "").strip(),
-                    content=str(reel_content or reel_description_override or text_body or "").strip(),
+                    content=_reel_dashboard_caption_text(
+                        reel_title=reel_title,
+                        reel_content=reel_content,
+                        reel_description_override=reel_description_override,
+                        text_body=text_body,
+                    ),
                     hashtags=list(reel_tags or []),
                     reel_thumbnail_choice=reel_thumbnail_choice,
                     on_step=lambda k, m: _track("REEL_" + str(k), m),
@@ -393,7 +413,15 @@ def _run_chromium_posting_flow(
                     _human_step_delay(label="trước Reel wizard (Next/Share)")
                     reel_submit_clicked = complete_meta_business_reel_post_wizard(
                         page,
-                        description=str(reel_description_override or text_body or "").strip(),
+                        description=(
+                            str(reel_description_override or "").strip()
+                            or _reel_dashboard_caption_text(
+                                reel_title=reel_title,
+                                reel_content=reel_content,
+                                reel_description_override=None,
+                                text_body=text_body,
+                            )
+                        ),
                         reel_tags=list(reel_tags or []),
                         share_now=share_now_fb,
                         scheduled_at_utc_iso=(str(job_scheduled_at_iso).strip() or None) if not share_now_fb else None,
