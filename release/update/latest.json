@@ -1,7 +1,7 @@
 {
-  "version": "1.0.77",
+  "version": "1.0.78",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "7d57a6ec8eb891d14804540443e403366cc81a99ca038d485d687ec5043ffc3c",
-  "notes": "Dedupe title/content/hashtag job lich dang: prepare_queue_job_post_fields mot lan, hashtag trung tu khoa giu 1, Reel khong lap caption.",
-  "generated_at": "2026-05-25T09:41:17"
+  "sha256": "23eb4facc35285e18a54dd82c836cf3543fe3a37ba3a0bea1885692515797550",
+  "notes": "TOTP/session recovery, auto multi-task concurrency, first-run bootstrap, multi-instance",
+  "generated_at": "2026-05-29T13:30:45"
 }
