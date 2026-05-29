@@ -16,6 +16,7 @@ from typing import Any, Iterable, Optional, TypedDict
 
 from loguru import logger
 
+from src.utils.json_store_lock import json_file_lock
 from src.utils.paths import project_root
 
 
@@ -48,6 +49,11 @@ class AccountRecord(TypedDict, total=False):
     browser_exe_path: str
     import_type: str
     notes: str
+    email: str
+    password_ref: str
+    totp_enabled: bool
+    totp_secret_ref: str
+    session_status: str
 
 
 def _default_accounts_path() -> Path:
@@ -217,8 +223,9 @@ class AccountsDatabaseManager:
         Returns:
             Danh sách tài khoản mới nhất.
         """
-        self._invalidate_rows_cache()
-        return self.load_all()
+        with json_file_lock(self.file_path):
+            self._invalidate_rows_cache()
+            return self._load_all_unlocked()
 
     def load_all(self) -> list[AccountRecord]:
         """
@@ -234,6 +241,10 @@ class AccountsDatabaseManager:
             json.JSONDecodeError: Nội dung không phải JSON hợp lệ.
             ValueError: Cấu trúc không phải mảng hoặc phần tử không phải object.
         """
+        with json_file_lock(self.file_path):
+            return self._load_all_unlocked()
+
+    def _load_all_unlocked(self) -> list[AccountRecord]:
         if not self.file_path.is_file():
             self._invalidate_rows_cache()
             logger.error("Không tìm thấy file accounts: {}", self.file_path)
@@ -268,17 +279,18 @@ class AccountsDatabaseManager:
         Raises:
             ValueError: Một bản ghi không hợp lệ.
         """
-        rows: list[AccountRecord] = []
-        for idx, acc in enumerate(accounts):
-            if not isinstance(acc, dict):
-                raise ValueError(f"Bản ghi index {idx} không phải dict.")
-            self._validate_account_shape(acc)
-            rows.append(acc)
-        text = json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
-        self._atomic_write_text(text)
-        self._rows_cache = rows
-        self._rows_mtime = self.file_path.stat().st_mtime
-        logger.info("Đã ghi {} tài khoản xuống {}", len(rows), self.file_path)
+        with json_file_lock(self.file_path):
+            rows: list[AccountRecord] = []
+            for idx, acc in enumerate(accounts):
+                if not isinstance(acc, dict):
+                    raise ValueError(f"Bản ghi index {idx} không phải dict.")
+                self._validate_account_shape(acc)
+                rows.append(acc)
+            text = json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
+            self._atomic_write_text(text)
+            self._rows_cache = rows
+            self._rows_mtime = self.file_path.stat().st_mtime
+            logger.info("Đã ghi {} tài khoản xuống {}", len(rows), self.file_path)
 
     def get_by_id(self, account_id: str) -> Optional[AccountRecord]:
         """
@@ -307,26 +319,31 @@ class AccountsDatabaseManager:
         Raises:
             ValueError: Thiếu id hoặc schema không hợp lệ.
         """
-        normalized = self._normalize_account_dict(dict(account))
-        self._validate_account_shape(normalized)
-        acc_id = normalized.get("id")
-        if not acc_id:
-            raise ValueError("Bản ghi phải có trường 'id' không rỗng.")
-        current = self.load_all()
-        replaced = False
-        new_list: list[AccountRecord] = []
-        for row in current:
-            if row.get("id") == acc_id:
+        with json_file_lock(self.file_path):
+            normalized = self._normalize_account_dict(dict(account))
+            self._validate_account_shape(normalized)
+            acc_id = normalized.get("id")
+            if not acc_id:
+                raise ValueError("Bản ghi phải có trường 'id' không rỗng.")
+            self._invalidate_rows_cache()
+            current = self._load_all_unlocked()
+            replaced = False
+            new_list: list[AccountRecord] = []
+            for row in current:
+                if row.get("id") == acc_id:
+                    new_list.append(normalized)  # type: ignore[arg-type]
+                    replaced = True
+                else:
+                    new_list.append(row)
+            if not replaced:
                 new_list.append(normalized)  # type: ignore[arg-type]
-                replaced = True
+                logger.info("Thêm tài khoản mới id={}", acc_id)
             else:
-                new_list.append(row)
-        if not replaced:
-            new_list.append(normalized)  # type: ignore[arg-type]
-            logger.info("Thêm tài khoản mới id={}", acc_id)
-        else:
-            logger.info("Cập nhật tài khoản id={}", acc_id)
-        self.save_all(new_list)
+                logger.info("Cập nhật tài khoản id={}", acc_id)
+            text = json.dumps(new_list, ensure_ascii=False, indent=2) + "\n"
+            self._atomic_write_text(text)
+            self._rows_cache = new_list
+            self._rows_mtime = self.file_path.stat().st_mtime
 
     def update_account_fields(self, account_id: str, updates: dict[str, Any]) -> None:
         """
@@ -339,20 +356,25 @@ class AccountsDatabaseManager:
         Raises:
             ValueError: Không tìm thấy id hoặc sau gộp không còn hợp lệ schema.
         """
-        rows = self.load_all()
-        current = next((r for r in rows if r.get("id") == account_id), None)
-        if current is None:
-            raise ValueError(f"Không tìm thấy tài khoản: {account_id}")
-        merged: dict[str, Any] = self._normalize_account_dict({**dict(current), **updates})
-        self._validate_account_shape(merged)
-        new_list: list[AccountRecord] = []
-        for row in rows:
-            if row.get("id") == account_id:
-                new_list.append(merged)  # type: ignore[arg-type]
-            else:
-                new_list.append(row)
-        self.save_all(new_list)
-        logger.info("Đã cập nhật trường {} cho id={}", list(updates.keys()), account_id)
+        with json_file_lock(self.file_path):
+            self._invalidate_rows_cache()
+            rows = self._load_all_unlocked()
+            current = next((r for r in rows if r.get("id") == account_id), None)
+            if current is None:
+                raise ValueError(f"Không tìm thấy tài khoản: {account_id}")
+            merged: dict[str, Any] = self._normalize_account_dict({**dict(current), **updates})
+            self._validate_account_shape(merged)
+            new_list: list[AccountRecord] = []
+            for row in rows:
+                if row.get("id") == account_id:
+                    new_list.append(merged)  # type: ignore[arg-type]
+                else:
+                    new_list.append(row)
+            text = json.dumps(new_list, ensure_ascii=False, indent=2) + "\n"
+            self._atomic_write_text(text)
+            self._rows_cache = new_list
+            self._rows_mtime = self.file_path.stat().st_mtime
+            logger.info("Đã cập nhật trường {} cho id={}", list(updates.keys()), account_id)
 
     def record_post_outcome(self, account_id: str, *, success: bool) -> None:
         """

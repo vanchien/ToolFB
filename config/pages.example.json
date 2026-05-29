@@ -1,0 +1,10 @@
+[
+  {
+    "id": "page_demo",
+    "account_id": "acc_demo",
+    "page_name": "Page mẫu",
+    "page_url": "https://www.facebook.com/",
+    "post_style": "post",
+    "notes": "Gắn đúng account_id; thêm Page thật qua tab Page / Group."
+  }
+]

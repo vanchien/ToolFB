@@ -16,6 +16,7 @@ from typing import Any, Iterable, Optional, TypedDict
 
 from loguru import logger
 
+from src.utils.json_store_lock import json_file_lock
 from src.utils.paths import project_root
 
 
@@ -174,6 +175,10 @@ class SchedulePostsManager:
         self._validate_row(d)
 
     def load_all(self) -> list[SchedulePostJob]:
+        with json_file_lock(self.file_path):
+            return self._load_all_unlocked()
+
+    def _load_all_unlocked(self) -> list[SchedulePostJob]:
         if not self.file_path.is_file():
             self._invalidate_cache()
             raise FileNotFoundError(str(self.file_path))
@@ -196,67 +201,76 @@ class SchedulePostsManager:
         return list(out)
 
     def save_all(self, rows: Iterable[SchedulePostJob]) -> None:
-        lst = list(rows)
-        for r in lst:
-            self._validate_row(dict(r))
-        self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
-        self._rows_cache = list(lst)
-        self._rows_mtime = self.file_path.stat().st_mtime
-        logger.info("Đã ghi {} job schedule_posts vào {}", len(lst), self.file_path)
+        with json_file_lock(self.file_path):
+            lst = list(rows)
+            for r in lst:
+                self._validate_row(dict(r))
+            self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
+            self._rows_cache = list(lst)
+            self._rows_mtime = self.file_path.stat().st_mtime
+            logger.info("Đã ghi {} job schedule_posts vào {}", len(lst), self.file_path)
 
     def upsert(self, row: SchedulePostJob) -> None:
-        d: dict[str, Any] = dict(row)
-        if not str(d.get("id", "")).strip():
-            d["id"] = uuid.uuid4().hex[:16]
-        self._validate_row(d)
-        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        if not str(d.get("created_at", "")).strip():
-            d["created_at"] = now
-        jid = str(d["id"])
-        cur = self.load_all()
-        replaced = False
-        new_list: list[SchedulePostJob] = []
-        for x in cur:
-            if str(x.get("id")) == jid:
-                new_list.append(d)  # type: ignore[arg-type]
-                replaced = True
-            else:
-                new_list.append(x)
-        if not replaced:
-            new_list.append(d)  # type: ignore[arg-type]
-        self.save_all(new_list)
-
-    def upsert_many(self, rows: Iterable[SchedulePostJob]) -> int:
-        """Upsert nhiều job trong một lần đọc/ghi file (tránh O(n²) khi nạp hàng loạt)."""
-        incoming: list[dict[str, Any]] = []
-        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        for row in rows:
-            d = dict(row)
+        with json_file_lock(self.file_path):
+            d: dict[str, Any] = dict(row)
             if not str(d.get("id", "")).strip():
                 d["id"] = uuid.uuid4().hex[:16]
             self._validate_row(d)
+            now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             if not str(d.get("created_at", "")).strip():
                 d["created_at"] = now
-            incoming.append(d)
-        if not incoming:
-            return 0
-        by_id = {str(d["id"]): d for d in incoming}
-        cur = self.load_all()
-        out: list[SchedulePostJob] = []
-        applied: set[str] = set()
-        for x in cur:
-            xid = str(x.get("id", "")).strip()
-            if xid in by_id:
-                out.append(by_id[xid])  # type: ignore[arg-type]
-                applied.add(xid)
-            else:
-                out.append(x)
-        for d in incoming:
             jid = str(d["id"])
-            if jid not in applied:
-                out.append(d)  # type: ignore[arg-type]
-        self.save_all(out)
-        return len(incoming)
+            self._invalidate_cache()
+            cur = self._load_all_unlocked()
+            replaced = False
+            new_list: list[SchedulePostJob] = []
+            for x in cur:
+                if str(x.get("id")) == jid:
+                    new_list.append(d)  # type: ignore[arg-type]
+                    replaced = True
+                else:
+                    new_list.append(x)
+            if not replaced:
+                new_list.append(d)  # type: ignore[arg-type]
+            self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
+            self._rows_cache = new_list
+            self._rows_mtime = self.file_path.stat().st_mtime
+
+    def upsert_many(self, rows: Iterable[SchedulePostJob]) -> int:
+        """Upsert nhiều job trong một lần đọc/ghi file (tránh O(n²) khi nạp hàng loạt)."""
+        with json_file_lock(self.file_path):
+            incoming: list[dict[str, Any]] = []
+            now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            for row in rows:
+                d = dict(row)
+                if not str(d.get("id", "")).strip():
+                    d["id"] = uuid.uuid4().hex[:16]
+                self._validate_row(d)
+                if not str(d.get("created_at", "")).strip():
+                    d["created_at"] = now
+                incoming.append(d)
+            if not incoming:
+                return 0
+            by_id = {str(d["id"]): d for d in incoming}
+            self._invalidate_cache()
+            cur = self._load_all_unlocked()
+            out: list[SchedulePostJob] = []
+            applied: set[str] = set()
+            for x in cur:
+                xid = str(x.get("id", "")).strip()
+                if xid in by_id:
+                    out.append(by_id[xid])  # type: ignore[arg-type]
+                    applied.add(xid)
+                else:
+                    out.append(x)
+            for d in incoming:
+                jid = str(d["id"])
+                if jid not in applied:
+                    out.append(d)  # type: ignore[arg-type]
+            self._atomic_write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+            self._rows_cache = out
+            self._rows_mtime = self.file_path.stat().st_mtime
+            return len(incoming)
 
     def delete_by_id(self, job_id: str) -> bool:
         jid = str(job_id).strip()

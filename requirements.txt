@@ -1,5 +1,6 @@
 # Sau pip install: python -m playwright install firefox  (hoặc playwright install)
 # Video Editor / FFmpeg: ffmpeg PATH hoặc tools/ffmpeg/bin; ffplay — ưu tiên copy từ máy vào bin, không có mới tải zip full (tắt tải: TOOLFB_NO_AUTO_FFPLAY=1)
+pyotp>=2.9.0
 loguru>=0.7.0
 playwright==1.58.0
 playwright-stealth>=1.0.0

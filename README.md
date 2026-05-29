@@ -1,43 +1,104 @@
 # ToolFB
 
-Công cụ hỗ trợ Facebook + lên lịch bài + AI (Gemini / Veo) + tải video (yt-dlp), v.v.
+Công cụ tự động Facebook: lịch đăng bài, quản lý Page/Group, AI (Gemini), tải video (yt-dlp), chỉnh video, TikTok — giao diện Windows (Tkinter).
 
-## Cài đặt nhanh (máy mới)
+## Yêu cầu
 
-1. **Clone / cập nhật**
-   ```bash
-   git pull origin main
-   ```
-2. **Python** (3.10+ khuyên dùng) — cài dependency nếu project có `requirements.txt` / dùng môi trường ảo.
-3. **Chạy**
-   ```bash
-   python main.py --gui
-   ```
+- **Windows 10/11** (khuyên dùng; dev có thể chạy Python trực tiếp)
+- **Python 3.10+** (3.11–3.12 ổn định)
+- **RAM** 8GB+ (16GB nếu vừa tải video + chỉnh video + đăng bài song song)
+- **FFmpeg** — tùy chọn; app có thể dùng `tools/ffmpeg/bin` hoặc FFmpeg trên PATH
 
-## Veo3 / Veo3Studio (cài local — không có trong repo)
+## Cài đặt từ GitHub (máy mới)
 
-Thư mục **`tools/Veo3Studio/`** bị `.gitignore` để repo nhẹ và tránh binary lớn trên GitHub.
-
-**Máy mới sau khi clone:** cài bản Veo3Studio Lite (hoặc copy từ máy khác) vào `ToolFB/tools/Veo3Studio/`, đảm bảo có `Veo3Studio.exe` (hoặc chỉnh đường dẫn trong tab **AI Video** → `tool_exe`).
-
-## Cấu hình riêng từng máy (không commit)
-
-Các file như `config/app_secrets.json`, tài khoản, lịch đăng, v.v. được `.gitignore` — mỗi máy tự cấu hình (có thể dùng `config/app_secrets.example.json` làm mẫu).
-
-## Cập nhật từ GitHub
-
-**Mã nguồn (git):**
-
-```bash
-git pull origin main
+```bat
+git clone https://github.com/<ORG>/ToolFB.git
+cd ToolFB
+scripts\setup_windows.bat
 ```
 
-**Trong GUI — «Kiểm tra cập nhật» / «Cập nhật ngay»**
+Hoặc thủ công:
 
-- Repo đã kèm `config/update_channel.json` trỏ tới `…/releases/latest/download/latest.json` (GitHub Release **mới nhất** phải đính kèm file `latest.json` và gói zip trong manifest).
-- Bấm **Kiểm tra cập nhật**: nếu có bản mới, đóng hộp thoại rồi bấm **Cập nhật ngay** để tải gói và áp dụng (bản `.exe` Windows có thể cần **mở lại chương trình** để script nền thay `ToolFB_GUI.exe` / `_internal`).
-- Máy không có `.git` hoặc đổi kênh: **Cấu hình kênh cập nhật** (hoặc biến môi trường `TOOLFB_UPDATE_MANIFEST_URL`). Mẫu: `config/update_channel.example.json`.
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m playwright install firefox
+.venv\Scripts\python main.py --gui
+```
 
-**Người phát hành:** khi đẩy bản mới, cập nhật `version.json` trong repo, tạo/đổi GitHub Release, đính kèm `ToolFB_release_bundle.zip` và `latest.json` (đúng `version`, `download_url`, `sha256` của zip) để các máy khách nhận bản mới khi kiểm tra cập nhật.
+Lần đầu mở app sẽ **tự tạo** `config/accounts.json`, `pages.json`, … từ file `*.example.json` (không ghi đè nếu đã có).
 
-**GitHub Actions:** trong repo có workflow **Publish GitHub Release** (`.github/workflows/release.yml`). Chạy thủ công tab *Actions* → *Run workflow*: tự bump semver, build bundle (PyInstaller + Playwright browsers + yt-dlp/ffmpeg theo script `tools/`), đăng release kèm zip + `latest.json`. Workflow dùng cache pip và cache thư mục Playwright trong workspace để lần build sau nhanh hơn. Tùy chọn **push_version_commit**: bật nếu muốn bot đẩy luôn `version.json` và `release/update/latest.json` lên nhánh hiện tại sau khi release (cần nhánh cho phép push; nếu `main` bị rule chặn, giữ tắt và tự commit sau khi xem diff trên runner hoặc dùng `Publish_Update_GitHub.bat` / `tools/publish_all.py` ở máy local).
+## Chạy chương trình
+
+| Cách | Lệnh |
+|------|------|
+| GUI (khuyên dùng) | `Start_ToolFB_GUI.bat` hoặc `python main.py --gui` |
+| Scheduler terminal | `python main.py` (dev) / `ToolFB_GUI.exe --cli` (bản exe) |
+| Nhiều cửa sổ | `python main.py --gui --multi-instance --data-dir D:\ToolFB_2` |
+
+## Thiết lập lần đầu (trong GUI)
+
+1. Tab **Tài khoản** → **Thêm** — profile Firefox, cookie_path, portable_path  
+2. Tab **Page / Group** — gắn Page với `account_id`  
+3. Tab **Cài đặt AI** — dán Gemini API key (hoặc sửa `config/app_secrets.json` từ mẫu)  
+4. Tab **Job lịch** — tạo job; **Bắt đầu lịch** khi sẵn sàng  
+5. (Tùy chọn) **Facebook đăng nhập / TOTP** trong form sửa tài khoản — vault `config/account_credentials.json`
+
+Nút **Hướng dẫn** trên thanh công cụ mở checklist nhanh.
+
+## Đa tác vụ (download + Video Editor + đăng bài)
+
+App **tự giảm** tải browser/FFmpeg khi nhiều chức năng chạy cùng lúc (`TOOLFB_AUTO_MULTITASK=1`, mặc định bật).
+
+| Biến môi trường | Ý nghĩa |
+|-----------------|--------|
+| `BROWSER_CONCURRENCY` | Số browser đăng song song (mặc định ~ CPU/2) |
+| `TOOLFB_FFMPEG_CONCURRENCY` | Số FFmpeg song song (1–2) |
+| `TOOLFB_MANUAL_CONCURRENCY` | `1` = tắt tự điều chỉnh |
+| `TOOLFB_DATA_DIR` | Thư mục dữ liệu riêng khi mở nhiều instance |
+
+## File không đưa lên Git (mỗi máy tự có)
+
+Đã khai báo trong `.gitignore`:
+
+- `config/accounts.json`, `pages.json`, `schedule_posts.json`, `app_secrets.json`, …
+- `config/account_credentials.json` (mật khẩu / TOTP)
+- `data/` (profile, cookie, tải video)
+- `logs/`
+- `tools/Veo3Studio/`, `tools/ffmpeg/` (binary lớn)
+
+Dùng file **`config/*.example.json`** làm mẫu.
+
+## Veo3 / Veo3Studio
+
+Thư mục `tools/Veo3Studio/` **không** có trong repo. Cài tay hoặc copy từ máy khác; chỉnh `tool_exe` trong tab **AI Video**.
+
+## Cập nhật
+
+**Git:** `git pull origin main`
+
+**Trong app:** *Kiểm tra cập nhật* / *Cập nhật* — cần release GitHub kèm `latest.json` + zip (xem `config/update_channel.example.json`).
+
+**Phát hành:** workflow `.github/workflows/release.yml` hoặc `Publish_Update_GitHub.bat`.
+
+## Kiểm thử
+
+```bat
+.venv\Scripts\python.exe -m pytest tests/ -q
+```
+
+## Cấu trúc chính
+
+```
+main.py              # Entry GUI / CLI
+src/gui/             # Giao diện
+src/scheduler.py     # Lịch đăng + browser pool
+src/automation/      # Playwright Facebook
+src/services/        # Post, download, video editor
+config/              # Cấu hình (*.example.json trong repo)
+data/                # Runtime (gitignore)
+```
+
+## Giấy phép / hỗ trợ
+
+Dùng nội bộ / theo quy định repo. Báo lỗi qua Issues trên GitHub kèm log `logs/` và phiên bản (hiển thị góc GUI).

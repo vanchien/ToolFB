@@ -477,6 +477,77 @@ class AccountFormDialog:
             font=("Segoe UI", 8),
         )
         hint.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        r += 1
+
+        lf_login = ttk.LabelFrame(lf, text="Facebook đăng nhập / TOTP 2FA (tùy chọn)", padding=6)
+        lf_login.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        lf_login.columnconfigure(1, weight=1)
+        lr = 0
+        ttk.Label(lf_login, text="Email Facebook").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
+        self._e_email = ttk.Entry(lf_login, width=48)
+        self._e_email.insert(0, str(init.get("email", "")))
+        self._e_email.grid(row=lr, column=1, sticky="ew", pady=2)
+        lr += 1
+        ttk.Label(lf_login, text="Mật khẩu").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
+        pw_row = ttk.Frame(lf_login)
+        pw_row.grid(row=lr, column=1, sticky="ew", pady=2)
+        pw_row.columnconfigure(0, weight=1)
+        self._e_password = ttk.Entry(pw_row, width=40, show="•")
+        self._e_password.grid(row=0, column=0, sticky="ew")
+        self._var_show_password = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            pw_row,
+            text="Hiện",
+            variable=self._var_show_password,
+            command=self._toggle_password_visibility,
+        ).grid(row=0, column=1, padx=(4, 0))
+        lr += 1
+        self._var_totp_enabled = tk.BooleanVar(value=bool(init.get("totp_enabled")))
+        ttk.Checkbutton(
+            lf_login,
+            text="Bật TOTP (Google/Microsoft Authenticator)",
+            variable=self._var_totp_enabled,
+        ).grid(row=lr, column=0, columnspan=2, sticky="w", pady=2)
+        lr += 1
+        ttk.Label(lf_login, text="TOTP Secret (Base32)").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
+        totp_row = ttk.Frame(lf_login)
+        totp_row.grid(row=lr, column=1, sticky="ew", pady=2)
+        totp_row.columnconfigure(0, weight=1)
+        self._e_totp_secret = ttk.Entry(totp_row, width=40, show="•")
+        self._e_totp_secret.grid(row=0, column=0, sticky="ew")
+        self._var_show_totp = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            totp_row,
+            text="Hiện",
+            variable=self._var_show_totp,
+            command=self._toggle_totp_visibility,
+        ).grid(row=0, column=1, padx=(4, 0))
+        lr += 1
+        self._lbl_vault_status = ttk.Label(
+            lf_login,
+            text="",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        )
+        self._lbl_vault_status.grid(row=lr, column=0, columnspan=2, sticky="w")
+        lr += 1
+        ttk.Label(
+            lf_login,
+            text="Mật khẩu/secret lưu trong config/account_credentials.json (không ghi vào accounts.json).",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=lr, column=0, columnspan=2, sticky="w")
+        lr += 1
+        btn_row = ttk.Frame(lf_login)
+        btn_row.grid(row=lr, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._var_test_login_fresh = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            btn_row,
+            text="Đăng nhập lại từ đầu (bỏ phiên profile)",
+            variable=self._var_test_login_fresh,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="Test Login", command=self._on_test_login_recovery).pack(side=tk.LEFT)
+        self._load_vault_credentials_into_form(init)
 
         self._on_use_proxy_toggle()
 
@@ -1360,7 +1431,17 @@ class AccountFormDialog:
             "import_type": import_type,
             "notes": self._collect_notes(),
             "browser_exe_path": browser_exe_path.strip(),
+            "email": self._form_email(),
+            "totp_enabled": self._form_totp_enabled(),
+            "password_ref": "",
+            "totp_secret_ref": "",
+            "session_status": str((self._initial or {}).get("session_status") or "active").strip() or "active",
         }
+        if aid:
+            from src.utils.account_credentials import default_password_ref, default_totp_secret_ref
+
+            rec["password_ref"] = default_password_ref(aid)
+            rec["totp_secret_ref"] = default_totp_secret_ref(aid)
         if self._initial and self._initial.get("last_post_at"):
             rec["last_post_at"] = self._initial["last_post_at"]
         if self._initial:
@@ -1370,6 +1451,206 @@ class AccountFormDialog:
                     rec[k] = v
         self._manager.validate_account(rec)
         return rec
+
+    def _toggle_password_visibility(self) -> None:
+        if not hasattr(self, "_e_password"):
+            return
+        self._e_password.configure(show="" if self._var_show_password.get() else "•")
+
+    def _toggle_totp_visibility(self) -> None:
+        if not hasattr(self, "_e_totp_secret"):
+            return
+        self._e_totp_secret.configure(show="" if self._var_show_totp.get() else "•")
+
+    def _load_vault_credentials_into_form(self, init: dict[str, Any]) -> None:
+        aid = str(init.get("id", "")).strip()
+        if not aid or not hasattr(self, "_e_password"):
+            return
+        from src.utils.account_credentials import get_account_password, get_account_totp_secret
+
+        pwd_ref = str(init.get("password_ref") or "").strip() or None
+        totp_ref = str(init.get("totp_secret_ref") or "").strip() or None
+        pw = get_account_password(aid, pwd_ref)
+        totp = get_account_totp_secret(aid, totp_ref) if bool(init.get("totp_enabled")) else ""
+        if pw:
+            self._e_password.delete(0, tk.END)
+            self._e_password.insert(0, pw)
+        if totp:
+            self._e_totp_secret.delete(0, tk.END)
+            self._e_totp_secret.insert(0, totp)
+        self._refresh_vault_status_label(has_password=bool(pw), has_totp=bool(totp))
+
+    def _refresh_vault_status_label(self, *, has_password: bool, has_totp: bool) -> None:
+        if not hasattr(self, "_lbl_vault_status"):
+            return
+        parts: list[str] = []
+        if has_password:
+            parts.append("có mật khẩu")
+        if has_totp:
+            parts.append("có TOTP secret")
+        if parts:
+            self._lbl_vault_status.configure(
+                text=f"Vault hiện tại: {', '.join(parts)} — bấm «Hiện» để kiểm tra.",
+                foreground="#1a7f37",
+            )
+        else:
+            self._lbl_vault_status.configure(
+                text="Vault: chưa có mật khẩu/secret — nhập rồi bấm «Lưu».",
+                foreground="gray",
+            )
+
+    def _form_email(self) -> str:
+        if hasattr(self, "_e_email"):
+            return self._e_email.get().strip()
+        return str((self._initial or {}).get("email", "")).strip()
+
+    def _form_totp_enabled(self) -> bool:
+        if hasattr(self, "_var_totp_enabled"):
+            return bool(self._var_totp_enabled.get())
+        return bool((self._initial or {}).get("totp_enabled"))
+
+    def _persist_credentials_for_account(self, aid: str) -> None:
+        if not aid or not hasattr(self, "_e_password"):
+            return
+        from src.utils.account_credentials import (
+            get_account_password,
+            get_account_totp_secret,
+            set_account_credentials,
+        )
+
+        pw = self._e_password.get().strip()
+        totp = self._e_totp_secret.get().strip() if hasattr(self, "_e_totp_secret") else ""
+        pwd_ref = str((self._initial or {}).get("password_ref") or "").strip() or None
+        totp_ref = str((self._initial or {}).get("totp_secret_ref") or "").strip() or None
+        if not pw:
+            pw = get_account_password(aid, pwd_ref)
+        if self._form_totp_enabled() and not totp:
+            totp = get_account_totp_secret(aid, totp_ref)
+        if pw:
+            set_account_credentials(aid, password=pw)
+        if self._form_totp_enabled() and totp:
+            set_account_credentials(aid, totp_secret=totp)
+        elif not self._form_totp_enabled():
+            set_account_credentials(aid, clear_totp=True)
+        self._refresh_vault_status_label(
+            has_password=bool(pw),
+            has_totp=bool(self._form_totp_enabled() and totp),
+        )
+
+    def _preview_account_for_login_test(self) -> dict[str, Any]:
+        aid = self._e_id.get().strip()
+        portable = ""
+        if self._e_portable_edit is not None:
+            portable = self._e_portable_edit.get().strip()
+        elif hasattr(self, "_lbl_profile_preview"):
+            portable = self._build_default_portable(aid) if aid else ""
+        cookie = self._e_cookie.get().strip() if hasattr(self, "_e_cookie") else ""
+        if not portable and aid:
+            portable = self._build_default_portable(aid)
+        from src.utils.account_credentials import default_password_ref, default_totp_secret_ref
+
+        self._persist_credentials_for_account(aid)
+        return {
+            "id": aid,
+            "name": self._e_name.get().strip(),
+            "browser_type": _browser_storage_from_label(self._cb_browser_label.get()),
+            "portable_path": portable,
+            "profile_path": portable,
+            "cookie_path": cookie,
+            "email": self._form_email(),
+            "totp_enabled": self._form_totp_enabled(),
+            "password_ref": default_password_ref(aid) if aid else "",
+            "totp_secret_ref": default_totp_secret_ref(aid) if aid else "",
+            "use_proxy": bool(self._var_use_proxy.get()),
+            "proxy": {
+                "host": self._e_ph.get().strip(),
+                "port": int(self._e_pp.get().strip() or "0"),
+                "user": self._e_pu.get().strip(),
+                "pass": self._e_ppw.get().strip(),
+            },
+        }
+
+    def _on_test_login_recovery(self) -> None:
+        aid = self._e_id.get().strip()
+        if not aid:
+            messagebox.showwarning("Test Login", "Nhập mã tài khoản (id) trước.", parent=self._top)
+            return
+        if not self._form_email():
+            messagebox.showwarning("Test Login", "Nhập email Facebook.", parent=self._top)
+            return
+        if not self._e_password.get().strip():
+            messagebox.showwarning("Test Login", "Nhập mật khẩu (lưu vào vault khi Lưu).", parent=self._top)
+            return
+        if self._form_totp_enabled() and not self._e_totp_secret.get().strip():
+            messagebox.showwarning("Test Login", "Bật TOTP nhưng chưa nhập secret.", parent=self._top)
+            return
+
+        preview = self._preview_account_for_login_test()
+        ck_rel = preview.get("cookie_path") or f"data/cookies/{aid}.json"
+        force_fresh = bool(getattr(self, "_var_test_login_fresh", tk.BooleanVar(value=True)).get())
+
+        def _run(*, fresh: bool = force_fresh) -> None:
+            from src.automation.browser_factory import BrowserFactory, sync_close_persistent_context
+            from src.automation.facebook_actions import prime_facebook_session_page
+            from src.services.facebook_session_recovery import try_recover_facebook_session
+
+            factory = None
+            ctx = None
+            err_msg = ""
+            ok = False
+            try:
+                factory = BrowserFactory(accounts=self._manager, headless=False)
+                ctx = factory.launch_persistent_context_from_account_dict(preview, headless=False)
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                prime_facebook_session_page(page)
+                ok = try_recover_facebook_session(
+                    page,
+                    preview,
+                    cookie_path=ck_rel,
+                    force_fresh_login=fresh,
+                )
+            except Exception as exc:  # noqa: BLE001
+                err_msg = str(exc)
+            finally:
+                sync_close_persistent_context(ctx, log_label="test_login_recovery")
+                if factory is not None:
+                    try:
+                        factory.close()
+                    except Exception:
+                        pass
+
+            def _notify() -> None:
+                if err_msg:
+                    messagebox.showerror("Test Login", err_msg, parent=self._top)
+                elif ok:
+                    detail = (
+                        "Đăng nhập email/mật khẩu + TOTP thành công."
+                        if fresh
+                        else "Profile đã có phiên hợp lệ (không cần đăng nhập lại)."
+                    )
+                    messagebox.showinfo(
+                        "Test Login",
+                        f"{detail}\nSession đã lưu vào cookie_path.",
+                        parent=self._top,
+                    )
+                else:
+                    messagebox.showwarning(
+                        "Test Login",
+                        "Chưa xác nhận được phiên — có thể sai mật khẩu/TOTP, checkpoint hoặc cần xử lý tay.",
+                        parent=self._top,
+                    )
+
+            self._top.after(0, _notify)
+
+        import threading
+
+        threading.Thread(target=_run, kwargs={"fresh": force_fresh}, daemon=True).start()
+        hint = "đăng nhập lại từ form (email + mật khẩu + TOTP)" if force_fresh else "kiểm tra phiên profile hiện có"
+        messagebox.showinfo(
+            "Test Login",
+            f"Đang mở trình duyệt để {hint}…",
+            parent=self._top,
+        )
 
     def _on_ok(self) -> None:
         try:
@@ -1386,6 +1667,17 @@ class AccountFormDialog:
         except ValueError as exc:
             messagebox.showerror("Dữ liệu không hợp lệ", str(exc), parent=self._top)
             return
+        if isinstance(self._result, dict):
+            aid = str(self._result.get("id", "")).strip()
+            try:
+                self._persist_credentials_for_account(aid)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror(
+                    "Lỗi lưu vault",
+                    f"Không ghi được mật khẩu/TOTP vào config/account_credentials.json:\n{exc}",
+                    parent=self._top,
+                )
+                return
         self._top.grab_release()
         self._top.destroy()
 

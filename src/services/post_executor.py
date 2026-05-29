@@ -220,6 +220,7 @@ def _run_chromium_posting_flow(
     reel_title: str | None = None,
     reel_content: str | None = None,
     reel_video_path: str | None = None,
+    account_record: dict[str, Any] | None = None,
 ) -> None:
     """
     Các bước đăng Meta Business Composer (Reel / caption / Publish) — dùng chung mọi engine Playwright.
@@ -273,7 +274,7 @@ def _run_chromium_posting_flow(
         prime_facebook_session_page(page)
         t0 = _perf_mark(perf_on, "prime_session_page", t0)
         _track(STEP_SESSION_ENSURE, "Đảm bảo phiên Facebook")
-        ensure_facebook_session_for_post(page, cookie_path)
+        ensure_facebook_session_for_post(page, cookie_path, account=account_record)
         t0 = _perf_mark(perf_on, "ensure_session_for_post", t0)
         _track(STEP_NAV_TARGET, "Điều hướng tới đích đăng")
         if is_reel_dashboard_flow:
@@ -549,6 +550,7 @@ def _run_firefox_posting_flow(
     reel_title: str | None = None,
     reel_content: str | None = None,
     reel_video_path: str | None = None,
+    account_record: dict[str, Any] | None = None,
 ) -> None:
     """
     Luồng đăng khi profile là Firefox (Gecko).
@@ -576,6 +578,7 @@ def _run_firefox_posting_flow(
         reel_title=reel_title,
         reel_content=reel_content,
         reel_video_path=reel_video_path,
+        account_record=account_record,
     )
 
 
@@ -599,6 +602,7 @@ def execute_facebook_post_sequence(
     reel_title: str | None = None,
     reel_content: str | None = None,
     reel_video_path: str | None = None,
+    account_record: dict[str, Any] | None = None,
 ) -> None:
     """
     Mở Facebook → phiên → composer → nội dung / Reel → đăng → verify.
@@ -647,6 +651,7 @@ def execute_facebook_post_sequence(
         reel_title=reel_title,
         reel_content=reel_content,
         reel_video_path=reel_video_path,
+        account_record=account_record,
     )
 
 

@@ -50,6 +50,7 @@ data/video_editor/remote_audio_config.json
 
 # Cấu hình theo máy / tài khoản (giữ bản *.example.json nếu có)
 config/accounts.json
+config/account_credentials.json
 config/pages.json
 config/entities.json
 config/schedule.json

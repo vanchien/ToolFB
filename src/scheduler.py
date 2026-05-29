@@ -439,6 +439,12 @@ class BrowserSlotPool:
             self._max,
             free,
         )
+        try:
+            from src.utils.concurrency_runtime import reconcile_multi_task_limits
+
+            reconcile_multi_task_limits(browser_slots_in_use=self._in_use)
+        except Exception:
+            pass
         if ek:
             logger.info(
                 "[Engine] {} dùng engine={} {}/{} (còn {} slot engine).",
@@ -473,6 +479,12 @@ class BrowserSlotPool:
         self._sem.release()
         if ek:
             self._engine_sems[ek].release()
+        try:
+            from src.utils.concurrency_runtime import reconcile_multi_task_limits
+
+            reconcile_multi_task_limits(browser_slots_in_use=self._in_use)
+        except Exception:
+            pass
         logger.info(
             "[Trình duyệt] Đã giải phóng slot cho {} — đang dùng {}/{} (còn {} slot).",
             account_id,
@@ -1534,6 +1546,7 @@ def run_scheduled_post_for_account(
             )
             return False
         account_run_slot = _acquire_account_run_slot(account_id)
+        session_status_before = str(acc.get("session_status") or "active").strip() or "active"
         acc_runtime, runtime_profile_dir = _prepare_account_for_parallel_run(
             account=dict(acc),
             account_id=account_id,
@@ -1833,6 +1846,7 @@ def run_scheduled_post_for_account(
                 reel_title=reel_title,
                 reel_content=reel_content,
                 reel_video_path=reel_video_path,
+                account_record=acc_runtime,
             )
             post_ok = True
         except Exception as exc:  # noqa: BLE001
@@ -1867,6 +1881,13 @@ def run_scheduled_post_for_account(
                         factory.close()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Lỗi khi đóng BrowserFactory ({}): {}", account_id, exc)
+            try:
+                st = str(acc_runtime.get("session_status") or "").strip()
+                if st and st != session_status_before:
+                    mgr.update_account_fields(account_id, {"session_status": st})
+                    logger.info("[Session] Đã lưu session_status={} account={}", st, account_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Session] Không lưu session_status ({}): {}", account_id, exc)
             pool.release_slot(account_id, engine=posting_engine)
 
         if not post_ok and not err_msg:

@@ -89,22 +89,13 @@ from src.utils.runtime_cleanup import cleanup_runtime_junk
 
 
 def _ensure_minimal_config_for_first_run() -> None:
-    """
-    Sau khi clone git, thường thiếu ``config/accounts.json`` → ``main.py`` thoát ngay, GUI không lên.
-    Tạo ``config/`` và file accounts rỗng ``[]`` nếu chưa có (không ghi đè file đã tồn tại).
-    """
-    from src.utils.paths import project_root
+    """Sau clone GitHub: tạo ``config/*.json`` từ mẫu + thư mục ``data/`` / ``logs/``."""
+    from src.utils.first_run_bootstrap import bootstrap_all
 
-    root = project_root()
-    cfg = root / "config"
-    cfg.mkdir(parents=True, exist_ok=True)
-    path = _default_accounts_path()
-    if not path.is_file():
-        path.write_text("[]\n", encoding="utf-8")
-        logger.info(
-            "Đã tạo {} rỗng (máy mới / clone repo). Mở tab Tài khoản để thêm profile.",
-            path,
-        )
+    info = bootstrap_all()
+    created = info.get("created_config") or []
+    if created:
+        logger.info("Bootstrap máy mới: đã tạo config — {}", ", ".join(created))
 
 
 def _preflight_or_exit() -> AccountsDatabaseManager:
@@ -174,14 +165,23 @@ def _configure_logging() -> None:
 
 def _cleanup_previous_background_instances() -> None:
     """
-    Windows EXE mode: tự dọn các tiến trình ToolFB_GUI.exe cũ trước khi chạy.
+    Windows EXE: tùy chọn dọn các tiến trình ToolFB_GUI.exe cũ (chế độ single-instance).
 
-    Mục tiêu: tránh treo/đụng tài nguyên khi người dùng bấm mở app nhiều lần
-    hoặc còn tiến trình nền từ phiên trước.
-    """
+    Mặc định **cho phép nhiều cửa sổ** — mỗi cửa sổ nên dùng ``TOOLFB_DATA_DIR`` riêng
+    (hoặc shortcut với ``--data-dir``) để không ghi đè ``config/`` / ``data/``.
+  """
     if os.name != "nt":
         return
     if not getattr(sys, "frozen", False):
+        return
+    if os.environ.get("TOOLFB_MULTI_INSTANCE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        logger.info("Cho phép nhiều instance (TOOLFB_MULTI_INSTANCE).")
+        return
+    if os.environ.get("TOOLFB_SINGLE_INSTANCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        logger.info(
+            "Không dọn process cũ — có thể mở nhiều ToolFB. "
+            "Đặt TOOLFB_SINGLE_INSTANCE=1 để chỉ một cửa sổ (bản cũ)."
+        )
         return
     if os.environ.get("TOOLFB_DISABLE_STARTUP_CLEANUP", "").strip() in {"1", "true", "yes", "on"}:
         logger.info("Bỏ qua dọn tiến trình nền do TOOLFB_DISABLE_STARTUP_CLEANUP=1")
@@ -232,9 +232,31 @@ def main() -> None:
         action="store_true",
         help="Bản .exe (PyInstaller): chạy scheduler 24/7 trên terminal, không mở GUI. Bỏ qua tham số này khi dev bằng python.",
     )
+    parser.add_argument(
+        "--multi-instance",
+        action="store_true",
+        help="Cho phép chạy song song nhiều cửa sổ (không taskkill bản cũ). Nên kèm --data-dir.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        metavar="PATH",
+        default="",
+        help="Thư mục dữ liệu riêng (config/, data/, logs/). Mỗi instance một PATH để tránh đụng file.",
+    )
     args = parser.parse_args()
 
+    if str(args.data_dir or "").strip():
+        os.environ["TOOLFB_DATA_DIR"] = str(Path(args.data_dir).expanduser().resolve())
+        from src.utils.paths import reset_project_root_cache
+
+        reset_project_root_cache()
+    if args.multi_instance:
+        os.environ["TOOLFB_MULTI_INSTANCE"] = "1"
+
     _configure_logging()
+    from src.utils.concurrency_runtime import apply_multi_task_defaults
+
+    apply_multi_task_defaults(gui=bool(args.gui or (getattr(sys, "frozen", False) and not args.cli)))
     _enforce_playwright_browser_lock()
     _cleanup_previous_background_instances()
     cleanup_runtime_junk()

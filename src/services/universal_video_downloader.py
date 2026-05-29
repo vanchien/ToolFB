@@ -2072,6 +2072,17 @@ class UniversalVideoDownloader:
         return job
 
     def run_download_job(self, job_id: str, *, on_progress: ProgressHook | None = None) -> dict[str, Any]:
+        from src.utils.concurrency_runtime import workload_scope
+
+        job = self._store.get_job(job_id)
+        if not job:
+            raise KeyError(f"Không có job: {job_id}")
+        with workload_scope("download"):
+            return self._run_download_job_inner(job_id, on_progress=on_progress)
+
+    def _run_download_job_inner(
+        self, job_id: str, *, on_progress: ProgressHook | None = None
+    ) -> dict[str, Any]:
         job = self._store.get_job(job_id)
         if not job:
             raise KeyError(f"Không có job: {job_id}")

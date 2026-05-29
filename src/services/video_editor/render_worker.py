@@ -18,8 +18,25 @@ from src.services.video_editor.layout import ensure_video_editor_layout
 ProgressCb = Callable[[float], None]
 WaitHeartbeatCb = Callable[[], None]
 
-# Một FFmpeg duy nhất trên toàn app (preview + export dùng chung) — tránh 2 tiến trình chồng CPU/RAM/I-O.
-_FFMPEG_GLOBAL_ENCODE_LOCK = threading.Lock()
+# Giới hạn số FFmpeg chạy song song (preview + export) — mặc định 2 (``TOOLFB_FFMPEG_CONCURRENCY``).
+_FFMPEG_SLOTS: threading.Semaphore | None = None
+_FFMPEG_SLOTS_GUARD = threading.Lock()
+
+
+def _ffmpeg_slot_count() -> int:
+    raw = str(os.environ.get("TOOLFB_FFMPEG_CONCURRENCY", "2") or "2").strip()
+    try:
+        return max(1, min(3, int(raw)))
+    except ValueError:
+        return 2
+
+
+def _ffmpeg_slots() -> threading.Semaphore:
+    global _FFMPEG_SLOTS
+    with _FFMPEG_SLOTS_GUARD:
+        if _FFMPEG_SLOTS is None:
+            _FFMPEG_SLOTS = threading.Semaphore(_ffmpeg_slot_count())
+        return _FFMPEG_SLOTS
 
 
 class RenderWorker:
@@ -115,16 +132,23 @@ class RenderWorker:
         Chạy FFmpeg export MP4.
         `command` là argv đầy đủ (ffmpeg đầu tiên).
         """
-        with _FFMPEG_GLOBAL_ENCODE_LOCK:
-            return self._render_locked(
-                project,
-                output_path,
-                command,
-                duration_sec=duration_sec,
-                progress_callback=progress_callback,
-                log_path=log_path,
-                wait_heartbeat_callback=wait_heartbeat_callback,
-            )
+        from src.utils.concurrency_runtime import workload_scope
+
+        sem = _ffmpeg_slots()
+        sem.acquire()
+        try:
+            with workload_scope("video_editor"):
+                return self._render_locked(
+                    project,
+                    output_path,
+                    command,
+                    duration_sec=duration_sec,
+                    progress_callback=progress_callback,
+                    log_path=log_path,
+                    wait_heartbeat_callback=wait_heartbeat_callback,
+                )
+        finally:
+            sem.release()
 
     def _render_locked(
         self,

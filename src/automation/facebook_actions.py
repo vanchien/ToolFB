@@ -1004,37 +1004,73 @@ def facebook_session_appears_logged_in(page: Page) -> bool:
         return False
 
 
-def ensure_facebook_session_for_post(page: Page, cookie_path: str | Path | None) -> None:
+def ensure_facebook_session_for_post(
+    page: Page,
+    cookie_path: str | Path | None,
+    account: dict[str, Any] | None = None,
+) -> None:
     """
-    Ưu tiên phiên đã có trong profile; chỉ nạp cookie khi mất phiên và ``FB_ALLOW_COOKIE_RESTORE=1`` (mặc định).
+    Ưu tiên phiên profile → refresh → cookie → đăng nhập lại (email/password [+ TOTP]) tối đa một lần.
 
     Raises:
         RuntimeError: Không thể tiếp tục (checkpoint, cookie hết hạn, v.v.) — nên đánh dấu need_manual_check.
         FileNotFoundError: Cần cookie nhưng file không có.
     """
+    from src.services.facebook_session_recovery import (
+        facebook_page_is_hard_checkpoint,
+        try_recover_facebook_session,
+    )
+    from src.utils.account_credentials import account_can_auto_reauth
+
+    def _raise_checkpoint(msg: str) -> None:
+        raise RuntimeError(f"{msg} need_manual_check")
+
+    def _raise_interstitial_no_creds(stage: str) -> None:
+        _raise_checkpoint(
+            f"FACEBOOK_2FA_OR_CHECKPOINT ({stage}): Facebook yêu cầu xác minh (2FA/checkpoint/đăng nhập lại). "
+            "Hoàn tất tay trên profile hoặc cấu hình email + mật khẩu (+ TOTP) trong tài khoản để tự đăng nhập lại."
+        )
+
+    auto_reauth_tried = False
+
+    def _try_auto_reauth(stage: str) -> bool:
+        nonlocal auto_reauth_tried
+        if auto_reauth_tried or not account or not account_can_auto_reauth(account):
+            return False
+        auto_reauth_tried = True
+        logger.info("[FB] ensure_session: thử đăng nhập lại ({})", stage)
+        return bool(try_recover_facebook_session(page, account, cookie_path=cookie_path))
+
     _human_pause()
     logger.info("[FB] ensure_session: url={!r}", page.url)
-    if _facebook_url_is_security_interstitial(page.url or ""):
-        raise RuntimeError(
-            "FACEBOOK_2FA_OR_CHECKPOINT: Facebook đang yêu cầu xác minh bảo mật (2 lớp / checkpoint / đăng nhập lại). "
-            "Mở đúng profile trong trình duyệt, hoàn tất bước Meta hiển thị, rồi chạy lại job hoặc «Lấy cookie (Playwright)». "
-            "Chrome/Chromium dễ bị hơn Firefox khi cookie hoặc máy thay đổi. need_manual_check"
+    url_now = page.url or ""
+    if facebook_page_is_hard_checkpoint(url_now):
+        _raise_checkpoint(
+            "FACEBOOK_CHECKPOINT: Meta yêu cầu xác minh (checkpoint/captcha/danh tính) — không tự xử lý."
         )
     if facebook_session_appears_logged_in(page):
-        logger.info("[FB] Profile vẫn đăng nhập — bỏ qua bước nạp cookie.")
+        logger.info("[FB] Profile vẫn đăng nhập — bỏ qua nạp cookie.")
         return
-    # Có thể vừa load dở hoặc bị chuyển host, thử refresh 1 lần trước khi đè cookie.
+    if _facebook_url_is_security_interstitial(url_now):
+        if _try_auto_reauth("initial_interstitial"):
+            return
+        _raise_interstitial_no_creds("đầu phiên")
+    if _try_auto_reauth("not_logged_in"):
+        return
     try:
         page.reload(wait_until="domcontentloaded", timeout=45_000)
         _force_www_facebook_if_mobile_redirect(page)
-        if _facebook_url_is_security_interstitial(page.url or ""):
-            raise RuntimeError(
-                "FACEBOOK_2FA_OR_CHECKPOINT: Sau refresh vẫn ở trang xác minh Meta (2FA/checkpoint). "
-                "Xử lý tay trên profile rồi chạy lại. need_manual_check"
-            )
+        if facebook_page_is_hard_checkpoint(page.url or ""):
+            _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau refresh vẫn ở checkpoint Meta.")
         if facebook_session_appears_logged_in(page):
             logger.info("[FB] Sau refresh, profile đã đăng nhập — bỏ qua nạp cookie.")
             return
+        if _facebook_url_is_security_interstitial(page.url or ""):
+            if _try_auto_reauth("after_refresh"):
+                return
+            _raise_interstitial_no_creds("sau refresh")
+    except RuntimeError:
+        raise
     except Exception:
         pass
     allow = _env_bool("FB_ALLOW_COOKIE_RESTORE", True)
@@ -1052,11 +1088,12 @@ def ensure_facebook_session_for_post(page: Page, cookie_path: str | Path | None)
         raise FileNotFoundError(str(path))
     logger.info("[FB] Thử khôi phục phiên bằng cookie: {}", path)
     login_with_cookie(page, path)
+    if facebook_page_is_hard_checkpoint(page.url or ""):
+        _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau nạp cookie vẫn ở checkpoint Meta.")
     if _facebook_url_is_security_interstitial(page.url or ""):
-        raise RuntimeError(
-            "FACEBOOK_2FA_OR_CHECKPOINT: Sau khi nạp cookie Facebook vẫn yêu cầu xác minh (2FA/checkpoint). "
-            "Cookie không đủ để bỏ qua bước này — đăng nhập/ xác minh tay trong profile, rồi «Lấy cookie» lại. need_manual_check"
-        )
+        if _try_auto_reauth("after_cookie"):
+            return
+        _raise_interstitial_no_creds("sau nạp cookie")
     if facebook_session_appears_logged_in(page):
         return
     pause_ms = max(0, min(15_000, _env_int("FB_POST_COOKIE_SESSION_WAIT_MS", 1_200)))
@@ -1076,13 +1113,14 @@ def ensure_facebook_session_for_post(page: Page, cookie_path: str | Path | None)
     if facebook_session_appears_logged_in(page):
         logger.info("[FB] Phiên OK sau goto www bổ sung (sau nạp cookie).")
         return
-    if not facebook_session_appears_logged_in(page):
-        _log_facebook_session_diagnostic(page, stage="after_cookie_restore")
-        raise RuntimeError(
-            "Sau khi nạp cookie vẫn không có phiên hợp lệ — có thể checkpoint hoặc cookie hết hạn (need_manual_check). "
-            "Xem log «Chẩn đoán phiên»: nếu thiếu c_user/xs, hãy «Lấy cookie (Playwright)» lại; nếu có c_user nhưng vẫn lỗi, "
-            "mở profile Firefox tay, đăng nhập Facebook, hoàn tất hộp thoại Meta (cookie/consent/checkpoint), rồi chạy lại job."
-        )
+    if _try_auto_reauth("final"):
+        return
+    _log_facebook_session_diagnostic(page, stage="after_cookie_restore")
+    raise RuntimeError(
+        "Sau khi nạp cookie vẫn không có phiên hợp lệ — có thể checkpoint hoặc cookie hết hạn (need_manual_check). "
+        "Xem log «Chẩn đoán phiên»: nếu thiếu c_user/xs, hãy «Lấy cookie (Playwright)» lại; nếu có c_user nhưng vẫn lỗi, "
+        "mở profile Firefox tay, đăng nhập Facebook, hoàn tất hộp thoại Meta (cookie/consent/checkpoint), rồi chạy lại job."
+    )
 
 
 def _load_playwright_cookies(cookie_path: Path) -> list[dict[str, Any]]:

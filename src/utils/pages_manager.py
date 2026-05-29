@@ -16,6 +16,7 @@ from typing import Any, Iterable, Optional, TypedDict
 
 from loguru import logger
 
+from src.utils.json_store_lock import json_file_lock
 from src.utils.page_workspace import ensure_page_workspace
 from src.utils.paths import project_root
 
@@ -130,6 +131,10 @@ class PagesManager:
         self._validate(d)
 
     def load_all(self) -> list[PageRecord]:
+        with json_file_lock(self.file_path):
+            return self._load_all_unlocked()
+
+    def _load_all_unlocked(self) -> list[PageRecord]:
         if not self.file_path.is_file():
             self._invalidate_rows_cache()
             raise FileNotFoundError(str(self.file_path))
@@ -153,13 +158,14 @@ class PagesManager:
         return list(out)
 
     def save_all(self, rows: Iterable[PageRecord]) -> None:
-        lst = list(rows)
-        for r in lst:
-            self._validate(r)
-        self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
-        self._rows_cache = list(lst)
-        self._rows_mtime = self.file_path.stat().st_mtime
-        logger.info("Đã ghi {} page/group vào {}", len(lst), self.file_path)
+        with json_file_lock(self.file_path):
+            lst = list(rows)
+            for r in lst:
+                self._validate(r)
+            self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
+            self._rows_cache = list(lst)
+            self._rows_mtime = self.file_path.stat().st_mtime
+            logger.info("Đã ghi {} page/group vào {}", len(lst), self.file_path)
 
     def upsert(self, row: PageRecord) -> None:
         d = dict(row)
@@ -167,29 +173,33 @@ class PagesManager:
             d["id"] = uuid.uuid4().hex[:12]
         self._validate(d)
         nid = str(d["id"])
-        current = self.load_all()
-        fb_id = self._normalize_fb_page_id(d)
-        if fb_id:
+        with json_file_lock(self.file_path):
+            self._invalidate_rows_cache()
+            current = self._load_all_unlocked()
+            fb_id = self._normalize_fb_page_id(d)
+            if fb_id:
+                for x in current:
+                    xid = str(x.get("id", "")).strip()
+                    if xid == nid:
+                        continue
+                    if self._normalize_fb_page_id(dict(x)) == fb_id:
+                        raise ValueError(
+                            f"Meta Page ID {fb_id} đã tồn tại ở page id={xid!r}. "
+                            "Hãy xóa bản ghi cũ trước khi thêm mới.",
+                        )
+            replaced = False
+            new_list: list[PageRecord] = []
             for x in current:
-                xid = str(x.get("id", "")).strip()
-                if xid == nid:
-                    continue
-                if self._normalize_fb_page_id(dict(x)) == fb_id:
-                    raise ValueError(
-                        f"Meta Page ID {fb_id} đã tồn tại ở page id={xid!r}. "
-                        "Hãy xóa bản ghi cũ trước khi thêm mới.",
-                    )
-        replaced = False
-        new_list: list[PageRecord] = []
-        for x in current:
-            if str(x.get("id")) == nid:
+                if str(x.get("id")) == nid:
+                    new_list.append(d)  # type: ignore[arg-type]
+                    replaced = True
+                else:
+                    new_list.append(x)
+            if not replaced:
                 new_list.append(d)  # type: ignore[arg-type]
-                replaced = True
-            else:
-                new_list.append(x)
-        if not replaced:
-            new_list.append(d)  # type: ignore[arg-type]
-        self.save_all(new_list)
+            self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
+            self._rows_cache = new_list
+            self._rows_mtime = self.file_path.stat().st_mtime
         try:
             ensure_page_workspace(nid)
         except ValueError as exc:
@@ -213,43 +223,47 @@ class PagesManager:
         if not incoming:
             return {"new": 0, "updated": 0}
 
-        current = self.load_all()
-        by_id: dict[str, PageRecord] = {str(x.get("id")): x for x in current if str(x.get("id"))}
-        fb_to_id: dict[str, str] = {}
-        for x in current:
-            xid = str(x.get("id", "")).strip()
-            if not xid:
-                continue
-            fb = self._normalize_fb_page_id(dict(x))
-            if fb and fb not in fb_to_id:
-                fb_to_id[fb] = xid
-        count_new = 0
-        count_updated = 0
-
-        for d in incoming:
-            nid = str(d.get("id") or "")
-            fb_id = self._normalize_fb_page_id(d)
-            if fb_id:
-                owner_id = fb_to_id.get(fb_id, "")
-                if owner_id and owner_id != nid:
-                    skipped_duplicate_meta_id += 1
-                    logger.warning(
-                        "Bỏ qua upsert_many id={} vì trùng fb_page_id={} với id={}",
-                        nid,
-                        fb_id,
-                        owner_id,
-                    )
+        with json_file_lock(self.file_path):
+            self._invalidate_rows_cache()
+            current = self._load_all_unlocked()
+            by_id: dict[str, PageRecord] = {str(x.get("id")): x for x in current if str(x.get("id"))}
+            fb_to_id: dict[str, str] = {}
+            for x in current:
+                xid = str(x.get("id", "")).strip()
+                if not xid:
                     continue
-                fb_to_id[fb_id] = nid
-            if nid in by_id:
-                by_id[nid] = d
-                count_updated += 1
-            else:
-                by_id[nid] = d
-                count_new += 1
+                fb = self._normalize_fb_page_id(dict(x))
+                if fb and fb not in fb_to_id:
+                    fb_to_id[fb] = xid
+            count_new = 0
+            count_updated = 0
 
-        new_list = list(by_id.values())
-        self.save_all(new_list)
+            for d in incoming:
+                nid = str(d.get("id") or "")
+                fb_id = self._normalize_fb_page_id(d)
+                if fb_id:
+                    owner_id = fb_to_id.get(fb_id, "")
+                    if owner_id and owner_id != nid:
+                        skipped_duplicate_meta_id += 1
+                        logger.warning(
+                            "Bỏ qua upsert_many id={} vì trùng fb_page_id={} với id={}",
+                            nid,
+                            fb_id,
+                            owner_id,
+                        )
+                        continue
+                    fb_to_id[fb_id] = nid
+                if nid in by_id:
+                    by_id[nid] = d
+                    count_updated += 1
+                else:
+                    by_id[nid] = d
+                    count_new += 1
+
+            new_list = list(by_id.values())
+            self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
+            self._rows_cache = new_list
+            self._rows_mtime = self.file_path.stat().st_mtime
 
         for d in incoming:
             nid = str(d.get("id") or "").strip()

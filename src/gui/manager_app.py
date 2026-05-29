@@ -257,6 +257,10 @@ class _ManagerWindow:
         Args:
             accounts: Manager JSON dùng cho scheduler và làm mới bảng.
         """
+        from src.utils.concurrency_runtime import apply_multi_task_defaults
+
+        apply_multi_task_defaults(gui=True)
+        self._multitask_reconcile_after_id: str | None = None
         self._accounts = accounts
         self._pages = PagesManager()
         self._schedule_posts = get_default_schedule_posts_manager()
@@ -274,6 +278,14 @@ class _ManagerWindow:
         self._app_version_str = read_local_version(project_root())
         self._root.title(f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+        try:
+            sw = int(self._root.winfo_screenwidth() or 1280)
+            sh = int(self._root.winfo_screenheight() or 800)
+            ww = min(1280, max(860, sw - 48))
+            wh = min(900, max(560, sh - 72))
+            self._root.geometry(f"{ww}x{wh}+{(sw - ww) // 2}+{(sh - wh) // 2}")
+        except tk.TclError:
+            pass
         self._compact_ui = int(self._root.winfo_screenheight() or 900) <= 820
         self._tree_rows_main = 9 if self._compact_ui else 11
         self._tree_rows_jobs = 8 if self._compact_ui else 10
@@ -342,12 +354,29 @@ class _ManagerWindow:
         main = ttk.Frame(self._root, padding=(6 if self._compact_ui else 8))
         main.pack(fill=tk.BOTH, expand=True)
 
-        title = ttk.Label(
-            main,
-            text="Facebook Automation — Lịch (scheduler) + Account Source + Page/Group",
+        title_fr = ttk.Frame(main)
+        title_fr.pack(fill=tk.X, pady=(0, 4 if self._compact_ui else 6))
+        ttk.Label(
+            title_fr,
+            text="Facebook Automation — Lịch + Tài khoản + Page/Group",
             font=("Segoe UI", 11 if self._compact_ui else 12, "bold"),
+        ).pack(anchor="w")
+        hint_row = ttk.Frame(title_fr)
+        hint_row.pack(fill=tk.X, pady=(2, 0))
+        self._setup_banner = hint_row
+        self._lbl_setup_hint = ttk.Label(
+            hint_row,
+            text="",
+            wraplength=920 if not self._compact_ui else 720,
+            justify=tk.LEFT,
+            foreground="#5c4b00",
+            font=("Segoe UI", 9),
         )
-        title.pack(anchor="w", pady=(0, 4 if self._compact_ui else 6))
+        self._lbl_setup_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(hint_row, text="Hướng dẫn", command=self._on_setup_guide, width=10).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        hint_row.pack_forget()
 
         bar = ttk.Frame(main)
         bar.pack(fill=tk.X, pady=(0, 6))
@@ -371,7 +400,7 @@ class _ManagerWindow:
         self._btn_stop.pack(side=tk.LEFT, padx=(0, 4))
         self._btn_refresh = ttk.Button(
             row0,
-            text="Làm mới tất cả",
+            text="Làm mới" if self._compact_ui else "Làm mới tất cả",
             command=self._refresh_all,
         )
         self._btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
@@ -409,6 +438,8 @@ class _ManagerWindow:
             command=self._apply_multi_page_compact_preset,
         )
         self._btn_compact_multi.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_setup_help = ttk.Button(row1, text="?", width=3, command=self._on_setup_guide)
+        self._btn_setup_help.pack(side=tk.LEFT, padx=(0, 4))
         self._btn_check_updates = ttk.Button(row1, text="Chỉ kiểm tra", command=self._on_check_updates)
         self._btn_check_updates.pack(side=tk.LEFT, padx=(0, 4))
         self._btn_apply_update = ttk.Button(row1, text="Cập nhật", command=self._on_apply_update)
@@ -439,6 +470,15 @@ class _ManagerWindow:
             foreground="gray",
         )
         self._lbl_app_version.pack(anchor="e", pady=(4, 0))
+        self._lbl_multitask = ttk.Label(
+            bar_status,
+            text="",
+            foreground="gray",
+            font=("Segoe UI", 8),
+            wraplength=280,
+            justify=tk.RIGHT,
+        )
+        self._lbl_multitask.pack(anchor="e", pady=(2, 0))
         self._set_browser_visibility(self._show_browser, update_env=False)
 
         body = ttk.PanedWindow(main, orient=tk.VERTICAL)
@@ -1225,6 +1265,7 @@ class _ManagerWindow:
         self._apply_ai_provider_view()
         self._sync_ai_tab_scrollregion()
         self._start_ui_watchdog()
+        self._start_multitask_reconcile_timer()
         self._root.after(900, self._schedule_probe_update_button_visibility)
         logger.info(
             "Đã mở giao diện quản lý — tab Tài khoản / Page / Job lịch / Cài đặt AI; «Bắt đầu lịch» chạy scheduler nền."
@@ -1298,6 +1339,128 @@ class _ManagerWindow:
         except Exception:
             pass
         self._ui_watchdog_after_id = None
+
+    def _start_multitask_reconcile_timer(self) -> None:
+        """Định kỳ tự điều chỉnh browser/FFmpeg khi nhiều chức năng chạy song song."""
+        if self._multitask_reconcile_after_id is not None:
+            return
+
+        def _tick() -> None:
+            try:
+                from src.scheduler import get_default_browser_pool
+                from src.utils.concurrency_runtime import reconcile_multi_task_limits
+
+                pool = get_default_browser_pool()
+                in_use = int(getattr(pool, "_in_use", 0))
+                reconcile_multi_task_limits(browser_slots_in_use=in_use)
+                self._update_multitask_status_label(browser_slots_in_use=in_use)
+            except Exception:
+                pass
+            self._multitask_reconcile_after_id = self._root.after(8_000, _tick)
+
+        self._multitask_reconcile_after_id = self._root.after(8_000, _tick)
+
+    def _stop_multitask_reconcile_timer(self) -> None:
+        if self._multitask_reconcile_after_id is None:
+            return
+        try:
+            self._root.after_cancel(self._multitask_reconcile_after_id)
+        except Exception:
+            pass
+        self._multitask_reconcile_after_id = None
+
+    def _refresh_setup_banner(self) -> None:
+        """Hiện banner hướng dẫn khi máy mới clone repo chưa có TK / API key."""
+        if not hasattr(self, "_setup_banner"):
+            return
+        try:
+            from src.utils.first_run_bootstrap import setup_status
+
+            st = setup_status()
+            parts: list[str] = []
+            if st.get("needs_account"):
+                parts.append("① Thêm tài khoản (tab Tài khoản)")
+            if st.get("needs_secrets"):
+                parts.append("② Cấu hình Gemini API (tab Cài đặt AI)")
+            if not parts:
+                self._setup_banner.pack_forget()
+                return
+            self._lbl_setup_hint.configure(
+                text="Máy mới / chưa cấu hình: " + " · ".join(parts) + " — bấm «Hướng dẫn» để xem chi tiết."
+            )
+            if not self._setup_banner.winfo_ismapped():
+                self._setup_banner.pack(fill=tk.X)
+        except Exception:
+            pass
+
+    def _update_multitask_status_label(self, *, browser_slots_in_use: int | None = None) -> None:
+        if not hasattr(self, "_lbl_multitask"):
+            return
+        try:
+            import os
+
+            from src.utils.concurrency_runtime import get_last_applied_limits, workload_snapshot
+
+            if browser_slots_in_use is None:
+                try:
+                    from src.scheduler import get_default_browser_pool
+
+                    browser_slots_in_use = int(getattr(get_default_browser_pool(), "_in_use", 0))
+                except Exception:
+                    browser_slots_in_use = 0
+            snap = workload_snapshot(browser_slots_in_use=browser_slots_in_use)
+            active = [k for k, v in snap.items() if v]
+            lim = get_last_applied_limits()
+            br = lim.get("BROWSER_CONCURRENCY") or os.environ.get("BROWSER_CONCURRENCY", "?")
+            ff = lim.get("TOOLFB_FFMPEG_CONCURRENCY") or os.environ.get("TOOLFB_FFMPEG_CONCURRENCY", "?")
+            if active:
+                self._lbl_multitask.configure(
+                    text=f"Đa tác vụ: {', '.join(active)} | browser≤{br} ffmpeg≤{ff}"
+                )
+            else:
+                self._lbl_multitask.configure(text=f"Sẵn sàng đa tác vụ | browser≤{br} ffmpeg≤{ff}")
+        except Exception:
+            pass
+
+    def _on_setup_guide(self) -> None:
+        """Checklist thiết lập cho máy clone từ GitHub."""
+        from src.utils.first_run_bootstrap import setup_status
+        from src.utils.paths import project_root
+
+        st = setup_status()
+        root = project_root()
+        body = (
+            "Thiết lập ToolFB (máy mới)\n"
+            "────────────────────────\n\n"
+            "1. Cài đặt (một lần)\n"
+            "   scripts\\setup_windows.bat\n"
+            "   hoặc: pip install -r requirements.txt\n"
+            "         python -m playwright install firefox\n\n"
+            "2. Chạy app\n"
+            "   Start_ToolFB_GUI.bat  hoặc  python main.py --gui\n\n"
+            "3. Trong app\n"
+            "   • Tab Tài khoản → Thêm (profile + cookie)\n"
+            "   • Tab Page/Group → thêm Page, gắn account_id\n"
+            "   • Tab Cài đặt AI → Gemini API key\n"
+            "   • Tab Job lịch → tạo job → Bắt đầu lịch\n\n"
+            "4. Tùy chọn\n"
+            "   • TOTP đăng nhập: Sửa tài khoản → Facebook login\n"
+            "   • Tải video / Video Editor: tab trong notebook\n"
+            "   • Nhiều cửa sổ: --multi-instance --data-dir <path>\n\n"
+            f"Thư mục dự án: {root}\n"
+            f"Tài khoản: {st.get('n_accounts', 0)} | API secrets: {'có' if st.get('has_secrets') else 'chưa'}\n\n"
+            "Chi tiết: README.md trong repo."
+        )
+        top = tk.Toplevel(self._root)
+        top.title("Hướng dẫn thiết lập")
+        top.transient(self._root)
+        top.geometry("520x480")
+        top.minsize(420, 360)
+        txt = tk.Text(top, wrap="word", font=("Segoe UI", 10), padx=8, pady=8)
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert("1.0", body)
+        txt.configure(state=tk.DISABLED)
+        ttk.Button(top, text="Đóng", command=top.destroy).pack(pady=6)
 
     def _sync_ai_tab_scrollregion(self) -> None:
         """Đồng bộ vùng cuộn cho tab AI Providers."""
@@ -2210,6 +2373,8 @@ class _ManagerWindow:
         self._refresh_tree()
         self._fill_pages_tree()
         self._fill_schedule_jobs_tree()
+        self._refresh_setup_banner()
+        self._update_multitask_status_label()
 
     def _refresh_all(self) -> None:
         self._refresh_tree()
@@ -8554,11 +8719,15 @@ class _ManagerWindow:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Luồng scheduler kết thúc lỗi: {}", exc)
 
+        from src.utils.concurrency_runtime import workload_begin
+
+        workload_begin("scheduler")
         self._worker = threading.Thread(target=runner, name="fb_scheduler", daemon=True)
         self._worker.start()
         self._btn_start.configure(state=tk.DISABLED)
         self._btn_stop.configure(state=tk.NORMAL)
         self._lbl_state.configure(text="Lịch: đang chạy")
+        self._start_multitask_reconcile_timer()
         logger.info("Đã bật lịch (scheduler trong thread nền, HEADLESS={}).", os.environ.get("HEADLESS", "1"))
 
     def _set_browser_visibility(self, show: bool, *, update_env: bool = True) -> None:
@@ -8612,7 +8781,10 @@ class _ManagerWindow:
         """
         Báo hiệu dừng scheduler theo kiểu non-blocking (không chặn UI thread).
         """
+        from src.utils.concurrency_runtime import workload_end
+
         self._set_ui_busy("stop_scheduler")
+        workload_end("scheduler")
         if self._stop_event is not None:
             self._stop_event.set()
         worker = self._worker
@@ -8655,6 +8827,13 @@ class _ManagerWindow:
         - Gỡ log sink và hủy cửa sổ ngay.
         """
         self._set_ui_busy("close_app")
+        self._stop_multitask_reconcile_timer()
+        try:
+            from src.utils.concurrency_runtime import workload_end
+
+            workload_end("scheduler")
+        except Exception:
+            pass
         try:
             if self._worker is not None and self._worker.is_alive() and self._stop_event is not None:
                 self._stop_event.set()
