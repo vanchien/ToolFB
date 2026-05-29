@@ -48,6 +48,14 @@ def test_verify_reel_fails_without_video_evidence() -> None:
         patch(
             "src.automation.facebook_actions._navigate_meta_published_posts_best_effort",
         ),
+        patch(
+            "src.automation.facebook_actions._reel_post_likely_submitted",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._reel_post_submit_strong_signal",
+            return_value=False,
+        ),
         patch("src.automation.facebook_actions._env_int", return_value=5000),
         patch("src.automation.facebook_actions._failure_screenshot"),
     ):

@@ -13,6 +13,7 @@ from typing import Any
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from src.utils.page_insights_format import format_metric
 from src.utils.pages_manager import PageRecord, PagesManager
 
 
@@ -56,6 +57,7 @@ class PageFormDialog:
         title: str,
         initial: PageRecord | None,
         id_readonly: bool,
+        insights: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._pages = pages
         self._owner_ids = [str(x).strip() for x in owner_account_ids if str(x).strip()]
@@ -78,6 +80,8 @@ class PageFormDialog:
         form.columnconfigure(1, weight=1)
 
         self._build_basics_form(form, init)
+        if insights:
+            self._build_insights_panel(form, insights)
 
         btnf = ttk.Frame(self._top, padding=8)
         btnf.grid(row=1, column=0, sticky="ew")
@@ -156,6 +160,28 @@ class PageFormDialog:
             lambda _e: lbl_hint.configure(wraplength=max(320, int(self._top.winfo_width()) - 60)),
             add="+",
         )
+
+    def _build_insights_panel(self, form: ttk.Frame, insights: dict[str, dict[str, Any]]) -> None:
+        row = form.grid_size()[1]
+        box = ttk.LabelFrame(form, text="Thống kê Insights (đã lưu)", padding=8)
+        box.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        lines: list[str] = []
+        for label, key in (("7 ngày", "7d"), ("28 ngày", "28d")):
+            snap = insights.get(key)
+            if not isinstance(snap, dict):
+                lines.append(f"• {label}: chưa có dữ liệu")
+                continue
+            fol = format_metric(snap.get("followers") if snap.get("followers") is not None else None)
+            views = format_metric(snap.get("views") if snap.get("views") is not None else None)
+            at = str(snap.get("fetched_at", "") or "").replace("T", " ")[:19]
+            err = str(snap.get("error", "") or "").strip()
+            line = f"• {label}: Followers {fol} | Views {views}"
+            if at:
+                line += f" — cập nhật {at}"
+            if err and fol == "—" and views == "—":
+                line += f" ({err[:80]})"
+            lines.append(line)
+        ttk.Label(box, text="\n".join(lines), justify="left", wraplength=500).pack(anchor="w")
 
     @property
     def result(self) -> dict[str, Any] | None:

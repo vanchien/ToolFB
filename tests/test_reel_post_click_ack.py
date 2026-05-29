@@ -99,7 +99,7 @@ def test_click_reel_post_succeeds_on_likely_submitted_grace() -> None:
         ),
         patch(
             "src.automation.facebook_actions._reel_post_likely_submitted",
-            side_effect=[False, False, True],
+            side_effect=[False, True],
         ),
         patch(
             "src.automation.facebook_actions._dismiss_reel_hashtag_suggestion",

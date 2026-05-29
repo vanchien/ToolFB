@@ -1922,10 +1922,15 @@ def _attach_media_automatic(
     if in_business and scope is None:
         _dismiss_blocking_ui_before_business_media(page)
 
+    def _attach_ok() -> bool:
+        if kind == "video":
+            _mute_browser_video_previews_after_attach(page, scope=scope)
+        return True
+
     for round_i in range(3):
         if _set_file_via_existing_input(page, path, kind=kind, scope=scope):
             logger.info("{} OK input trực tiếp (round={}): {}", tag, round_i + 1, path)
-            return True
+            return _attach_ok()
         try:
             page.wait_for_timeout(280)
         except Exception:
@@ -1933,7 +1938,7 @@ def _attach_media_automatic(
 
     if _set_file_via_business_add_button(page, path, kind=kind, scope=scope):
         logger.info("{} OK qua filechooser interception: {}", tag, path)
-        return True
+        return _attach_ok()
 
     if scope is not None:
         return _attach_media_automatic(
@@ -1950,7 +1955,7 @@ def _attach_media_automatic(
                 _open_business_add_photo_video(page)
             fc_info.value.set_files(str(path))
             logger.info("{} OK filechooser opt-in native: {}", tag, path)
-            return True
+            return _attach_ok()
         except Exception:
             _dismiss_leaked_native_file_dialog(page)
 
@@ -3511,6 +3516,135 @@ def upload_photo(page: Page, image_path: str | Path) -> None:
         raise
 
 
+_MUTE_MEDIA_JS = """() => {
+    const muteVideo = (v) => {
+        if (!v || v.nodeName !== 'VIDEO') return;
+        try {
+            v.muted = true;
+            v.defaultMuted = true;
+            v.volume = 0;
+            v.setAttribute('muted', '');
+        } catch (e) {}
+    };
+    const muteAudio = (a) => {
+        if (!a || a.nodeName !== 'AUDIO') return;
+        try {
+            a.muted = true;
+            a.volume = 0;
+            a.setAttribute('muted', '');
+        } catch (e) {}
+    };
+    const muteTree = (root) => {
+        let n = 0;
+        const el = root || document;
+        if (!el || !el.querySelectorAll) return 0;
+        el.querySelectorAll('video').forEach((v) => { muteVideo(v); n += 1; });
+        el.querySelectorAll('audio').forEach((a) => { muteAudio(a); n += 1; });
+        return n;
+    };
+    let n = muteTree(document);
+    if (!window.__toolfb_media_mute_observer) {
+        window.__toolfb_media_mute_observer = true;
+        try {
+            new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                    m.addedNodes.forEach((node) => {
+                        if (!node || node.nodeType !== 1) return;
+                        if (node.nodeName === 'VIDEO') muteVideo(node);
+                        if (node.nodeName === 'AUDIO') muteAudio(node);
+                        muteTree(node);
+                    });
+                }
+            }).observe(document.documentElement, { childList: true, subtree: true });
+        } catch (e) {}
+    }
+    return n;
+}"""
+
+_MUTE_MEDIA_IN_ROOT_JS = """(root) => {
+    const muteVideo = (v) => {
+        if (!v || v.nodeName !== 'VIDEO') return;
+        try {
+            v.muted = true;
+            v.defaultMuted = true;
+            v.volume = 0;
+            v.setAttribute('muted', '');
+        } catch (e) {}
+    };
+    const muteAudio = (a) => {
+        if (!a || a.nodeName !== 'AUDIO') return;
+        try {
+            a.muted = true;
+            a.volume = 0;
+            a.setAttribute('muted', '');
+        } catch (e) {}
+    };
+    let n = 0;
+    const el = root && root.querySelectorAll ? root : null;
+    if (!el) return 0;
+    el.querySelectorAll('video').forEach((v) => { muteVideo(v); n += 1; });
+    el.querySelectorAll('audio').forEach((a) => { muteAudio(a); n += 1; });
+    return n;
+}"""
+
+
+def _mute_browser_video_previews(
+    page: Page,
+    *,
+    scope: Locator | None = None,
+    silent: bool = False,
+) -> int:
+    """
+    Tắt tiếng mọi ``<video>`` / ``<audio>`` trong tab (và iframe) sau import preview.
+
+    Gắn ``MutationObserver`` (một lần mỗi frame) để video/audio thêm sau vẫn bị mute.
+    """
+    total = 0
+    try:
+        if scope is not None:
+            try:
+                total += int(scope.evaluate(_MUTE_MEDIA_IN_ROOT_JS) or 0)
+            except Exception:
+                pass
+        total += int(page.evaluate(_MUTE_MEDIA_JS) or 0)
+        for frame in page.frames:
+            try:
+                total += int(frame.evaluate(_MUTE_MEDIA_JS) or 0)
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug("[FB] mute video preview: {}", exc)
+    if total > 0 and not silent:
+        logger.info("[FB] Đã tắt tiếng preview media trong trình duyệt ({} phần tử).", total)
+    return total
+
+
+def _mute_browser_video_previews_after_attach(
+    page: Page,
+    *,
+    scope: Locator | None = None,
+    attempts: int = 5,
+    interval_ms: int = 450,
+) -> int:
+    """Tắt tiếng lặp vài lần — preview Meta thường mount ``<video>`` chậm sau ``set_input_files``."""
+    total = 0
+    tries = max(1, int(attempts))
+    for i in range(tries):
+        total += _mute_browser_video_previews(page, scope=scope, silent=(i > 0))
+        if i + 1 < tries:
+            try:
+                page.wait_for_timeout(max(120, int(interval_ms)))
+            except Exception:
+                break
+    if total > 0:
+        logger.info(
+            "[FB] Đã tắt tiếng preview media sau import ({} lần quét, {} phần tử).",
+            tries,
+            total,
+        )
+    return total
+
+
 def upload_video(page: Page, video_path: str | Path) -> None:
     """
     Đính kèm video vào composer (input file). Chờ preview/video element lâu hơn ảnh.
@@ -3533,6 +3667,7 @@ def upload_video(page: Page, video_path: str | Path) -> None:
                         "{} Không thấy thẻ video sau upload — tiếp tục bước tiếp theo, chờ wizard xác nhận.",
                         _reel_strict_prefix("Upload"),
                     )
+                _mute_browser_video_previews_after_attach(page)
                 _human_pause()
                 _enable_view_only_guard(page)
                 return
@@ -3554,6 +3689,7 @@ def upload_video(page: Page, video_path: str | Path) -> None:
             page.locator("video").first.wait_for(state="visible", timeout=22_000)
         except PlaywrightTimeoutError:
             logger.warning("{} Không thấy thẻ video sau upload — tiếp tục bước tiếp theo, chờ wizard xác nhận.", _reel_strict_prefix("Upload"))
+        _mute_browser_video_previews_after_attach(page)
         _human_pause()
         _enable_view_only_guard(page)
     except PlaywrightTimeoutError:
@@ -4126,10 +4262,13 @@ def wait_meta_reel_details_wizard(page: Page, *, timeout_ms: int = 120_000) -> b
     """
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
+        _mute_browser_video_previews(page, silent=True)
         if _meta_reel_details_visible(page):
+            _mute_browser_video_previews_after_attach(page, attempts=3)
             logger.info("{} Đã thấy màn Reel details / Next.", _reel_strict_prefix("Wizard"))
             return True
         if _meta_video_attachment_confirmed(page):
+            _mute_browser_video_previews_after_attach(page, attempts=3)
             logger.info(
                 "{} Xác nhận video đã đính kèm (play/output card) — chuyển bước tiếp theo, không chờ cứng wizard.",
                 _reel_strict_prefix("Wizard"),
@@ -6839,8 +6978,10 @@ def complete_reel_wizard_fill_next_and_post(
         return False
 
     logger.info("{} Bắt đầu wizard (submit_mode={}): payload={} ký tự.", stage, mode, len(payload))
+    _mute_browser_video_previews_after_attach(page, attempts=3)
 
     while time.time() < deadline:
+        _mute_browser_video_previews(page, silent=True)
         if _try_submit():
             return next_clicks, filled, post_clicked
 
@@ -7206,6 +7347,7 @@ def post_reel_via_page_dashboard(
     processing_re = re.compile(r"Processing|Uploading|Đang xử lý|đang tải", re.I)
     while time.time() < upload_deadline:
         dialog = _active_reel_dialog(page)
+        _mute_browser_video_previews(page, scope=dialog, silent=True)
         try:
             placeholder_vis = dialog.get_by_text(
                 re.compile(r"Upload your video in order to see a preview here", re.I)
@@ -7229,7 +7371,10 @@ def post_reel_via_page_dashboard(
         _failure_screenshot(page, "reel_upload_not_accepted")
         raise PlaywrightTimeoutError("Đã import video nhưng UI chưa nhận upload (placeholder vẫn còn / Next chưa sẵn sàng).")
 
+    dialog = _active_reel_dialog(page)
+    _mute_browser_video_previews_after_attach(page, scope=dialog)
     _step_pause(1200, 2600, label="sau UPLOAD_VIDEO")
+    _mute_browser_video_previews_after_attach(page, scope=_active_reel_dialog(page), attempts=3)
 
     ui_way = detect_meta_reel_ui_way(page)
     if ui_way == "unknown":

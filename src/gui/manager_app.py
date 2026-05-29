@@ -37,6 +37,7 @@ from src.gui.account_management import (
 from src.gui.cookie_capture import account_cookie_path_field, cookie_storage_dest, run_fb_cookie_capture_dialog
 from src.gui.page_management import PageFormDialog
 from src.gui.page_scan_dialog import PageScanDialog
+from src.gui.pages_export_dialog import PagesExportDialog
 from src.gui.schedule_job_dialog import SchedulePostJobDialog
 from src.gui.ui_responsiveness import (
     ASYNC_PREP_MIN_ROWS,
@@ -92,6 +93,9 @@ from src.utils.app_secrets import (
 from src.utils.app_restart import DEFERRED_GUI_BAT_NAME, relaunch_same_app_and_exit
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager
 from src.utils.pages_manager import PageRecord, PagesManager
+from src.utils.page_insights_format import format_metric
+from src.utils.page_insights_policy import PageInsightsPolicy, plan_page_insights_fetch
+from src.utils.page_insights_store import PageInsightsPeriod, PageInsightsStore
 from src.utils.page_schedule import parse_date_only_yyyy_mm_dd, scheduler_tz
 from src.utils.schedule_batch_preview import build_schedule_by_daily_slots, page_post_style_for_post_type
 from src.utils.schedule_job_content import build_schedule_slot_hhmm, internal_post_title_from_body
@@ -263,6 +267,7 @@ class _ManagerWindow:
         self._multitask_reconcile_after_id: str | None = None
         self._accounts = accounts
         self._pages = PagesManager()
+        self._page_insights = PageInsightsStore()
         self._schedule_posts = get_default_schedule_posts_manager()
         self._worker: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
@@ -578,8 +583,8 @@ class _ManagerWindow:
         tab_pg.rowconfigure(3, weight=1)
         ttk.Label(
             tab_pg,
-            text="Thêm / sửa Page (URL, owner…). Lịch + AI theo từng bài: tab «3. Job lịch đăng» — «Job lịch đăng…» từ đây mở nhanh tab đó. "
-            "Owner = id tài khoản; file pages.json.",
+            text="Thêm / sửa Page (URL, owner…). Thống kê: tối đa vài Page/lần, cache 12h (tránh checkpoint) — "
+            "chỉ bật «Bỏ qua cache» khi cần. Cần fb_page_id + đăng nhập. Lịch/AI: tab «3. Job lịch đăng».",
             font=("Segoe UI", 9),
             wraplength=640,
         ).grid(row=0, column=0, sticky="w", pady=(0, 4))
@@ -594,7 +599,31 @@ class _ManagerWindow:
         ttk.Button(pg_bar, text="Sửa", command=self._on_edit_page).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_bar, text="Job lịch đăng…", command=self._on_goto_jobs_for_page).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_bar, text="Xóa", command=self._on_delete_page).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_bar, text="Xuất CSV…", command=self._on_export_pages_csv).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_bar, text="Dọn trùng Meta ID", command=self._on_dedupe_pages_by_meta_id).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Label(pg_bar, text="Thống kê:").pack(side=tk.LEFT, padx=(8, 2))
+        self._var_pages_insights_period = tk.StringVar(value="7 ngày")
+        self._cb_pages_insights_period = ttk.Combobox(
+            pg_bar,
+            textvariable=self._var_pages_insights_period,
+            state="readonly",
+            width=14,
+            values=("7 ngày", "28 ngày (tháng)"),
+        )
+        self._cb_pages_insights_period.pack(side=tk.LEFT, padx=(0, 4))
+        self._cb_pages_insights_period.bind("<<ComboboxSelected>>", lambda _e: self._render_pages_tree())
+        self._var_pages_insights_force = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            pg_bar,
+            text="Bỏ qua cache",
+            variable=self._var_pages_insights_force,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_bar, text="Lấy thống kê (đã chọn)", command=self._on_fetch_page_insights_selected).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(pg_bar, text="Lấy thống kê (đã lọc)", command=self._on_fetch_page_insights_filtered).pack(
             side=tk.LEFT, padx=(0, 4)
         )
         ttk.Button(pg_bar, text="Làm mới tab này", command=self._on_refresh_pages).pack(side=tk.LEFT)
@@ -610,6 +639,9 @@ class _ManagerWindow:
             "account_id",
             "page_kind",
             "page_name",
+            "followers",
+            "views",
+            "stats_at",
             "ai_topic",
             "post_style",
             "schedule",
@@ -630,6 +662,9 @@ class _ManagerWindow:
             "account_id": "owner",
             "page_kind": "Loại",
             "page_name": "Tên Page",
+            "followers": "Followers",
+            "views": "Views",
+            "stats_at": "Cập nhật TK",
             "ai_topic": "Chủ đề AI",
             "post_style": "post_style",
             "schedule": "Lịch",
@@ -638,7 +673,7 @@ class _ManagerWindow:
             "fb_page_id": "Meta Page ID",
             "url": "Page_URL",
         }
-        widths_pg = (72, 72, 56, 88, 100, 56, 52, 72, 88, 110, 140)
+        widths_pg = (72, 72, 56, 88, 72, 72, 88, 100, 56, 52, 72, 88, 110, 140)
         for c, w in zip(cols_pg, widths_pg):
             self._tree_pages.heading(c, text=headings_pg[c], command=lambda k=c: self._on_pages_sort_click(k))
             self._tree_pages.column(c, width=w, stretch=True)
@@ -2064,6 +2099,25 @@ class _ManagerWindow:
             rows.sort(key=lambda r: str(r.get("page_kind", "")).strip().lower(), reverse=rev)
         elif sk == "post_style":
             rows.sort(key=lambda r: str(r.get("post_style", "")).strip().lower(), reverse=rev)
+        elif sk in ("followers", "views", "stats_at"):
+            period = self._pages_insights_period_key()
+
+            def _metric_val(r: dict[str, Any], field: str) -> int | str:
+                snap = self._page_insights.get_snapshot(str(r.get("id", "")), period)
+                if not snap:
+                    return -1 if field != "stats_at" else ""
+                if field == "stats_at":
+                    return str(snap.get("fetched_at", "") or "")
+                v = snap.get(field)
+                try:
+                    return int(v) if v is not None else -1
+                except (TypeError, ValueError):
+                    return -1
+
+            if sk == "stats_at":
+                rows.sort(key=lambda r: _metric_val(r, "stats_at"), reverse=rev)
+            else:
+                rows.sort(key=lambda r: _metric_val(r, sk), reverse=rev)
         return rows
 
     def _pages_tree_insert_specs(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2083,6 +2137,7 @@ class _ManagerWindow:
             fb_pid = str(p.get("fb_page_id", "") or "")
             if len(fb_pid) > 16:
                 fb_pid = fb_pid[:13] + "..."
+            fol, views, stats_at = self._page_insights_display(str(p.get("id", "")))
             row_tag = (
                 "pg_failed"
                 if st_disp == "failed"
@@ -2097,6 +2152,9 @@ class _ManagerWindow:
                         p.get("account_id", ""),
                         p.get("page_kind", "") or "—",
                         p.get("page_name", ""),
+                        fol,
+                        views,
+                        stats_at,
                         top or "—",
                         p.get("post_style", ""),
                         p.get("schedule_time", "") or "—",
@@ -2163,6 +2221,213 @@ class _ManagerWindow:
             self._tree_pages.insert("", tk.END, **spec)
         self._pages_tree_finish_render(rows)
 
+    def _pages_insights_period_key(self) -> PageInsightsPeriod:
+        label = (
+            self._var_pages_insights_period.get()
+            if hasattr(self, "_var_pages_insights_period")
+            else "7 ngày"
+        )
+        if "28" in str(label):
+            return "28d"
+        return "7d"
+
+    def _page_insights_display(self, page_id: str) -> tuple[str, str, str]:
+        period = self._pages_insights_period_key()
+        snap = self._page_insights.get_snapshot(page_id, period)
+        if not snap:
+            return "—", "—", "—"
+        fol = format_metric(snap.get("followers") if snap.get("followers") is not None else None)
+        views = format_metric(snap.get("views") if snap.get("views") is not None else None)
+        err = str(snap.get("error", "") or "").strip()
+        if err and fol == "—" and views == "—":
+            views = "!"
+        fetched = str(snap.get("fetched_at", "") or "").strip()
+        if fetched:
+            fetched = fetched.replace("T", " ")[:16]
+        return fol, views, fetched or "—"
+
+    def _pages_for_insights_fetch(self, *, selected_only: bool) -> list[dict[str, Any]]:
+        if selected_only:
+            ids = self._selected_page_ids()
+            if not ids:
+                return []
+            out: list[dict[str, Any]] = []
+            for pid in ids:
+                rec = self._record_page_by_id(pid)
+                if rec is not None:
+                    out.append(dict(rec))
+            return out
+        return self._pages_filtered_sorted_rows()
+
+    def _on_fetch_page_insights_selected(self) -> None:
+        self._run_page_insights_fetch(selected_only=True)
+
+    def _on_fetch_page_insights_filtered(self) -> None:
+        self._run_page_insights_fetch(selected_only=False)
+
+    def _run_page_insights_fetch(self, *, selected_only: bool) -> None:
+        pages = self._pages_for_insights_fetch(selected_only=selected_only)
+        if not pages:
+            messagebox.showwarning(
+                "Chưa có Page",
+                "Chọn ít nhất một Page trong bảng, hoặc bỏ lọc để quét theo danh sách hiện tại.",
+                parent=self._root,
+            )
+            return
+        missing_id = [p for p in pages if not str(p.get("fb_page_id", "") or "").strip()]
+        if missing_id and not messagebox.askyesno(
+            "Thiếu Meta Page ID",
+            f"{len(missing_id)} Page không có fb_page_id — Insights có thể thất bại.\nTiếp tục?",
+            parent=self._root,
+        ):
+            return
+        period = self._pages_insights_period_key()
+        period_label = "7 ngày" if period == "7d" else "28 ngày"
+        force = bool(getattr(self, "_var_pages_insights_force", tk.BooleanVar(value=False)).get())
+        policy = PageInsightsPolicy.from_env()
+        plan = plan_page_insights_fetch(
+            pages,
+            period=period,
+            store=self._page_insights,
+            policy=policy,
+            force_refresh=force,
+        )
+        lines = [
+            f"Kỳ: {period_label}",
+            f"• Bỏ qua (cache còn mới, ≥{policy.min_interval_hours:.0f}h): {len(plan.skipped)}",
+            f"• Sẽ quét ngay (tối đa {policy.max_pages_per_run} Page/lần): {len(plan.to_fetch)}",
+        ]
+        if plan.deferred_over_limit:
+            lines.append(f"• Hoãn (vượt giới hạn / cooldown tài khoản): {len(plan.deferred_over_limit)}")
+        if plan.account_blocked:
+            for aid, msg in list(plan.account_blocked.items())[:3]:
+                lines.append(f"  — {aid}: {msg}")
+        lines.append(
+            f"\nNghỉ ~{policy.page_delay_min_sec:.0f}–{policy.page_delay_max_sec:.0f}s giữa mỗi Page để giảm checkpoint."
+        )
+        if not plan.to_fetch:
+            messagebox.showinfo(
+                "Thống kê Page",
+                "\n".join(lines) + "\n\nKhông có Page nào cần quét. Bật «Bỏ qua cache» nếu muốn cập nhật lại.",
+                parent=self._root,
+            )
+            return
+        if not messagebox.askyesno("Xác nhận lấy thống kê", "\n".join(lines) + "\n\nTiếp tục?", parent=self._root):
+            return
+        top = tk.Toplevel(self._root)
+        top.title("Lấy thống kê Page")
+        top.transient(self._root)
+        top.grab_set()
+        top.geometry("460x150")
+        status_var = tk.StringVar(
+            value=f"Chuẩn bị… ({period_label}, quét {len(plan.to_fetch)} Page)"
+        )
+        ttk.Label(top, textvariable=status_var, wraplength=420).pack(fill=tk.X, padx=12, pady=12)
+        pbar = ttk.Progressbar(top, mode="indeterminate", length=400)
+        pbar.pack(fill=tk.X, padx=12, pady=(0, 12))
+        pbar.start(12)
+        done_evt = threading.Event()
+        err_holder: list[str] = []
+        ok_count = {"n": 0}
+
+        def worker() -> None:
+            from src.services.page_insights_scraper import fetch_insights_for_pages
+
+            by_owner: dict[str, list[dict[str, Any]]] = {}
+            for row in plan.to_fetch:
+                aid = str(row.get("account_id", "")).strip()
+                by_owner.setdefault(aid, []).append(row)
+            factory: BrowserFactory | None = None
+            try:
+                factory = BrowserFactory(accounts=self._accounts, headless=True)
+                for aid, group in by_owner.items():
+                    if not aid:
+                        err_holder.append("Có Page thiếu account_id (owner).")
+                        continue
+                    acc = self._accounts.get_by_id(aid)
+                    if acc is None:
+                        err_holder.append(f"Không tìm thấy tài khoản owner {aid!r}.")
+                        continue
+
+                    def _status(msg: str) -> None:
+                        try:
+                            self._root.after(0, lambda m=msg: status_var.set(m))
+                        except Exception:
+                            pass
+
+                    self._page_insights.touch_account_session(aid)
+                    ctx = factory.get_browser_context(aid, headless=True)
+                    try:
+                        batch = fetch_insights_for_pages(
+                            ctx,
+                            account=dict(acc),
+                            pages=group,
+                            period=period,
+                            status_cb=_status,
+                            policy=policy,
+                        )
+                        if batch.stopped_early and batch.stop_reason:
+                            err_holder.append(batch.stop_reason)
+                        for pid, snap in batch.results:
+                            self._page_insights.save_snapshot(
+                                pid,
+                                period,
+                                followers=snap.get("followers"),
+                                views=snap.get("views"),
+                                source_url=str(snap.get("source_url", "")),
+                                error=str(snap.get("error", "")),
+                            )
+                            if snap.get("followers") is not None or snap.get("views") is not None:
+                                ok_count["n"] += 1
+                    finally:
+                        sync_close_persistent_context(ctx, log_label=f"page_insights:{aid}")
+            except Exception as exc:  # noqa: BLE001
+                err_holder.append(str(exc))
+                logger.exception("Lấy thống kê Page lỗi")
+            finally:
+                if factory is not None:
+                    try:
+                        factory.close()
+                    except Exception:
+                        pass
+                done_evt.set()
+
+        threading.Thread(target=worker, name="page_insights_fetch", daemon=True).start()
+
+        def poll() -> None:
+            if not done_evt.is_set():
+                top.after(200, poll)
+                return
+            try:
+                pbar.stop()
+            except Exception:
+                pass
+            try:
+                top.grab_release()
+                top.destroy()
+            except Exception:
+                pass
+            self._render_pages_tree()
+            if err_holder:
+                messagebox.showwarning(
+                    "Thống kê Page",
+                    f"Đã lưu một phần ({ok_count['n']} Page có số liệu).\n\n" + "\n".join(err_holder[:5]),
+                    parent=self._root,
+                )
+            else:
+                extra = ""
+                if plan.skipped:
+                    extra = f"\nĐã bỏ qua {len(plan.skipped)} Page (cache còn mới)."
+                if plan.deferred_over_limit:
+                    extra += f"\nHoãn {len(plan.deferred_over_limit)} Page — chạy lại sau hoặc tăng TOOLFB_PAGE_INSIGHTS_MAX_PER_RUN."
+                messagebox.showinfo(
+                    "Thống kê Page",
+                    f"Hoàn tất ({period_label}): {ok_count['n']}/{len(plan.to_fetch)} Page quét có số liệu.{extra}",
+                    parent=self._root,
+                )
+
+        top.after(200, poll)
+
     def _pages_sort_label_to_key(self, label: str) -> str:
         mp = {
             "Tên Page (A-Z)": "page_name",
@@ -2189,6 +2454,9 @@ class _ManagerWindow:
             "account_id": "account_id",
             "page_kind": "page_kind",
             "page_name": "page_name",
+            "followers": "followers",
+            "views": "views",
+            "stats_at": "stats_at",
             "post_style": "post_style",
             "status": "status",
             "last_post": "last_post_at",
@@ -6854,6 +7122,50 @@ class _ManagerWindow:
             self._fill_pages_tree()
             logger.info("Đã thêm/cập nhật {} page từ scan.", dlg.saved_count)
 
+    def _pages_rows_for_csv_export(self, mode: str, owner_id: str) -> list[dict[str, Any]]:
+        mode = str(mode or "").strip().lower()
+        if mode == "selected":
+            ids = self._selected_page_ids()
+            if not ids:
+                raise ValueError("Chọn ít nhất một Page trong bảng.")
+            out: list[dict[str, Any]] = []
+            for pid in ids:
+                rec = self._record_page_by_id(pid)
+                if rec is not None:
+                    out.append(dict(rec))
+            return out
+        if mode == "account":
+            aid = str(owner_id or "").strip()
+            if not aid:
+                raise ValueError("Chọn tài khoản (owner) để xuất.")
+            rows = list(getattr(self, "_all_pages", []) or [])
+            if not rows:
+                rows = [dict(r) for r in self._pages.load_all()]
+            return [dict(r) for r in rows if str(r.get("account_id", "")).strip() == aid]
+        if mode == "filtered":
+            return [dict(r) for r in self._pages_filtered_sorted_rows()]
+        raise ValueError(f"Phạm vi xuất không hợp lệ: {mode!r}")
+
+    def _on_export_pages_csv(self) -> None:
+        owner_ids = sorted(
+            {
+                str(r.get("account_id", "")).strip()
+                for r in (getattr(self, "_all_pages", []) or [])
+                if str(r.get("account_id", "")).strip()
+            }
+        )
+        selected = len(self._selected_page_ids())
+        filtered = len(self._pages_filtered_sorted_rows())
+        dlg = PagesExportDialog(
+            self._root,
+            owner_account_ids=owner_ids,
+            selected_count=selected,
+            filtered_count=filtered,
+            resolve_rows=self._pages_rows_for_csv_export,
+        )
+        if dlg.exported_path:
+            logger.info("Đã xuất Page CSV: {}", dlg.exported_path)
+
     def _on_edit_page(self) -> None:
         pid = self._selected_page_id()
         if not pid:
@@ -6871,6 +7183,7 @@ class _ManagerWindow:
             title=f"Sửa Page — {pid}",
             initial=rec,
             id_readonly=True,
+            insights=self._page_insights.all_for_page(pid),
         )
         if dlg.result:
             row = dict(dlg.result)

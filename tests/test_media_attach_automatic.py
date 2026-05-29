@@ -48,7 +48,12 @@ def test_attach_media_page_fallback_when_dialog_scope_fails(tmp_path: Path) -> N
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"\x00\x00\x00\x18ftypmp42")
     page = MagicMock()
+    page.frames = []
     scope = MagicMock()
+
+    def _input_only_without_dialog_scope(page, path, *, kind, scope=None):
+        return scope is None
+
     with (
         patch(
             "src.automation.facebook_actions._is_meta_business_composer_context",
@@ -56,15 +61,18 @@ def test_attach_media_page_fallback_when_dialog_scope_fails(tmp_path: Path) -> N
         ),
         patch(
             "src.automation.facebook_actions._set_file_via_existing_input",
-            side_effect=[False, True],
+            side_effect=_input_only_without_dialog_scope,
         ) as mock_input,
         patch(
             "src.automation.facebook_actions._set_file_via_business_add_button",
             return_value=False,
         ),
+        patch(
+            "src.automation.facebook_actions._mute_browser_video_previews_after_attach",
+        ),
     ):
         assert _attach_media_automatic(page, video, kind="video", scope=scope, context="reel") is True
-    assert mock_input.call_count >= 2
+    assert mock_input.call_count >= 4
     assert mock_input.call_args_list[-1].kwargs.get("scope") is None
 
 

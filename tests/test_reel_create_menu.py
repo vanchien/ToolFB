@@ -79,7 +79,7 @@ def test_reel_post_strict_xpaths_match_html_div_post() -> None:
     assert "Post" in joined
     assert "dir='auto'" in joined or "dir=auto" in joined
     assert "Save" in joined
-    assert "normalize-space()='Post'])[last()]" not in joined.replace("x1j85h84", "")
+    assert "normalize-space()='Posts'" not in joined
 
 
 def test_reel_post_css_selectors_match_html_div_post() -> None:

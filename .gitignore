@@ -52,6 +52,7 @@ data/video_editor/remote_audio_config.json
 config/accounts.json
 config/account_credentials.json
 config/pages.json
+config/page_insights.json
 config/entities.json
 config/schedule.json
 config/schedule_posts.json
