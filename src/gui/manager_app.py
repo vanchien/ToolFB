@@ -100,6 +100,9 @@ from src.utils.page_schedule import parse_date_only_yyyy_mm_dd, scheduler_tz
 from src.utils.schedule_batch_preview import build_schedule_by_daily_slots, page_post_style_for_post_type
 from src.utils.schedule_job_content import build_schedule_slot_hhmm, internal_post_title_from_body
 from src.utils.schedule_posts_filters import (
+    format_account_filter_label,
+    format_page_filter_label,
+    split_hashtags_csv,
     apply_job_filters,
     is_overdue,
     sort_jobs,
@@ -122,8 +125,9 @@ from src.services.universal_video_downloader import ensure_downloader_layout
 from src.services.video_editor.layout import video_editor_schedule_jobs_json_path
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.gui.tiktok_manager_tab import build_tiktok_manager_tab
+from src.gui.human_interaction_tab import build_human_interaction_tab
 from src.gui.video_editor_tab import build_video_editor_tab
-from src.utils.proxy_check import check_http_proxy
+from src.utils.proxy_check import check_proxy
 
 _VE_PENDING_SORT_LABEL_TO_COL: dict[str, str] = {
     "Tạo lúc": "created",
@@ -312,6 +316,9 @@ class _ManagerWindow:
         self._all_jobs: list[dict[str, Any]] = []
         self._filtered_jobs: list[dict[str, Any]] = []
         self._job_page_name_by_id: dict[str, str] = {}
+        self._job_account_name_by_id: dict[str, str] = {}
+        self._jobs_filter_account_label_to_id: dict[str, str] = {}
+        self._jobs_filter_page_label_to_id: dict[str, str] = {}
         self._jobs_sort_key: str = "scheduled_at"
         self._jobs_sort_asc: bool = True
         self._jobs_search_after_id: str | None = None
@@ -704,6 +711,9 @@ class _ManagerWindow:
             side=tk.LEFT, padx=(0, 4)
         )
         ttk.Button(jb, text="Sửa job", command=self._on_edit_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Sửa nội dung hàng loạt…", command=self._on_jobs_bulk_edit_content).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
         ttk.Button(jb, text="Xóa job", command=self._on_delete_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(jb, text="Đăng luôn job đã chọn", command=self._on_run_selected_jobs_now).pack(side=tk.LEFT, padx=(8, 4))
         ttk.Button(jb, text="Chọn tất cả", command=self._on_jobs_select_all).pack(side=tk.LEFT, padx=(0, 4))
@@ -1258,6 +1268,12 @@ class _ManagerWindow:
         tt_host.rowconfigure(1, weight=1)
         build_tiktok_manager_tab(tt_host, self._root)
 
+        tab_human = ttk.Frame(nb, padding=4)
+        nb.add(tab_human, text="  9. Tương tác người dùng  ")
+        tab_human.columnconfigure(0, weight=1)
+        tab_human.rowconfigure(0, weight=1)
+        build_human_interaction_tab(tab_human, self._root)
+
         # --- Platform view (Facebook vs TikTok) ---
         self._tab_facebook_accounts = tab_acc
         self._tab_facebook_pages = tab_pg
@@ -1265,6 +1281,7 @@ class _ManagerWindow:
         self._tab_ve_pending_export = tab_ve_pending
         self._tab_ve_pending_notebook_child = tab_ve_pending
         self._tab_tiktok_manager = tab_tt
+        self._tab_human_interaction = tab_human
         self._apply_platform_view(self._platform_view_var.get())
 
         self._nb.bind("<<NotebookTabChanged>>", self._on_manager_notebook_tab_changed, add="+")
@@ -1284,8 +1301,8 @@ class _ManagerWindow:
         ly.pack(side=tk.RIGHT, fill=tk.Y)
         body.add(log_fr, weight=2)
         try:
-            body.paneconfigure(nb_host, minsize=380)
-            body.paneconfigure(log_fr, minsize=110)
+            body.paneconfigure(nb_host, minsize=340)
+            body.paneconfigure(log_fr, minsize=150)
         except tk.TclError:
             pass
 
@@ -2743,6 +2760,7 @@ class _ManagerWindow:
                 clear_file_exists_cache()
                 self._all_jobs = jobs
                 self._refresh_job_page_name_map()
+                self._refresh_job_account_name_map()
                 self._refresh_job_filter_choices()
                 self._render_schedule_jobs_tree()
                 self._root.after(50, self._fill_ve_pending_export_jobs_tree)
@@ -4220,11 +4238,43 @@ class _ManagerWindow:
             logger.debug("Không nạp được map tên page cho tab jobs: {}", exc)
         self._job_page_name_by_id = mp
 
+    def _refresh_job_account_name_map(self) -> None:
+        """Nạp map ``account_id -> name`` cho combobox lọc và cột account."""
+        mp: dict[str, str] = {}
+        try:
+            for a in self._accounts.load_all():
+                aid = str(a.get("id", "")).strip()
+                if not aid:
+                    continue
+                name = str(a.get("name", "") or "").strip()
+                mp[aid] = name or aid
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Không nạp được map tên account cho tab jobs: {}", exc)
+        self._job_account_name_by_id = mp
+
     def _job_page_display(self, page_id: str) -> str:
         pid = str(page_id or "").strip()
         if not pid:
             return ""
-        return str(self._job_page_name_by_id.get(pid) or pid)
+        return format_page_filter_label(pid, self._job_page_name_by_id.get(pid, ""))
+
+    def _job_account_display(self, account_id: str) -> str:
+        aid = str(account_id or "").strip()
+        if not aid:
+            return ""
+        return format_account_filter_label(aid, self._job_account_name_by_id.get(aid, ""))
+
+    def _resolve_jobs_filter_account_id(self, display: str) -> str:
+        disp = str(display or "").strip()
+        if not disp or disp == "Tất cả account":
+            return ""
+        return self._jobs_filter_account_label_to_id.get(disp, disp)
+
+    def _resolve_jobs_filter_page_id(self, display: str) -> str:
+        disp = str(display or "").strip()
+        if not disp or disp == "Tất cả page":
+            return ""
+        return self._jobs_filter_page_label_to_id.get(disp, disp)
 
     # ---------- Filter / Search / Sort cho danh sách job ----------
 
@@ -4244,12 +4294,12 @@ class _ManagerWindow:
         ent.bind("<KeyRelease>", self._on_jobs_search_changed)
 
         self._var_jobs_filter_account = tk.StringVar(value="Tất cả account")
-        self._cb_jobs_filter_account = ttk.Combobox(fr, textvariable=self._var_jobs_filter_account, state="readonly", width=18)
+        self._cb_jobs_filter_account = ttk.Combobox(fr, textvariable=self._var_jobs_filter_account, state="readonly", width=32)
         self._cb_jobs_filter_account.grid(row=0, column=2, padx=(0, 4))
         self._cb_jobs_filter_account.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
 
         self._var_jobs_filter_page = tk.StringVar(value="Tất cả page")
-        self._cb_jobs_filter_page = ttk.Combobox(fr, textvariable=self._var_jobs_filter_page, state="readonly", width=18)
+        self._cb_jobs_filter_page = ttk.Combobox(fr, textvariable=self._var_jobs_filter_page, state="readonly", width=32)
         self._cb_jobs_filter_page.grid(row=0, column=3, padx=(0, 4))
         self._cb_jobs_filter_page.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
 
@@ -4309,18 +4359,44 @@ class _ManagerWindow:
         ttk.Button(fr, text="Xóa lọc", command=self._on_jobs_clear_filters).grid(row=0, column=8, padx=(4, 0))
 
     def _refresh_job_filter_choices(self) -> None:
-        """Cập nhật options Account/Page combobox theo dữ liệu đang có."""
+        """Cập nhật options Account/Page combobox theo dữ liệu đang có (tên + id)."""
         if not hasattr(self, "_cb_jobs_filter_account"):
             return
         accs = sorted({str(j.get("account_id", "")).strip() for j in self._all_jobs if j.get("account_id")})
         pages = sorted({str(j.get("page_id", "")).strip() for j in self._all_jobs if j.get("page_id")})
-        cur_acc = self._var_jobs_filter_account.get()
-        self._cb_jobs_filter_account.configure(values=("Tất cả account", *accs))
-        if cur_acc not in ("Tất cả account", *accs):
+
+        acc_label_to_id: dict[str, str] = {}
+        acc_labels = ["Tất cả account"]
+        for aid in accs:
+            lbl = format_account_filter_label(aid, self._job_account_name_by_id.get(aid, ""))
+            acc_label_to_id[lbl] = aid
+            acc_labels.append(lbl)
+        self._jobs_filter_account_label_to_id = acc_label_to_id
+
+        pg_label_to_id: dict[str, str] = {}
+        pg_labels = ["Tất cả page"]
+        for pid in pages:
+            lbl = format_page_filter_label(pid, self._job_page_name_by_id.get(pid, ""))
+            pg_label_to_id[lbl] = pid
+            pg_labels.append(lbl)
+        self._jobs_filter_page_label_to_id = pg_label_to_id
+
+        cur_acc_id = self._resolve_jobs_filter_account_id(self._var_jobs_filter_account.get())
+        self._cb_jobs_filter_account.configure(values=tuple(acc_labels))
+        if cur_acc_id and cur_acc_id in accs:
+            self._var_jobs_filter_account.set(
+                format_account_filter_label(cur_acc_id, self._job_account_name_by_id.get(cur_acc_id, ""))
+            )
+        elif self._var_jobs_filter_account.get() not in acc_labels:
             self._var_jobs_filter_account.set("Tất cả account")
-        cur_pg = self._var_jobs_filter_page.get()
-        self._cb_jobs_filter_page.configure(values=("Tất cả page", *pages))
-        if cur_pg not in ("Tất cả page", *pages):
+
+        cur_pg_id = self._resolve_jobs_filter_page_id(self._var_jobs_filter_page.get())
+        self._cb_jobs_filter_page.configure(values=tuple(pg_labels))
+        if cur_pg_id and cur_pg_id in pages:
+            self._var_jobs_filter_page.set(
+                format_page_filter_label(cur_pg_id, self._job_page_name_by_id.get(cur_pg_id, ""))
+            )
+        elif self._var_jobs_filter_page.get() not in pg_labels:
             self._var_jobs_filter_page.set("Tất cả page")
 
     def _current_jobs_filters(self) -> dict[str, str]:
@@ -4338,8 +4414,8 @@ class _ManagerWindow:
         }
         return {
             "search_text": self._var_jobs_search.get().strip(),
-            "account": _clean(self._var_jobs_filter_account.get(), "Tất cả account"),
-            "page_id": _clean(self._var_jobs_filter_page.get(), "Tất cả page"),
+            "account": self._resolve_jobs_filter_account_id(self._var_jobs_filter_account.get()),
+            "page_id": self._resolve_jobs_filter_page_id(self._var_jobs_filter_page.get()),
             "post_type": _clean(self._var_jobs_filter_post_type.get(), "Tất cả loại"),
             "status": _clean(self._var_jobs_filter_status.get(), "Tất cả trạng thái"),
             "retry_mode": retry_map.get(retry_label, "all"),
@@ -4405,7 +4481,7 @@ class _ManagerWindow:
         return (
             j.get("id", ""),
             self._job_page_display(str(j.get("page_id", "") or "")),
-            j.get("account_id", ""),
+            self._job_account_display(str(j.get("account_id", "") or "")),
             j.get("post_type", ""),
             j.get("ai_language", ""),
             tit,
@@ -4646,13 +4722,15 @@ class _ManagerWindow:
         target = str(status or "").strip().lower()
         if not target:
             return
+        want_ids = {
+            str(j.get("id", "")).strip()
+            for j in self._filtered_jobs
+            if str(j.get("status", "")).strip().lower() == target
+        }
         sel: list[str] = []
         for iid in self._tree_jobs.get_children():
             vals = self._tree_jobs.item(iid, "values")
-            if not vals or len(vals) < 9:
-                continue
-            st = str(vals[8]).strip().lower()
-            if st == target:
+            if vals and str(vals[0]).strip() in want_ids:
                 sel.append(iid)
         if sel:
             self._tree_jobs.selection_set(sel)
@@ -4661,6 +4739,230 @@ class _ManagerWindow:
             if cur:
                 self._tree_jobs.selection_remove(*cur)
         self._update_schedule_jobs_stats_label()
+
+    def _selected_schedule_job_ids(self) -> list[str]:
+        """Lấy ``id`` job từ các dòng Treeview đang chọn."""
+        out: list[str] = []
+        for iid in self._tree_jobs.selection():
+            vals = self._tree_jobs.item(iid, "values")
+            if not vals:
+                continue
+            jid = str(vals[0]).strip()
+            if jid:
+                out.append(jid)
+        return out
+
+    def _on_jobs_bulk_edit_content(self) -> None:
+        """
+        Sửa hàng loạt ``title`` + ``content`` (chung) và ``hashtags`` cho job đã chọn.
+
+        Mặc định chỉ cập nhật job ``pending`` trong tập chọn.
+        """
+        job_ids = self._selected_schedule_job_ids()
+        if not job_ids:
+            messagebox.showwarning(
+                "Chưa chọn job",
+                "Chọn một hoặc nhiều job trong bảng.\n"
+                "Gợi ý: lọc Page + trạng thái «pending» → «Chọn pending» → «Sửa nội dung hàng loạt…».",
+                parent=self._root,
+            )
+            return
+
+        jobs_by_id: dict[str, dict[str, Any]] = {}
+        for jid in job_ids:
+            row = self._schedule_posts.get_by_id(jid)
+            if row:
+                jobs_by_id[jid] = dict(row)
+
+        if not jobs_by_id:
+            messagebox.showwarning("Không có dữ liệu", "Không đọc được job đã chọn.", parent=self._root)
+            return
+
+        pending_ids = [jid for jid, j in jobs_by_id.items() if str(j.get("status", "")).lower() == "pending"]
+        page_filter = self._resolve_jobs_filter_page_id(self._var_jobs_filter_page.get())
+        page_name = self._job_page_name_by_id.get(page_filter, "") if page_filter else ""
+
+        top = tk.Toplevel(self._root)
+        top.title("Sửa nội dung hàng loạt")
+        top.transient(self._root)
+        top.grab_set()
+        top.columnconfigure(0, weight=1)
+
+        hdr = (
+            f"Đã chọn {len(job_ids)} job"
+            + (f" · Page: {page_name or page_filter}" if page_filter else "")
+            + f" · {len(pending_ids)} pending"
+        )
+        ttk.Label(top, text=hdr, wraplength=520).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        var_pending_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top,
+            text=f"Chỉ cập nhật job pending ({len(pending_ids)}/{len(job_ids)})",
+            variable=var_pending_only,
+        ).grid(row=1, column=0, sticky="w", padx=12)
+
+        body = ttk.Frame(top, padding=(12, 4))
+        body.grid(row=2, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+        top.rowconfigure(2, weight=1)
+
+        var_apply_title = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text="Tiêu đề + Nội dung (dùng chung)", variable=var_apply_title).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4)
+        )
+        txt_title = tk.Text(body, height=4, width=58, wrap=tk.WORD)
+        txt_title.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        sample = next(iter(jobs_by_id.values()), {})
+        init_body = str(sample.get("content") or sample.get("title") or "").strip()
+        if init_body:
+            txt_title.insert("1.0", init_body)
+
+        var_apply_ht = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text="Hashtags (phẩy hoặc xuống dòng)", variable=var_apply_ht).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(0, 4)
+        )
+        ent_ht = ttk.Entry(body, width=60)
+        ent_ht.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ht0 = sample.get("hashtags") or []
+        if isinstance(ht0, list) and ht0:
+            ent_ht.insert(0, ", ".join(str(x) for x in ht0))
+
+        ttk.Label(
+            body,
+            text="Chỉ các trường được tick: thay mới hoàn toàn (bỏ cũ), không nối/ghép. "
+            "Trường không tick — giữ nguyên từng job.",
+            foreground="gray",
+            wraplength=520,
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        lbl_progress = ttk.Label(top, text="", foreground="gray")
+        lbl_progress.grid(row=3, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        btn_fr = ttk.Frame(top)
+        btn_fr.grid(row=4, column=0, sticky="e", padx=12, pady=(8, 12))
+
+        def _set_progress(done: int, total: int, jid: str = "") -> None:
+            short = jid[:14] + "…" if len(jid) > 14 else jid
+            lbl_progress.configure(text=f"Đang lưu {done}/{total}… {short}")
+            if hasattr(self, "_lbl_jobs_regen_status"):
+                self._lbl_jobs_regen_status.configure(text=f"Sửa hàng loạt {done}/{total}")
+
+        def _apply() -> None:
+            targets = list(pending_ids) if var_pending_only.get() else list(jobs_by_id.keys())
+            if not targets:
+                messagebox.showwarning(
+                    "Không có job pending",
+                    "Không có job pending trong tập chọn.\nBỏ tick «Chỉ pending» để sửa mọi trạng thái.",
+                    parent=top,
+                )
+                return
+            patch: dict[str, Any] = {}
+            if var_apply_title.get():
+                line = txt_title.get("1.0", "end").strip()
+                if line:
+                    patch["title"] = line
+                    patch["content"] = line
+            if var_apply_ht.get():
+                # Ghi đè toàn bộ mảng hashtag (ô trống = xóa hashtag cũ).
+                patch["hashtags"] = split_hashtags_csv(ent_ht.get())
+            if not patch:
+                messagebox.showwarning(
+                    "Chưa chọn trường",
+                    "Tick ít nhất một trường cần thay:\n"
+                    "• Tiêu đề + Nội dung — nhập chữ mới\n"
+                    "• Hashtags — nhập danh sách mới (ô trống = xóa hashtag cũ)",
+                    parent=top,
+                )
+                return
+            if var_apply_title.get() and not patch.get("title"):
+                messagebox.showwarning(
+                    "Thiếu tiêu đề/nội dung",
+                    "Đã tick «Tiêu đề + Nội dung» nhưng ô trống — nhập nội dung hoặc bỏ tick.",
+                    parent=top,
+                )
+                return
+            replace_note = []
+            if "title" in patch:
+                replace_note.append("title + content (thay mới)")
+            if "hashtags" in patch:
+                n_ht = len(patch["hashtags"])
+                replace_note.append(f"hashtags ({n_ht} tag, thay mới)" if n_ht else "hashtags (xóa hết)")
+            if not messagebox.askyesno(
+                "Xác nhận ghi đè",
+                f"Cập nhật {len(targets)} job?\n"
+                f"Thay thế: {', '.join(replace_note)}\n"
+                "Các trường khác (lịch, video, AI, trạng thái…) giữ nguyên.\n\n"
+                "Chạy lần lượt trên nền — cửa sổ không bị treo.",
+                parent=top,
+            ):
+                return
+
+            btn_apply.configure(state=tk.DISABLED)
+            btn_cancel.configure(state=tk.DISABLED)
+            top.grab_release()
+            self._set_ui_busy("Sửa hàng loạt job")
+            _set_progress(0, len(targets))
+            target_list = list(targets)
+            target_set = set(targets)
+            mgr = self._schedule_posts
+
+            def _on_prog(done: int, total: int, jid: str) -> None:
+                try:
+                    self._root.after(0, lambda d=done, t=total, j=jid: _set_progress(d, t, j))
+                except tk.TclError:
+                    pass
+
+            def _worker() -> tuple[int, dict[str, Any]]:
+                ok_n = mgr.update_jobs_fields_sequential(
+                    target_list,
+                    fields=patch,
+                    on_progress=_on_prog,
+                    step_delay_sec=0.03,
+                )
+                return ok_n, patch
+
+            def _on_done(result: tuple[int, dict[str, Any]]) -> None:
+                ok_n, applied_patch = result
+                for j in self._all_jobs:
+                    if str(j.get("id", "")).strip() in target_set:
+                        j.update(applied_patch)
+                self._clear_ui_busy()
+                if hasattr(self, "_lbl_jobs_regen_status"):
+                    self._lbl_jobs_regen_status.configure(text=f"Đã sửa {ok_n}/{len(target_list)} job")
+                try:
+                    top.destroy()
+                except tk.TclError:
+                    pass
+                self._render_schedule_jobs_tree()
+                messagebox.showinfo(
+                    "Đã lưu",
+                    f"Đã cập nhật {ok_n}/{len(target_list)} job (lần lượt, một lần ghi file).",
+                    parent=self._root,
+                )
+
+            def _on_err(exc: BaseException) -> None:
+                self._clear_ui_busy()
+                logger.warning("Bulk edit jobs: {}", exc)
+                try:
+                    btn_apply.configure(state=tk.NORMAL)
+                    btn_cancel.configure(state=tk.NORMAL)
+                    top.grab_set()
+                except tk.TclError:
+                    pass
+                messagebox.showerror("Lỗi sửa hàng loạt", str(exc), parent=top)
+
+            run_background_then_main(self._root, _worker, _on_done, on_error=_on_err)
+
+        btn_cancel = ttk.Button(btn_fr, text="Hủy", command=top.destroy)
+        btn_cancel.pack(side=tk.RIGHT, padx=(6, 0))
+        btn_apply = ttk.Button(btn_fr, text="Áp dụng", command=_apply)
+        btn_apply.pack(side=tk.RIGHT)
+
+        try:
+            top.geometry("+%d+%d" % (self._root.winfo_rootx() + 60, self._root.winfo_rooty() + 80))
+        except tk.TclError:
+            pass
 
     def _on_jobs_select_overdue_visible(self) -> None:
         now_utc = datetime.now(timezone.utc)
@@ -7228,12 +7530,16 @@ class _ManagerWindow:
         fb_jobs_text = "  3. Job lịch đăng (schedule_posts.json)  "
         ve_pending_text = "  7.Job chờ đăng từ Video Editor  "
         tt_text = "  8. TikTok Manager  "
+        human_text = "  9. Tương tác người dùng  "
 
         if want_tiktok:
             # Ẩn tab Facebook
             for child in (self._tab_facebook_jobs, self._tab_facebook_pages, self._tab_facebook_accounts):
                 if child is not None and self._notebook_has_tab(child):
                     nb.forget(child)
+            # Ẩn tab tương tác Facebook khi đang ở view TikTok.
+            if self._tab_human_interaction is not None and self._notebook_has_tab(self._tab_human_interaction):
+                nb.forget(self._tab_human_interaction)
             if self._tab_ve_pending_export is not None and not self._notebook_has_tab(self._tab_ve_pending_export):
                 nb.add(self._tab_ve_pending_export, text=ve_pending_text)
             # Hiện TikTok
@@ -7256,6 +7562,8 @@ class _ManagerWindow:
             nb.add(self._tab_facebook_pages, text=fb_pages_text)
         if self._tab_facebook_jobs is not None and not self._notebook_has_tab(self._tab_facebook_jobs):
             nb.add(self._tab_facebook_jobs, text=fb_jobs_text)
+        if self._tab_human_interaction is not None and not self._notebook_has_tab(self._tab_human_interaction):
+            nb.add(self._tab_human_interaction, text=human_text)
 
         # Cập nhật index tab jobs để nút điều hướng hoạt động đúng.
         if self._tab_facebook_jobs is not None and self._notebook_has_tab(self._tab_facebook_jobs):
@@ -7760,7 +8068,7 @@ class _ManagerWindow:
                     n_die += 1
                     lines.append(f"• {aid}: LỖI — port proxy không hợp lệ")
                     continue
-                ok, msg = check_http_proxy(
+                ok, msg, scheme = check_proxy(
                     str(px.get("host", "")),
                     port,
                     user=str(px.get("user", "")),
@@ -7771,7 +8079,8 @@ class _ManagerWindow:
                     ip = (msg or "").replace("\n", " ")
                     if len(ip) > 80:
                         ip = ip[:77] + "…"
-                    lines.append(f"• {aid}: LIVE — {ip}")
+                    kind = scheme.upper() if scheme != "none" else "?"
+                    lines.append(f"• {aid}: LIVE ({kind}) — {ip}")
                 else:
                     n_die += 1
                     err = (msg or "").replace("\n", " ")
@@ -7891,12 +8200,18 @@ class _ManagerWindow:
             )
             return
         if len(ids) == 1:
-            q = f"Xóa vĩnh viễn tài khoản {ids[0]!r}?"
+            q = (
+                f"Xóa vĩnh viễn tài khoản {ids[0]!r}?\n\n"
+                "Sẽ xóa luôn profile Firefox/Playwright riêng, file cookie và mật khẩu trong vault."
+            )
         else:
             preview = ", ".join(ids[:15])
             if len(ids) > 15:
                 preview += f", … (+{len(ids) - 15})"
-            q = f"Xóa vĩnh viễn {len(ids)} tài khoản?\n\n{preview}"
+            q = (
+                f"Xóa vĩnh viễn {len(ids)} tài khoản?\n\n{preview}\n\n"
+                "Sẽ xóa profile Playwright, cookie và vault của từng tài khoản."
+            )
         if not messagebox.askyesno("Xác nhận xóa", q, parent=self._root):
             return
         failed: list[str] = []
@@ -7937,8 +8252,13 @@ class _ManagerWindow:
         base["status"] = "pending"
         new_id = f"{aid}_copy"
         base["id"] = new_id
-        base["portable_path"] = f"data/profiles/chromium/{new_id}"
-        base["cookie_path"] = f"data/cookies/{new_id}.json"
+        base["import_type"] = "duplicate"
+        from src.utils.account_browser_profile import default_cookie_path, default_portable_path
+
+        bt = str(base.get("browser_type") or "firefox")
+        base["portable_path"] = default_portable_path(new_id, bt)
+        base["profile_path"] = base["portable_path"]
+        base["cookie_path"] = default_cookie_path(new_id)
         dlg = AccountFormDialog(
             self._root,
             self._accounts,
@@ -8126,8 +8446,11 @@ class _ManagerWindow:
                         if guess.exists():
                             resolved = guess
                             remapped_profile_path += 1
-                acc["portable_path"] = str(resolved)
-                acc["profile_path"] = str(resolved)
+                from src.utils.account_browser_profile import relativize_account_storage_path
+
+                rel_pp = relativize_account_storage_path(str(resolved))
+                acc["portable_path"] = rel_pp
+                acc["profile_path"] = rel_pp
             exe = str(acc.get("browser_exe_path", "")).strip()
             exe_ok = bool(exe) and Path(exe).is_file()
             if not exe_ok and portable:

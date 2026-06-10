@@ -8,8 +8,11 @@ import pytest
 
 from src.utils.schedule_posts_filters import (
     apply_job_filters,
+    format_account_filter_label,
+    format_page_filter_label,
     is_overdue,
     sort_jobs,
+    split_hashtags_csv,
 )
 
 
@@ -168,6 +171,18 @@ def test_is_overdue_only_pending_past() -> None:
 def test_empty_search_returns_all(sample_jobs: list[dict]) -> None:
     assert len(apply_job_filters(sample_jobs, search_text="")) == len(sample_jobs)
     assert len(apply_job_filters(sample_jobs)) == len(sample_jobs)
+
+
+def test_format_filter_labels() -> None:
+    assert "Minh Tuyết" in format_page_filter_label("538b89cc73f2", "Minh Tuyết")
+    assert "538b89cc73f2" in format_page_filter_label("538b89cc73f2", "Minh Tuyết")
+    assert "facebok1" in format_account_filter_label("acc_1", "facebok1")
+    assert "acc_1" in format_account_filter_label("acc_1", "facebok1")
+
+
+def test_split_hashtags_csv() -> None:
+    assert split_hashtags_csv("foo, bar") == ["#foo", "#bar"]
+    assert split_hashtags_csv("#tag1\n#tag2") == ["#tag1", "#tag2"]
 
 
 def test_unknown_sort_key_falls_back_safely(sample_jobs: list[dict]) -> None:

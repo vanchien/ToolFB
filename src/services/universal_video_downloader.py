@@ -25,6 +25,12 @@ LogFn = Callable[[str], None]
 # ``download()``: ``event`` = start | file_complete | stderr_activity | error_line
 ProgressHook = Callable[[dict[str, Any]], None]
 
+# Giới hạn quét playlist/kênh (YouTube/TikTok) — có thể vài nghìn entry.
+UV_MAX_PLAYLIST_ENTRIES = 10_000
+UV_PLAYLIST_SCAN_CHUNK = 400
+# Trên ngưỡng này tab Tải video dùng tải tuần tự từng URL (ổn định, dễ hủy).
+UV_DOWNLOAD_SEQUENTIAL_THRESHOLD = 25
+
 # yt-dlp: ưu tiên tối thiểu 720p (HD); trần chiều cao 2160 (Short dọc / 4K). Fallback dần xuống thấp hơn nếu site không có HD.
 YTDLP_FORMAT_HD_MERGE = (
     "bestvideo[height>=720][height<=2160]+bestaudio/"
@@ -79,6 +85,57 @@ def _paths_seen_and_list_for_job(video_rows: list[dict[str, Any]], job_id: str) 
         seen.add(key)
         paths.append(norm)
     return seen, paths
+
+
+def extract_failed_download_pairs(job: dict[str, Any] | None) -> list[tuple[str, str]]:
+    """Lấy danh sách (url, lỗi) từ ``failed_items`` của job tải video."""
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for it in (job or {}).get("failed_items") or []:
+        if not isinstance(it, dict):
+            continue
+        url = str(it.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        pairs.append((url, str(it.get("error") or "").strip()))
+    return pairs
+
+
+def write_failed_download_urls_log(
+    *,
+    platform: str,
+    job_id: str,
+    failed_pairs: list[tuple[str, str]],
+    log_fn: LogFn | None = None,
+) -> Path | None:
+    """
+    Ghi URL lỗi sau batch tải vào ``logs/download_failures/failed_<nền_tảng>_<job>_<time>.txt``.
+    """
+    if not failed_pairs:
+        return None
+    out_dir = project_root() / "logs" / "download_failures"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_plat = re.sub(r"[^\w.-]+", "_", str(platform or "unknown").strip())[:48] or "unknown"
+    safe_jid = re.sub(r"[^\w.-]+", "_", str(job_id or "job").strip())[:32] or "job"
+    path = out_dir / f"failed_{safe_plat}_{safe_jid}_{ts}.txt"
+    lines = [
+        f"# Job: {job_id}",
+        f"# Nền tảng: {platform}",
+        f"# Số URL lỗi: {len(failed_pairs)}",
+        f"# Ghi lúc: {datetime.now().replace(microsecond=0).isoformat()}",
+        "",
+    ]
+    for url, err in failed_pairs:
+        lines.append(url)
+        if err:
+            lines.append(f"  # {err.replace(chr(10), ' ')[:500]}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    msg = f"[INFO] Đã ghi {len(failed_pairs)} URL lỗi → {path}"
+    if log_fn is not None:
+        log_fn(msg)
+    return path
 
 
 def _ytdlp_subprocess_kw() -> dict[str, Any]:
@@ -623,7 +680,7 @@ def persist_facebook_reels_settings(
     if cookie_path is not None:
         fb["cookie_path"] = str(cookie_path or "").strip()
     if max_collect is not None:
-        fb["max_collect"] = max(10, min(500, int(max_collect)))
+        fb["max_collect"] = max(10, min(UV_MAX_PLAYLIST_ENTRIES, int(max_collect)))
     if max_scroll_rounds is not None:
         fb["max_scroll_rounds"] = max(5, min(280, int(max_scroll_rounds)))
     if max_scan_minutes is not None:
@@ -1312,12 +1369,85 @@ class UniversalYTDLPWrapper:
             return None
         return {"title": (title or vid or final_url)[:500], "url": final_url}
 
+    def _list_flat_playlist_orchestrated(
+        self,
+        raw: str,
+        *,
+        platform: str,
+        max_entries: int,
+        chunk: int,
+        on_partial: Callable[[list[dict[str, str]]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Quét playlist dài theo từng lô ``--playlist-start`` / ``--playlist-end`` để tránh timeout một lần."""
+        all_out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        warnings: list[str] = []
+        playlist_title = ""
+        extractor = ""
+        n = max(1, int(max_entries))
+        step = max(80, min(800, int(chunk)))
+        for page_start in range(1, n + 1, step):
+            page_end = min(page_start + step - 1, n)
+            page = self.list_flat_playlist_entries(
+                raw,
+                max_entries=n,
+                playlist_start=page_start,
+                playlist_end=page_end,
+                _orchestrating=True,
+            )
+            if not page.get("success"):
+                if all_out:
+                    warnings.append(str(page.get("error") or "Lỗi lô quét"))
+                    break
+                return page
+            if not playlist_title:
+                playlist_title = str(page.get("playlist_title") or "").strip()
+            if not extractor:
+                extractor = str(page.get("extractor") or "").strip()
+            page_entries = page.get("entries") or []
+            added = 0
+            for rec in page_entries:
+                if not isinstance(rec, dict):
+                    continue
+                u = str(rec.get("url") or "").strip()
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                all_out.append(rec)
+                added += 1
+            if on_partial and all_out:
+                try:
+                    on_partial(list(all_out))
+                except Exception:
+                    pass
+            if added == 0 or len(page_entries) < (page_end - page_start + 1):
+                break
+            if len(all_out) >= n:
+                break
+            pause = float(self._yt.get("playlist_scan_inter_page_sleep_sec") or 0.35)
+            if pause > 0:
+                time.sleep(min(2.0, pause))
+        if not all_out:
+            return {"success": False, "error": "Không lấy được entry nào từ playlist/kênh."}
+        warn = "; ".join(warnings).strip()
+        return {
+            "success": True,
+            "entries": all_out[:n],
+            "playlist_title": playlist_title,
+            "extractor": extractor,
+            "partial": bool(warn),
+            "warning": warn,
+        }
+
     def list_flat_playlist_entries(
         self,
         url: str,
         *,
         max_entries: int = 500,
         on_partial: Callable[[list[dict[str, str]]], None] | None = None,
+        playlist_start: int = 1,
+        playlist_end: int | None = None,
+        _orchestrating: bool = False,
     ) -> dict[str, Any]:
         """
         Liệt kê entry trong kênh / playlist (``--flat-playlist``) không tải video.
@@ -1337,7 +1467,23 @@ class UniversalYTDLPWrapper:
             }
         if platform == "tiktok" and ut != "profile":
             return {"success": False, "error": "TikTok cần URL profile (dạng https://www.tiktok.com/@user)."}
-        n = max(1, min(int(max_entries or 500), 2000))
+        n = max(1, min(int(max_entries or 500), UV_MAX_PLAYLIST_ENTRIES))
+        if not _orchestrating:
+            chunk = int(self._yt.get("playlist_scan_chunk") or UV_PLAYLIST_SCAN_CHUNK)
+            chunk = max(80, min(800, chunk))
+            # TikTok profile: yt-dlp thường không phân trang playlist-start/end ổn định — quét một lần.
+            if platform == "youtube" and n > chunk:
+                return self._list_flat_playlist_orchestrated(
+                    raw,
+                    platform=platform,
+                    max_entries=n,
+                    chunk=chunk,
+                    on_partial=on_partial,
+                )
+        pstart = max(1, int(playlist_start or 1))
+        pend = int(playlist_end) if playlist_end is not None else n
+        pend = max(pstart, min(pend, n))
+        page_count = max(1, pend - pstart + 1)
         # Fast path: tránh parse JSON lớn cho playlist dài (máy yếu sẽ đỡ lag/đỡ RAM).
         cmd = [
             *self._resolve_prefix(),
@@ -1349,11 +1495,12 @@ class UniversalYTDLPWrapper:
             "utf-8",
             "--flat-playlist",
             "--lazy-playlist",
-            "--playlist-end",
-            str(n),
             "--print",
             "%(id)s\t%(title)s\t%(webpage_url)s\t%(url)s\t%(uploader_id)s",
         ]
+        if pstart > 1:
+            cmd.extend(["--playlist-start", str(pstart)])
+        cmd.extend(["--playlist-end", str(pend)])
         scan_sock = int(self._yt.get("playlist_scan_socket_timeout_sec") or 0)
         if scan_sock <= 0:
             scan_sock = int(self._yt.get("socket_timeout_sec") or 0)
@@ -1364,8 +1511,9 @@ class UniversalYTDLPWrapper:
             cmd.extend(["--proxy", proxy])
         cmd.append(raw)
         timeout = int(self._yt.get("timeout_sec") or 600)
-        # Trần theo n: ít entry không cần ngân sách cố định rất lớn; kênh dài vẫn có trần ~320s.
-        timeout_scan = min(timeout, max(60, min(320, n * 8 + 48)))
+        # Trần theo số entry trong lô; TikTok một lần có thể cần timeout dài hơn.
+        scan_cap = 1800 if platform == "tiktok" and not _orchestrating else 900
+        timeout_scan = min(timeout, max(90, min(scan_cap, page_count * 6 + 72)))
         try:
             p = subprocess.Popen(
                 cmd,
@@ -1385,7 +1533,7 @@ class UniversalYTDLPWrapper:
         t0 = time.monotonic()
         last_partial_ts = 0.0
         _stderr_stop = threading.Event()
-        line_q: queue.Queue[str | None] = queue.Queue(maxsize=max(4096, n * 8))
+        line_q: queue.Queue[str | None] = queue.Queue(maxsize=max(4096, page_count * 8))
 
         def _read_stderr() -> None:
             if p.stderr is None:
@@ -1509,9 +1657,10 @@ class UniversalYTDLPWrapper:
                 "--encoding",
                 "utf-8",
                 "--flat-playlist",
-                "--playlist-end",
-                str(n),
             ]
+            if pstart > 1:
+                cmd_fallback.extend(["--playlist-start", str(pstart)])
+            cmd_fallback.extend(["--playlist-end", str(pend)])
             scan_sock = int(self._yt.get("playlist_scan_socket_timeout_sec") or 0)
             if scan_sock <= 0:
                 scan_sock = int(self._yt.get("socket_timeout_sec") or 0)
@@ -1525,7 +1674,7 @@ class UniversalYTDLPWrapper:
                     cmd_fallback,
                     capture_output=True,
                     text=True,
-                    timeout=min(max(180, n + 120), timeout),
+                    timeout=min(max(180, page_count + 120), timeout_scan + 60),
                     encoding="utf-8",
                     errors="replace",
                     stdin=subprocess.DEVNULL,
@@ -2170,7 +2319,13 @@ class UniversalVideoDownloader:
         return job
 
     def run_download_url_for_job(
-        self, job_id: str, item_url: str, *, on_progress: ProgressHook | None = None
+        self,
+        job_id: str,
+        item_url: str,
+        *,
+        on_progress: ProgressHook | None = None,
+        videos_rows: list[dict[str, Any]] | None = None,
+        skip_output_dir_validate: bool = False,
     ) -> dict[str, Any]:
         """
         Tải một URL đơn và gộp kết quả vào job có sẵn (dùng cho batch: một job — nhiều video).
@@ -2187,9 +2342,11 @@ class UniversalVideoDownloader:
             return job
         self._active_job_id = job_id
         jid_q = str(job.get("id") or "")
-        videos_rows = self._store.list_downloaded_videos()
+        if videos_rows is None:
+            videos_rows = self._store.list_downloaded_videos()
         seen_lower, job_paths_acc = _paths_seen_and_list_for_job(videos_rows, jid_q)
-        DownloadFolderManager.validate_output_dir(job["output_dir"])
+        if not skip_output_dir_validate:
+            DownloadFolderManager.validate_output_dir(job["output_dir"])
         tmpl = DownloadFolderManager.build_output_template(job)
         if not str(job.get("started_at") or "").strip():
             job["status"] = "running"
@@ -2256,6 +2413,8 @@ class UniversalVideoDownloader:
             job_paths_acc.append(norm)
         if records:
             self._store.save_downloaded_videos(records)
+            for rec in records:
+                videos_rows.insert(0, rec)
         job["downloaded_files"] = list(dict.fromkeys(job_paths_acc))
         job["status"] = "running"
         if ret.get("paths_unreported") and not filepaths:
@@ -2418,6 +2577,51 @@ class UniversalVideoDownloader:
         self._store.save_job(job)
         self._active_job_id = None
         return job
+
+    def run_download_urls_sequential_for_job(
+        self,
+        job_id: str,
+        urls: list[str],
+        *,
+        on_progress: ProgressHook | None = None,
+        on_item_done: Callable[[int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Tải lần lượt từng URL trong một job — ổn định với danh sách dài (vài nghìn video).
+        Gọi ``finalize_batch_download_job`` sau khi vòng lặp kết thúc.
+        """
+        urls = [str(u).strip() for u in urls if str(u).strip()]
+        if not urls:
+            raise ValueError("Thiếu URL")
+        total = len(urls)
+        job = self._store.get_job(job_id)
+        if not job:
+            raise KeyError(f"Không có job: {job_id}")
+        videos_rows = self._store.list_downloaded_videos()
+        output_validated = False
+        refresh_cache_every = max(8, min(40, int(self._uvd.get("yt_dlp", {}).get("sequential_cache_refresh_every") or 20)))
+        for idx, item_url in enumerate(urls, start=1):
+            if self.is_cancel_requested():
+                break
+            if on_item_done is not None:
+                try:
+                    on_item_done(idx, total, item_url)
+                except Exception:
+                    pass
+            try:
+                job = self.run_download_url_for_job(
+                    job_id,
+                    item_url,
+                    on_progress=on_progress,
+                    videos_rows=videos_rows,
+                    skip_output_dir_validate=output_validated,
+                )
+                output_validated = True
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[yt-dlp] tuần tự URL {idx}/{total} lỗi: {item_url[:120]}… | {exc}")
+            if idx % refresh_cache_every == 0:
+                videos_rows = self._store.list_downloaded_videos()
+        return self._store.get_job(job_id) or job
 
     def _attach_existing_sources_to_job(
         self,

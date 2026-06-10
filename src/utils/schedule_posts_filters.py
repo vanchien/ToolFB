@@ -35,6 +35,37 @@ def _norm(v: Any) -> str:
     return str(v).strip().lower()
 
 
+def format_page_filter_label(page_id: str, page_name: str = "") -> str:
+    """Nhãn combobox lọc page: ``Tên Page (page_id)``."""
+    pid = str(page_id or "").strip()
+    name = str(page_name or "").strip()
+    if name and pid:
+        return f"{name} ({pid})"
+    return name or pid
+
+
+def format_account_filter_label(account_id: str, account_name: str = "") -> str:
+    """Nhãn combobox lọc account: ``Tên account (account_id)``."""
+    aid = str(account_id or "").strip()
+    name = str(account_name or "").strip()
+    if name and aid:
+        return f"{name} ({aid})"
+    return aid or name
+
+
+def split_hashtags_csv(text: str) -> list[str]:
+    """Tách hashtag từ chuỗi phẩy / xuống dòng."""
+    out: list[str] = []
+    for part in str(text or "").replace("\n", ",").split(","):
+        tag = part.strip()
+        if not tag:
+            continue
+        if not tag.startswith("#"):
+            tag = f"#{tag.lstrip('#')}"
+        out.append(tag)
+    return out
+
+
 def _job_search_haystack(job: dict[str, Any]) -> str:
     """
     Dồn các trường có thể tìm kiếm thành 1 blob để khớp chuỗi con.

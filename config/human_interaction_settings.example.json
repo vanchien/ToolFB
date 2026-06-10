@@ -1,0 +1,16 @@
+{
+  "accounts_path": "",
+  "proxies_path": "",
+  "accounts_text": "",
+  "proxies_text": "",
+  "threads": 4,
+  "grid_cols": 4,
+  "headless": false,
+  "profile": "normal",
+  "like_rate_pct": 30,
+  "comment_rate_pct": 10,
+  "virtual_cursor": true,
+  "ai_comments": false,
+  "mapped_accounts_login": [],
+  "mapped_accounts_interaction": []
+}

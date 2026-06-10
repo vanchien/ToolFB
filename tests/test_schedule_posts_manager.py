@@ -58,6 +58,41 @@ def test_schedule_posts_default_status(mgr: SchedulePostsManager) -> None:
     assert int(r.get("max_retry", 0)) == 3
 
 
+def test_schedule_posts_update_jobs_fields_sequential_progress(mgr: SchedulePostsManager) -> None:
+    jids: list[str] = []
+    for i in range(4):
+        mgr.upsert({"page_id": "p", "account_id": "a", "post_type": "text", "title": f"X{i}"})
+        jids.append(str(mgr.load_all()[-1]["id"]))
+    seen: list[str] = []
+
+    def _prog(done: int, total: int, jid: str) -> None:
+        seen.append(jid)
+
+    n = mgr.update_jobs_fields_sequential(
+        jids,
+        fields={"title": "Y"},
+        on_progress=_prog,
+        step_delay_sec=0,
+    )
+    assert n == 4
+    assert len(seen) == 4
+    assert set(seen) == set(jids)
+
+
+def test_schedule_posts_update_jobs_fields_batch(mgr: SchedulePostsManager) -> None:
+    jids: list[str] = []
+    for i in range(3):
+        mgr.upsert({"page_id": "p", "account_id": "a", "post_type": "text", "title": f"T{i}"})
+        jids.append(str(mgr.load_all()[-1]["id"]))
+    n = mgr.update_jobs_fields_batch(jids, title="Shared", content="Shared", hashtags=["#x"])
+    assert n == 3
+    for jid in jids:
+        row = mgr.get_by_id(jid)
+        assert row is not None
+        assert row["title"] == "Shared"
+        assert row["hashtags"] == ["#x"]
+
+
 def test_schedule_posts_update_job_fields(mgr: SchedulePostsManager) -> None:
     mgr.upsert({"page_id": "p3", "account_id": "a3", "post_type": "text", "title": "T"})
     jid = str(mgr.load_all()[0]["id"])

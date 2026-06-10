@@ -25,6 +25,15 @@ else:
     _STEALTH_IMPORT_ERROR = None
 
 from src.automation.mobile_viewport import resolve_mobile_viewport
+from src.utils.browser_fingerprint import (
+    apply_fingerprint_init_script,
+    default_desktop_firefox_user_agent,
+    merge_firefox_user_prefs,
+    resolve_browser_locale,
+    resolve_browser_timezone,
+    resolve_proxy_geo,
+)
+from src.utils.proxy_check import proxy_host_port_configured
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager, ProxyConfig
 from src.utils.paths import project_root as _project_root
 
@@ -138,6 +147,130 @@ _shared_pw_by_thread: dict[int, Playwright] = {}
 _shared_pw_ref_by_thread: dict[int, int] = {}
 _shared_pw_lock = threading.Lock()
 
+# Một profile portable chỉ được gắn một Firefox/Playwright context tại một thời điểm.
+_profile_path_locks: dict[str, threading.Lock] = {}
+_profile_path_holders: dict[str, str] = {}  # profile_key -> account_id
+_profile_registry_lock = threading.Lock()
+
+_BROWSER_LAUNCH_SEM: threading.Semaphore | None = None
+_BROWSER_LAUNCH_SEM_LIMIT = 0
+
+
+def _browser_launch_semaphore() -> threading.Semaphore:
+    """Giới hạn số Firefox/Chromium launch song song — tránh spike CPU/RAM khi pool N luồng."""
+    global _BROWSER_LAUNCH_SEM, _BROWSER_LAUNCH_SEM_LIMIT
+    limit = max(1, _env_int("FB_MAX_PARALLEL_BROWSER_LAUNCH", 2))
+    if _BROWSER_LAUNCH_SEM is None or _BROWSER_LAUNCH_SEM_LIMIT != limit:
+        _BROWSER_LAUNCH_SEM = threading.Semaphore(limit)
+        _BROWSER_LAUNCH_SEM_LIMIT = limit
+        logger.debug("[Browser] Semaphore launch song song tối đa {} cửa sổ.", limit)
+    return _BROWSER_LAUNCH_SEM
+
+
+def _acquire_browser_launch_slot(
+    *,
+    account_id: str = "",
+    timeout_sec: float | None = None,
+) -> None:
+    """
+    Chờ slot launch (tránh mở quá nhiều Firefox cùng lúc).
+
+    Raises:
+        RuntimeError: Hết thời gian chờ (pool khác đang giữ slot).
+    """
+    sem = _browser_launch_semaphore()
+    if timeout_sec is None:
+        sem.acquire()
+        return
+    wait = max(5.0, float(timeout_sec))
+    if sem.acquire(timeout=wait):
+        return
+    aid = str(account_id or "").strip()
+    raise RuntimeError(
+        f"Quá {wait:.0f}s chờ mở trình duyệt"
+        + (f" (account={aid})" if aid else "")
+        + " — có thể đang chạy «Đăng nhập»/pool khác. Bấm «Dừng» hoặc đợi cửa sổ kia mở xong."
+    )
+
+
+def _profile_path_key(user_data_dir: Path) -> str:
+    return str(user_data_dir.resolve()).lower()
+
+
+def _get_profile_path_lock(profile_key: str) -> threading.Lock:
+    with _profile_registry_lock:
+        lock = _profile_path_locks.get(profile_key)
+        if lock is None:
+            lock = threading.Lock()
+            _profile_path_locks[profile_key] = lock
+        return lock
+
+
+def acquire_profile_browser_slot(
+    user_data_dir: Path,
+    account_id: str,
+    *,
+    timeout_sec: float | None = None,
+) -> threading.Lock:
+    """
+  Chiếm slot profile: mỗi ``user_data_dir`` chỉ một tài khoản / một context Firefox.
+
+    Raises:
+        RuntimeError: Profile đang mở cho tài khoản khác hoặc hết thời gian chờ khóa.
+    """
+    profile_key = _profile_path_key(user_data_dir)
+    aid = str(account_id or "").strip() or "(unknown)"
+    with _profile_registry_lock:
+        holder = _profile_path_holders.get(profile_key)
+        if holder and holder != aid:
+            raise RuntimeError(
+                f"Profile Firefox đang dùng bởi tài khoản «{holder}» "
+                f"({user_data_dir}) — không mở thêm cho «{aid}». "
+                "Đóng trình duyệt tài khoản kia trước."
+            )
+        _profile_path_holders[profile_key] = aid
+    lock = _get_profile_path_lock(profile_key)
+    if timeout_sec is not None:
+        wait = max(5.0, float(timeout_sec))
+        if not lock.acquire(timeout=wait):
+            with _profile_registry_lock:
+                if _profile_path_holders.get(profile_key) == aid:
+                    _profile_path_holders.pop(profile_key, None)
+            raise RuntimeError(
+                f"Quá {wait:.0f}s chờ khóa profile Firefox (account={aid}). "
+                "Có thể pool «Đăng nhập» đang giữ profile — bấm «Dừng» hoặc đóng Firefox cũ."
+            )
+    else:
+        lock.acquire()
+    logger.info(
+        "Đã khóa profile Firefox | account={} | profile={}",
+        aid,
+        user_data_dir,
+    )
+    return lock
+
+
+def release_profile_browser_slot(
+    user_data_dir: Path, account_id: str, profile_lock: threading.Lock | None
+) -> None:
+    """Giải phóng slot profile sau ``context.close()``."""
+    if profile_lock is None:
+        return
+    profile_key = _profile_path_key(user_data_dir)
+    aid = str(account_id or "").strip() or "(unknown)"
+    try:
+        profile_lock.release()
+    except RuntimeError:
+        pass
+    with _profile_registry_lock:
+        if _profile_path_holders.get(profile_key) == aid:
+            _profile_path_holders.pop(profile_key, None)
+    logger.info(
+        "Đã mở khóa profile Firefox | account={} | profile={}",
+        aid,
+        user_data_dir,
+    )
+
 
 def _acquire_shared_playwright() -> Playwright:
     thread_id = threading.get_ident()
@@ -203,15 +336,49 @@ def _cleanup_firefox_profile_lock_files(user_data_dir: Path) -> None:
             logger.debug("Không xóa được Firefox lock file {}: {}", p, exc)
 
 
-def sync_close_persistent_context(context: BrowserContext | None, *, log_label: str = "") -> None:
+def sync_close_persistent_context(
+    context: BrowserContext | None,
+    *,
+    log_label: str = "",
+    timeout_sec: float = 0.0,
+) -> None:
     """
     Đóng ``BrowserContext`` persistent: đóng từng ``Page`` còn mở rồi ``context.close()``.
 
     Giảm race driver Node (``EPIPE``) khi Chromium còn phát sự kiện sau khi pipe đã đóng.
+    ``timeout_sec`` > 0: giới hạn thời gian đóng (tránh kẹt slot pool tương tác).
     """
     if context is None:
         return
+
+    def _close_inner() -> None:
+        _sync_close_persistent_context_impl(context, log_label=log_label)
+
+    if timeout_sec and float(timeout_sec) > 0:
+        import concurrent.futures
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_close_inner)
+                fut.result(timeout=max(3.0, float(timeout_sec)))
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "Timeout đóng BrowserContext sau {:.0f}s ({}) — bỏ qua để không chặn pool",
+                float(timeout_sec),
+                log_label or "(context)",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lỗi khi đóng BrowserContext có timeout ({}): {}", log_label, exc)
+        return
+    _close_inner()
+
+
+def _sync_close_persistent_context_impl(context: BrowserContext, *, log_label: str = "") -> None:
     label = (log_label or "").strip() or "(context)"
+    relay = getattr(context, "_toolfb_socks_relay", None)  # noqa: SLF001
+    profile_lock = getattr(context, "_toolfb_profile_lock", None)
+    profile_dir = getattr(context, "_toolfb_profile_dir", None)
+    profile_account = getattr(context, "_toolfb_profile_account_id", None)
     try:
         for pg in list(context.pages):
             try:
@@ -231,6 +398,29 @@ def sync_close_persistent_context(context: BrowserContext | None, *, log_label: 
             logger.debug("BrowserContext đã đóng trước đó ({}): {}", label, exc)
         else:
             logger.warning("Lỗi khi đóng BrowserContext ({}): {}", label, exc)
+    if relay is not None:
+        try:
+            relay.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Dừng SOCKS5 relay ({}): {}", label, exc)
+        try:
+            del context._toolfb_socks_relay  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if profile_lock is not None and profile_dir is not None:
+        try:
+            release_profile_browser_slot(
+                Path(profile_dir),
+                str(profile_account or label),
+                profile_lock,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Mở khóa profile ({}): {}", label, exc)
+        for attr in ("_toolfb_profile_lock", "_toolfb_profile_dir", "_toolfb_profile_account_id"):
+            try:
+                delattr(context, attr)
+            except Exception:
+                pass
 
 
 def apply_viewport_from_env_to_page(page: Page, playwright: Playwright | None = None) -> None:
@@ -286,16 +476,6 @@ def account_use_proxy_enabled(acc: dict) -> bool:
     return True
 
 
-def proxy_host_port_configured(proxy: ProxyConfig) -> bool:
-    """True nếu có host không rỗng và port > 0."""
-    host = str(proxy.get("host", "")).strip()
-    try:
-        port = int(proxy.get("port", 0))
-    except (TypeError, ValueError):
-        return False
-    return bool(host) and port > 0
-
-
 def format_proxy_server_url(proxy: ProxyConfig) -> str:
     """
     Ghép chuỗi proxy dạng ``http://user:pass@host:port`` hoặc ``http://host:port`` nếu không có user.
@@ -321,51 +501,24 @@ def format_proxy_server_url(proxy: ProxyConfig) -> str:
 
 def playwright_proxy_settings(proxy: ProxyConfig) -> dict[str, Any]:
     """
-    Cấu hình ``proxy`` cho ``launch_persistent_context`` / Playwright.
+    Cấu hình ``proxy`` cho ``launch_persistent_context`` (HTTP/HTTPS/SOCKS4/SOCKS5).
 
-    Dùng ``server`` không chứa mật khẩu và tách ``username`` / ``password`` — Firefox ổn định hơn
-    so với gom ``user:pass`` vào URL (tránh lỗi ``NS_ERROR_PROXY_*`` / xác thực sai).
-
-    Hỗ trợ:
-    - HTTP: ``host`` = ``proxy.example.com`` hoặc ``http://proxy.example.com`` (cổng ở ``port``).
-    - SOCKS5: ``host`` = ``socks5://ip`` hoặc ``socks5://ip:1080`` (nếu thiếu cổng trong chuỗi thì dùng ``port``).
+    Logic tập trung tại ``src.utils.proxy_check.build_playwright_proxy_settings``.
     """
-    raw_host = str(proxy.get("host", "")).strip()
-    try:
-        port = int(proxy.get("port", 0))
-    except (TypeError, ValueError):
-        port = 0
-    user = (proxy.get("user") or "").strip()
-    password = (proxy.get("pass") or "").strip()
+    from src.utils.proxy_check import build_playwright_proxy_settings
 
-    rl = raw_host.lower()
-    if rl.startswith("socks5://"):
-        rest = raw_host[9:].rstrip("/")
-        if port > 0:
-            tail = rest.split("@")[-1]
-            if ":" not in tail:
-                rest = f"{rest}:{port}"
-        settings: dict[str, Any] = {"server": f"socks5://{rest}"}
-    else:
-        host = raw_host
-        for prefix in ("http://", "https://"):
-            if host.lower().startswith(prefix):
-                host = host[len(prefix) :]
-                break
-        host = host.split("/")[0].strip()
-        settings = {"server": f"http://{host}:{port}"}
-    if user:
-        settings["username"] = user
-        settings["password"] = password
-    return settings
+    return build_playwright_proxy_settings(proxy)  # type: ignore[arg-type]
 
 
 class BrowserFactory:
     """
     Factory khởi tạo ``BrowserContext`` persistent theo ``account_id``.
 
-    Mặc định dùng ``sync_playwright()`` chia sẻ theo **từng thread** (refcount) để mỗi worker
-    không phải ``start()/stop()`` liên tục nhưng vẫn an toàn thread-affinity. Tắt: ``FB_PLAYWRIGHT_SHARED=0``.
+    Mặc định **mỗi** ``BrowserFactory`` = một ``sync_playwright()`` riêng (``owned``) — tách
+    driver Node giữa các lần mở tài khoản. Bật chia sẻ theo thread: ``FB_PLAYWRIGHT_SHARED=1``.
+
+    Mỗi tài khoản: ``launch_persistent_context`` + ``portable_path`` riêng; không hai account
+    cùng profile; khóa ``acquire_profile_browser_slot``.
 
     Nếu inject ``playwright`` từ bên ngoài, factory không stop instance đó.
     """
@@ -391,12 +544,16 @@ class BrowserFactory:
         if playwright is not None:
             self._pw_mode = "injected"
             self._playwright = playwright
-        elif _env_bool("FB_PLAYWRIGHT_SHARED", True):
+        elif _env_bool("FB_PLAYWRIGHT_SHARED", False):
             self._pw_mode = "shared"
             self._playwright = _acquire_shared_playwright()
         else:
             self._pw_mode = "owned"
             self._playwright = sync_playwright().start()
+            logger.info(
+                "Playwright riêng cho phiên tài khoản (owned) — thread_id={}",
+                threading.get_ident(),
+            )
         self._default_headless = headless
         logger.debug(
             "BrowserFactory khởi tạo (pw_mode={}, headless_mặc_định={})",
@@ -456,6 +613,12 @@ class BrowserFactory:
             path = _project_root() / path
         resolved = path.resolve()
         if resolved.is_dir():
+            from src.utils.account_browser_profile import assert_profile_directory_owned_by
+
+            assert_profile_directory_owned_by(
+                str(account.get("id", "")).strip(),
+                resolved,
+            )
             logger.debug("Profile portable: {}", resolved)
             return resolved
         allow_create = _env_bool("FB_AUTO_CREATE_PROFILE_DIR", False)
@@ -494,7 +657,16 @@ class BrowserFactory:
             return self._playwright.webkit
         raise ValueError(f"browser_type không hỗ trợ: {name}")
 
-    def _launch_args_for(self, browser_key: str, *, viewport_width: int | None = None, viewport_height: int | None = None) -> list[str]:
+    def _launch_args_for(
+        self,
+        browser_key: str,
+        *,
+        viewport_width: int | None = None,
+        viewport_height: int | None = None,
+        window_x: int | None = None,
+        window_y: int | None = None,
+        fit_outer_window: bool = False,
+    ) -> list[str]:
         """
         Trả về ``args`` khởi chạy theo loại trình duyệt (chống phát hiện bot cho Chromium).
 
@@ -525,13 +697,18 @@ class BrowserFactory:
                 args.extend([p for p in raw_extra.split() if p])
             if viewport_width and viewport_height:
                 args.append(f"--window-size={viewport_width},{viewport_height}")
+            if window_x is not None and window_y is not None:
+                args.append(f"--window-position={int(window_x)},{int(window_y)}")
             return args
         if browser_key == "firefox":
             args: list[str] = []
-            # Mặc định tắt: -width/-height dễ lệch chrome vs viewport Playwright → cột trắng / lỗi layout.
-            # Bật khi cần: FB_FIREFOX_OUTER_WINDOW_FIT=1
-            if _env_bool("FB_FIREFOX_OUTER_WINDOW_FIT", False) and viewport_width and viewport_height:
+            # Lưới đa cửa sổ: bật -width/-height; mặc định tắt để tránh lệch layout khi không chia lưới.
+            if (
+                fit_outer_window or _env_bool("FB_FIREFOX_OUTER_WINDOW_FIT", False)
+            ) and viewport_width and viewport_height:
                 args.extend(["-width", str(viewport_width), "-height", str(viewport_height)])
+            if window_x is not None and window_y is not None:
+                args.extend(["-left", str(int(window_x)), "-top", str(int(window_y))])
             return args
         return []
 
@@ -568,11 +745,25 @@ class BrowserFactory:
         acc: dict[str, Any],
         *,
         headless: Optional[bool] = None,
+        grid_viewport: tuple[int, int] | None = None,
+        window_position: tuple[int, int] | None = None,
+        disable_notifications: bool = False,
+        launch_slot_timeout_sec: float | None = None,
+        skip_geo_lookup: bool = False,
+        force_desktop_facebook: bool = False,
     ) -> BrowserContext:
         """
         Mở persistent context từ dict (cùng khóa như ``accounts.json``), không cần bản ghi đã lưu DB.
 
         Dùng cho form «Thêm mới» — đăng nhập Facebook rồi ``storage_state`` ra ``cookie_path``.
+
+        Args:
+            grid_viewport: ``(width, height)`` từ Grid Layout Manager; ghi đè viewport mặc định.
+            window_position: ``(x, y)`` góc trái cửa sổ (Chromium ``--window-position``; Firefox ``-left``/``-top`` + Win32).
+            disable_notifications: Tắt thông báo trình duyệt (Firefox pref / Chromium args).
+            launch_slot_timeout_sec: Chờ slot launch tối đa (giây); ``None`` = chờ vô hạn.
+            skip_geo_lookup: Bỏ tra ip-api qua proxy (mở tay nhanh hơn).
+            force_desktop_facebook: Luôn ``www.facebook.com`` + viewport desktop (tab Tương tác sau đăng nhập).
         """
         if self._playwright is None:
             raise RuntimeError("Playwright đã bị stop; tạo BrowserFactory mới hoặc không gọi close() quá sớm.")
@@ -593,13 +784,27 @@ class BrowserFactory:
             browser_key,
             user_data_dir,
         )
+        socks_relay = None
         if apply_proxy:
-            pw_proxy = playwright_proxy_settings(proxy_cfg)  # type: ignore[arg-type]
-            logger.info(
-                "Proxy Playwright | server={} | có_user={}",
-                pw_proxy["server"],
-                bool(pw_proxy.get("username")),
-            )
+            from src.utils.socks5_http_relay import Socks5HttpRelay, socks_proxy_needs_http_relay
+
+            if socks_proxy_needs_http_relay(proxy_cfg) and not _env_bool("TOOLFB_DISABLE_SOCKS_RELAY", False):
+                socks_relay = Socks5HttpRelay.from_proxy_config(proxy_cfg)  # type: ignore[arg-type]
+                socks_relay.start()
+                pw_proxy = {"server": socks_relay.local_url}
+                logger.info(
+                    "Proxy Playwright | SOCKS5 có auth → relay HTTP local {} (upstream socks5://{}:{})",
+                    socks_relay.local_url,
+                    socks_relay._upstream_host,
+                    socks_relay._upstream_port,
+                )
+            else:
+                pw_proxy = playwright_proxy_settings(proxy_cfg)  # type: ignore[arg-type]
+                logger.info(
+                    "Proxy Playwright | server={} | có_user={}",
+                    pw_proxy["server"],
+                    bool(pw_proxy.get("username")),
+                )
             logger.debug("Proxy URL tương đương (log ẩn pass): {}", _redact_proxy_url(format_proxy_server_url(proxy_cfg)))
         elif use_px:
             logger.warning(
@@ -611,11 +816,35 @@ class BrowserFactory:
 
         use_headless = self._default_headless if headless is None else headless
         browser_type = self._select_browser_type(browser_key)
+        manual_open = launch_slot_timeout_sec is not None
+        use_desktop_fb = manual_open or force_desktop_facebook
         # Chính sách runtime: automation luôn desktop viewport ổn định.
         mobile_mode = False
         mv = resolve_mobile_viewport(self._playwright, mobile_mode=mobile_mode)
-        vp_w, vp_h = mv.width, mv.height
-        shell = bool(getattr(mv, "use_mobile_facebook_shell", False))
+        if grid_viewport and len(grid_viewport) >= 2:
+            # Lưới đa cửa sổ: viewport = kích thước ô (tránh cửa sổ 1280px chồng lên nhau).
+            vp_w, vp_h = max(320, int(grid_viewport[0])), max(400, int(grid_viewport[1]))
+            if use_desktop_fb:
+                logger.info(
+                    "[Browser] Lưới {}×{} + www/desktop (account={})",
+                    vp_w,
+                    vp_h,
+                    account_id,
+                )
+        elif use_desktop_fb:
+            vp_w, vp_h = mv.width, mv.height
+        else:
+            vp_w, vp_h = mv.width, mv.height
+        win_x = int(window_position[0]) if window_position and len(window_position) >= 1 else None
+        win_y = int(window_position[1]) if window_position and len(window_position) >= 2 else None
+        safe_w = max(320, _env_int("FB_DESKTOP_SAFE_MIN_WIDTH", 900))
+        auto_narrow = _env_bool("FB_AUTO_MOBILE_WEB_WHEN_NARROW", True)
+        if force_desktop_facebook:
+            shell = False
+        elif not mobile_mode:
+            shell = bool(auto_narrow and vp_w < safe_w)
+        else:
+            shell = bool(getattr(mv, "use_mobile_facebook_shell", False))
         if shell:
             os.environ["TOOLFB_NAV_MOBILE_FB"] = "1"
         else:
@@ -632,13 +861,32 @@ class BrowserFactory:
         elif effective_mobile:
             ua = _mobile_user_agent_default()
         else:
-            ua = ""
+            ua = default_desktop_firefox_user_agent()
 
+        proxy_cfg_for_fp = proxy_cfg if apply_proxy else None
+        if apply_proxy and not skip_geo_lookup:
+            geo_fp = resolve_proxy_geo(acc, proxy_cfg_for_fp)
+        else:
+            geo_fp = None
+            if apply_proxy and skip_geo_lookup:
+                logger.info(
+                    "[Browser] Bỏ tra geo ip-api (mở tay) — locale/timezone mặc định account={}",
+                    account_id,
+                )
+        locale_id = resolve_browser_locale(acc, proxy=proxy_cfg_for_fp, geo=geo_fp)
+        timezone_id = resolve_browser_timezone(acc, proxy=proxy_cfg_for_fp, geo=geo_fp)
+        place_window = bool(not use_headless and win_x is not None and win_y is not None)
+        fit_outer_from_grid = bool(grid_viewport and not use_headless)
         args = self._launch_args_for(
             browser_key,
             viewport_width=vp_w if not use_headless else None,
             viewport_height=vp_h if not use_headless else None,
+            window_x=win_x if not use_headless else None,
+            window_y=win_y if not use_headless else None,
+            fit_outer_window=fit_outer_from_grid,
         )
+        if disable_notifications and browser_key in ("chromium", "chrome"):
+            _append_unique_arg(args, "--disable-notifications")
         if browser_key in ("chromium", "chrome"):
             # Chỉ bật khi người dùng chủ động yêu cầu; một số máy có thể chậm/hang khi áp cờ mạng quá mạnh.
             if _env_bool("FB_CHROMIUM_FAST_NETWORK", False):
@@ -658,11 +906,20 @@ class BrowserFactory:
             user_data_dir=str(user_data_dir),
             headless=use_headless,
             args=args,
-            locale=os.environ.get("PLAYWRIGHT_LOCALE", "vi-VN"),
+            locale=locale_id,
+            timezone_id=timezone_id,
             viewport={"width": vp_w, "height": vp_h},
             # Cùng kích thước screen để window.screen khớp viewport, tránh trang lỗi / layout tính sai chiều ngang.
             screen={"width": vp_w, "height": vp_h},
         )
+        if geo_fp:
+            logger.info(
+                "Browser fingerprint | locale={} | timezone={} | geo_ip={} | country={}",
+                locale_id,
+                timezone_id,
+                geo_fp.get("ip", ""),
+                geo_fp.get("country_code", ""),
+            )
         if browser_key in ("chromium", "chrome"):
             raw_to = os.environ.get("FB_CHROMIUM_LAUNCH_TIMEOUT_MS", "").strip()
             if raw_to:
@@ -670,6 +927,12 @@ class BrowserFactory:
                     launch_kwargs["timeout"] = max(1, int(raw_to))
                 except ValueError:
                     logger.warning("FB_CHROMIUM_LAUNCH_TIMEOUT_MS={!r} không hợp lệ — bỏ qua.", raw_to)
+        elif browser_key == "firefox":
+            raw_ff = os.environ.get("FB_FIREFOX_LAUNCH_TIMEOUT_MS", "90000").strip()
+            try:
+                launch_kwargs["timeout"] = max(15_000, int(raw_ff))
+            except ValueError:
+                launch_kwargs["timeout"] = 90_000
         if ua:
             launch_kwargs["user_agent"] = ua
         if effective_mobile and browser_key in ("chromium", "chrome", "webkit"):
@@ -680,16 +943,17 @@ class BrowserFactory:
             # Firefox: không có is_mobile; vẫn cần DPR + touch để Juggler setDefaultViewport khớp (giảm dải trắng).
             launch_kwargs["device_scale_factor"] = float(mv.device_scale_factor)
             launch_kwargs["has_touch"] = True
-            launch_kwargs["firefox_user_prefs"] = {
-                # Tránh làm tròn / khóa kích thước viewport gây lệch với cửa sổ nhỏ.
-                "privacy.resistFingerprinting": False,
-            }
+            launch_kwargs["firefox_user_prefs"] = merge_firefox_user_prefs(
+                {"privacy.resistFingerprinting": False}
+            )
             logger.warning(
                 "Chế độ mobile shell (FB_MOBILE hoặc viewport hẹp) + firefox: không có is_mobile của Chromium. "
                 "Nếu layout lệch, thử browser_type=chromium."
             )
         if browser_key == "firefox":
-            ff = dict(launch_kwargs.get("firefox_user_prefs") or {})
+            ff = merge_firefox_user_prefs(dict(launch_kwargs.get("firefox_user_prefs") or {}))
+            if disable_notifications:
+                ff["dom.webnotifications.enabled"] = False
             if not apply_proxy:
                 # Ép kết nối trực tiếp: profile portable có thể còn PAC/manual proxy từ máy cũ → NS_ERROR_PROXY_*.
                 ff.update(
@@ -707,7 +971,10 @@ class BrowserFactory:
                 )
             launch_kwargs["firefox_user_prefs"] = ff
         if apply_proxy:
-            launch_kwargs["proxy"] = playwright_proxy_settings(proxy_cfg)  # type: ignore[arg-type]
+            if socks_relay is not None:
+                launch_kwargs["proxy"] = {"server": socks_relay.local_url}
+            else:
+                launch_kwargs["proxy"] = playwright_proxy_settings(proxy_cfg)  # type: ignore[arg-type]
         elif not _env_bool("FB_KEEP_SYSTEM_PROXY", False):
             clean = {k: v for k, v in os.environ.items()}
             for k in (
@@ -768,59 +1035,86 @@ class BrowserFactory:
         if browser_key == "firefox":
             _cleanup_firefox_profile_lock_files(user_data_dir)
 
+        profile_lock = acquire_profile_browser_slot(
+            user_data_dir,
+            account_id,
+            timeout_sec=launch_slot_timeout_sec if launch_slot_timeout_sec is not None else None,
+        )
+        acquired_launch_sem = False
         try:
-            context = browser_type.launch_persistent_context(**launch_kwargs)
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "executable doesn't exist" in msg or "executable does not exist" in msg:
-                from src.utils.playwright_browser_lock import browser_executable_missing_message
-
-                raise RuntimeError(
-                    browser_executable_missing_message(
-                        browser_key=browser_key,
-                        project_root=_project_root(),
-                    )
-                ) from exc
-            # Firefox thỉnh thoảng launch xong rồi thoát ngay (exitCode=0) do lock/profile state.
-            if browser_key == "firefox" and "process did exit: exitcode=0" in msg:
-                logger.warning(
-                    "Firefox launch thoát sớm (account={}) — thử dọn lock profile và launch lại 1 lần.",
+            if manual_open:
+                logger.info(
+                    "[Browser] Mở trình duyệt thủ công account={} — không chờ semaphore pool.",
                     account_id,
                 )
-                _cleanup_firefox_profile_lock_files(user_data_dir)
-                time.sleep(0.25)
+            else:
+                _acquire_browser_launch_slot(
+                    account_id=account_id,
+                    timeout_sec=launch_slot_timeout_sec,
+                )
+                acquired_launch_sem = True
+            try:
                 try:
                     context = browser_type.launch_persistent_context(**launch_kwargs)
-                except Exception as exc2:
-                    msg2 = str(exc2).lower()
-                    if "process did exit: exitcode=0" not in msg2:
-                        raise
-                    allow_cross_engine_fallback = _env_bool("FB_ALLOW_CROSS_ENGINE_FALLBACK", False)
-                    if not allow_cross_engine_fallback:
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if "executable doesn't exist" in msg or "executable does not exist" in msg:
+                        from src.utils.playwright_browser_lock import browser_executable_missing_message
+
                         raise RuntimeError(
-                            "Firefox profile thoát sớm (exitCode=0) sau 2 lần thử. "
-                            "Để tránh mở sai phiên đăng nhập, app KHÔNG tự đổi sang Chromium. "
-                            "Bạn có thể bật FB_ALLOW_CROSS_ENGINE_FALLBACK=1 nếu muốn fallback tạm."
-                        ) from exc2
-                    logger.warning(
-                        "Firefox vẫn thoát sớm sau retry (account={}) — fallback sang Chromium vì FB_ALLOW_CROSS_ENGINE_FALLBACK=1.",
-                        account_id,
-                    )
-                    fallback_kwargs = dict(launch_kwargs)
-                    fallback_kwargs.pop("firefox_user_prefs", None)
-                    # executable_path hiện tại thường là firefox.exe; bỏ để dùng Chromium/channel.
-                    fallback_kwargs.pop("executable_path", None)
-                    fallback_kwargs["args"] = self._launch_args_for(
-                        "chromium",
-                        viewport_width=vp_w if not use_headless else None,
-                        viewport_height=vp_h if not use_headless else None,
-                    )
-                    ch_fb = _playwright_chromium_channel(browser_key="chromium", has_executable_path=False)
-                    if ch_fb:
-                        fallback_kwargs["channel"] = ch_fb
-                    context = self._playwright.chromium.launch_persistent_context(**fallback_kwargs)
-            else:
-                raise
+                            browser_executable_missing_message(
+                                browser_key=browser_key,
+                                project_root=_project_root(),
+                            )
+                        ) from exc
+                    # Firefox thỉnh thoảng launch xong rồi thoát ngay (exitCode=0) do lock/profile state.
+                    if browser_key == "firefox" and "process did exit: exitcode=0" in msg:
+                        logger.warning(
+                            "Firefox launch thoát sớm (account={}) — thử dọn lock profile và launch lại 1 lần.",
+                            account_id,
+                        )
+                        _cleanup_firefox_profile_lock_files(user_data_dir)
+                        time.sleep(0.25)
+                        try:
+                            context = browser_type.launch_persistent_context(**launch_kwargs)
+                        except Exception as exc2:
+                            msg2 = str(exc2).lower()
+                            if "process did exit: exitcode=0" not in msg2:
+                                raise
+                            allow_cross_engine_fallback = _env_bool("FB_ALLOW_CROSS_ENGINE_FALLBACK", False)
+                            if not allow_cross_engine_fallback:
+                                raise RuntimeError(
+                                    "Firefox profile thoát sớm (exitCode=0) sau 2 lần thử. "
+                                    "Để tránh mở sai phiên đăng nhập, app KHÔNG tự đổi sang Chromium. "
+                                    "Bạn có thể bật FB_ALLOW_CROSS_ENGINE_FALLBACK=1 nếu muốn fallback tạm."
+                                ) from exc2
+                            logger.warning(
+                                "Firefox vẫn thoát sớm sau retry (account={}) — fallback sang Chromium vì FB_ALLOW_CROSS_ENGINE_FALLBACK=1.",
+                                account_id,
+                            )
+                            fallback_kwargs = dict(launch_kwargs)
+                            fallback_kwargs.pop("firefox_user_prefs", None)
+                            fallback_kwargs.pop("executable_path", None)
+                            fallback_kwargs["args"] = self._launch_args_for(
+                                "chromium",
+                                viewport_width=vp_w if not use_headless else None,
+                                viewport_height=vp_h if not use_headless else None,
+                                window_x=win_x if not use_headless else None,
+                                window_y=win_y if not use_headless else None,
+                                fit_outer_window=bool(grid_viewport and not use_headless),
+                            )
+                            ch_fb = _playwright_chromium_channel(browser_key="chromium", has_executable_path=False)
+                            if ch_fb:
+                                fallback_kwargs["channel"] = ch_fb
+                            context = self._playwright.chromium.launch_persistent_context(**fallback_kwargs)
+                    else:
+                        raise
+            finally:
+                if acquired_launch_sem:
+                    _browser_launch_semaphore().release()
+        except Exception:
+            release_profile_browser_slot(user_data_dir, account_id, profile_lock)
+            raise
         stealth = _stealth_for_project(use_mobile_fingerprint=effective_mobile)
         if stealth is None:
             if _STEALTH_IMPORT_ERROR is not None:
@@ -834,6 +1128,45 @@ class BrowserFactory:
                 logger.info("Đã áp dụng playwright-stealth lên BrowserContext (account={}).", account_id)
             except Exception as stealth_exc:  # noqa: BLE001
                 logger.warning("Lỗi apply playwright-stealth, tiếp tục không stealth: {}", stealth_exc)
+        apply_fingerprint_init_script(context)
+        try:
+            from src.services.facebook_recaptcha import install_recaptcha_network_interception
+
+            install_recaptcha_network_interception(context)
+        except Exception as cap_exc:  # noqa: BLE001
+            logger.warning("[FB reCAPTCHA] Không cài network interception: {}", cap_exc)
+        if socks_relay is not None:
+            context._toolfb_socks_relay = socks_relay  # type: ignore[attr-defined]
+        context._toolfb_profile_lock = profile_lock  # type: ignore[attr-defined]
+        context._toolfb_profile_dir = str(user_data_dir)  # type: ignore[attr-defined]
+        context._toolfb_profile_account_id = account_id  # type: ignore[attr-defined]
+        if place_window and browser_key == "firefox":
+            try:
+                from src.utils.win_browser_window import (
+                    firefox_outer_window_size,
+                    place_firefox_window_for_profile,
+                )
+
+                outer_w, outer_h = firefox_outer_window_size(vp_w, vp_h)
+                place_firefox_window_for_profile(
+                    user_data_dir,
+                    x=win_x,
+                    y=win_y,
+                    width=outer_w,
+                    height=outer_h,
+                )
+            except Exception as place_exc:  # noqa: BLE001
+                logger.warning("Không đặt được vị trí cửa sổ Firefox (grid): {}", place_exc)
+
+        logger.info(
+            "Đã mở Firefox/{} persistent | account={} | profile={} | pw_mode={} | proxy={} | grid_pos={}",
+            browser_key,
+            account_id,
+            user_data_dir,
+            self._pw_mode,
+            bool(apply_proxy),
+            f"{win_x},{win_y}" if win_x is not None and win_y is not None else "-",
+        )
         return context
 
 

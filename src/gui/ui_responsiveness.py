@@ -16,6 +16,8 @@ import tkinter as tk
 from tkinter import ttk
 
 DEFAULT_TREE_CHUNK = 45
+DEFAULT_TREE_APPEND_CHUNK = 60
+DEFAULT_TREE_SELECT_CHUNK = 120
 ASYNC_PREP_MIN_ROWS = 30
 
 
@@ -66,6 +68,38 @@ def tree_insert_chunked(
         )
         return
     if on_complete is not None and is_current(generation):
+        on_complete()
+
+
+def tree_select_all_chunked(
+    root: tk.Misc,
+    tree: ttk.Treeview,
+    *,
+    start: int = 0,
+    chunk: int = DEFAULT_TREE_SELECT_CHUNK,
+    on_complete: Callable[[], None] | None = None,
+) -> None:
+    """Chọn dần mọi dòng Treeview — tránh Not Responding khi hàng nghìn dòng."""
+    children = list(tree.get_children())
+    end = min(start + max(1, chunk), len(children))
+    if start < end:
+        try:
+            tree.selection_add(*children[start:end])
+        except tk.TclError:
+            pass
+    if end < len(children):
+        root.after(
+            1,
+            lambda n=end: tree_select_all_chunked(
+                root,
+                tree,
+                start=n,
+                chunk=chunk,
+                on_complete=on_complete,
+            ),
+        )
+        return
+    if on_complete is not None:
         on_complete()
 
 

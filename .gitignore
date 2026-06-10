@@ -58,9 +58,11 @@ config/schedule.json
 config/schedule_posts.json
 config/ai_image_config.json
 config/universal_video_downloader.json
+config/human_interaction_settings.json
 
 # Large local tool cache/binaries (không đẩy lên GitHub)
 tools/ffmpeg/
+tools/ffmpeg.zip
 tools/yt-dlp/
 
 # Veo3Studio — cài tay từng máy (tab AI Video / đường dẫn tool_exe), không đưa lên GitHub

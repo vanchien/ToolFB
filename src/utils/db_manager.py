@@ -49,7 +49,9 @@ class AccountRecord(TypedDict, total=False):
     browser_exe_path: str
     import_type: str
     notes: str
+    facebook_uid: str
     email: str
+    recovery_email: str
     password_ref: str
     totp_enabled: bool
     totp_secret_ref: str
@@ -127,16 +129,18 @@ class AccountsDatabaseManager:
             d["browser_type"] = "chromium"
         elif not bt:
             d["browser_type"] = "firefox"
-        px = d.get("proxy")
-        if px is None:
-            d["proxy"] = {"host": "", "port": 0, "user": "", "pass": ""}
-        elif isinstance(px, dict):
-            p2 = dict(px)
-            if str(p2.get("user", "")).strip() == "" and str(p2.get("username", "")).strip():
-                p2["user"] = str(p2.get("username", "")).strip()
-            if str(p2.get("pass", "")).strip() == "" and str(p2.get("password", "")).strip():
-                p2["pass"] = str(p2.get("password", "")).strip()
-            d["proxy"] = p2
+        from src.utils.proxy_check import proxy_dict_from_accounts_json
+
+        d["proxy"] = proxy_dict_from_accounts_json(d.get("proxy"))
+        from src.utils.account_browser_profile import relativize_account_storage_path
+
+        root = project_root()
+        for key in ("portable_path", "profile_path", "cookie_path"):
+            if d.get(key):
+                d[key] = relativize_account_storage_path(str(d[key]), project_root_dir=root)
+        exe = str(d.get("browser_exe_path") or "").strip()
+        if exe:
+            d["browser_exe_path"] = relativize_account_storage_path(exe, project_root_dir=root)
         return d
 
     def _validate_account_shape(self, record: dict[str, Any]) -> None:
@@ -259,11 +263,23 @@ class AccountsDatabaseManager:
         if not isinstance(data, list):
             raise ValueError("File accounts.json phải là một mảng JSON ở gốc.")
         out: list[AccountRecord] = []
+        migrated = False
         for idx, item in enumerate(data):
             if not isinstance(item, dict):
                 raise ValueError(f"Phần tử index {idx} không phải object JSON.")
-            self._validate_account_shape(item)
-            out.append(item)  # type: ignore[arg-type]
+            normalized = self._normalize_account_dict(item)
+            if normalized != item:
+                migrated = True
+            self._validate_account_shape(normalized)
+            out.append(normalized)  # type: ignore[arg-type]
+        if migrated:
+            text = json.dumps(out, ensure_ascii=False, indent=2) + "\n"
+            self._atomic_write_text(text)
+            mtime = self.file_path.stat().st_mtime
+            logger.info(
+                "Đã chuẩn hóa đường dẫn relative trong {} (portable/cookie) — portable sang máy khác.",
+                self.file_path.name,
+            )
         self._rows_cache = out
         self._rows_mtime = mtime
         logger.info("Đã đọc {} tài khoản từ {}", len(out), self.file_path)
@@ -327,6 +343,13 @@ class AccountsDatabaseManager:
                 raise ValueError("Bản ghi phải có trường 'id' không rỗng.")
             self._invalidate_rows_cache()
             current = self._load_all_unlocked()
+            from src.utils.account_browser_profile import assert_portable_path_not_shared
+
+            assert_portable_path_not_shared(
+                str(acc_id),
+                str(normalized.get("portable_path") or normalized.get("profile_path") or ""),
+                [r for r in current if r.get("id") != acc_id],
+            )
             replaced = False
             new_list: list[AccountRecord] = []
             for row in current:
@@ -336,8 +359,30 @@ class AccountsDatabaseManager:
                 else:
                     new_list.append(row)
             if not replaced:
+                from src.utils.account_browser_profile import (
+                    ensure_profile_directory_exists,
+                    provision_fresh_browser_profile,
+                )
+
+                it = str(normalized.get("import_type") or "new").strip().lower()
+                bt = str(normalized.get("browser_type") or "firefox")
+                if it in ("new", "duplicate", ""):
+                    portable_rel, cookie_rel = provision_fresh_browser_profile(
+                        str(acc_id),
+                        bt,
+                        cookie_path=str(normalized.get("cookie_path") or ""),
+                    )
+                    normalized["portable_path"] = portable_rel
+                    normalized["profile_path"] = portable_rel
+                    normalized["cookie_path"] = cookie_rel
+                else:
+                    portable_raw = str(
+                        normalized.get("portable_path") or normalized.get("profile_path") or ""
+                    ).strip()
+                    if portable_raw:
+                        ensure_profile_directory_exists(str(acc_id), portable_raw)
                 new_list.append(normalized)  # type: ignore[arg-type]
-                logger.info("Thêm tài khoản mới id={}", acc_id)
+                logger.info("Thêm tài khoản mới id={} (profile Playwright riêng)", acc_id)
             else:
                 logger.info("Cập nhật tài khoản id={}", acc_id)
             text = json.dumps(new_list, ensure_ascii=False, indent=2) + "\n"
@@ -364,6 +409,14 @@ class AccountsDatabaseManager:
                 raise ValueError(f"Không tìm thấy tài khoản: {account_id}")
             merged: dict[str, Any] = self._normalize_account_dict({**dict(current), **updates})
             self._validate_account_shape(merged)
+            if "portable_path" in updates or "profile_path" in updates:
+                from src.utils.account_browser_profile import assert_portable_path_not_shared
+
+                assert_portable_path_not_shared(
+                    account_id,
+                    str(merged.get("portable_path") or merged.get("profile_path") or ""),
+                    [r for r in rows if r.get("id") != account_id],
+                )
             new_list: list[AccountRecord] = []
             for row in rows:
                 if row.get("id") == account_id:
@@ -406,13 +459,26 @@ class AccountsDatabaseManager:
         Returns:
             True nếu đã xóa ít nhất một bản ghi, False nếu không có id đó.
         """
-        current = self.load_all()
-        new_list = [a for a in current if a.get("id") != account_id]
-        if len(new_list) == len(current):
-            logger.warning("Không có tài khoản để xóa với id={}", account_id)
-            return False
-        self.save_all(new_list)
-        logger.info("Đã xóa tài khoản id={}", account_id)
+        with json_file_lock(self.file_path):
+            self._invalidate_rows_cache()
+            current = self._load_all_unlocked()
+            removed = next((a for a in current if a.get("id") == account_id), None)
+            new_list = [a for a in current if a.get("id") != account_id]
+            if len(new_list) == len(current):
+                logger.warning("Không có tài khoản để xóa với id={}", account_id)
+                return False
+            if removed is not None:
+                from src.utils.account_browser_profile import delete_account_browser_bundle
+
+                delete_account_browser_bundle(dict(removed))
+            text = json.dumps(new_list, ensure_ascii=False, indent=2) + "\n"
+            self._atomic_write_text(text)
+            self._rows_cache = new_list
+            try:
+                self._rows_mtime = self.file_path.stat().st_mtime
+            except OSError:
+                self._rows_mtime = None
+        logger.info("Đã xóa tài khoản id={} (kèm profile/cookie/vault)", account_id)
         return True
 
 

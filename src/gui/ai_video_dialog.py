@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -21,15 +22,28 @@ from src.services.facebook_reels_catalog import (
     scan_facebook_profile_reels_page,
 )
 from src.services.universal_video_downloader import (
+    UV_DOWNLOAD_SEQUENTIAL_THRESHOLD,
+    UV_MAX_PLAYLIST_ENTRIES,
     UniversalVideoDownloader,
     _extract_hashtags_from_text,
     classify_url_type,
     detect_platform,
     ensure_downloader_layout,
+    extract_failed_download_pairs,
     load_universal_video_downloader_config,
     persist_facebook_reels_settings,
+    write_failed_download_urls_log,
 )
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
+from src.gui.ui_responsiveness import (
+    DEFAULT_TREE_APPEND_CHUNK,
+    DEFAULT_TREE_CHUNK,
+    DEFAULT_TREE_SELECT_CHUNK,
+    run_background_then_main,
+    tree_delete_all,
+    tree_insert_chunked,
+    tree_select_all_chunked,
+)
 from src.utils.app_secrets import get_nanobanana_runtime_config
 from src.utils.db_manager import AccountsDatabaseManager
 from src.utils.paths import project_root
@@ -39,6 +53,10 @@ _INTERNAL_TOOL_EXE = _INTERNAL_TOOL_DIR / "Veo3Studio.exe"
 _EXTERNAL_TOOL_DIR = Path(r"C:\Users\Hello\Desktop\Tool")
 _EXTERNAL_TOOL_EXE = _EXTERNAL_TOOL_DIR / "Veo3Studio.exe"
 UV_LIBRARY_UI_MAX_ROWS = 1200
+UV_CHANNEL_LIST_MAX = UV_MAX_PLAYLIST_ENTRIES
+UV_FB_MAX_COLLECT = UV_MAX_PLAYLIST_ENTRIES
+# Trên ngưỡng này «Chọn hết» dùng chọn logic (không highlight từng dòng) để GUI không treo.
+UV_LOGICAL_SELECT_ALL_THRESHOLD = 280
 
 
 class _UvCollapsibleSection:
@@ -186,6 +204,14 @@ class AIVideoDialog:
         self._uv_log_buffer: list[str] = []
         self._uv_log_flush_after_id: str | None = None
         self._uv_last_partial_ui_ts: float = 0.0
+        self._uv_fb_tree_gen = 0
+        self._uv_yt_tree_gen = 0
+        self._uv_tt_tree_gen = 0
+        self._uv_fb_logical_select_all = False
+        self._uv_yt_logical_select_all = False
+        self._uv_tt_logical_select_all = False
+        self._uv_lib_tree_gen = 0
+        self._uv_lib_refresh_gen = 0
         self._uv_embedded_warm_done: bool = False
         self._start_tab = str(start_tab or "reverse").strip().lower()
         try:
@@ -843,13 +869,18 @@ class AIVideoDialog:
         yt_scan_opts = ttk.Frame(platform_scan_opts)
         ttk.Label(yt_scan_opts, text="Tối đa entry").grid(row=0, column=0, sticky="w")
         ttk.Entry(yt_scan_opts, textvariable=self._var_uv_yt_list_max, width=6).grid(row=0, column=1, sticky="w", padx=(6, 12))
-        ttk.Label(yt_scan_opts, text="(1–2000, giới hạn tốc độ quét)", foreground="#666", font=("Segoe UI", 8)).grid(
-            row=0, column=2, sticky="w"
-        )
+        ttk.Label(
+            yt_scan_opts,
+            text=f"(1–{UV_CHANNEL_LIST_MAX}, quét theo lô để tránh treo)",
+            foreground="#666",
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=2, sticky="w")
         tt_scan_opts = ttk.Frame(platform_scan_opts)
         ttk.Label(tt_scan_opts, text="Tối đa entry").grid(row=0, column=0, sticky="w")
         ttk.Entry(tt_scan_opts, textvariable=self._var_uv_tt_list_max, width=6).grid(row=0, column=1, sticky="w", padx=(6, 12))
-        ttk.Label(tt_scan_opts, text="(1–2000)", foreground="#666", font=("Segoe UI", 8)).grid(row=0, column=2, sticky="w")
+        ttk.Label(tt_scan_opts, text=f"(1–{UV_CHANNEL_LIST_MAX})", foreground="#666", font=("Segoe UI", 8)).grid(
+            row=0, column=2, sticky="w"
+        )
         platform_ops_btns = ttk.Frame(platform_ops)
         platform_ops_btns.pack(anchor="w", pady=(6, 0))
         btn_ops_generic_dl = ttk.Button(platform_ops_btns, text="Tải URL hiện tại", command=self._on_uv_download)
@@ -931,7 +962,9 @@ class AIVideoDialog:
                 return
             if p == "facebook":
                 _set_badge("f Facebook", "#1877F2")
-                var_platform_ops.set("Facebook: chọn tài khoản → quét Reels (Bước 1). Chọn dòng → «Tải reel đã chọn» (batch nếu nhiều).")
+                var_platform_ops.set(
+                    "Facebook: quét Reels (Bước 1) → «Tải hết danh sách» hoặc chọn dòng → «Tải reel đã chọn»."
+                )
                 _show_platform_buttons([btn_ops_fb_scan])
                 _show_sections(show_fb=True, show_yt=False, show_tt=False, view_key="facebook")
                 return
@@ -991,7 +1024,9 @@ class AIVideoDialog:
         btn_fb_select.pack(side=tk.LEFT, padx=(0, 8))
         btn_fb_dl = ttk.Button(fb_act, text="3) Tải reel đã chọn", command=self._on_uv_download_fb_reels_selected)
         btn_fb_dl.pack(side=tk.LEFT, padx=(0, 8))
-        self._uv_busy_disable_widgets.extend((btn_fb_select, btn_fb_dl))
+        btn_fb_dl_all = ttk.Button(fb_act, text="Tải hết danh sách", command=self._on_uv_download_fb_reels_all)
+        btn_fb_dl_all.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_fb_select, btn_fb_dl, btn_fb_dl_all))
         fb_tree_fr = ttk.Frame(fb_fr)
         fb_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         fb_tree_fr.columnconfigure(0, weight=1)
@@ -1047,7 +1082,9 @@ class AIVideoDialog:
         btn_yt_select.pack(side=tk.LEFT, padx=(0, 8))
         btn_yt_dl = ttk.Button(yt_act, text="3) Tải video đã chọn", command=self._on_uv_download_yt_selected)
         btn_yt_dl.pack(side=tk.LEFT, padx=(0, 8))
-        self._uv_busy_disable_widgets.extend((btn_yt_select, btn_yt_dl))
+        btn_yt_dl_all = ttk.Button(yt_act, text="Tải hết danh sách", command=self._on_uv_download_yt_all)
+        btn_yt_dl_all.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_yt_select, btn_yt_dl, btn_yt_dl_all))
         yt_tree_fr = ttk.Frame(yt_fr)
         yt_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         yt_tree_fr.columnconfigure(0, weight=1)
@@ -1102,7 +1139,9 @@ class AIVideoDialog:
         btn_tt_select.pack(side=tk.LEFT, padx=(0, 8))
         btn_tt_dl = ttk.Button(tt_act, text="3) Tải TikTok đã chọn", command=self._on_uv_download_tt_selected)
         btn_tt_dl.pack(side=tk.LEFT, padx=(0, 8))
-        self._uv_busy_disable_widgets.extend((btn_tt_select, btn_tt_dl))
+        btn_tt_dl_all = ttk.Button(tt_act, text="Tải hết danh sách", command=self._on_uv_download_tt_all)
+        btn_tt_dl_all.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_tt_select, btn_tt_dl, btn_tt_dl_all))
         tt_tree_fr = ttk.Frame(tt_fr)
         tt_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         tt_tree_fr.columnconfigure(0, weight=1)
@@ -1509,7 +1548,7 @@ class AIVideoDialog:
             mins = int(self._var_uv_fb_scan_minutes.get().strip())
         except ValueError:
             mins = 30
-        mc = max(10, min(500, mc))
+        mc = max(10, min(UV_FB_MAX_COLLECT, mc))
         ms = max(5, min(280, ms))
         mins = max(1, min(180, mins))
         till_end = bool(self._var_uv_fb_scroll_until_end.get())
@@ -1610,27 +1649,114 @@ class AIVideoDialog:
         self._var_uv_fb_scan_status.set(msg)
         messagebox.showinfo("Quét Reels", msg, parent=self._top)
 
-    def _refresh_fb_reel_tree(self, urls: list[str]) -> None:
+    def _uv_tree_gen_bump(self, attr: str) -> int:
+        g = int(getattr(self, attr, 0)) + 1
+        setattr(self, attr, g)
+        return g
+
+    def _uv_tree_gen_is_current(self, attr: str, generation: int) -> bool:
+        return int(getattr(self, attr, 0)) == int(generation)
+
+    def _uv_finish_scan_tree_refresh(
+        self,
+        *,
+        rows_or_urls: list[Any],
+        refresh_fn: Callable[..., None],
+        backing_count: Callable[[], int],
+        status_setter: Callable[[str], None],
+        status_text: str,
+        sync_backing: Callable[[list[Any]], None] | None = None,
+    ) -> None:
+        """Sau quét xong: chỉ vẽ lại tree nếu dữ liệu thay đổi so với lần partial cuối."""
+        current_n = backing_count()
+        if len(rows_or_urls) == current_n and current_n > 0:
+            if sync_backing is not None:
+                sync_backing(rows_or_urls)
+            status_setter(status_text)
+            return
+        refresh_fn(rows_or_urls)
+        status_setter(status_text)
+
+    def _uv_tree_append_specs_chunked(
+        self,
+        tree: ttk.Treeview,
+        specs: list[dict[str, Any]],
+        *,
+        gen_attr: str,
+    ) -> None:
+        """Append nhiều dòng Treeview theo lô — dùng khi partial quét thêm hàng trăm dòng."""
+        if not specs:
+            return
+        gen = self._uv_tree_gen_bump(gen_attr)
+
+        def _done() -> None:
+            if self._uv_tree_gen_is_current(gen_attr, gen):
+                self._sync_uv_download_scrollregion(scroll_to_content=False)
+
+        tree_insert_chunked(
+            self._top,
+            tree,
+            specs,
+            generation=gen,
+            is_current=lambda g: self._uv_tree_gen_is_current(gen_attr, g),
+            on_complete=_done,
+            chunk=DEFAULT_TREE_APPEND_CHUNK,
+        )
+
+    def _refresh_fb_reel_tree(self, urls: list[str], *, append_from: int = 0) -> None:
+        """Làm mới hoặc chỉ append dòng mới (``append_from`` > 0) để quét dài không block UI."""
         self._uv_fb_reel_urls = list(urls)
         tr = self._tree_fb_reels
         if tr is None:
             return
-        for x in tr.get_children():
-            tr.delete(x)
-        for i, u in enumerate(urls):
-            tr.insert("", "end", iid=str(i), values=(str(i + 1), u))
-        self._sync_uv_download_scrollregion(scroll_to_content=bool(urls))
+        if append_from > 0 and append_from <= len(urls):
+            specs = [{"iid": str(i), "values": (str(i + 1), urls[i])} for i in range(append_from, len(urls))]
+            if specs:
+                self._uv_tree_append_specs_chunked(tr, specs, gen_attr="_uv_fb_tree_gen")
+            return
+        gen = self._uv_tree_gen_bump("_uv_fb_tree_gen")
+        tree_delete_all(tr)
+        if not urls:
+            self._sync_uv_download_scrollregion(scroll_to_content=False)
+            return
+        specs = [{"iid": str(i), "values": (str(i + 1), u)} for i, u in enumerate(urls)]
+
+        def _done() -> None:
+            if self._uv_tree_gen_is_current("_uv_fb_tree_gen", gen):
+                self._sync_uv_download_scrollregion(scroll_to_content=True)
+
+        tree_insert_chunked(
+            self._top,
+            tr,
+            specs,
+            generation=gen,
+            is_current=lambda g: self._uv_tree_gen_is_current("_uv_fb_tree_gen", g),
+            on_complete=_done,
+            chunk=DEFAULT_TREE_CHUNK,
+        )
 
     def _on_uv_fb_select_all(self) -> None:
         tr = self._tree_fb_reels
         if not tr:
             return
-        tr.selection_set(tr.get_children())
+        n = len(self._uv_fb_reel_urls)
+        if n > UV_LOGICAL_SELECT_ALL_THRESHOLD:
+            self._uv_fb_logical_select_all = True
+            tr.selection_remove(tr.selection())
+            self._var_uv_fb_scan_status.set(f"Đã chọn logic {n} reel — bấm «Tải reel đã chọn».")
+            return
+        self._uv_fb_logical_select_all = False
+        children = tr.get_children()
+        if len(children) > DEFAULT_TREE_SELECT_CHUNK:
+            tree_select_all_chunked(self._top, tr, chunk=DEFAULT_TREE_SELECT_CHUNK)
+        else:
+            tr.selection_set(children)
 
     def _on_uv_fb_select_none(self) -> None:
         tr = self._tree_fb_reels
         if not tr:
             return
+        self._uv_fb_logical_select_all = False
         tr.selection_remove(tr.selection())
 
     def _on_uv_scan_fb_reels(self) -> None:
@@ -1679,21 +1805,30 @@ class AIVideoDialog:
             True,
             f"Đang mở Playwright và quét tab Reels ({mode_txt}, tối đa {max_minutes} phút)…",
         )
+        self._uv_fb_logical_select_all = False
         self._refresh_fb_reel_tree([])
         self._var_uv_fb_scan_status.set("Đang quét — bảng «URL reel» sẽ hiện dần…")
 
         def _status(msg: str) -> None:
             self._top.after(0, lambda m=msg: self._var_uv_fb_scan_status.set(m))
 
+        last_fb_count = {"n": 0}
+
         def _partial(urls: list[str]) -> None:
             snap = list(urls)
             now = time.monotonic()
-            if now - self._uv_last_partial_ui_ts < 0.28:
+            grow = len(snap) - int(last_fb_count["n"])
+            if grow < 2 and now - self._uv_last_partial_ui_ts < 0.35:
                 return
             self._uv_last_partial_ui_ts = now
+            prev = int(last_fb_count["n"])
+            last_fb_count["n"] = len(snap)
 
             def _apply() -> None:
-                self._refresh_fb_reel_tree(snap)
+                if prev <= 0:
+                    self._refresh_fb_reel_tree(snap)
+                else:
+                    self._refresh_fb_reel_tree(snap, append_from=prev)
                 if snap:
                     self._var_uv_fb_scan_status.set(f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng).")
 
@@ -1738,11 +1873,17 @@ class AIVideoDialog:
                 if res.get("ok"):
                     items = res.get("items") or []
                     urls = [str(x.get("url") or "") for x in items if isinstance(x, dict)]
-                    self._refresh_fb_reel_tree(urls)
-                    self._var_uv_fb_scan_status.set(res.get("message") or f"{len(urls)} reel.")
+                    self._uv_finish_scan_tree_refresh(
+                        rows_or_urls=urls,
+                        refresh_fn=self._refresh_fb_reel_tree,
+                        backing_count=lambda: len(self._uv_fb_reel_urls),
+                        status_setter=self._var_uv_fb_scan_status.set,
+                        status_text=res.get("message") or f"{len(urls)} reel.",
+                        sync_backing=lambda u: setattr(self, "_uv_fb_reel_urls", list(u)),
+                    )
                     messagebox.showinfo(
                         "Quét Reels",
-                        f"{res.get('message', '')}\n\nChọn dòng trong bảng rồi «Tải reel đã chọn» (có thể «Chọn hết» trước).",
+                        f"{res.get('message', '')}\n\n«Tải hết danh sách» hoặc chọn dòng → «Tải reel đã chọn».",
                         parent=self._top,
                     )
                 else:
@@ -1753,17 +1894,27 @@ class AIVideoDialog:
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_fb_reels").start()
 
+    def _on_uv_download_fb_reels_all(self) -> None:
+        n = len(self._uv_fb_reel_urls)
+        if not self._uv_confirm_download_all("Tải hết reel", n, item_label="reel"):
+            return
+        self._uv_fb_logical_select_all = True
+        self._run_uv_fb_reel_download_batch(list(self._uv_fb_reel_urls))
+
     def _on_uv_download_fb_reels_selected(self) -> None:
         tr = self._tree_fb_reels
         if not tr or not self._uv_fb_reel_urls:
             messagebox.showwarning("Tải reel", "Chưa có danh sách — hãy «Quét Reels» trước.", parent=self._top)
             return
-        sel = tr.selection()
-        if not sel:
-            messagebox.showwarning("Tải reel", "Chọn ít nhất một dòng trong bảng reel.", parent=self._top)
-            return
-        idxs = sorted({int(i) for i in sel if str(i).isdigit()})
-        urls = [self._uv_fb_reel_urls[i] for i in idxs if 0 <= i < len(self._uv_fb_reel_urls)]
+        if self._uv_fb_logical_select_all and self._uv_fb_reel_urls:
+            urls = list(self._uv_fb_reel_urls)
+        else:
+            sel = tr.selection()
+            if not sel:
+                messagebox.showwarning("Tải reel", "Chọn ít nhất một dòng trong bảng reel.", parent=self._top)
+                return
+            idxs = sorted({int(i) for i in sel if str(i).isdigit()})
+            urls = [self._uv_fb_reel_urls[i] for i in idxs if 0 <= i < len(self._uv_fb_reel_urls)]
         if not urls:
             messagebox.showwarning("Tải reel", "Không lấy được URL từ lựa chọn.", parent=self._top)
             return
@@ -1841,17 +1992,33 @@ class AIVideoDialog:
                 if down.is_cancel_requested():
                     cancelled = True
                 else:
+                    use_seq = n > UV_DOWNLOAD_SEQUENTIAL_THRESHOLD
 
                     def _pulse() -> None:
-                        self._var_uv_operation_status.set(
-                            f"Đang tải {n} reel (một tiến trình yt-dlp — nhanh hơn tuần tự từng URL)…"
-                        )
-                        self._append_uv_log(f"[INFO] Bắt đầu batch {n} reel (1× yt-dlp -a …)")
+                        if use_seq:
+                            self._var_uv_operation_status.set(f"Đang tải tuần tự {n} reel (1/{n})…")
+                            self._append_uv_log(f"[INFO] Bắt đầu tải tuần tự {n} reel…")
+                        else:
+                            self._var_uv_operation_status.set(f"Đang tải batch {n} reel (yt-dlp -a)…")
+                            self._append_uv_log(f"[INFO] Bắt đầu batch {n} reel (1× yt-dlp -a …)")
 
                     self._top.after(0, _pulse)
                     ph = self._uv_download_progress_hook()
+
+                    def _item_done(idx: int, total: int, _url: str) -> None:
+                        if idx == 1 or idx % 8 == 0 or idx == total:
+                            self._top.after(
+                                0,
+                                lambda i=idx, t=total: self._var_uv_operation_status.set(f"Đang tải reel {i}/{t}…"),
+                            )
+
                     try:
-                        jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
+                        if use_seq:
+                            jcur = down.run_download_urls_sequential_for_job(
+                                jid, urls, on_progress=ph, on_item_done=_item_done
+                            ) or {}
+                        else:
+                            jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
                         for it in jcur.get("failed_items") or []:
                             uu = str(it.get("url") or "").strip()
                             ee = str(it.get("error") or "")
@@ -1872,28 +2039,26 @@ class AIVideoDialog:
                 self._top.after(
                     0,
                     lambda ok=n_ok, ff=n_fail, tot=n: self._var_uv_operation_status.set(
-                        f"Hoàn tất batch: {ok}/{tot} video OK, {ff} lỗi."
+                        f"Hoàn tất tải: {ok}/{tot} video OK, {ff} lỗi."
                     ),
                 )
 
-                def _done(cancelled_run: bool, ok_count: int, fail_count: int) -> None:
+                def _done(cancelled_run: bool, ok_count: int, fail_count: int, job_done: dict[str, Any]) -> None:
                     self._uv_set_busy(False)
                     self._refresh_uv_library()
-                    if cancelled_run:
-                        messagebox.showinfo(
-                            "Tải reel",
-                            f"Đã dừng theo «Tạm dừng / Hủy».\nĐã tải thành công {ok_count}/{n} video (lỗi: {fail_count}).",
-                            parent=self._top,
-                        )
-                        return
-                    self._show_uv_done_with_open_folder(
-                        "Tải reel",
-                        f"Hoàn tất lệnh tải {n} reel — một job ({jid}).\n"
-                        f"Thành công: {ok_count} video | Lỗi: {fail_count}."
-                        + (f"\nReel lỗi: {len(failed_urls)} (đã ghi log)." if failed_urls else ""),
+                    self._show_uv_list_download_done(
+                        title="Tải reel",
+                        platform_key="facebook_reels",
+                        job_id=jid,
+                        total=n,
+                        ok_count=ok_count,
+                        fail_count=fail_count,
+                        jdone=job_done,
+                        cancelled=cancelled_run,
+                        item_label="reel",
                     )
 
-                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail: _done(c, ok, ff))
+                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
             except Exception as exc:  # noqa: BLE001
                 if jid:
                     try:
@@ -1918,31 +2083,73 @@ class AIVideoDialog:
             lim = int(self._var_uv_yt_list_max.get().strip())
         except ValueError:
             lim = 100
-        return max(1, min(400, lim))
+        return max(1, min(UV_CHANNEL_LIST_MAX, lim))
 
-    def _refresh_yt_channel_tree(self, rows: list[dict[str, str]]) -> None:
+    def _refresh_yt_channel_tree(self, rows: list[dict[str, str]], *, append_from: int = 0) -> None:
         self._uv_yt_entry_rows = list(rows)
         tr = self._tree_yt_channel
         if tr is None:
             return
-        for x in tr.get_children():
-            tr.delete(x)
-        for i, r in enumerate(rows):
-            title = str(r.get("title") or "")
-            url = str(r.get("url") or "")
-            tr.insert("", "end", iid=str(i), values=(str(i + 1), title, url))
-        self._sync_uv_download_scrollregion(scroll_to_content=bool(rows))
+        if append_from > 0 and append_from <= len(rows):
+            specs = [
+                {
+                    "iid": str(i),
+                    "values": (str(i + 1), str(rows[i].get("title") or ""), str(rows[i].get("url") or "")),
+                }
+                for i in range(append_from, len(rows))
+            ]
+            if specs:
+                self._uv_tree_append_specs_chunked(tr, specs, gen_attr="_uv_yt_tree_gen")
+            return
+        gen = self._uv_tree_gen_bump("_uv_yt_tree_gen")
+        tree_delete_all(tr)
+        if not rows:
+            self._sync_uv_download_scrollregion(scroll_to_content=False)
+            return
+        specs = [
+            {
+                "iid": str(i),
+                "values": (str(i + 1), str(r.get("title") or ""), str(r.get("url") or "")),
+            }
+            for i, r in enumerate(rows)
+        ]
+
+        def _done() -> None:
+            if self._uv_tree_gen_is_current("_uv_yt_tree_gen", gen):
+                self._sync_uv_download_scrollregion(scroll_to_content=True)
+
+        tree_insert_chunked(
+            self._top,
+            tr,
+            specs,
+            generation=gen,
+            is_current=lambda g: self._uv_tree_gen_is_current("_uv_yt_tree_gen", g),
+            on_complete=_done,
+            chunk=DEFAULT_TREE_CHUNK,
+        )
 
     def _on_uv_yt_select_all(self) -> None:
         tr = self._tree_yt_channel
         if not tr:
             return
-        tr.selection_set(tr.get_children())
+        n = len(self._uv_yt_entry_rows)
+        if n > UV_LOGICAL_SELECT_ALL_THRESHOLD:
+            self._uv_yt_logical_select_all = True
+            tr.selection_remove(tr.selection())
+            self._var_uv_yt_scan_status.set(f"Đã chọn logic {n} video — bấm «Tải video đã chọn».")
+            return
+        self._uv_yt_logical_select_all = False
+        children = tr.get_children()
+        if len(children) > DEFAULT_TREE_SELECT_CHUNK:
+            tree_select_all_chunked(self._top, tr, chunk=DEFAULT_TREE_SELECT_CHUNK)
+        else:
+            tr.selection_set(children)
 
     def _on_uv_yt_select_none(self) -> None:
         tr = self._tree_yt_channel
         if not tr:
             return
+        self._uv_yt_logical_select_all = False
         tr.selection_remove(tr.selection())
 
     def _on_uv_scan_yt_channel(self) -> None:
@@ -1978,6 +2185,7 @@ class AIVideoDialog:
         down = self._uv_require_downloader(fail_title="Quét YouTube")
         if down is None:
             return
+        self._uv_yt_logical_select_all = False
         self._uv_set_busy(True, f"Đang quét danh sách YouTube (tối đa {lim} video, yt-dlp)…")
         self._refresh_yt_channel_tree([])
         self._var_uv_yt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
@@ -1990,10 +2198,14 @@ class AIVideoDialog:
             if grow < 3 and now - self._uv_last_partial_ui_ts < 0.55:
                 return
             self._uv_last_partial_ui_ts = now
+            prev = int(last_ui_count["n"])
             last_ui_count["n"] = len(snap)
 
             def _apply() -> None:
-                self._refresh_yt_channel_tree(snap)
+                if prev <= 0:
+                    self._refresh_yt_channel_tree(snap)
+                else:
+                    self._refresh_yt_channel_tree(snap, append_from=prev)
                 self._var_uv_yt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video.")
 
             self._top.after(0, _apply)
@@ -2006,20 +2218,26 @@ class AIVideoDialog:
                 if res.get("success"):
                     entries = res.get("entries") or []
                     rows = [e for e in entries if isinstance(e, dict) and str(e.get("url") or "").strip()]
-                    self._refresh_yt_channel_tree(rows)
                     ptitle = str(res.get("playlist_title") or "").strip()
                     warn = str(res.get("warning") or "").strip()
                     partial = bool(res.get("partial"))
                     status = f"Đã quét {len(rows)} video." + (f" — {ptitle}" if ptitle else "")
                     if partial and warn:
                         status += f" ({warn})"
-                    self._var_uv_yt_scan_status.set(status)
+                    self._uv_finish_scan_tree_refresh(
+                        rows_or_urls=rows,
+                        refresh_fn=self._refresh_yt_channel_tree,
+                        backing_count=lambda: len(self._uv_yt_entry_rows),
+                        status_setter=self._var_uv_yt_scan_status.set,
+                        status_text=status,
+                        sync_backing=lambda r: setattr(self, "_uv_yt_entry_rows", list(r)),
+                    )
                     messagebox.showinfo(
                         "Quét YouTube",
                         (
                             f"{len(rows)} video trong danh sách.\n"
                             + ("(Quét một phần do mạng chậm, bạn vẫn có thể tải các video đã hiện.)\n" if partial else "")
-                            + "Chọn dòng rồi «Tải video đã chọn» (có thể «Chọn hết» trước)."
+                            + "«Tải hết danh sách» hoặc chọn dòng → «Tải video đã chọn»."
                         ),
                         parent=self._top,
                     )
@@ -2031,18 +2249,34 @@ class AIVideoDialog:
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_yt_channel").start()
 
+    def _on_uv_download_yt_all(self) -> None:
+        n = len(self._uv_yt_entry_rows)
+        if not self._uv_confirm_download_all("Tải hết YouTube", n, item_label="video"):
+            return
+        self._uv_yt_logical_select_all = True
+        urls = [str(r.get("url") or "") for r in self._uv_yt_entry_rows]
+        urls = [u for u in urls if u]
+        if not urls:
+            messagebox.showwarning("Tải hết YouTube", "Danh sách không có URL hợp lệ.", parent=self._top)
+            return
+        self._run_uv_yt_channel_download_batch(urls)
+
     def _on_uv_download_yt_selected(self) -> None:
         tr = self._tree_yt_channel
         if not tr or not self._uv_yt_entry_rows:
             messagebox.showwarning("Tải YouTube", "Chưa có danh sách — hãy «Quét kênh (yt-dlp)» trước.", parent=self._top)
             return
-        sel = tr.selection()
-        if not sel:
-            messagebox.showwarning("Tải YouTube", "Chọn ít nhất một dòng trong bảng.", parent=self._top)
-            return
-        idxs = sorted({int(i) for i in sel if str(i).isdigit()})
-        urls = [str(self._uv_yt_entry_rows[i].get("url") or "") for i in idxs if 0 <= i < len(self._uv_yt_entry_rows)]
-        urls = [u for u in urls if u]
+        if self._uv_yt_logical_select_all and self._uv_yt_entry_rows:
+            urls = [str(r.get("url") or "") for r in self._uv_yt_entry_rows]
+            urls = [u for u in urls if u]
+        else:
+            sel = tr.selection()
+            if not sel:
+                messagebox.showwarning("Tải YouTube", "Chọn ít nhất một dòng trong bảng.", parent=self._top)
+                return
+            idxs = sorted({int(i) for i in sel if str(i).isdigit()})
+            urls = [str(self._uv_yt_entry_rows[i].get("url") or "") for i in idxs if 0 <= i < len(self._uv_yt_entry_rows)]
+            urls = [u for u in urls if u]
         if not urls:
             messagebox.showwarning("Tải YouTube", "Không lấy được URL từ lựa chọn.", parent=self._top)
             return
@@ -2105,16 +2339,35 @@ class AIVideoDialog:
                     cancelled = True
                 else:
 
+                    use_seq = n > UV_DOWNLOAD_SEQUENTIAL_THRESHOLD
+
                     def _pulse_yt() -> None:
-                        self._var_uv_operation_status.set(
-                            f"Đang tải {n} video YouTube (một tiến trình yt-dlp — nhanh hơn tuần tự từng URL)…"
-                        )
-                        self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL YouTube (1× yt-dlp -a …)")
+                        if use_seq:
+                            self._var_uv_operation_status.set(f"Đang tải tuần tự {n} video YouTube (1/{n})…")
+                            self._append_uv_log(f"[INFO] Bắt đầu tải tuần tự {n} URL YouTube…")
+                        else:
+                            self._var_uv_operation_status.set(f"Đang tải batch {n} video YouTube (yt-dlp -a)…")
+                            self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL YouTube (1× yt-dlp -a …)")
 
                     self._top.after(0, _pulse_yt)
                     ph = self._uv_download_progress_hook()
+
+                    def _item_done_yt(idx: int, total: int, _url: str) -> None:
+                        if idx == 1 or idx % 8 == 0 or idx == total:
+                            self._top.after(
+                                0,
+                                lambda i=idx, t=total: self._var_uv_operation_status.set(
+                                    f"Đang tải YouTube {i}/{t}…"
+                                ),
+                            )
+
                     try:
-                        jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
+                        if use_seq:
+                            jcur = down.run_download_urls_sequential_for_job(
+                                jid, urls, on_progress=ph, on_item_done=_item_done_yt
+                            ) or {}
+                        else:
+                            jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
                         for it in jcur.get("failed_items") or []:
                             uu = str(it.get("url") or "").strip()
                             ee = str(it.get("error") or "")
@@ -2135,28 +2388,26 @@ class AIVideoDialog:
                 self._top.after(
                     0,
                     lambda ok=n_ok, ff=n_fail, tot=n: self._var_uv_operation_status.set(
-                        f"Hoàn tất batch: {ok}/{tot} video OK, {ff} lỗi."
+                        f"Hoàn tất tải: {ok}/{tot} video OK, {ff} lỗi."
                     ),
                 )
 
-                def _done(cancelled_run: bool, ok_count: int, fail_count: int) -> None:
+                def _done(cancelled_run: bool, ok_count: int, fail_count: int, job_done: dict[str, Any]) -> None:
                     self._uv_set_busy(False)
                     self._refresh_uv_library()
-                    if cancelled_run:
-                        messagebox.showinfo(
-                            "Tải YouTube",
-                            f"Đã dừng theo «Tạm dừng / Hủy».\nĐã tải thành công {ok_count}/{n} video (lỗi: {fail_count}).",
-                            parent=self._top,
-                        )
-                        return
-                    self._show_uv_done_with_open_folder(
-                        "Tải YouTube",
-                        f"Hoàn tất lệnh tải {n} video — một job ({jid}).\n"
-                        f"Thành công: {ok_count} video | Lỗi: {fail_count}."
-                        + (f"\nURL lỗi: {len(failed_urls)} (đã ghi log)." if failed_urls else ""),
+                    self._show_uv_list_download_done(
+                        title="Tải YouTube",
+                        platform_key="youtube",
+                        job_id=jid,
+                        total=n,
+                        ok_count=ok_count,
+                        fail_count=fail_count,
+                        jdone=job_done,
+                        cancelled=cancelled_run,
+                        item_label="video",
                     )
 
-                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail: _done(c, ok, ff))
+                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
             except Exception as exc:  # noqa: BLE001
                 if jid:
                     try:
@@ -2174,31 +2425,73 @@ class AIVideoDialog:
             lim = int(self._var_uv_tt_list_max.get().strip())
         except ValueError:
             lim = 100
-        return max(1, min(400, lim))
+        return max(1, min(UV_CHANNEL_LIST_MAX, lim))
 
-    def _refresh_tt_channel_tree(self, rows: list[dict[str, str]]) -> None:
+    def _refresh_tt_channel_tree(self, rows: list[dict[str, str]], *, append_from: int = 0) -> None:
         self._uv_tt_entry_rows = list(rows)
         tr = self._tree_tt_channel
         if tr is None:
             return
-        for x in tr.get_children():
-            tr.delete(x)
-        for i, r in enumerate(rows):
-            title = str(r.get("title") or "")
-            url = str(r.get("url") or "")
-            tr.insert("", "end", iid=str(i), values=(str(i + 1), title, url))
-        self._sync_uv_download_scrollregion(scroll_to_content=bool(rows))
+        if append_from > 0 and append_from <= len(rows):
+            specs = [
+                {
+                    "iid": str(i),
+                    "values": (str(i + 1), str(rows[i].get("title") or ""), str(rows[i].get("url") or "")),
+                }
+                for i in range(append_from, len(rows))
+            ]
+            if specs:
+                self._uv_tree_append_specs_chunked(tr, specs, gen_attr="_uv_tt_tree_gen")
+            return
+        gen = self._uv_tree_gen_bump("_uv_tt_tree_gen")
+        tree_delete_all(tr)
+        if not rows:
+            self._sync_uv_download_scrollregion(scroll_to_content=False)
+            return
+        specs = [
+            {
+                "iid": str(i),
+                "values": (str(i + 1), str(r.get("title") or ""), str(r.get("url") or "")),
+            }
+            for i, r in enumerate(rows)
+        ]
+
+        def _done() -> None:
+            if self._uv_tree_gen_is_current("_uv_tt_tree_gen", gen):
+                self._sync_uv_download_scrollregion(scroll_to_content=True)
+
+        tree_insert_chunked(
+            self._top,
+            tr,
+            specs,
+            generation=gen,
+            is_current=lambda g: self._uv_tree_gen_is_current("_uv_tt_tree_gen", g),
+            on_complete=_done,
+            chunk=DEFAULT_TREE_CHUNK,
+        )
 
     def _on_uv_tt_select_all(self) -> None:
         tr = self._tree_tt_channel
         if not tr:
             return
-        tr.selection_set(tr.get_children())
+        n = len(self._uv_tt_entry_rows)
+        if n > UV_LOGICAL_SELECT_ALL_THRESHOLD:
+            self._uv_tt_logical_select_all = True
+            tr.selection_remove(tr.selection())
+            self._var_uv_tt_scan_status.set(f"Đã chọn logic {n} video — bấm «Tải TikTok đã chọn».")
+            return
+        self._uv_tt_logical_select_all = False
+        children = tr.get_children()
+        if len(children) > DEFAULT_TREE_SELECT_CHUNK:
+            tree_select_all_chunked(self._top, tr, chunk=DEFAULT_TREE_SELECT_CHUNK)
+        else:
+            tr.selection_set(children)
 
     def _on_uv_tt_select_none(self) -> None:
         tr = self._tree_tt_channel
         if not tr:
             return
+        self._uv_tt_logical_select_all = False
         tr.selection_remove(tr.selection())
 
     def _on_uv_scan_tt_channel(self) -> None:
@@ -2226,6 +2519,7 @@ class AIVideoDialog:
         down = self._uv_require_downloader(fail_title="Quét TikTok")
         if down is None:
             return
+        self._uv_tt_logical_select_all = False
         self._uv_set_busy(True, f"Đang quét danh sách TikTok (tối đa {lim} video, yt-dlp)…")
         self._refresh_tt_channel_tree([])
         self._var_uv_tt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
@@ -2238,10 +2532,14 @@ class AIVideoDialog:
             if grow < 3 and now - self._uv_last_partial_ui_ts < 0.55:
                 return
             self._uv_last_partial_ui_ts = now
+            prev = int(last_ui_count["n"])
             last_ui_count["n"] = len(snap)
 
             def _apply() -> None:
-                self._refresh_tt_channel_tree(snap)
+                if prev <= 0:
+                    self._refresh_tt_channel_tree(snap)
+                else:
+                    self._refresh_tt_channel_tree(snap, append_from=prev)
                 self._var_uv_tt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video TikTok.")
 
             self._top.after(0, _apply)
@@ -2254,19 +2552,25 @@ class AIVideoDialog:
                 if res.get("success"):
                     entries = res.get("entries") or []
                     rows = [e for e in entries if isinstance(e, dict) and str(e.get("url") or "").strip()]
-                    self._refresh_tt_channel_tree(rows)
                     warn = str(res.get("warning") or "").strip()
                     partial = bool(res.get("partial"))
                     status = f"Đã quét {len(rows)} video TikTok."
                     if partial and warn:
                         status += f" ({warn})"
-                    self._var_uv_tt_scan_status.set(status)
+                    self._uv_finish_scan_tree_refresh(
+                        rows_or_urls=rows,
+                        refresh_fn=self._refresh_tt_channel_tree,
+                        backing_count=lambda: len(self._uv_tt_entry_rows),
+                        status_setter=self._var_uv_tt_scan_status.set,
+                        status_text=status,
+                        sync_backing=lambda r: setattr(self, "_uv_tt_entry_rows", list(r)),
+                    )
                     messagebox.showinfo(
                         "Quét TikTok",
                         (
                             f"{len(rows)} video trong profile.\n"
                             + ("(Quét một phần do mạng chậm, bạn vẫn có thể tải các video đã hiện.)\n" if partial else "")
-                            + "Chọn dòng rồi «Tải TikTok đã chọn» (có thể «Chọn hết» trước)."
+                            + "«Tải hết danh sách» hoặc chọn dòng → «Tải TikTok đã chọn»."
                         ),
                         parent=self._top,
                     )
@@ -2278,18 +2582,34 @@ class AIVideoDialog:
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_tt_channel").start()
 
+    def _on_uv_download_tt_all(self) -> None:
+        n = len(self._uv_tt_entry_rows)
+        if not self._uv_confirm_download_all("Tải hết TikTok", n, item_label="video"):
+            return
+        self._uv_tt_logical_select_all = True
+        urls = [str(r.get("url") or "") for r in self._uv_tt_entry_rows]
+        urls = [u for u in urls if u]
+        if not urls:
+            messagebox.showwarning("Tải hết TikTok", "Danh sách không có URL hợp lệ.", parent=self._top)
+            return
+        self._run_uv_tt_channel_download_batch(urls)
+
     def _on_uv_download_tt_selected(self) -> None:
         tr = self._tree_tt_channel
         if not tr or not self._uv_tt_entry_rows:
             messagebox.showwarning("Tải TikTok", "Chưa có danh sách — hãy «Quét kênh TikTok (yt-dlp)» trước.", parent=self._top)
             return
-        sel = tr.selection()
-        if not sel:
-            messagebox.showwarning("Tải TikTok", "Chọn ít nhất một dòng trong bảng.", parent=self._top)
-            return
-        idxs = sorted({int(i) for i in sel if str(i).isdigit()})
-        urls = [str(self._uv_tt_entry_rows[i].get("url") or "") for i in idxs if 0 <= i < len(self._uv_tt_entry_rows)]
-        urls = [u for u in urls if u]
+        if self._uv_tt_logical_select_all and self._uv_tt_entry_rows:
+            urls = [str(r.get("url") or "") for r in self._uv_tt_entry_rows]
+            urls = [u for u in urls if u]
+        else:
+            sel = tr.selection()
+            if not sel:
+                messagebox.showwarning("Tải TikTok", "Chọn ít nhất một dòng trong bảng.", parent=self._top)
+                return
+            idxs = sorted({int(i) for i in sel if str(i).isdigit()})
+            urls = [str(self._uv_tt_entry_rows[i].get("url") or "") for i in idxs if 0 <= i < len(self._uv_tt_entry_rows)]
+            urls = [u for u in urls if u]
         if not urls:
             messagebox.showwarning("Tải TikTok", "Không lấy được URL từ lựa chọn.", parent=self._top)
             return
@@ -2351,16 +2671,35 @@ class AIVideoDialog:
                     cancelled = True
                 else:
 
+                    use_seq = n > UV_DOWNLOAD_SEQUENTIAL_THRESHOLD
+
                     def _pulse_tt() -> None:
-                        self._var_uv_operation_status.set(
-                            f"Đang tải {n} video TikTok (một tiến trình yt-dlp — nhanh hơn tuần tự từng URL)…"
-                        )
-                        self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL TikTok (1× yt-dlp -a …)")
+                        if use_seq:
+                            self._var_uv_operation_status.set(f"Đang tải tuần tự {n} video TikTok (1/{n})…")
+                            self._append_uv_log(f"[INFO] Bắt đầu tải tuần tự {n} URL TikTok…")
+                        else:
+                            self._var_uv_operation_status.set(f"Đang tải batch {n} video TikTok (yt-dlp -a)…")
+                            self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL TikTok (1× yt-dlp -a …)")
 
                     self._top.after(0, _pulse_tt)
                     ph = self._uv_download_progress_hook()
+
+                    def _item_done_tt(idx: int, total: int, _url: str) -> None:
+                        if idx == 1 or idx % 8 == 0 or idx == total:
+                            self._top.after(
+                                0,
+                                lambda i=idx, t=total: self._var_uv_operation_status.set(
+                                    f"Đang tải TikTok {i}/{t}…"
+                                ),
+                            )
+
                     try:
-                        jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
+                        if use_seq:
+                            jcur = down.run_download_urls_sequential_for_job(
+                                jid, urls, on_progress=ph, on_item_done=_item_done_tt
+                            ) or {}
+                        else:
+                            jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
                         for it in jcur.get("failed_items") or []:
                             uu = str(it.get("url") or "").strip()
                             ee = str(it.get("error") or "")
@@ -2381,28 +2720,26 @@ class AIVideoDialog:
                 self._top.after(
                     0,
                     lambda ok=n_ok, ff=n_fail, tot=n: self._var_uv_operation_status.set(
-                        f"Hoàn tất batch: {ok}/{tot} video OK, {ff} lỗi."
+                        f"Hoàn tất tải: {ok}/{tot} video OK, {ff} lỗi."
                     ),
                 )
 
-                def _done(cancelled_run: bool, ok_count: int, fail_count: int) -> None:
+                def _done(cancelled_run: bool, ok_count: int, fail_count: int, job_done: dict[str, Any]) -> None:
                     self._uv_set_busy(False)
                     self._refresh_uv_library()
-                    if cancelled_run:
-                        messagebox.showinfo(
-                            "Tải TikTok",
-                            f"Đã dừng theo «Tạm dừng / Hủy».\nĐã tải thành công {ok_count}/{n} video (lỗi: {fail_count}).",
-                            parent=self._top,
-                        )
-                        return
-                    self._show_uv_done_with_open_folder(
-                        "Tải TikTok",
-                        f"Hoàn tất lệnh tải {n} video — một job ({jid}).\n"
-                        f"Thành công: {ok_count} video | Lỗi: {fail_count}."
-                        + (f"\nURL lỗi: {len(failed_urls)} (đã ghi log)." if failed_urls else ""),
+                    self._show_uv_list_download_done(
+                        title="Tải TikTok",
+                        platform_key="tiktok",
+                        job_id=jid,
+                        total=n,
+                        ok_count=ok_count,
+                        fail_count=fail_count,
+                        jdone=job_done,
+                        cancelled=cancelled_run,
+                        item_label="video",
                     )
 
-                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail: _done(c, ok, ff))
+                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
             except Exception as exc:  # noqa: BLE001
                 if jid:
                     try:
@@ -2756,6 +3093,75 @@ class AIVideoDialog:
         if open_now:
             self._on_uv_open_out_dir()
 
+    def _uv_confirm_download_all(self, title: str, count: int, *, item_label: str = "video") -> bool:
+        """Xác nhận tải hết danh sách đã quét (tránh bấm nhầm với list lớn)."""
+        if count <= 0:
+            messagebox.showwarning(title, "Danh sách trống — hãy «Quét» trước.", parent=self._top)
+            return False
+        if count > UV_LOGICAL_SELECT_ALL_THRESHOLD:
+            return bool(
+                messagebox.askyesno(
+                    title,
+                    f"Tải hết {count} {item_label} trong danh sách?\n\n"
+                    "Quá trình có thể mất nhiều giờ. Nên bật «Bỏ qua file đã có» để resume an toàn.\n"
+                    "Bạn có thể dùng «Tạm dừng / Hủy» giữa chừng.\n\nTiếp tục?",
+                    parent=self._top,
+                )
+            )
+        if count > 30:
+            return bool(
+                messagebox.askyesno(
+                    title,
+                    f"Tải hết {count} {item_label} trong danh sách?",
+                    parent=self._top,
+                )
+            )
+        return True
+
+    def _uv_failed_log_hint(self, job: dict[str, Any], *, platform_key: str, job_id: str) -> str:
+        """Ghi file URL lỗi và trả về dòng gợi ý hiển thị cho user."""
+        pairs = extract_failed_download_pairs(job)
+        path = write_failed_download_urls_log(
+            platform=platform_key,
+            job_id=job_id,
+            failed_pairs=pairs,
+            log_fn=self._append_uv_log,
+        )
+        if path is None:
+            return ""
+        return f"\nFile URL lỗi: {path}"
+
+    def _show_uv_list_download_done(
+        self,
+        *,
+        title: str,
+        platform_key: str,
+        job_id: str,
+        total: int,
+        ok_count: int,
+        fail_count: int,
+        jdone: dict[str, Any],
+        cancelled: bool,
+        item_label: str = "video",
+    ) -> None:
+        """Thông báo hoàn tất batch quét-list + ghi file .txt nếu có URL lỗi."""
+        log_hint = self._uv_failed_log_hint(jdone, platform_key=platform_key, job_id=job_id)
+        if cancelled:
+            messagebox.showinfo(
+                title,
+                f"Đã dừng theo «Tạm dừng / Hủy».\n"
+                f"Đã tải thành công {ok_count}/{total} {item_label} (lỗi: {fail_count})."
+                + log_hint,
+                parent=self._top,
+            )
+            return
+        self._show_uv_done_with_open_folder(
+            title,
+            f"Hoàn tất lệnh tải {total} {item_label} — job ({job_id}).\n"
+            f"Thành công: {ok_count} | Lỗi: {fail_count}."
+            + log_hint,
+        )
+
     def warm_embedded_download_panel(self) -> None:
         """Tab Tải Video nhúng trong cửa sổ chính: chạy kiểm tra yt-dlp + làm mới thư viện khi user mở tab."""
         if self._embedded_download_host is None or self._uv_embedded_warm_done:
@@ -2768,15 +3174,30 @@ class AIVideoDialog:
     def _refresh_uv_library(self) -> None:
         if self._tree_uv is None or not self._uv_downloader:
             return
-        for x in self._tree_uv.get_children():
-            self._tree_uv.delete(x)
-        rows = self._uv_downloader.list_downloaded_videos()
+        down = self._uv_downloader
+        self._uv_lib_refresh_gen = int(getattr(self, "_uv_lib_refresh_gen", 0)) + 1
+        refresh_gen = self._uv_lib_refresh_gen
+
+        def _worker() -> list[dict[str, Any]]:
+            return down.list_downloaded_videos()
+
+        def _apply(rows: list[dict[str, Any]]) -> None:
+            if refresh_gen != self._uv_lib_refresh_gen:
+                return
+            self._apply_uv_library_rows(rows)
+
+        run_background_then_main(self._top, _worker, _apply)
+
+    def _apply_uv_library_rows(self, rows: list[dict[str, Any]]) -> None:
+        if self._tree_uv is None:
+            return
+        tree_delete_all(self._tree_uv)
         total_ok = len([r for r in rows if str(r.get("video_path") or "").strip()])
         self._refresh_uv_library_job_filter(rows)
         selected_job_filter = str(self._var_uv_lib_job_filter.get() or "").strip()
         shown_ok = 0
-        inserted = 0
-        for i, r in enumerate(rows, start=1):
+        specs: list[dict[str, Any]] = []
+        for r in rows:
             vid = str(r.get("id") or "")
             if not vid:
                 continue
@@ -2784,29 +3205,39 @@ class AIVideoDialog:
             if selected_job_filter and selected_job_filter != "Tất cả job" and display_job != selected_job_filter:
                 continue
             shown_ok += 1
-            if inserted >= UV_LIBRARY_UI_MAX_ROWS:
+            if len(specs) >= UV_LIBRARY_UI_MAX_ROWS:
                 continue
             dur = r.get("duration") or 0
             try:
                 ds = f"{float(dur):.1f}s"
             except (TypeError, ValueError):
                 ds = str(dur)
-            self._tree_uv.insert(
-                "",
-                "end",
-                iid=vid,
-                values=(
-                    display_job,
-                    str(r.get("platform") or ""),
-                    str(r.get("title") or "")[:120],
-                    self._uv_format_library_hashtags_cell(r),
-                    ds,
-                    str(r.get("uploader") or "")[:40],
-                    str(r.get("status") or ""),
-                    str(r.get("video_path") or ""),
-                ),
+            specs.append(
+                {
+                    "iid": vid,
+                    "values": (
+                        display_job,
+                        str(r.get("platform") or ""),
+                        str(r.get("title") or "")[:120],
+                        self._uv_format_library_hashtags_cell(r),
+                        ds,
+                        str(r.get("uploader") or "")[:40],
+                        str(r.get("status") or ""),
+                        str(r.get("video_path") or ""),
+                    ),
+                }
             )
-            inserted += 1
+        inserted = len(specs)
+        if specs:
+            gen = self._uv_tree_gen_bump("_uv_lib_tree_gen")
+            tree_insert_chunked(
+                self._top,
+                self._tree_uv,
+                specs,
+                generation=gen,
+                is_current=lambda g: self._uv_tree_gen_is_current("_uv_lib_tree_gen", g),
+                chunk=DEFAULT_TREE_CHUNK,
+            )
         if selected_job_filter and selected_job_filter != "Tất cả job":
             tail = f", đang hiển thị: {inserted}" if shown_ok > inserted else ""
             self._var_uv_lib_total_ok.set(f"Tổng thành công: {total_ok} video (đang lọc: {shown_ok}{tail})")

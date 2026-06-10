@@ -33,6 +33,7 @@ from src.utils.schedule_job_content import (
 )
 
 _REEL_STRICT_JOB_ID: ContextVar[str] = ContextVar("_REEL_STRICT_JOB_ID", default="")
+_LAST_PASS_FIELD_LOG_AT: float = 0.0
 
 
 def set_reel_strict_log_job_id(job_id: str | None) -> None:
@@ -77,6 +78,12 @@ def prime_facebook_session_page(page: Page) -> None:
     if cur and "facebook.com" not in cur.lower() and not cur.startswith("about:"):
         logger.warning("[FB] Trước prime, URL hiện tại: {} — ép về Facebook.", cur)
     logger.info("[FB] prime_facebook_session_page -> {}", u)
+    try:
+        from src.services.facebook_recaptcha import reset_recaptcha_network_capture
+
+        reset_recaptcha_network_capture(page, reason="prime")
+    except Exception:
+        pass
     page.goto(u, wait_until="domcontentloaded", timeout=90_000)
     _force_www_facebook_if_mobile_redirect(page)
 
@@ -777,15 +784,14 @@ def _disable_view_only_guard(page: Page) -> None:
 
 def _typing_delay_ms() -> int:
     """
-    Trả về độ trễ gõ phím (ms) ngẫu nhiên (env ``FB_TYPING_DELAY_*_MS``, mặc định 80–220).
+    Trả về độ trễ gõ phím (ms) ngẫu nhiên (env ``FB_TYPING_DELAY_*_MS``, mặc định 50–200).
 
     Returns:
         Số nguyên milliseconds.
     """
-    return _rand_delay_ms(
-        max(40, _env_int("FB_TYPING_DELAY_MIN_MS", 80)),
-        max(40, _env_int("FB_TYPING_DELAY_MAX_MS", 220)),
-    )
+    from src.utils.human_typing import human_typing_delay_ms
+
+    return human_typing_delay_ms()
 
 
 def _resolve_path(maybe_relative: str | Path) -> Path:
@@ -966,7 +972,7 @@ def facebook_session_appears_logged_in(page: Page) -> bool:
     try:
         u = (page.url or "").lower()
         if "facebook.com" in u and _facebook_url_is_security_interstitial(page.url or ""):
-            logger.info("[FB] URL checkpoint/2FA — chưa có phiên hợp lệ cho đăng bài tự động.")
+            logger.debug("[FB] URL checkpoint/2FA — chưa có phiên hợp lệ (đang chờ captcha/TOTP).")
             return False
         names = _facebook_context_cookie_names(page)
         has_c_user = "c_user" in names
@@ -978,12 +984,31 @@ def facebook_session_appears_logged_in(page: Page) -> bool:
         if "facebook.com" not in u:
             return False
         if "/login" in u or "/checkpoint" in u or "two_step" in u:
-            logger.info("[FB] URL login/checkpoint — phiên không dùng được cho đăng bài tự động.")
+            logger.debug("[FB] URL login/checkpoint — phiên chưa đăng nhập.")
             return False
         loc = page.locator("input[name='pass'], input#pass, form[method='post'] input[type='password']")
         if loc.first.is_visible(timeout=1_200):
-            logger.info("[FB] Thấy ô mật khẩu đăng nhập — coi như chưa đăng nhập.")
-            return False
+            on_login_url = "/login" in u or u.rstrip("/").endswith("facebook.com/login")
+            royal = page.locator(
+                "form[data-testid='royal_login_form'], #login_form, form[action*='login']"
+            )
+            primary_login = on_login_url
+            try:
+                primary_login = primary_login or (
+                    royal.count() > 0 and royal.first.is_visible(timeout=400)
+                )
+            except Exception:
+                primary_login = on_login_url
+            if primary_login:
+                global _LAST_PASS_FIELD_LOG_AT
+                now = time.monotonic()
+                if now - _LAST_PASS_FIELD_LOG_AT >= 25.0:
+                    logger.info(
+                        "[FB] Thấy form đăng nhập chính — coi như chưa đăng nhập (url={}).",
+                        (page.url or "")[:80],
+                    )
+                    _LAST_PASS_FIELD_LOG_AT = now
+                return False
         # UI mới / Business Suite: đôi khi không có [role=navigation] trên www nhưng cookie phiên vẫn hợp lệ.
         if has_c_user and "xs" in names and "facebook.com" in u:
             if "/login" not in u and "/checkpoint" not in u and "two_step" not in u:
@@ -1016,6 +1041,10 @@ def ensure_facebook_session_for_post(
         RuntimeError: Không thể tiếp tục (checkpoint, cookie hết hạn, v.v.) — nên đánh dấu need_manual_check.
         FileNotFoundError: Cần cookie nhưng file không có.
     """
+    from src.services.facebook_recaptcha import (
+        auto_solve_facebook_recaptcha_if_present,
+        wait_for_recaptcha_and_solve,
+    )
     from src.services.facebook_session_recovery import (
         facebook_page_is_hard_checkpoint,
         try_recover_facebook_session,
@@ -1043,15 +1072,30 @@ def ensure_facebook_session_for_post(
 
     _human_pause()
     logger.info("[FB] ensure_session: url={!r}", page.url)
+    # Chủ động thử xử lý nếu trang hiện tại đã chứa reCAPTCHA.
+    if account:
+        auto_solve_facebook_recaptcha_if_present(page, account, stage="ensure_session:start")
     url_now = page.url or ""
     if facebook_page_is_hard_checkpoint(url_now):
+        if account and wait_for_recaptcha_and_solve(
+            page, account, stage="ensure_session:checkpoint", wait_timeout_ms=12_000
+        ):
+            if facebook_session_appears_logged_in(page):
+                logger.info("[FB] CapSolver đã xử lý reCAPTCHA — tiếp tục phiên.")
+                return
         _raise_checkpoint(
-            "FACEBOOK_CHECKPOINT: Meta yêu cầu xác minh (checkpoint/captcha/danh tính) — không tự xử lý."
+            "FACEBOOK_CHECKPOINT: Meta yêu cầu xác minh (checkpoint/captcha/danh tính) — "
+            "cấu hình CapSolver (TOOLFB_CAPSOLVER_API_KEY) hoặc xử lý tay."
         )
     if facebook_session_appears_logged_in(page):
         logger.info("[FB] Profile vẫn đăng nhập — bỏ qua nạp cookie.")
         return
     if _facebook_url_is_security_interstitial(url_now):
+        if account and wait_for_recaptcha_and_solve(
+            page, account, stage="ensure_session:interstitial", wait_timeout_ms=12_000
+        ):
+            if facebook_session_appears_logged_in(page):
+                return
         if _try_auto_reauth("initial_interstitial"):
             return
         _raise_interstitial_no_creds("đầu phiên")
@@ -1061,11 +1105,24 @@ def ensure_facebook_session_for_post(
         page.reload(wait_until="domcontentloaded", timeout=45_000)
         _force_www_facebook_if_mobile_redirect(page)
         if facebook_page_is_hard_checkpoint(page.url or ""):
+            if account and wait_for_recaptcha_and_solve(
+                page, account, stage="ensure_session:after_refresh_checkpoint", wait_timeout_ms=12_000
+            ):
+                if facebook_session_appears_logged_in(page):
+                    return
             _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau refresh vẫn ở checkpoint Meta.")
         if facebook_session_appears_logged_in(page):
             logger.info("[FB] Sau refresh, profile đã đăng nhập — bỏ qua nạp cookie.")
             return
         if _facebook_url_is_security_interstitial(page.url or ""):
+            if account and wait_for_recaptcha_and_solve(
+                page,
+                account,
+                stage="ensure_session:after_refresh_interstitial",
+                wait_timeout_ms=12_000,
+            ):
+                if facebook_session_appears_logged_in(page):
+                    return
             if _try_auto_reauth("after_refresh"):
                 return
             _raise_interstitial_no_creds("sau refresh")
@@ -1089,8 +1146,21 @@ def ensure_facebook_session_for_post(
     logger.info("[FB] Thử khôi phục phiên bằng cookie: {}", path)
     login_with_cookie(page, path)
     if facebook_page_is_hard_checkpoint(page.url or ""):
+        if account and wait_for_recaptcha_and_solve(
+            page, account, stage="ensure_session:after_cookie_checkpoint", wait_timeout_ms=12_000
+        ):
+            if facebook_session_appears_logged_in(page):
+                return
         _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau nạp cookie vẫn ở checkpoint Meta.")
     if _facebook_url_is_security_interstitial(page.url or ""):
+        if account and wait_for_recaptcha_and_solve(
+            page,
+            account,
+            stage="ensure_session:after_cookie_interstitial",
+            wait_timeout_ms=12_000,
+        ):
+            if facebook_session_appears_logged_in(page):
+                return
         if _try_auto_reauth("after_cookie"):
             return
         _raise_interstitial_no_creds("sau nạp cookie")
@@ -1115,6 +1185,9 @@ def ensure_facebook_session_for_post(
         return
     if _try_auto_reauth("final"):
         return
+    if account and auto_solve_facebook_recaptcha_if_present(page, account, stage="ensure_session:final"):
+        if facebook_session_appears_logged_in(page):
+            return
     _log_facebook_session_diagnostic(page, stage="after_cookie_restore")
     raise RuntimeError(
         "Sau khi nạp cookie vẫn không có phiên hợp lệ — có thể checkpoint hoặc cookie hết hạn (need_manual_check). "

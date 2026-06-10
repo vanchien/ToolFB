@@ -12,6 +12,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Iterable, Optional, TypedDict
 
 from loguru import logger
@@ -315,31 +316,83 @@ class SchedulePostsManager:
         st = str(status).strip().lower()
         return [x for x in self.load_all() if str(x.get("status", "")).strip().lower() == st]
 
+    def _merge_job_fields(self, row: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+        """Ghi đè từng key trong ``fields`` — không nối/ghép với giá trị cũ."""
+        merged: dict[str, Any] = dict(row)
+        for k, v in fields.items():
+            if v is None:
+                merged.pop(k, None)
+            else:
+                merged[k] = v if not isinstance(v, list) else list(v)
+        self._validate_row(merged)
+        return merged
+
     def update_job_fields(self, job_id: str, **fields: Any) -> bool:
         """Merge các trường vào job có ``id`` = ``job_id``."""
-        jid = str(job_id).strip()
-        if not jid:
-            return False
-        cur = self.load_all()
-        new_list: list[SchedulePostJob] = []
-        found = False
-        for x in cur:
-            if str(x.get("id")) != jid:
-                new_list.append(x)
-                continue
-            found = True
-            merged: dict[str, Any] = dict(x)
-            for k, v in fields.items():
-                if v is None:
-                    merged.pop(k, None)
+        return self.update_jobs_fields_batch([job_id], **fields) == 1
+
+    def update_jobs_fields_batch(self, job_ids: Iterable[str], **fields: Any) -> int:
+        """
+        Cập nhật nhiều job trong **một lần** đọc/ghi file (bulk edit GUI).
+
+        Returns:
+            Số job đã cập nhật thành công.
+        """
+        return self.update_jobs_fields_sequential(job_ids, fields=fields, on_progress=None)
+
+    def update_jobs_fields_sequential(
+        self,
+        job_ids: Iterable[str],
+        *,
+        fields: dict[str, Any],
+        on_progress: Callable[[int, int, str], None] | None = None,
+        step_delay_sec: float = 0.0,
+    ) -> int:
+        """
+        Cập nhật nhiều job — merge trong một lần đọc/ghi, báo tiến từng job (GUI không treo).
+
+        ``on_progress(done, total, job_id)`` gọi sau mỗi job được merge (có thể từ thread nền).
+        """
+        import time
+
+        want_order = list(dict.fromkeys(str(x).strip() for x in job_ids if str(x).strip()))
+        want = set(want_order)
+        if not want or not fields:
+            return 0
+        total = len(want_order)
+        with json_file_lock(self.file_path):
+            self._invalidate_cache()
+            cur = self._load_all_unlocked()
+            merged_by_id: dict[str, dict[str, Any]] = {}
+            updated = 0
+            for x in cur:
+                jid = str(x.get("id", "")).strip()
+                if jid in want:
+                    merged_by_id[jid] = self._merge_job_fields(dict(x), fields)
+            out: list[SchedulePostJob] = []
+            for x in cur:
+                jid = str(x.get("id", "")).strip()
+                if jid in merged_by_id:
+                    out.append(merged_by_id[jid])  # type: ignore[arg-type]
                 else:
-                    merged[k] = v
-            self._validate_row(merged)
-            new_list.append(merged)  # type: ignore[arg-type]
-        if not found:
-            return False
-        self.save_all(new_list)
-        return True
+                    out.append(x)
+            for jid in want_order:
+                if jid not in merged_by_id:
+                    continue
+                updated += 1
+                if on_progress is not None:
+                    try:
+                        on_progress(updated, total, jid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if step_delay_sec > 0:
+                    time.sleep(step_delay_sec)
+            if updated <= 0:
+                return 0
+            self._atomic_write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+            self._rows_cache = out
+            self._rows_mtime = self.file_path.stat().st_mtime
+            return updated
 
 
 _default_sp_lock = threading.Lock()

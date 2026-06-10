@@ -378,6 +378,16 @@ def scan_facebook_profile_reels_page(
                     except Exception:
                         body_text = ""
                     if _is_login_or_checkpoint(page.url, body_text):
+                        try:
+                            from src.services.facebook_recaptcha import auto_solve_facebook_recaptcha_if_present
+
+                            if auto_solve_facebook_recaptcha_if_present(
+                                page, acc, stage="reels_catalog:init"
+                            ):
+                                body_text = page.inner_text("body", timeout=3000)
+                        except Exception:
+                            pass
+                    if _is_login_or_checkpoint(page.url, body_text):
                         return {
                             "ok": False,
                             "items": [],
@@ -461,7 +471,17 @@ def scan_facebook_profile_reels_page(
                         except Exception:
                             body_text = ""
                         if _is_login_or_checkpoint(page.url, body_text):
-                            st("Phát hiện login/checkpoint — dừng quét.")
+                            try:
+                                from src.services.facebook_recaptcha import auto_solve_facebook_recaptcha_if_present
+
+                                if auto_solve_facebook_recaptcha_if_present(
+                                    page, acc, stage="reels_catalog:scroll"
+                                ):
+                                    body_text = page.inner_text("body", timeout=1500)
+                            except Exception:
+                                pass
+                        if _is_login_or_checkpoint(page.url, body_text):
+                            st("Phát hiện login/checkpoint/reCAPTCHA — dừng quét.")
                             return {
                                 "ok": False,
                                 "items": [],

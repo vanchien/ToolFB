@@ -20,13 +20,15 @@ from typing import Any
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from loguru import logger
 
 from src.gui.cookie_capture import account_cookie_path_field, cookie_storage_dest, run_fb_cookie_capture_dialog
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
+from src.services.totp_service import generate_totp_code
 from src.utils.browser_exe_discover import find_browser_exe_in_directory as _find_browser_exe_in_directory
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager
 from src.utils.paths import project_root
-from src.utils.proxy_check import check_http_proxy
+from src.utils.proxy_check import check_proxy, parse_proxy_line, playwright_host_for_scheme
 
 
 def _parse_schedule_time(value: str) -> None:
@@ -459,15 +461,32 @@ class AccountFormDialog:
         self._e_ppw = ttk.Entry(self._frm_px, width=40, show="*")
         self._e_ppw.insert(0, str(px.get("pass", "") or px.get("password", "")))
         self._e_ppw.grid(row=pr, column=1, sticky="ew")
+        pr += 1
+        ttk.Label(
+            self._frm_px,
+            text="Dán: host:port:user:pass (nhiều proxy VN là SOCKS5, tool tự nhận khi kiểm tra)",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=pr, column=0, columnspan=2, sticky="w", pady=(2, 0))
         r += 1
-        ttk.Button(lf, text="Kiểm tra proxy", command=self._on_check_proxy_dialog).grid(
-            row=r, column=1, sticky="w", pady=4
+        px_btn_row = ttk.Frame(lf)
+        px_btn_row.grid(row=r, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Button(px_btn_row, text="Dán chuỗi proxy", command=self._on_paste_proxy_line).pack(
+            side=tk.LEFT, padx=(0, 6)
         )
+        ttk.Button(px_btn_row, text="Kiểm tra proxy", command=self._on_check_proxy_dialog).pack(side=tk.LEFT)
         r += 1
         ttk.Label(lf, text="Ghi chú").grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=2)
         self._e_notes = tk.Text(lf, height=2, width=50, wrap="word", font=("Segoe UI", 9))
         self._e_notes.insert("1.0", str(init.get("notes", "")))
         self._e_notes.grid(row=r, column=1, sticky="ew", pady=2)
+        r += 1
+        ttk.Label(
+            lf,
+            text="SOCKS5 + user/pass: Host = socks5://IP; trình duyệt tự dùng relay HTTP local (Chromium không nhận auth SOCKS trực tiếp).",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=r, column=0, columnspan=2, sticky="w")
         r += 1
 
         hint = ttk.Label(
@@ -483,10 +502,35 @@ class AccountFormDialog:
         lf_login.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         lf_login.columnconfigure(1, weight=1)
         lr = 0
+        init_uid, init_email = self._split_uid_email_from_init(init)
+        ttk.Label(lf_login, text="UID Facebook").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
+        self._e_facebook_uid = ttk.Entry(lf_login, width=48)
+        self._e_facebook_uid.insert(0, init_uid)
+        self._e_facebook_uid.grid(row=lr, column=1, sticky="ew", pady=2)
+        lr += 1
         ttk.Label(lf_login, text="Email Facebook").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
         self._e_email = ttk.Entry(lf_login, width=48)
-        self._e_email.insert(0, str(init.get("email", "")))
+        self._e_email.insert(0, init_email)
         self._e_email.grid(row=lr, column=1, sticky="ew", pady=2)
+        lr += 1
+        ttk.Label(
+            lf_login,
+            text="Đăng nhập: UID + mật khẩu hoặc Email + mật khẩu (chỉ cần một trong hai).",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=lr, column=0, columnspan=2, sticky="w")
+        lr += 1
+        ttk.Label(lf_login, text="Email khôi phục").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
+        self._e_recovery_email = ttk.Entry(lf_login, width=48)
+        self._e_recovery_email.insert(0, str(init.get("recovery_email", "")))
+        self._e_recovery_email.grid(row=lr, column=1, sticky="ew", pady=2)
+        lr += 1
+        ttk.Label(
+            lf_login,
+            text="Dùng khi Meta hỏi email dự phòng / vượt checkpoint (lưu trong vault, không ghi accounts.json).",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=lr, column=0, columnspan=2, sticky="w")
         lr += 1
         ttk.Label(lf_login, text="Mật khẩu").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
         pw_row = ttk.Frame(lf_login)
@@ -522,6 +566,29 @@ class AccountFormDialog:
             variable=self._var_show_totp,
             command=self._toggle_totp_visibility,
         ).grid(row=0, column=1, padx=(4, 0))
+        ttk.Button(totp_row, text="Lấy mã", width=8, command=self._on_generate_totp_code).grid(
+            row=0, column=2, padx=(4, 0)
+        )
+        lr += 1
+        code_row = ttk.Frame(lf_login)
+        code_row.grid(row=lr, column=1, sticky="ew", pady=(0, 2))
+        ttk.Label(code_row, text="Mã 2FA:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._e_totp_code = ttk.Entry(code_row, width=12, state="readonly", font=("Segoe UI", 11, "bold"))
+        self._e_totp_code.grid(row=0, column=1, sticky="w")
+        self._btn_copy_totp = ttk.Button(
+            code_row,
+            text="Sao chép mã",
+            width=11,
+            command=self._on_copy_totp_code,
+            state=tk.DISABLED,
+        )
+        self._btn_copy_totp.grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(
+            code_row,
+            text="(dùng secret ở trên, ~30s đổi mã)",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=3, sticky="w", padx=(8, 0))
         lr += 1
         self._lbl_vault_status = ttk.Label(
             lf_login,
@@ -533,13 +600,17 @@ class AccountFormDialog:
         lr += 1
         ttk.Label(
             lf_login,
-            text="Mật khẩu/secret lưu trong config/account_credentials.json (không ghi vào accounts.json).",
+            text="Mật khẩu/secret/email khôi phục lưu trong config/account_credentials.json (không ghi vào accounts.json).",
             foreground="gray",
             font=("Segoe UI", 8),
         ).grid(row=lr, column=0, columnspan=2, sticky="w")
         lr += 1
         btn_row = ttk.Frame(lf_login)
-        btn_row.grid(row=lr, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        btn_row.grid(row=lr, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(btn_row, text="Lưu đăng nhập", command=self._on_save_login_credentials).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(btn_row, text="Tự đăng nhập", command=self._on_auto_login).pack(side=tk.LEFT, padx=(0, 8))
         self._var_test_login_fresh = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             btn_row,
@@ -547,6 +618,13 @@ class AccountFormDialog:
             variable=self._var_test_login_fresh,
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="Test Login", command=self._on_test_login_recovery).pack(side=tk.LEFT)
+        lr += 1
+        ttk.Label(
+            lf_login,
+            text="«Lưu đăng nhập»: vault (mật khẩu/TOTP/email khôi phục). «Lưu» ở cuối cửa sổ: cả tài khoản + vault.",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=lr, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._load_vault_credentials_into_form(init)
 
         self._on_use_proxy_toggle()
@@ -568,19 +646,114 @@ class AccountFormDialog:
             except tk.TclError:
                 pass
 
+    def _proxy_form_host_port(self) -> tuple[str, int]:
+        host = self._e_ph.get().strip()
+        try:
+            port = int(str(self._e_pp.get()).strip() or "0")
+        except ValueError:
+            port = 0
+        return host, port
+
+    def _ensure_proxy_ready_for_login(self, *, dialog_title: str) -> bool:
+        """Khi bật proxy: bắt buộc host/port và kiểm tra LIVE trước đăng nhập."""
+        if not bool(self._var_use_proxy.get()):
+            return True
+        host, port = self._proxy_form_host_port()
+        if not host or port <= 0:
+            messagebox.showerror(
+                dialog_title,
+                "Đã bật «Dùng proxy» — nhập host và port hợp lệ trước khi đăng nhập.",
+                parent=self._top,
+            )
+            return False
+        ok, msg, scheme = check_proxy(
+            host,
+            port,
+            user=self._e_pu.get().strip(),
+            password=self._e_ppw.get().strip(),
+        )
+        if not ok:
+            messagebox.showerror(
+                dialog_title,
+                f"Proxy chưa kết nối được (cần LIVE trước khi đăng nhập):\n{msg}",
+                parent=self._top,
+            )
+            return False
+        if scheme == "socks5":
+            self._apply_proxy_scheme_to_form(scheme)
+        logger.info("[{}] Proxy LIVE ({}) — IP: {}", dialog_title, scheme, msg)
+        return True
+
+    def _apply_proxy_dict_to_form(self, px: dict[str, Any]) -> None:
+        self._e_ph.delete(0, tk.END)
+        self._e_ph.insert(0, str(px.get("host", "")))
+        self._e_pp.delete(0, tk.END)
+        self._e_pp.insert(0, str(px.get("port", "")))
+        self._e_pu.delete(0, tk.END)
+        self._e_pu.insert(0, str(px.get("user", "")))
+        self._e_ppw.delete(0, tk.END)
+        self._e_ppw.insert(0, str(px.get("pass", "")))
+
+    def _apply_proxy_scheme_to_form(self, scheme: str) -> None:
+        if scheme != "socks5":
+            return
+        host, port = self._proxy_form_host_port()
+        if not host or port <= 0:
+            return
+        fixed = playwright_host_for_scheme(host, "socks5")
+        if str(self._e_ph.get()).strip() != fixed:
+            self._e_ph.delete(0, tk.END)
+            self._e_ph.insert(0, fixed)
+
+    def _on_paste_proxy_line(self) -> None:
+        try:
+            raw = self._top.clipboard_get().strip()
+        except tk.TclError:
+            raw = ""
+        if not raw:
+            messagebox.showinfo(
+                "Proxy",
+                "Copy chuỗi proxy (vd. 203.175.96.175:25308:user:pass) rồi bấm lại.",
+                parent=self._top,
+            )
+            return
+        try:
+            px = parse_proxy_line(raw)
+        except ValueError as exc:
+            messagebox.showerror("Proxy", str(exc), parent=self._top)
+            return
+        self._var_use_proxy.set(True)
+        self._on_use_proxy_toggle()
+        self._apply_proxy_dict_to_form(px)
+        messagebox.showinfo(
+            "Proxy",
+            f"Đã điền:\nHost={px['host']}\nPort={px['port']}\nUser={px.get('user') or '(trống)'}\n\n"
+            "Bấm «Kiểm tra proxy» — nếu là SOCKS5, Host sẽ tự đổi thành socks5://…",
+            parent=self._top,
+        )
+
     def _on_check_proxy_dialog(self) -> None:
         if not bool(self._var_use_proxy.get()):
             messagebox.showinfo("Proxy", "Đang tắt «Dùng proxy» — không kiểm tra.", parent=self._top)
             return
-        try:
-            port = int(str(self._e_pp.get()).strip() or "0")
-        except ValueError:
-            messagebox.showerror("Proxy", "Port không hợp lệ.", parent=self._top)
+        host, port = self._proxy_form_host_port()
+        if not host or port <= 0:
+            messagebox.showerror("Proxy", "Nhập host và port proxy.", parent=self._top)
             return
-        host = self._e_ph.get().strip()
-        ok, msg = check_http_proxy(host, port, user=self._e_pu.get().strip(), password=self._e_ppw.get().strip())
+        ok, msg, scheme = check_proxy(
+            host, port, user=self._e_pu.get().strip(), password=self._e_ppw.get().strip()
+        )
         if ok:
-            messagebox.showinfo("Proxy", f"LIVE — IP: {msg}", parent=self._top)
+            if scheme == "socks5":
+                self._apply_proxy_scheme_to_form(scheme)
+                host_show = self._e_ph.get().strip()
+                messagebox.showinfo(
+                    "Proxy",
+                    f"LIVE (SOCKS5) — IP: {msg}\n\nHost đã đặt: {host_show}\n(Lưu tài khoản để giữ cấu hình.)",
+                    parent=self._top,
+                )
+            else:
+                messagebox.showinfo("Proxy", f"LIVE (HTTP) — IP: {msg}", parent=self._top)
         else:
             messagebox.showerror("Proxy", msg, parent=self._top)
 
@@ -1431,6 +1604,7 @@ class AccountFormDialog:
             "import_type": import_type,
             "notes": self._collect_notes(),
             "browser_exe_path": browser_exe_path.strip(),
+            "facebook_uid": self._form_facebook_uid(),
             "email": self._form_email(),
             "totp_enabled": self._form_totp_enabled(),
             "password_ref": "",
@@ -1462,25 +1636,88 @@ class AccountFormDialog:
             return
         self._e_totp_secret.configure(show="" if self._var_show_totp.get() else "•")
 
+    def _set_totp_code_display(self, code: str) -> None:
+        if not hasattr(self, "_e_totp_code"):
+            return
+        self._e_totp_code.configure(state=tk.NORMAL)
+        self._e_totp_code.delete(0, tk.END)
+        if code:
+            self._e_totp_code.insert(0, code)
+        self._e_totp_code.configure(state="readonly")
+        if hasattr(self, "_btn_copy_totp"):
+            self._btn_copy_totp.configure(state=tk.NORMAL if code else tk.DISABLED)
+
+    def _on_generate_totp_code(self) -> None:
+        secret = self._e_totp_secret.get().strip() if hasattr(self, "_e_totp_secret") else ""
+        if not secret:
+            messagebox.showwarning(
+                "Mã 2FA",
+                "Nhập TOTP Secret (Base32) trước — hoặc bật TOTP và bấm «Lưu» để nạp từ vault.",
+                parent=self._top,
+            )
+            self._set_totp_code_display("")
+            return
+        code = generate_totp_code(secret)
+        if not code:
+            messagebox.showerror(
+                "Mã 2FA",
+                "Không sinh được mã — kiểm tra secret Base32 (chữ A–Z, số 2–7) hoặc cài pyotp trong .venv.",
+                parent=self._top,
+            )
+            self._set_totp_code_display("")
+            return
+        self._set_totp_code_display(code)
+
+    def _on_copy_totp_code(self) -> None:
+        code = ""
+        if hasattr(self, "_e_totp_code"):
+            code = self._e_totp_code.get().strip()
+        if not code:
+            messagebox.showinfo("Sao chép", "Chưa có mã — bấm «Lấy mã» trước.", parent=self._top)
+            return
+        try:
+            self._top.clipboard_clear()
+            self._top.clipboard_append(code)
+        except tk.TclError as exc:
+            messagebox.showerror("Sao chép", f"Không copy được:\n{exc}", parent=self._top)
+            return
+        messagebox.showinfo("Sao chép", f"Đã copy mã 2FA: {code}", parent=self._top)
+
     def _load_vault_credentials_into_form(self, init: dict[str, Any]) -> None:
         aid = str(init.get("id", "")).strip()
         if not aid or not hasattr(self, "_e_password"):
             return
-        from src.utils.account_credentials import get_account_password, get_account_totp_secret
+        from src.utils.account_credentials import (
+            get_account_password,
+            get_account_recovery_email,
+            get_account_totp_secret,
+        )
 
         pwd_ref = str(init.get("password_ref") or "").strip() or None
         totp_ref = str(init.get("totp_secret_ref") or "").strip() or None
         pw = get_account_password(aid, pwd_ref)
         totp = get_account_totp_secret(aid, totp_ref) if bool(init.get("totp_enabled")) else ""
+        recovery = get_account_recovery_email(aid, pwd_ref)
+        if not recovery:
+            recovery = str(init.get("recovery_email") or "").strip()
         if pw:
             self._e_password.delete(0, tk.END)
             self._e_password.insert(0, pw)
         if totp:
             self._e_totp_secret.delete(0, tk.END)
             self._e_totp_secret.insert(0, totp)
-        self._refresh_vault_status_label(has_password=bool(pw), has_totp=bool(totp))
+        if recovery and hasattr(self, "_e_recovery_email"):
+            self._e_recovery_email.delete(0, tk.END)
+            self._e_recovery_email.insert(0, recovery)
+        self._refresh_vault_status_label(
+            has_password=bool(pw),
+            has_totp=bool(totp),
+            has_recovery=bool(recovery),
+        )
 
-    def _refresh_vault_status_label(self, *, has_password: bool, has_totp: bool) -> None:
+    def _refresh_vault_status_label(
+        self, *, has_password: bool, has_totp: bool, has_recovery: bool = False
+    ) -> None:
         if not hasattr(self, "_lbl_vault_status"):
             return
         parts: list[str] = []
@@ -1488,6 +1725,8 @@ class AccountFormDialog:
             parts.append("có mật khẩu")
         if has_totp:
             parts.append("có TOTP secret")
+        if has_recovery:
+            parts.append("có email khôi phục")
         if parts:
             self._lbl_vault_status.configure(
                 text=f"Vault hiện tại: {', '.join(parts)} — bấm «Hiện» để kiểm tra.",
@@ -1495,14 +1734,41 @@ class AccountFormDialog:
             )
         else:
             self._lbl_vault_status.configure(
-                text="Vault: chưa có mật khẩu/secret — nhập rồi bấm «Lưu».",
+                text="Vault: chưa có mật khẩu/secret/email khôi phục — nhập rồi bấm «Lưu».",
                 foreground="gray",
             )
+
+    @staticmethod
+    def _looks_like_facebook_uid(value: str) -> bool:
+        s = str(value or "").strip()
+        return bool(s) and s.isdigit() and len(s) >= 8
+
+    def _split_uid_email_from_init(self, init: dict[str, Any]) -> tuple[str, str]:
+        uid = str(init.get("facebook_uid", "")).strip()
+        email = str(init.get("email", "")).strip()
+        if not uid and self._looks_like_facebook_uid(email):
+            return email, ""
+        return uid, email
+
+    def _form_facebook_uid(self) -> str:
+        if hasattr(self, "_e_facebook_uid"):
+            return self._e_facebook_uid.get().strip()
+        uid, _ = self._split_uid_email_from_init(self._initial or {})
+        return uid
 
     def _form_email(self) -> str:
         if hasattr(self, "_e_email"):
             return self._e_email.get().strip()
-        return str((self._initial or {}).get("email", "")).strip()
+        _, email = self._split_uid_email_from_init(self._initial or {})
+        return email
+
+    def _form_has_login_identity(self) -> bool:
+        return bool(self._form_facebook_uid() or self._form_email())
+
+    def _form_recovery_email(self) -> str:
+        if hasattr(self, "_e_recovery_email"):
+            return self._e_recovery_email.get().strip()
+        return str((self._initial or {}).get("recovery_email", "")).strip()
 
     def _form_totp_enabled(self) -> bool:
         if hasattr(self, "_var_totp_enabled"):
@@ -1514,27 +1780,36 @@ class AccountFormDialog:
             return
         from src.utils.account_credentials import (
             get_account_password,
+            get_account_recovery_email,
             get_account_totp_secret,
             set_account_credentials,
         )
 
         pw = self._e_password.get().strip()
         totp = self._e_totp_secret.get().strip() if hasattr(self, "_e_totp_secret") else ""
+        recovery = self._form_recovery_email()
         pwd_ref = str((self._initial or {}).get("password_ref") or "").strip() or None
         totp_ref = str((self._initial or {}).get("totp_secret_ref") or "").strip() or None
         if not pw:
             pw = get_account_password(aid, pwd_ref)
         if self._form_totp_enabled() and not totp:
             totp = get_account_totp_secret(aid, totp_ref)
+        if not recovery:
+            recovery = get_account_recovery_email(aid, pwd_ref)
         if pw:
             set_account_credentials(aid, password=pw)
         if self._form_totp_enabled() and totp:
             set_account_credentials(aid, totp_secret=totp)
         elif not self._form_totp_enabled():
             set_account_credentials(aid, clear_totp=True)
+        if recovery:
+            set_account_credentials(aid, recovery_email=recovery)
+        else:
+            set_account_credentials(aid, clear_recovery_email=True)
         self._refresh_vault_status_label(
             has_password=bool(pw),
             has_totp=bool(self._form_totp_enabled() and totp),
+            has_recovery=bool(recovery),
         )
 
     def _preview_account_for_login_test(self) -> dict[str, Any]:
@@ -1557,6 +1832,7 @@ class AccountFormDialog:
             "portable_path": portable,
             "profile_path": portable,
             "cookie_path": cookie,
+            "facebook_uid": self._form_facebook_uid(),
             "email": self._form_email(),
             "totp_enabled": self._form_totp_enabled(),
             "password_ref": default_password_ref(aid) if aid else "",
@@ -1570,24 +1846,96 @@ class AccountFormDialog:
             },
         }
 
-    def _on_test_login_recovery(self) -> None:
+    def _validate_login_credentials_form(self, dialog_title: str) -> bool:
         aid = self._e_id.get().strip()
         if not aid:
-            messagebox.showwarning("Test Login", "Nhập mã tài khoản (id) trước.", parent=self._top)
-            return
-        if not self._form_email():
-            messagebox.showwarning("Test Login", "Nhập email Facebook.", parent=self._top)
-            return
+            messagebox.showwarning(dialog_title, "Nhập mã tài khoản (id) trước.", parent=self._top)
+            return False
+        if not self._form_has_login_identity():
+            messagebox.showwarning(
+                dialog_title,
+                "Nhập UID Facebook hoặc Email Facebook (một trong hai).",
+                parent=self._top,
+            )
+            return False
         if not self._e_password.get().strip():
-            messagebox.showwarning("Test Login", "Nhập mật khẩu (lưu vào vault khi Lưu).", parent=self._top)
-            return
+            messagebox.showwarning(
+                dialog_title,
+                "Nhập mật khẩu (bấm «Lưu đăng nhập» hoặc «Lưu» để ghi vault).",
+                parent=self._top,
+            )
+            return False
         if self._form_totp_enabled() and not self._e_totp_secret.get().strip():
-            messagebox.showwarning("Test Login", "Bật TOTP nhưng chưa nhập secret.", parent=self._top)
+            messagebox.showwarning(dialog_title, "Bật TOTP nhưng chưa nhập secret.", parent=self._top)
+            return False
+        return True
+
+    def _on_save_login_credentials(self) -> None:
+        if not self._validate_login_credentials_form("Lưu đăng nhập"):
+            return
+        aid = self._e_id.get().strip()
+        try:
+            self._persist_credentials_for_account(aid)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Lưu đăng nhập",
+                f"Không ghi được vault:\n{exc}",
+                parent=self._top,
+            )
+            return
+        messagebox.showinfo(
+            "Lưu đăng nhập",
+            "Đã lưu mật khẩu / TOTP / email khôi phục vào vault.\n"
+            "Bấm «Lưu» ở cuối cửa sổ để ghi UID/email vào accounts.json.",
+            parent=self._top,
+        )
+
+    def _on_auto_login(self) -> None:
+        if not self._validate_login_credentials_form("Tự đăng nhập"):
+            return
+        if not self._ensure_proxy_ready_for_login(dialog_title="Tự đăng nhập"):
+            return
+        self._persist_credentials_for_account(self._e_id.get().strip())
+        force_fresh = bool(self._var_test_login_fresh.get())
+        self._start_facebook_login_worker(
+            dialog_title="Tự đăng nhập",
+            force_fresh=force_fresh,
+            require_proxy_check=False,
+        )
+
+    def _safe_messagebox(self, kind: str, title: str, message: str) -> None:
+        """
+        Hiển thị messagebox chỉ khi form còn tồn tại.
+
+        Tránh lỗi ``bad window path name`` khi callback chạy sau lúc người dùng đã đóng Toplevel.
+        """
+        try:
+            if not hasattr(self, "_top") or not bool(self._top.winfo_exists()):
+                return
+        except tk.TclError:
+            return
+        try:
+            if kind == "error":
+                messagebox.showerror(title, message, parent=self._top)
+            elif kind == "warning":
+                messagebox.showwarning(title, message, parent=self._top)
+            else:
+                messagebox.showinfo(title, message, parent=self._top)
+        except tk.TclError:
             return
 
+    def _start_facebook_login_worker(
+        self,
+        *,
+        dialog_title: str,
+        force_fresh: bool,
+        require_proxy_check: bool = True,
+    ) -> None:
+        if require_proxy_check and not self._ensure_proxy_ready_for_login(dialog_title=dialog_title):
+            return
+        aid = self._e_id.get().strip()
         preview = self._preview_account_for_login_test()
         ck_rel = preview.get("cookie_path") or f"data/cookies/{aid}.json"
-        force_fresh = bool(getattr(self, "_var_test_login_fresh", tk.BooleanVar(value=True)).get())
 
         def _run(*, fresh: bool = force_fresh) -> None:
             from src.automation.browser_factory import BrowserFactory, sync_close_persistent_context
@@ -1612,7 +1960,7 @@ class AccountFormDialog:
             except Exception as exc:  # noqa: BLE001
                 err_msg = str(exc)
             finally:
-                sync_close_persistent_context(ctx, log_label="test_login_recovery")
+                sync_close_persistent_context(ctx, log_label="facebook_login_worker")
                 if factory is not None:
                     try:
                         factory.close()
@@ -1621,35 +1969,55 @@ class AccountFormDialog:
 
             def _notify() -> None:
                 if err_msg:
-                    messagebox.showerror("Test Login", err_msg, parent=self._top)
+                    self._safe_messagebox("error", dialog_title, err_msg)
                 elif ok:
                     detail = (
-                        "Đăng nhập email/mật khẩu + TOTP thành công."
+                        "Đăng nhập UID/email + mật khẩu (+ TOTP nếu bật) thành công."
                         if fresh
                         else "Profile đã có phiên hợp lệ (không cần đăng nhập lại)."
                     )
-                    messagebox.showinfo(
-                        "Test Login",
+                    self._safe_messagebox(
+                        "info",
+                        dialog_title,
                         f"{detail}\nSession đã lưu vào cookie_path.",
-                        parent=self._top,
                     )
                 else:
-                    messagebox.showwarning(
-                        "Test Login",
+                    self._safe_messagebox(
+                        "warning",
+                        dialog_title,
                         "Chưa xác nhận được phiên — có thể sai mật khẩu/TOTP, checkpoint hoặc cần xử lý tay.",
-                        parent=self._top,
                     )
 
-            self._top.after(0, _notify)
+            try:
+                if bool(self._top.winfo_exists()):
+                    self._top.after(0, _notify)
+            except tk.TclError:
+                return
 
         import threading
 
         threading.Thread(target=_run, kwargs={"fresh": force_fresh}, daemon=True).start()
-        hint = "đăng nhập lại từ form (email + mật khẩu + TOTP)" if force_fresh else "kiểm tra phiên profile hiện có"
+        px = " (qua proxy đã kiểm tra LIVE)" if bool(self._var_use_proxy.get()) else ""
+        hint = (
+            "đăng nhập lại từ form (UID hoặc email + mật khẩu + TOTP)"
+            if force_fresh
+            else "kiểm tra phiên profile hiện có"
+        )
         messagebox.showinfo(
-            "Test Login",
-            f"Đang mở trình duyệt để {hint}…",
+            dialog_title,
+            f"Đang mở trình duyệt để {hint}{px}…",
             parent=self._top,
+        )
+
+    def _on_test_login_recovery(self) -> None:
+        if not self._validate_login_credentials_form("Test Login"):
+            return
+        force_fresh = bool(self._var_test_login_fresh.get())
+        self._persist_credentials_for_account(self._e_id.get().strip())
+        self._start_facebook_login_worker(
+            dialog_title="Test Login",
+            force_fresh=force_fresh,
+            require_proxy_check=True,
         )
 
     def _on_ok(self) -> None:

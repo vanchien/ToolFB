@@ -1,1 +1,31 @@
-[]
+[
+  {
+    "id": "acc_example_01",
+    "name": "Ví dụ — SOCKS5 có User/Pass (CapSolver + trình duyệt cùng IP)",
+    "browser_type": "firefox",
+    "portable_path": "data/profiles/firefox/acc_example_01",
+    "cookie_path": "data/cookies/acc_example_01.json",
+    "facebook_uid": "100000000000001",
+    "email": "email@example.com",
+    "use_proxy": true,
+    "proxy": {
+      "host": "socks5://157.15.38.223",
+      "port": 29620,
+      "user": "admin254",
+      "pass": "admin254"
+    },
+    "password_ref": "account:acc_example_01",
+    "totp_secret_ref": "account:acc_example_01",
+    "totp_enabled": true
+  },
+  {
+    "id": "acc_example_02",
+    "name": "Ví dụ — proxy dạng chuỗi URL (tự parse khi mở Tool)",
+    "browser_type": "firefox",
+    "portable_path": "data/profiles/firefox/acc_example_02",
+    "cookie_path": "data/cookies/acc_example_02.json",
+    "facebook_uid": "100000000000002",
+    "use_proxy": true,
+    "proxy": "socks5://admin254:admin254@203.175.97.12:11193"
+  }
+]

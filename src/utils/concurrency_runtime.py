@@ -65,6 +65,8 @@ def apply_multi_task_defaults(*, gui: bool = False) -> None:
     _env_setdefault("SCHEDULER_POOL_THREADS", str(scheduler_pool))
     _env_setdefault("TOOLFB_FFMPEG_CONCURRENCY", str(ffmpeg))
     _env_setdefault("TOOLFB_AUTO_MULTITASK", "1")
+    # Mỗi BrowserFactory = Playwright driver riêng; tránh dùng chung Node driver giữa tài khoản.
+    _env_setdefault("FB_PLAYWRIGHT_SHARED", "0")
 
     if gui:
         _env_setdefault("SCHEDULE_PER_ACCOUNT_MAX_PARALLEL", "1")
