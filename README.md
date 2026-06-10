@@ -75,9 +75,13 @@ Thư mục `tools/Veo3Studio/` **không** có trong repo. Cài tay hoặc copy t
 
 ## Cập nhật
 
-**Git:** `git pull origin main`
+**Máy đã clone repo:** Mặc định app **tự `git pull`** khi mở (bản clone, working tree sạch). Tắt: `set TOOLFB_AUTO_GIT_PULL=0` hoặc `"git_pull_on_startup": false` trong `config/auto_update.json` (mẫu: `config/auto_update.example.json`). Sau pull nên **khởi động lại app**.
 
-**Trong app:** *Kiểm tra cập nhật* / *Cập nhật* — cần release GitHub kèm `latest.json` + zip (xem `config/update_channel.example.json`).
+**Task Scheduler (không mở app):** chạy `tools\auto_git_pull.ps1` hoặc `.venv\Scripts\python.exe tools\sync_from_github.py --force`.
+
+**Git thủ công:** `git pull origin main`
+
+**Trong app:** *Kiểm tra cập nhật* / *Cập nhật* — bản zip cần release GitHub kèm `latest.json` (xem `config/update_channel.example.json`).
 
 **Phát hành:** workflow `.github/workflows/release.yml` hoặc `Publish_Update_GitHub.bat`.
 

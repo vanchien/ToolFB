@@ -1,0 +1,5 @@
+{
+  "git_pull_on_startup": true,
+  "min_interval_minutes": 30,
+  "pip_install_after_pull": true
+}

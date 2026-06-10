@@ -322,6 +322,267 @@ def apply_git_pull_ff(project_root: Path, *, result: GitUpdateCheckResult, timeo
     return False, (out + "\n---\n" + out2).strip() if out else (out2 or "git pull --ff-only thất bại")
 
 
+@dataclass(frozen=True)
+class AutoGitPullSettings:
+    """Cấu hình tự động ``git pull`` khi mở app (bản clone)."""
+
+    git_pull_on_startup: bool = True
+    min_interval_minutes: int = 30
+    pip_install_after_pull: bool = True
+
+
+@dataclass(frozen=True)
+class AutoGitPullOutcome:
+    """Kết quả đồng bộ git lúc khởi động hoặc script ``tools/sync_from_github.py``."""
+
+    enabled: bool
+    skipped_reason: str | None
+    pulled: bool
+    commits_behind: int
+    message: str
+    pip_ran: bool
+    pip_message: str
+    check_result: GitUpdateCheckResult | None
+
+
+def _auto_git_pull_state_path(project_root: Path) -> Path:
+    return project_root / "data" / "auto_git_pull_state.json"
+
+
+def _load_auto_git_pull_settings(project_root: Path) -> AutoGitPullSettings:
+    """Đọc ``config/auto_update.json``; thiếu file → bật auto pull (máy clone)."""
+    defaults = AutoGitPullSettings()
+    cfg_path = project_root / "config" / "auto_update.json"
+    if not cfg_path.is_file():
+        return defaults
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return defaults
+    if not isinstance(raw, dict):
+        return defaults
+    on_startup = raw.get("git_pull_on_startup", defaults.git_pull_on_startup)
+    interval = raw.get("min_interval_minutes", defaults.min_interval_minutes)
+    pip_after = raw.get("pip_install_after_pull", defaults.pip_install_after_pull)
+    try:
+        interval_i = max(0, int(interval))
+    except (TypeError, ValueError):
+        interval_i = defaults.min_interval_minutes
+    return AutoGitPullSettings(
+        git_pull_on_startup=bool(on_startup),
+        min_interval_minutes=interval_i,
+        pip_install_after_pull=bool(pip_after),
+    )
+
+
+def is_auto_git_pull_enabled(project_root: Path) -> bool:
+    """
+    Bật auto pull khi ``TOOLFB_AUTO_GIT_PULL=1`` hoặc ``config/auto_update.json``
+    có ``git_pull_on_startup: true`` (mặc định bật nếu không có file). Tắt: ``TOOLFB_AUTO_GIT_PULL=0``.
+    """
+    env = os.environ.get("TOOLFB_AUTO_GIT_PULL", "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return _load_auto_git_pull_settings(project_root).git_pull_on_startup
+
+
+def git_working_tree_clean(project_root: Path) -> bool:
+    """``True`` khi không có thay đổi chưa commit (an toàn để ``git pull --ff-only``)."""
+    p = _git_run(project_root, ["status", "--porcelain"], timeout=60)
+    return p.returncode == 0 and not (p.stdout or "").strip()
+
+
+def _read_auto_git_pull_last_ts(project_root: Path) -> float:
+    path = _auto_git_pull_state_path(project_root)
+    if not path.is_file():
+        return 0.0
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return float(raw.get("last_pull_epoch", 0) or 0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _write_auto_git_pull_state(project_root: Path, *, pulled: bool) -> None:
+    path = _auto_git_pull_state_path(project_root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"last_pull_epoch": time.time(), "last_pulled": bool(pulled)}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("Không ghi state auto git pull: {}", exc)
+
+
+def _pip_install_requirements(project_root: Path, *, timeout: int = 600) -> tuple[bool, str]:
+    """``pip install -r requirements.txt`` sau khi pull (dùng venv nếu có)."""
+    req = project_root / "requirements.txt"
+    if not req.is_file():
+        return False, "Không có requirements.txt."
+    py = project_root / ".venv" / "Scripts" / "python.exe"
+    if not py.is_file():
+        py = Path(sys.executable)
+    try:
+        p = subprocess.run(
+            [str(py), "-m", "pip", "install", "-r", str(req), "-q"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return False, "pip install quá thời gian chờ."
+    out = ((p.stdout or "").strip() + "\n" + (p.stderr or "").strip()).strip()
+    if p.returncode == 0:
+        return True, out or "pip install xong."
+    return False, out or f"pip install lỗi (mã {p.returncode})."
+
+
+def maybe_auto_git_pull_on_startup(
+    project_root: Path,
+    *,
+    timeout_fetch: int = 180,
+    force: bool = False,
+) -> AutoGitPullOutcome:
+    """
+    Kiểm tra bản mới trên ``origin``; nếu được bật và working tree sạch thì ``git pull --ff-only``.
+
+    Dùng khi mở GUI hoặc ``python tools/sync_from_github.py`` (Task Scheduler).
+    """
+    enabled = is_auto_git_pull_enabled(project_root)
+    if not should_use_git_updates(project_root):
+        return AutoGitPullOutcome(
+            enabled=enabled,
+            skipped_reason="not_git_clone",
+            pulled=False,
+            commits_behind=0,
+            message="Không phải bản git clone.",
+            pip_ran=False,
+            pip_message="",
+            check_result=None,
+        )
+
+    info = check_git_updates(project_root, timeout_fetch=timeout_fetch)
+    if not info.ok:
+        return AutoGitPullOutcome(
+            enabled=enabled,
+            skipped_reason="check_failed",
+            pulled=False,
+            commits_behind=0,
+            message=info.error or "git fetch thất bại.",
+            pip_ran=False,
+            pip_message="",
+            check_result=info,
+        )
+
+    if not enabled:
+        return AutoGitPullOutcome(
+            enabled=False,
+            skipped_reason="disabled",
+            pulled=False,
+            commits_behind=info.commits_behind,
+            message="Auto git pull tắt (TOOLFB_AUTO_GIT_PULL=0 hoặc config).",
+            pip_ran=False,
+            pip_message="",
+            check_result=info,
+        )
+
+    if not info.has_new_commits:
+        return AutoGitPullOutcome(
+            enabled=True,
+            skipped_reason="up_to_date",
+            pulled=False,
+            commits_behind=0,
+            message="Đã là bản mới nhất trên origin.",
+            pip_ran=False,
+            pip_message="",
+            check_result=info,
+        )
+
+    if not git_working_tree_clean(project_root):
+        return AutoGitPullOutcome(
+            enabled=True,
+            skipped_reason="dirty_worktree",
+            pulled=False,
+            commits_behind=info.commits_behind,
+            message=(
+                f"Có {info.commits_behind} commit mới nhưng working tree chưa sạch — "
+                "commit/stash thủ công hoặc bấm «Cập nhật» trong app."
+            ),
+            pip_ran=False,
+            pip_message="",
+            check_result=info,
+        )
+
+    settings = _load_auto_git_pull_settings(project_root)
+    min_sec = max(0, settings.min_interval_minutes) * 60
+    if not force and min_sec > 0:
+        elapsed = time.time() - _read_auto_git_pull_last_ts(project_root)
+        if elapsed < min_sec:
+            return AutoGitPullOutcome(
+                enabled=True,
+                skipped_reason="min_interval",
+                pulled=False,
+                commits_behind=info.commits_behind,
+                message=(
+                    f"Có {info.commits_behind} commit mới; chờ thêm "
+                    f"{int(min_sec - elapsed)}s trước lần auto pull tiếp theo."
+                ),
+                pip_ran=False,
+                pip_message="",
+                check_result=info,
+            )
+
+    behind_before = info.commits_behind
+    ok, pull_msg = apply_git_pull_ff(project_root, result=info)
+    if not ok:
+        return AutoGitPullOutcome(
+            enabled=True,
+            skipped_reason="pull_failed",
+            pulled=False,
+            commits_behind=behind_before,
+            message=pull_msg[:4000] or "git pull thất bại.",
+            pip_ran=False,
+            pip_message="",
+            check_result=info,
+        )
+
+    _write_auto_git_pull_state(project_root, pulled=True)
+    pip_ran = False
+    pip_msg = ""
+    if settings.pip_install_after_pull:
+        pip_ran, pip_msg = _pip_install_requirements(project_root)
+
+    summary = (
+        f"Đã pull {behind_before} commit từ GitHub.\n"
+        f"{pull_msg[:1500]}"
+    ).strip()
+    if pip_ran:
+        summary += "\n\nĐã cập nhật dependencies (pip install -r requirements.txt)."
+    elif settings.pip_install_after_pull and pip_msg:
+        summary += f"\n\n(pip: {pip_msg[:500]})"
+
+    logger.info("Auto git pull: {} commit — {}", behind_before, pull_msg[:200])
+    return AutoGitPullOutcome(
+        enabled=True,
+        skipped_reason=None,
+        pulled=True,
+        commits_behind=0,
+        message=summary,
+        pip_ran=pip_ran,
+        pip_message=pip_msg,
+        check_result=info,
+    )
+
+
 def read_local_version(project_root: Path) -> str:
     """Đọc phiên bản local từ ``version.json`` (fallback ``0.0.0-dev``)."""
     vf = project_root / "version.json"

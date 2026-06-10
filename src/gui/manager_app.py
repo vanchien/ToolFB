@@ -56,6 +56,7 @@ from src.services.app_updater import (
     check_git_updates,
     github_latest_manifest_url,
     is_newer_version,
+    maybe_auto_git_pull_on_startup,
     prefer_repo_raw_manifest_url,
     read_local_version,
     read_manifest_from_url,
@@ -1318,7 +1319,7 @@ class _ManagerWindow:
         self._sync_ai_tab_scrollregion()
         self._start_ui_watchdog()
         self._start_multitask_reconcile_timer()
-        self._root.after(900, self._schedule_probe_update_button_visibility)
+        self._root.after(900, self._schedule_startup_git_sync)
         logger.info(
             "Đã mở giao diện quản lý — tab Tài khoản / Page / Job lịch / Cài đặt AI; «Bắt đầu lịch» chạy scheduler nền."
         )
@@ -8793,19 +8794,28 @@ class _ManagerWindow:
         except tk.TclError:
             pass
 
-    def _schedule_probe_update_button_visibility(self) -> None:
+    def _schedule_startup_git_sync(self) -> None:
         """
-        Sau khi mở GUI: kiểm tra nền (git hoặc manifest) có bản mới không — chỉ để hiện nút «Cập nhật»,
-        không tự tải (tránh bất ngờ khi mở app).
+        Sau khi mở GUI: với bản git clone — tự ``git pull`` nếu bật (``config/auto_update`` / env);
+        luôn kiểm tra để hiện nút «Cập nhật» khi còn commit mới (dirty tree / lỗi pull).
         """
 
         def worker() -> None:
+            pulled = False
+            commits_pulled = 0
             has_new = False
+            root_p = project_root()
             try:
-                root_p = project_root()
                 if should_use_git_updates(root_p):
-                    info = check_git_updates(root_p, timeout_fetch=120)
-                    has_new = bool(info.ok and info.has_new_commits)
+                    outcome = maybe_auto_git_pull_on_startup(root_p, timeout_fetch=120)
+                    pulled = outcome.pulled
+                    info = outcome.check_result
+                    if pulled and info is not None:
+                        commits_pulled = max(0, info.commits_behind)
+                    if pulled:
+                        has_new = False
+                    elif info is not None:
+                        has_new = bool(info.ok and info.has_new_commits)
                 else:
                     mu = resolve_manifest_url(root_p)
                     if mu:
@@ -8814,9 +8824,28 @@ class _ManagerWindow:
                         has_new = is_newer_version(mf.version, lv)
             except Exception:
                 has_new = False
+                pulled = False
 
             def on_main() -> None:
-                if has_new:
+                if pulled:
+                    self._git_update_result = None
+                    self._app_version_str = read_local_version(root_p)
+                    self._root.title(
+                        f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})"
+                    )
+                    self._lbl_app_version.configure(text=f"Phiên bản {self._app_version_str}")
+                    tip = (
+                        f"Đã tự cập nhật {commits_pulled} commit từ GitHub."
+                        if commits_pulled
+                        else "Đã tự cập nhật code từ GitHub."
+                    )
+                    self._lbl_state.configure(text=tip)
+                    self._hide_apply_update_button()
+                    self._show_update_success_restart_dialog(
+                        version=self._app_version_str,
+                        backup_dir=None,
+                    )
+                elif has_new:
                     self._show_apply_update_button()
                 else:
                     self._hide_apply_update_button()
@@ -8826,7 +8855,7 @@ class _ManagerWindow:
             except Exception:
                 pass
 
-        threading.Thread(target=worker, name="probe_update_btn", daemon=True).start()
+        threading.Thread(target=worker, name="startup_git_sync", daemon=True).start()
 
     def _git_run_pull_thread(self, root: Path, info: GitUpdateCheckResult) -> None:
         """
