@@ -1,7 +1,7 @@
 {
-  "version": "1.0.79",
+  "version": "1.0.80",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "763f32bc05f7988ea50e43c80d53e014d8ab78cedb201c144bdea1c379353489",
-  "notes": "Page insights, CSV export, mute video preview, anti-checkpoint stats policy",
-  "generated_at": "2026-05-29T21:33:41"
+  "sha256": "7da884d16c26e2c1538a47cb9c117d120245d90d5969b3c7235d58d6e9ac531b",
+  "notes": "Auto git pull khi mo app (ban clone); pool tuong tac fix 4 luong; quet/tai hang nghin video; bulk edit lich dang",
+  "generated_at": "2026-06-11T00:00:18"
 }
