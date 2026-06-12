@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.services.universal_video_downloader import (
+    DownloadMetadataStore,
+    _read_json_object_list_file,
     build_download_job_combo_options,
     clear_pending_video_editor_job,
     read_pending_video_editor_job,
@@ -48,6 +50,13 @@ def test_combo_shows_completed_job_without_video_rows() -> None:
     assert "0 video" in vals[0]
 
 
+def test_combo_shows_running_job_without_videos() -> None:
+    jobs = [{"id": "dl_run", "platform": "tiktok", "status": "running", "created_at": "2026-06-02T12:00:00"}]
+    vals, mapping = build_download_job_combo_options(jobs, [], show_empty=False)
+    assert len(vals) == 1
+    assert mapping[vals[0]] == "dl_run"
+
+
 def test_combo_hides_pending_empty_job() -> None:
     jobs = [{"id": "dl_pend", "platform": "tiktok", "status": "pending"}]
     vals, _ = build_download_job_combo_options(jobs, [], show_empty=False)
@@ -59,6 +68,29 @@ def test_combo_orphan_videos_without_job_record() -> None:
     vals, mapping = build_download_job_combo_options([], videos, show_empty=False)
     assert len(vals) == 1
     assert mapping[vals[0]] == "dl_orphan"
+
+
+def test_read_json_list_survives_transient_bad_file(tmp_path: Path) -> None:
+    p = tmp_path / "download_jobs.json"
+    p.write_text("[", encoding="utf-8")
+    assert _read_json_object_list_file(p, retries=2) == []
+    p.write_text('[{"id": "ok"}]\n', encoding="utf-8")
+    rows = _read_json_object_list_file(p, retries=3)
+    assert rows and rows[0]["id"] == "ok"
+
+
+def test_metadata_store_atomic_roundtrip(tmp_path: Path) -> None:
+    paths = {
+        "root": tmp_path,
+        "jobs_file": tmp_path / "download_jobs.json",
+        "videos_file": tmp_path / "downloaded_videos.json",
+        "archive": tmp_path / "archive.txt",
+    }
+    store = DownloadMetadataStore(paths=paths)
+    store.save_job({"id": "dl_x", "platform": "youtube", "status": "completed"})
+    jobs = store.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == "dl_x"
 
 
 def test_pending_job_file_roundtrip(tmp_path: Path) -> None:

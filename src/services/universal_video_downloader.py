@@ -1217,31 +1217,55 @@ def build_download_job_combo_options(
     return vals, new_map
 
 
+def _read_json_object_list_file(path: Path, *, retries: int = 5) -> list[dict[str, Any]]:
+    """
+    Đọc JSON list an toàn — retry khi file đang được ghi (Windows / máy khách hay lỗi parse tạm).
+    """
+    if not path.is_file():
+        return []
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                return [x for x in raw if isinstance(x, dict)]
+            return []
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt + 1 < retries:
+                time.sleep(0.04 * (attempt + 1))
+    return []
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Ghi file JSON atomically (temp + replace) — tránh đọc dở khi tab Video Editor refresh."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:10]}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 class DownloadMetadataStore:
     def __init__(self, *, paths: dict[str, Path] | None = None) -> None:
         self._paths = paths or ensure_downloader_layout()
 
     def _read_jobs(self) -> list[dict[str, Any]]:
-        try:
-            raw = json.loads(self._paths["jobs_file"].read_text(encoding="utf-8"))
-            return [x for x in raw if isinstance(x, dict)]
-        except Exception:
-            return []
+        return _read_json_object_list_file(self._paths["jobs_file"])
 
     def _write_jobs(self, rows: list[dict[str, Any]]) -> None:
-        self._paths["jobs_file"].parent.mkdir(parents=True, exist_ok=True)
-        self._paths["jobs_file"].write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(
+            self._paths["jobs_file"],
+            json.dumps(rows, ensure_ascii=False, indent=2) + "\n",
+        )
 
     def _read_videos(self) -> list[dict[str, Any]]:
-        try:
-            raw = json.loads(self._paths["videos_file"].read_text(encoding="utf-8"))
-            return [x for x in raw if isinstance(x, dict)]
-        except Exception:
-            return []
+        return _read_json_object_list_file(self._paths["videos_file"])
 
     def _write_videos(self, rows: list[dict[str, Any]]) -> None:
-        self._paths["videos_file"].parent.mkdir(parents=True, exist_ok=True)
-        self._paths["videos_file"].write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(
+            self._paths["videos_file"],
+            json.dumps(rows, ensure_ascii=False, indent=2) + "\n",
+        )
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self._read_jobs()

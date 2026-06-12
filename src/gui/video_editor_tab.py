@@ -784,7 +784,10 @@ def build_video_editor_tab(
         _dl_combo_refresh["after_id"] = root.after(250, _fire)
 
     def _on_download_job_finished_event(_event: tk.Event | None = None) -> None:
+        # Refresh ngay + retry — tránh race khi job vừa ghi xong JSON (máy khách chậm / đọc đồng thời).
         refresh_download_job_combo()
+        root.after(400, refresh_download_job_combo)
+        root.after(1500, refresh_download_job_combo)
 
     root.bind(DOWNLOAD_JOB_FINISHED_TK_EVENT, _on_download_job_finished_event, add="+")
 

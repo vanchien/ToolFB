@@ -152,8 +152,10 @@ class AIVideoDialog:
         project_spec: dict[str, Any] | None = None,
         start_tab: str = "reverse",
         embedded_download_host: ttk.Frame | None = None,
+        on_download_job_finished: Callable[[str], None] | None = None,
     ) -> None:
         self._parent = parent
+        self._on_download_job_finished = on_download_job_finished
         self._project_spec = dict(project_spec or {})
         self._suspend_reverse_source_reset = True
         self._reverse_source_change_after: str | None = None
@@ -3569,9 +3571,15 @@ class AIVideoDialog:
         if not jid:
             return
         self._last_download_job_id = jid
-        if int(ok_count) > 0:
-            self._store_pending_job_for_video_editor(jid)
-            set_root_pending_download_job(self._top, jid)
+        # Luôn ghi pending — máy khác / mở tab Editor sau vẫn chọn đúng job (kể cả batch lỗi một phần).
+        self._store_pending_job_for_video_editor(jid)
+        set_root_pending_download_job(self._top, jid)
+        cb = getattr(self, "_on_download_job_finished", None)
+        if callable(cb):
+            try:
+                cb(jid)
+            except Exception:
+                pass
         try:
             self._top.event_generate(DOWNLOAD_JOB_FINISHED_TK_EVENT, when="tail")
         except Exception:

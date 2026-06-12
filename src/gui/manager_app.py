@@ -1089,6 +1089,9 @@ class _ManagerWindow:
                 project_spec={},
                 start_tab="download",
                 embedded_download_host=tab_dl,
+                on_download_job_finished=lambda _jid: (
+                    self._refresh_ve_download_jobs() if self._refresh_ve_download_jobs else None
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             self._embedded_download_panel = None
