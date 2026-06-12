@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from src.utils.json_store_lock import json_file_lock
 from src.utils.paths import project_root
 
 LogFn = Callable[[str], None]
@@ -662,8 +663,109 @@ def _to_ytdlp_cookie_file(cookie_path: str | None) -> tuple[str | None, Path | N
     return str(tmp), tmp
 
 
+def downloader_layout_candidate_roots() -> list[Path]:
+    """
+    Các thư mục gốc có thể chứa ``data/downloader`` (release zip: ``exe_gui/`` vs gốc cài đặt).
+    """
+    seen: set[str] = set()
+    out: list[Path] = []
+    pr = project_root().resolve()
+
+    def add(root: Path) -> None:
+        try:
+            key = str(root.resolve())
+        except OSError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(root.resolve())
+
+    add(pr)
+    if pr.name.lower() == "exe_gui":
+        add(pr.parent)
+    else:
+        add(pr / "exe_gui")
+    add(pr / "portable_clean")
+    if pr.parent.is_dir():
+        add(pr.parent)
+        add(pr.parent / "exe_gui")
+    return out
+
+
+def _merge_downloader_metadata_canonical() -> None:
+    """
+    Gộp ``download_jobs.json`` / ``downloaded_videos.json`` về ``project_root()/data/downloader``.
+
+    Máy khách thường chạy ``exe_gui/ToolFB_GUI.exe`` (data trong ``exe_gui/data/``) rồi cập nhật
+    hoặc mở ``ToolFB_GUI.exe`` ở thư mục cha — metadata bị tách đôi, combobox Video Editor trống.
+    """
+    canonical_root = (project_root() / "data" / "downloader").resolve()
+    canonical_root.mkdir(parents=True, exist_ok=True)
+    jobs_file = canonical_root / "download_jobs.json"
+    videos_file = canonical_root / "downloaded_videos.json"
+    archive_file = canonical_root / "archive.txt"
+
+    jobs_by_id: dict[str, dict[str, Any]] = {}
+    videos_by_id: dict[str, dict[str, Any]] = {}
+    archive_lines: list[str] = []
+    archive_seen: set[str] = set()
+    sources: list[Path] = []
+
+    for base in downloader_layout_candidate_roots():
+        dl_root = (base / "data" / "downloader").resolve()
+        if not dl_root.is_dir():
+            continue
+        jf = dl_root / "download_jobs.json"
+        vf = dl_root / "downloaded_videos.json"
+        af = dl_root / "archive.txt"
+        if not jf.is_file() and not vf.is_file():
+            continue
+        sources.append(dl_root)
+        for row in _read_json_object_list_file(jf):
+            jid = str(row.get("id") or "").strip()
+            if jid:
+                jobs_by_id[jid] = row
+        for row in _read_json_object_list_file(vf):
+            vid = str(row.get("id") or "").strip()
+            if vid:
+                videos_by_id[vid] = row
+        if af.is_file():
+            try:
+                for line in af.read_text(encoding="utf-8").splitlines():
+                    s = line.strip()
+                    if s and s not in archive_seen:
+                        archive_seen.add(s)
+                        archive_lines.append(s)
+            except OSError:
+                pass
+
+    if len(sources) <= 1 and not jobs_by_id and not videos_by_id:
+        return
+
+    jobs_out = sorted(
+        jobs_by_id.values(),
+        key=lambda j: (
+            _parse_download_job_time(j.get("updated_at")),
+            _parse_download_job_time(j.get("completed_at")),
+            _parse_download_job_time(j.get("created_at")),
+        ),
+        reverse=True,
+    )
+    videos_out = list(videos_by_id.values())
+
+    with json_file_lock(jobs_file):
+        _atomic_write_text(jobs_file, json.dumps(jobs_out, ensure_ascii=False, indent=2) + "\n")
+    with json_file_lock(videos_file):
+        _atomic_write_text(videos_file, json.dumps(videos_out, ensure_ascii=False, indent=2) + "\n")
+    if archive_lines:
+        with json_file_lock(archive_file):
+            _atomic_write_text(archive_file, "\n".join(archive_lines) + ("\n" if archive_lines else ""))
+
+
 def ensure_downloader_layout() -> dict[str, Path]:
-    root = project_root() / "data" / "downloader"
+    _merge_downloader_metadata_canonical()
+    root = (project_root() / "data" / "downloader").resolve()
     paths = {
         "root": root,
         "jobs_file": root / "download_jobs.json",
@@ -674,10 +776,27 @@ def ensure_downloader_layout() -> dict[str, Path]:
     for key in ("jobs_file", "videos_file"):
         p = paths[key]
         if not p.is_file():
-            p.write_text("[]\n", encoding="utf-8")
+            with json_file_lock(p):
+                if not p.is_file():
+                    _atomic_write_text(p, "[]\n")
     if not paths["archive"].is_file():
-        paths["archive"].write_text("", encoding="utf-8")
+        with json_file_lock(paths["archive"]):
+            if not paths["archive"].is_file():
+                _atomic_write_text(paths["archive"], "")
     return paths
+
+
+def downloader_metadata_summary() -> dict[str, Any]:
+    """Tóm tắt metadata tải video (đường dẫn + số lượng) — hiển thị trên Video Editor."""
+    paths = ensure_downloader_layout()
+    jobs = _read_json_object_list_file(paths["jobs_file"])
+    videos = _read_json_object_list_file(paths["videos_file"])
+    return {
+        "root": str(paths["root"]),
+        "jobs_file": str(paths["jobs_file"]),
+        "job_count": len(jobs),
+        "video_count": len(videos),
+    }
 
 
 def default_universal_video_downloader_config() -> dict[str, Any]:
@@ -1247,25 +1366,31 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 class DownloadMetadataStore:
     def __init__(self, *, paths: dict[str, Path] | None = None) -> None:
-        self._paths = paths or ensure_downloader_layout()
+        self._paths_override = paths
+
+    def _refresh_paths(self) -> dict[str, Path]:
+        paths = self._paths_override or ensure_downloader_layout()
+        return paths
 
     def _read_jobs(self) -> list[dict[str, Any]]:
-        return _read_json_object_list_file(self._paths["jobs_file"])
+        paths = self._refresh_paths()
+        return _read_json_object_list_file(paths["jobs_file"])
 
     def _write_jobs(self, rows: list[dict[str, Any]]) -> None:
-        _atomic_write_text(
-            self._paths["jobs_file"],
-            json.dumps(rows, ensure_ascii=False, indent=2) + "\n",
-        )
+        paths = self._refresh_paths()
+        payload = json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
+        with json_file_lock(paths["jobs_file"]):
+            _atomic_write_text(paths["jobs_file"], payload)
 
     def _read_videos(self) -> list[dict[str, Any]]:
-        return _read_json_object_list_file(self._paths["videos_file"])
+        paths = self._refresh_paths()
+        return _read_json_object_list_file(paths["videos_file"])
 
     def _write_videos(self, rows: list[dict[str, Any]]) -> None:
-        _atomic_write_text(
-            self._paths["videos_file"],
-            json.dumps(rows, ensure_ascii=False, indent=2) + "\n",
-        )
+        paths = self._refresh_paths()
+        payload = json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
+        with json_file_lock(paths["videos_file"]):
+            _atomic_write_text(paths["videos_file"], payload)
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self._read_jobs()
@@ -2458,12 +2583,16 @@ class UniversalVideoDownloader:
         self._log = log or (lambda _m: None)
         self._cfg_root = load_universal_video_downloader_config()
         self._uvd = dict(self._cfg_root.get("universal_video_downloader") or {})
-        self._paths = ensure_downloader_layout()
-        self._store = DownloadMetadataStore(paths=self._paths)
+        self._store = DownloadMetadataStore()
         self._yt = UniversalYTDLPWrapper(yt_cfg=dict(self._uvd.get("yt_dlp") or {}), log=self._log)
         self._cancel = threading.Event()
         self._active_job_id: str | None = None
         self._auto_refresh_ytdlp_background()
+
+    @property
+    def _paths(self) -> dict[str, Path]:
+        """Luôn trỏ metadata downloader chuẩn (sau merge exe_gui / thư mục gốc)."""
+        return ensure_downloader_layout()
 
     def _auto_refresh_ytdlp_background(self) -> None:
         def _work() -> None:

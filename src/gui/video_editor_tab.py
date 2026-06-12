@@ -88,6 +88,7 @@ from src.services.universal_video_downloader import (
     build_download_job_combo_options,
     clear_root_pending_download_job,
     consume_auto_import_download_job,
+    downloader_metadata_summary,
     ensure_downloader_layout,
     get_root_pending_download_job,
 )
@@ -374,7 +375,7 @@ def build_video_editor_tab(
     ve_paths = ensure_video_editor_layout()
     pm = VideoEditorProjectManager(paths=ve_paths)
     mm = MediaManager(paths=ve_paths)
-    dl_store = DownloadMetadataStore(paths=ensure_downloader_layout())
+    dl_store = DownloadMetadataStore()
     tm = TimelineManager(project_manager=pm)
     builder = FFmpegCommandBuilder()
     preview_worker = RenderWorker()
@@ -674,11 +675,48 @@ def build_video_editor_tab(
     dl_job_map: dict[str, str] = {}
     var_show_empty_jobs = tk.BooleanVar(value=False)
     var_dl_job = tk.StringVar(value="")
-    _dl_paths = ensure_downloader_layout()
+    var_dl_job_meta = tk.StringVar(value="")
     _dl_combo_refresh = {"gen": 0, "after_id": ""}
     ttk.Label(top_job, text="B2 - Job tải:").pack(side=tk.LEFT, padx=(0, 4))
     cb_dl_job = ttk.Combobox(top_job, textvariable=var_dl_job, width=50, state="readonly")
     cb_dl_job.pack(side=tk.LEFT, padx=(0, 4))
+
+    def _update_dl_job_meta_label(*, job_combo_count: int | None = None) -> None:
+        try:
+            meta = downloader_metadata_summary()
+        except Exception:
+            var_dl_job_meta.set("Metadata job tải: không đọc được.")
+            return
+        n_jobs = int(meta.get("job_count") or 0)
+        n_videos = int(meta.get("video_count") or 0)
+        root_path = str(meta.get("root") or "")
+        shown = job_combo_count if job_combo_count is not None else len(dl_job_map)
+        hint = (
+            f"Metadata: {n_jobs} job, {n_videos} video — combobox hiện {shown} mục. "
+            f"Thư mục: {root_path}"
+        )
+        if shown <= 0 and (n_jobs > 0 or n_videos > 0):
+            hint += " — bấm «2) Nạp danh sách job» hoặc bật «Hiện cả job rỗng/lỗi»."
+        elif shown <= 0:
+            hint += " — tải video ở tab 6; nếu đã tải mà vẫn trống, chạy .exe cùng thư mục đã tải."
+        var_dl_job_meta.set(hint)
+
+    def _open_downloader_metadata_folder() -> None:
+        try:
+            folder = Path(downloader_metadata_summary().get("root") or "")
+        except Exception:
+            messagebox.showwarning("Video Editor", "Không xác định được thư mục metadata.", parent=root)
+            return
+        if not folder.is_dir():
+            messagebox.showwarning("Video Editor", f"Thư mục chưa tồn tại:\n{folder}", parent=root)
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))  # noqa: S606
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Video Editor", str(exc), parent=root)
 
     def _select_download_job_in_combo(jid: str) -> bool:
         target = str(jid or "").strip()
@@ -729,6 +767,7 @@ def build_video_editor_tab(
                 var_dl_job.set(vals[0] if vals else "")
         if pending_jid and consume_auto_import_download_job(root):
             root.after(120, _auto_import_pending_download_job)
+        _update_dl_job_meta_label(job_combo_count=len(vals))
 
     def _auto_import_pending_download_job() -> None:
         """Import job đã chọn — chỉ khi user bấm «Mở Video Editor» hoặc xác nhận sau tải."""
@@ -746,12 +785,14 @@ def build_video_editor_tab(
         show_empty = bool(var_show_empty_jobs.get())
 
         def _worker() -> None:
+            store = DownloadMetadataStore()
             vals, new_map = build_download_job_combo_options(
-                dl_store.list_jobs(),
-                dl_store.list_downloaded_videos(),
+                store.list_jobs(),
+                store.list_downloaded_videos(),
                 show_empty=show_empty,
             )
-            pending_jid = get_root_pending_download_job(root, paths=_dl_paths)
+            dl_paths = ensure_downloader_layout()
+            pending_jid = get_root_pending_download_job(root, paths=dl_paths)
             _schedule_on_main_thread(
                 lambda: _apply_download_job_combo_ui(
                     vals=vals,
@@ -835,7 +876,7 @@ def build_video_editor_tab(
         def _worker() -> None:
             rows = [
                 r
-                for r in dl_store.list_downloaded_videos()
+                for r in DownloadMetadataStore().list_downloaded_videos()
                 if str(r.get("download_job_id") or "").strip() == jid
             ]
             if not rows:
@@ -932,7 +973,7 @@ def build_video_editor_tab(
             def _done() -> None:
                 _import_dl_busy["v"] = False
                 if added > 0 or source_video_ids:
-                    clear_root_pending_download_job(root, paths=_dl_paths)
+                    clear_root_pending_download_job(root, paths=ensure_downloader_layout())
                 refresh_media_tree()
                 root.after(30, refresh_timeline)
                 notify(msg)
@@ -943,12 +984,18 @@ def build_video_editor_tab(
 
     ttk.Button(top_job, text="2) Nạp danh sách job", command=refresh_download_job_combo).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(top_job, text="3) Import video vào Media", command=import_from_download_job).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_job, text="Mở thư mục metadata", command=_open_downloader_metadata_folder).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Checkbutton(
         top_job,
         text="Hiện cả job rỗng/lỗi",
         variable=var_show_empty_jobs,
         command=refresh_download_job_combo,
     ).pack(side=tk.LEFT, padx=(8, 0))
+    dl_meta_row = ttk.Frame(parent)
+    dl_meta_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+    ttk.Label(dl_meta_row, textvariable=var_dl_job_meta, wraplength=960, justify=tk.LEFT, foreground="#555").pack(
+        anchor="w"
+    )
     root.after_idle(refresh_download_job_combo)
 
     status_fr = ttk.Frame(parent, padding=(6, 2, 6, 4))

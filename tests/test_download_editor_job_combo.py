@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from src.services.universal_video_downloader import (
     DownloadMetadataStore,
+    _merge_downloader_metadata_canonical,
     _read_json_object_list_file,
     build_download_job_combo_options,
     clear_pending_video_editor_job,
+    downloader_metadata_summary,
+    ensure_downloader_layout,
     read_pending_video_editor_job,
     write_pending_video_editor_job,
 )
+from src.utils.paths import reset_project_root_cache
 
 
 def test_combo_shows_job_with_videos() -> None:
@@ -91,6 +96,42 @@ def test_metadata_store_atomic_roundtrip(tmp_path: Path) -> None:
     jobs = store.list_jobs()
     assert len(jobs) == 1
     assert jobs[0]["id"] == "dl_x"
+
+
+def test_merge_downloader_metadata_from_exe_gui_folder(tmp_path: Path, monkeypatch) -> None:
+    """Metadata trong exe_gui/data được gộp về data/downloader chuẩn khi chạy từ thư mục cha."""
+    install = tmp_path / "ToolFB"
+    exe_gui = install / "exe_gui"
+    legacy_dl = exe_gui / "data" / "downloader"
+    legacy_dl.mkdir(parents=True)
+    (legacy_dl / "download_jobs.json").write_text(
+        json.dumps(
+            [{"id": "dl_legacy1", "platform": "instagram", "status": "completed", "created_at": "2026-06-01T10:00:00"}],
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (legacy_dl / "downloaded_videos.json").write_text(
+        json.dumps(
+            [{"id": "v1", "download_job_id": "dl_legacy1", "video_path": str(tmp_path / "a.mp4")}],
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TOOLFB_DATA_DIR", str(install))
+    reset_project_root_cache()
+    _merge_downloader_metadata_canonical()
+    paths = ensure_downloader_layout()
+    jobs = _read_json_object_list_file(paths["jobs_file"])
+    videos = _read_json_object_list_file(paths["videos_file"])
+    assert any(str(j.get("id")) == "dl_legacy1" for j in jobs)
+    assert len(videos) == 1
+    meta = downloader_metadata_summary()
+    assert int(meta["job_count"]) >= 1
+    reset_project_root_cache()
+    monkeypatch.delenv("TOOLFB_DATA_DIR", raising=False)
 
 
 def test_pending_job_file_roundtrip(tmp_path: Path) -> None:
