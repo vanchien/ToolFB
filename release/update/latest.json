@@ -1,7 +1,7 @@
 {
-  "version": "1.0.80",
+  "version": "1.0.81",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "7da884d16c26e2c1538a47cb9c117d120245d90d5969b3c7235d58d6e9ac531b",
-  "notes": "Auto git pull khi mo app (ban clone); pool tuong tac fix 4 luong; quet/tai hang nghin video; bulk edit lich dang",
-  "generated_at": "2026-06-11T00:00:18"
+  "sha256": "832425d693747fa42efc0ea9dc024cc3f4ac01204288c4b2cfd272a674bdec1f",
+  "notes": "Instagram: quet tab Reels bang Playwright (fix Unsupported URL). Luong tai -> Video Editor dong bo job. Sua loi login-wall TypeError.",
+  "generated_at": "2026-06-12T12:37:43"
 }
