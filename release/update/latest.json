@@ -1,7 +1,7 @@
 {
-  "version": "1.0.82",
+  "version": "1.0.83",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "948f6acc32c762529194539023964a3234de60de1bcfb244a5a3e49bbce4d3ee",
-  "notes": "Fix job tai khong hien o Video Editor: ghi JSON atomic, retry doc, refresh truc tiep tab Editor.",
-  "generated_at": "2026-06-12T15:18:43"
+  "sha256": "fc8510f30c70166037b9b4eece77676858cb0bf105ac678917086d9ae0f5cbd4",
+  "notes": "Fix job tai khong hien Video Editor: gop metadata exe_gui/data vao data/downloader; hien duong dan metadata tren tab Editor.",
+  "generated_at": "2026-06-12T16:38:06"
 }
