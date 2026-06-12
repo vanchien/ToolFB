@@ -1,5 +1,5 @@
 {
-  "app_version": "1.0.81",
+  "app_version": "1.0.82",
   "playwright_python": "1.58.0",
   "browsers": {
     "chromium": "chromium-1208",
