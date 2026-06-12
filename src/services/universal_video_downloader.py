@@ -31,6 +31,114 @@ UV_PLAYLIST_SCAN_CHUNK = 400
 # Trên ngưỡng này tab Tải video dùng tải tuần tự từng URL (ổn định, dễ hủy).
 UV_DOWNLOAD_SEQUENTIAL_THRESHOLD = 25
 
+# Sự kiện Tk: tab Tải video báo job xong → Video Editor làm mới combobox job.
+DOWNLOAD_JOB_FINISHED_TK_EVENT = "<<ToolFB_DownloadJobFinished>>"
+PENDING_VE_JOB_FILE = "pending_video_editor_job.json"
+TOOLFB_PENDING_DOWNLOAD_JOB_ATTR = "_toolfb_pending_download_job_id"
+TOOLFB_VE_AUTO_IMPORT_DOWNLOAD_ATTR = "_toolfb_ve_auto_import_download"
+
+
+def pending_video_editor_job_path(*, paths: dict[str, Path] | None = None) -> Path:
+    layout = paths or ensure_downloader_layout()
+    return layout["root"] / PENDING_VE_JOB_FILE
+
+
+def write_pending_video_editor_job(job_id: str, *, paths: dict[str, Path] | None = None) -> None:
+    """Ghi job chờ nạp vào Video Editor (file JSON + caller nên set attr trên root Tk)."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+    p = pending_video_editor_job_path(paths=paths)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(
+                {"job_id": jid, "saved_at": datetime.now().replace(microsecond=0).isoformat()},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def read_pending_video_editor_job(*, paths: dict[str, Path] | None = None, consume: bool = False) -> str:
+    p = pending_video_editor_job_path(paths=paths)
+    if not p.is_file():
+        return ""
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        if consume:
+            p.unlink(missing_ok=True)
+        return ""
+    jid = str((raw or {}).get("job_id") or "").strip() if isinstance(raw, dict) else ""
+    if consume and jid:
+        p.unlink(missing_ok=True)
+    return jid
+
+
+def clear_pending_video_editor_job(*, paths: dict[str, Path] | None = None) -> None:
+    pending_video_editor_job_path(paths=paths).unlink(missing_ok=True)
+
+
+def set_root_pending_download_job(root: Any, job_id: str) -> None:
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+    try:
+        setattr(root, TOOLFB_PENDING_DOWNLOAD_JOB_ATTR, jid)
+    except Exception:
+        pass
+
+
+def get_root_pending_download_job(root: Any, *, paths: dict[str, Path] | None = None) -> str:
+    try:
+        jid = str(getattr(root, TOOLFB_PENDING_DOWNLOAD_JOB_ATTR, "") or "").strip()
+    except Exception:
+        jid = ""
+    if jid:
+        return jid
+    return read_pending_video_editor_job(paths=paths, consume=False)
+
+
+def clear_root_pending_download_job(root: Any, *, paths: dict[str, Path] | None = None) -> None:
+    try:
+        if hasattr(root, TOOLFB_PENDING_DOWNLOAD_JOB_ATTR):
+            delattr(root, TOOLFB_PENDING_DOWNLOAD_JOB_ATTR)
+    except Exception:
+        try:
+            setattr(root, TOOLFB_PENDING_DOWNLOAD_JOB_ATTR, "")
+        except Exception:
+            pass
+    clear_pending_video_editor_job(paths=paths)
+
+
+def arm_auto_import_download_job(root: Any) -> None:
+    try:
+        setattr(root, TOOLFB_VE_AUTO_IMPORT_DOWNLOAD_ATTR, True)
+    except Exception:
+        pass
+
+
+def consume_auto_import_download_job(root: Any) -> bool:
+    try:
+        armed = bool(getattr(root, TOOLFB_VE_AUTO_IMPORT_DOWNLOAD_ATTR, False))
+    except Exception:
+        armed = False
+    if not armed:
+        return False
+    try:
+        delattr(root, TOOLFB_VE_AUTO_IMPORT_DOWNLOAD_ATTR)
+    except Exception:
+        try:
+            setattr(root, TOOLFB_VE_AUTO_IMPORT_DOWNLOAD_ATTR, False)
+        except Exception:
+            pass
+    return True
+
 # yt-dlp: ưu tiên tối thiểu 720p (HD); trần chiều cao 2160 (Short dọc / 4K). Fallback dần xuống thấp hơn nếu site không có HD.
 YTDLP_FORMAT_HD_MERGE = (
     "bestvideo[height>=720][height<=2160]+bestaudio/"
@@ -226,6 +334,12 @@ def _extract_video_id_for_scan(url: str) -> str:
     if m:
         return m.group(1)
     m = re.search(r"facebook\.com/reel/(\d+)", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"instagram\.com/(?:reel|p|tv)/([A-Za-z0-9_-]+)", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"instagr\.am/p/([A-Za-z0-9_-]+)", u, re.I)
     if m:
         return m.group(1)
     return ""
@@ -627,6 +741,14 @@ def default_universal_video_downloader_config() -> dict[str, Any]:
             "scroll_until_end": True,
             "show_browser": False,
         },
+        "instagram_reels": {
+            "cookie_path": "",
+            "max_collect": 120,
+            "max_scroll_rounds": 60,
+            "max_scan_minutes": 15,
+            "scroll_until_end": True,
+            "show_browser": False,
+        },
     }
 
 
@@ -651,9 +773,12 @@ def load_universal_video_downloader_config() -> dict[str, Any]:
     dl.update(dict(uvd.get("download") or {}))
     fb = dict(base["facebook_reels"])
     fb.update(dict(uvd.get("facebook_reels") or {}))
+    ig = dict(base["instagram_reels"])
+    ig.update(dict(uvd.get("instagram_reels") or {}))
     merged["yt_dlp"] = yt
     merged["download"] = dl
     merged["facebook_reels"] = fb
+    merged["instagram_reels"] = ig
     return {"universal_video_downloader": merged}
 
 
@@ -693,15 +818,84 @@ def persist_facebook_reels_settings(
     cfg_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def persist_instagram_reels_settings(
+    *,
+    cookie_path: str | None = None,
+    max_collect: int | None = None,
+    max_scroll_rounds: int | None = None,
+    max_scan_minutes: int | None = None,
+    scroll_until_end: bool | None = None,
+) -> None:
+    """Merge ``instagram_reels`` vào ``config/universal_video_downloader.json``. Chỉ cập nhật tham số khác ``None``."""
+    cfg_path = project_root() / "config" / "universal_video_downloader.json"
+    raw: dict[str, Any] = {}
+    if cfg_path.is_file():
+        try:
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    uvd = dict(raw.get("universal_video_downloader") or {})
+    ig = dict(uvd.get("instagram_reels") or {})
+    if cookie_path is not None:
+        ig["cookie_path"] = str(cookie_path or "").strip()
+    if max_collect is not None:
+        ig["max_collect"] = max(10, min(UV_MAX_PLAYLIST_ENTRIES, int(max_collect)))
+    if max_scroll_rounds is not None:
+        ig["max_scroll_rounds"] = max(5, min(280, int(max_scroll_rounds)))
+    if max_scan_minutes is not None:
+        ig["max_scan_minutes"] = max(1, min(180, int(max_scan_minutes)))
+    if scroll_until_end is not None:
+        ig["scroll_until_end"] = bool(scroll_until_end)
+    uvd["instagram_reels"] = ig
+    raw["universal_video_downloader"] = uvd
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def detect_platform(url: str) -> str:
     u = url.lower()
     if "youtube.com" in u or "youtu.be" in u:
         return "youtube"
     if "tiktok.com" in u:
         return "tiktok"
+    if "instagram.com" in u or "instagr.am" in u:
+        return "instagram"
     if "facebook.com" in u or "fb.watch" in u:
         return "facebook"
     return "unknown"
+
+
+_IG_AUTH_HINT = (
+    "\n\n── Gợi ý (Instagram) ──\n"
+    "Reel/Post công khai: dán link trực tiếp «/reel/…» hoặc «/p/…».\n"
+    "Quét profile/tab Reels: cần đăng nhập — export cookie trình duyệt (Netscape JSON) "
+    "và đặt ``cookie_path`` trong config ``universal_video_downloader.json`` hoặc dùng "
+    "``--cookies-from-browser`` khi chạy yt-dlp tay.\n"
+    "Cập nhật yt-dlp: ``pip install -U yt-dlp``."
+)
+
+
+def augment_instagram_auth_message(url: str, err: str) -> str:
+    """Thêm hướng dẫn khi Instagram báo login/private/unsupported."""
+    if not err or "instagram" not in str(url or "").lower():
+        return err
+    low = err.lower()
+    if any(
+        k in low
+        for k in (
+            "login",
+            "private",
+            "cookies",
+            "sign in",
+            "authentication",
+            "unsupported url",
+            "not available",
+        )
+    ):
+        return err.rstrip() + _IG_AUTH_HINT
+    return err
 
 
 _FB_PROFILE_UNSUPPORTED_HINT = (
@@ -808,6 +1002,31 @@ def classify_url_type(url: str) -> str:
             return "profile"
         if "facebook.com/reel/" in u:
             return "single_video"
+    if "instagram.com" in u or "instagr.am" in u:
+        if re.search(r"instagram\.com/(reel|p|tv)/[A-Za-z0-9_-]+", u):
+            return "single_video"
+        if re.search(r"instagr\.am/p/[A-Za-z0-9_-]+", u):
+            return "single_video"
+        if re.search(r"instagram\.com/[^/]+/reels/?(?:[?#].*)?$", u):
+            return "profile"
+        m = re.match(r"https?://(?:www\.)?instagram\.com/([^/?#]+)/?(?:[?#].*)?$", url.strip(), re.I)
+        if m:
+            seg = m.group(1).lower()
+            reserved = {
+                "p",
+                "reel",
+                "reels",
+                "stories",
+                "explore",
+                "accounts",
+                "direct",
+                "tv",
+                "about",
+                "legal",
+                "developer",
+            }
+            if seg not in reserved:
+                return "profile"
     if "/videos/" in u:
         return "single_video"
     return "unknown"
@@ -896,6 +1115,106 @@ class DownloadFolderManager:
                 Path(output_dir) / "%(extractor)s" / "%(upload_date|unknown_date)s_%(id)s_%(title).80s.%(ext)s"
             )
         return str(Path(output_dir) / "%(upload_date|unknown_date)s_%(id)s_%(title).80s.%(ext)s")
+
+
+def _parse_download_job_time(raw: Any) -> float:
+    s = str(raw or "").strip()
+    if not s:
+        return 0.0
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return 0.0
+
+
+def build_download_job_combo_options(
+    jobs: list[dict[str, Any]],
+    videos: list[dict[str, Any]],
+    *,
+    show_empty: bool = False,
+) -> tuple[list[str], dict[str, str]]:
+    """
+    Nhãn combobox «Job tải» cho Video Editor.
+
+    Luôn hiện job có video; job ``completed``/``running``/``failed`` dù chưa ghi metadata video;
+    job ``pending`` rỗng chỉ khi bật «Hiện cả job rỗng/lỗi».
+    """
+    count_by_job: dict[str, int] = {}
+    for r in videos:
+        if not isinstance(r, dict):
+            continue
+        jid = str(r.get("download_job_id") or "").strip()
+        if not jid:
+            continue
+        count_by_job[jid] = int(count_by_job.get(jid, 0)) + 1
+
+    jobs_by_id: dict[str, dict[str, Any]] = {}
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        jid = str(j.get("id") or "").strip()
+        if jid:
+            jobs_by_id[jid] = j
+
+    def _label_for(jid: str, j: dict[str, Any] | None, vcount: int) -> str:
+        plat = str((j or {}).get("platform") or "").strip() or "unknown"
+        st = str((j or {}).get("status") or "").strip() or "-"
+        jname = str((j or {}).get("name") or "").strip()
+        short_id = jid[-6:] if len(jid) > 6 else jid
+        if jname:
+            return f"{jname} | {plat} | {vcount} video | {st} | #{short_id}"
+        return f"{plat} | {vcount} video | {st} | #{short_id}"
+
+    def _include_job(jid: str, vcount: int, j: dict[str, Any] | None) -> bool:
+        if vcount > 0:
+            return True
+        if show_empty:
+            return True
+        st = str((j or {}).get("status") or "").strip().lower()
+        return st in ("completed", "running", "failed", "need_manual_upload")
+
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+
+    jobs_sorted = sorted(
+        [j for j in jobs if isinstance(j, dict)],
+        key=lambda j: (
+            int(count_by_job.get(str(j.get("id") or "").strip(), 0)),
+            _parse_download_job_time(j.get("updated_at")),
+            _parse_download_job_time(j.get("completed_at")),
+            _parse_download_job_time(j.get("created_at")),
+        ),
+        reverse=True,
+    )
+    for j in jobs_sorted:
+        jid = str(j.get("id") or "").strip()
+        if not jid or jid in seen:
+            continue
+        vcount = int(count_by_job.get(jid, 0))
+        if not _include_job(jid, vcount, j):
+            continue
+        ordered_ids.append(jid)
+        seen.add(jid)
+
+    for jid, vcount in sorted(count_by_job.items(), key=lambda x: (-x[1], x[0])):
+        if jid in seen or vcount <= 0:
+            continue
+        ordered_ids.append(jid)
+        seen.add(jid)
+
+    vals: list[str] = []
+    new_map: dict[str, str] = {}
+    for jid in ordered_ids:
+        j = jobs_by_id.get(jid)
+        vcount = int(count_by_job.get(jid, 0))
+        label = _label_for(jid, j, vcount)
+        if label in new_map:
+            label = f"{label} ({jid[-4:]})"
+        vals.append(label)
+        new_map[label] = jid
+    return vals, new_map
 
 
 class DownloadMetadataStore:
@@ -1294,6 +1613,7 @@ class UniversalYTDLPWrapper:
         if p.returncode != 0:
             err = (p.stderr or p.stdout or "").strip()
             err = augment_facebook_unsupported_url_message(url, err[:1200])
+            err = augment_instagram_auth_message(url, err[:1200])
             return {"success": False, "error": err[:2200]}
         try:
             data = json.loads(p.stdout or "{}")
@@ -1338,6 +1658,11 @@ class UniversalYTDLPWrapper:
             m = re.search(r"tiktok\.com/@[^/?#]+", source_url, re.I)
             if m:
                 return f"{m.group(0)}/video/{vid}"
+        if platform == "instagram" and vid and re.fullmatch(r"[A-Za-z0-9_-]{5,}", vid):
+            low_src = source_url.lower()
+            if "/reel/" in low_src or str(entry.get("ie_key") or "").lower() == "instagramreel":
+                return f"https://www.instagram.com/reel/{vid}/"
+            return f"https://www.instagram.com/p/{vid}/"
         return ""
 
     @staticmethod
@@ -1457,8 +1782,11 @@ class UniversalYTDLPWrapper:
         if not raw:
             return {"success": False, "error": "Thiếu URL."}
         platform = detect_platform(raw)
-        if platform not in ("youtube", "tiktok"):
-            return {"success": False, "error": "Chỉ hỗ trợ quét danh sách cho YouTube hoặc TikTok."}
+        if platform not in ("youtube", "tiktok", "instagram"):
+            return {
+                "success": False,
+                "error": "Chỉ hỗ trợ quét danh sách cho YouTube, TikTok hoặc Instagram.",
+            }
         ut = classify_url_type(raw)
         if platform == "youtube" and ut not in ("playlist", "channel"):
             return {
@@ -1467,6 +1795,14 @@ class UniversalYTDLPWrapper:
             }
         if platform == "tiktok" and ut != "profile":
             return {"success": False, "error": "TikTok cần URL profile (dạng https://www.tiktok.com/@user)."}
+        if platform == "instagram" and ut != "profile":
+            return {
+                "success": False,
+                "error": (
+                    "Instagram cần URL profile hoặc tab Reels "
+                    "(ví dụ https://www.instagram.com/username/ hoặc …/username/reels/)."
+                ),
+            }
         n = max(1, min(int(max_entries or 500), UV_MAX_PLAYLIST_ENTRIES))
         if not _orchestrating:
             chunk = int(self._yt.get("playlist_scan_chunk") or UV_PLAYLIST_SCAN_CHUNK)
@@ -1512,7 +1848,7 @@ class UniversalYTDLPWrapper:
         cmd.append(raw)
         timeout = int(self._yt.get("timeout_sec") or 600)
         # Trần theo số entry trong lô; TikTok một lần có thể cần timeout dài hơn.
-        scan_cap = 1800 if platform == "tiktok" and not _orchestrating else 900
+        scan_cap = 1800 if platform in ("tiktok", "instagram") and not _orchestrating else 900
         timeout_scan = min(timeout, max(90, min(scan_cap, page_count * 6 + 72)))
         try:
             p = subprocess.Popen(
@@ -1980,6 +2316,7 @@ class UniversalYTDLPWrapper:
                     }
                 err_snip = err_full.strip()[-1200:] or f"yt-dlp exit {rc}"
                 err_snip = augment_facebook_unsupported_url_message(effective_url, err_snip)
+                err_snip = augment_instagram_auth_message(effective_url, err_snip)
                 if not (use_batch_file and filepaths):
                     if cookie_tmp is not None:
                         cookie_tmp.unlink(missing_ok=True)
@@ -2710,6 +3047,7 @@ class UniversalVideoDownloader:
             job["status"] = "completed"
             job["error_message"] = ""
         job["completed_at"] = _now_iso()
+        job["updated_at"] = _now_iso()
         self._store.save_job(job)
         return job
 

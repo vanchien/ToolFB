@@ -82,9 +82,14 @@ from src.services.video_editor.stock_audio_library import (
     stock_topic_filter_labels,
 )
 from src.services.universal_video_downloader import (
+    DOWNLOAD_JOB_FINISHED_TK_EVENT,
     DownloadMetadataStore,
     _extract_hashtags_from_text,
+    build_download_job_combo_options,
+    clear_root_pending_download_job,
+    consume_auto_import_download_job,
     ensure_downloader_layout,
+    get_root_pending_download_job,
 )
 from src.utils.ffmpeg_paths import (
     ffplay_resolve_skips_ensure_heavy_work,
@@ -363,7 +368,9 @@ def _ve_resolve_combo_display(
     return s
 
 
-def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[], None], Callable[[], None]]:
+def build_video_editor_tab(
+    parent: ttk.Frame, root: tk.Tk
+) -> tuple[Callable[[], None], Callable[[], None], Callable[[], None]]:
     ve_paths = ensure_video_editor_layout()
     pm = VideoEditorProjectManager(paths=ve_paths)
     mm = MediaManager(paths=ve_paths)
@@ -667,24 +674,37 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
     dl_job_map: dict[str, str] = {}
     var_show_empty_jobs = tk.BooleanVar(value=False)
     var_dl_job = tk.StringVar(value="")
-    _auto_import_pending_job = {"armed": False}
+    _dl_paths = ensure_downloader_layout()
+    _dl_combo_refresh = {"gen": 0, "after_id": ""}
     ttk.Label(top_job, text="B2 - Job tải:").pack(side=tk.LEFT, padx=(0, 4))
     cb_dl_job = ttk.Combobox(top_job, textvariable=var_dl_job, width=50, state="readonly")
     cb_dl_job.pack(side=tk.LEFT, padx=(0, 4))
-    pending_editor_job_file = ensure_downloader_layout()["root"] / "pending_video_editor_job.json"
 
-    def _consume_pending_editor_job_id() -> str:
-        if not pending_editor_job_file.is_file():
-            return ""
-        try:
-            raw = json.loads(pending_editor_job_file.read_text(encoding="utf-8"))
-        except Exception:
-            pending_editor_job_file.unlink(missing_ok=True)
-            return ""
-        pending_editor_job_file.unlink(missing_ok=True)
-        if not isinstance(raw, dict):
-            return ""
-        return str(raw.get("job_id") or "").strip()
+    def _select_download_job_in_combo(jid: str) -> bool:
+        target = str(jid or "").strip()
+        if not target:
+            return False
+        for label, mapped in dl_job_map.items():
+            if mapped == target:
+                var_dl_job.set(label)
+                return True
+        return False
+
+    def _ensure_default_project_for_pipeline() -> bool:
+        """Tự tạo/chọn project khi luồng tải → import (không hỏi tên nếu chưa có project)."""
+        nonlocal project
+        if project:
+            return True
+        if project_ids:
+            load_project_id(project_ids[0])
+            return project is not None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        project = pm.create_project(f"Tải_{stamp}")
+        refresh_project_combo()
+        var_project.set(str(project.get("id") or ""))
+        refresh_all()
+        notify(f"Đã tạo dự án «{project.get('name')}» cho luồng import.")
+        return True
 
     def _apply_download_job_combo_ui(
         *,
@@ -692,97 +712,81 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         new_map: dict[str, str],
         keep_current_jid: str,
         pending_jid: str,
+        refresh_gen: int,
     ) -> None:
+        if refresh_gen != _dl_combo_refresh["gen"]:
+            return
         dl_job_map.clear()
         dl_job_map.update(new_map)
         cb_dl_job.configure(values=vals)
         if pending_jid:
-            for label, jid in dl_job_map.items():
-                if jid == pending_jid:
-                    var_dl_job.set(label)
-                    _auto_import_pending_job["armed"] = True
-                    break
-            else:
-                if vals and not str(var_dl_job.get() or "").strip():
-                    var_dl_job.set(vals[0])
+            if not _select_download_job_in_combo(pending_jid) and vals:
+                var_dl_job.set(vals[0])
         elif vals and not str(var_dl_job.get() or "").strip():
             var_dl_job.set(vals[0])
         elif keep_current_jid:
-            for label, jid in dl_job_map.items():
-                if jid == keep_current_jid:
-                    var_dl_job.set(label)
-                    break
-            else:
+            if not _select_download_job_in_combo(keep_current_jid):
                 var_dl_job.set(vals[0] if vals else "")
-        if _auto_import_pending_job["armed"]:
-            _auto_import_pending_job["armed"] = False
-            root.after(80, import_from_download_job)
+        if pending_jid and consume_auto_import_download_job(root):
+            root.after(120, _auto_import_pending_download_job)
 
-    def refresh_download_job_combo() -> None:
+    def _auto_import_pending_download_job() -> None:
+        """Import job đã chọn — chỉ khi user bấm «Mở Video Editor» hoặc xác nhận sau tải."""
+        if _import_dl_busy["v"]:
+            root.after(150, _auto_import_pending_download_job)
+            return
+        if not _ensure_default_project_for_pipeline():
+            root.after(150, _auto_import_pending_download_job)
+            return
+        import_from_download_job()
+
+    def _run_download_job_combo_refresh(refresh_gen: int) -> None:
         keep_label = str(var_dl_job.get() or "").strip()
         keep_current_jid = dl_job_map.get(keep_label, "").strip()
         show_empty = bool(var_show_empty_jobs.get())
 
         def _worker() -> None:
-            vals: list[str] = []
-            new_map: dict[str, str] = {}
-            all_videos = dl_store.list_downloaded_videos()
-            count_by_job: dict[str, int] = {}
-            for r in all_videos:
-                jid = str(r.get("download_job_id") or "").strip()
-                if not jid:
-                    continue
-                count_by_job[jid] = int(count_by_job.get(jid, 0)) + 1
-
-            def _parse_job_time(raw: Any) -> float:
-                s = str(raw or "").strip()
-                if not s:
-                    return 0.0
-                try:
-                    if s.endswith("Z"):
-                        s = s[:-1] + "+00:00"
-                    return datetime.fromisoformat(s).timestamp()
-                except Exception:
-                    return 0.0
-
-            jobs_raw = [j for j in dl_store.list_jobs() if isinstance(j, dict)]
-            jobs_sorted = sorted(
-                jobs_raw,
-                key=lambda j: (
-                    int(count_by_job.get(str(j.get("id") or "").strip(), 0)),
-                    _parse_job_time(j.get("updated_at")),
-                    _parse_job_time(j.get("created_at")),
-                ),
-                reverse=True,
+            vals, new_map = build_download_job_combo_options(
+                dl_store.list_jobs(),
+                dl_store.list_downloaded_videos(),
+                show_empty=show_empty,
             )
-            for j in jobs_sorted:
-                jid = str(j.get("id") or "").strip()
-                if not jid:
-                    continue
-                plat = str(j.get("platform") or "").strip() or "unknown"
-                st = str(j.get("status") or "").strip() or "-"
-                jname = str(j.get("name") or "").strip()
-                vcount = int(count_by_job.get(jid, 0))
-                if vcount <= 0 and not show_empty:
-                    continue
-                short_id = jid[-6:] if len(jid) > 6 else jid
-                if jname:
-                    label = f"{jname} | {plat} | {vcount} video | {st} | #{short_id}"
-                else:
-                    label = f"{plat} | {vcount} video | {st} | #{short_id}"
-                vals.append(label)
-                new_map[label] = jid
-            pending_jid = _consume_pending_editor_job_id()
+            pending_jid = get_root_pending_download_job(root, paths=_dl_paths)
             _schedule_on_main_thread(
                 lambda: _apply_download_job_combo_ui(
                     vals=vals,
                     new_map=new_map,
                     keep_current_jid=keep_current_jid,
                     pending_jid=pending_jid,
+                    refresh_gen=refresh_gen,
                 )
             )
 
         threading.Thread(target=_worker, name="ve_refresh_dl_jobs", daemon=True).start()
+
+    def refresh_download_job_combo() -> None:
+        """Làm mới combobox job tải (debounce ~250ms khi gọi liên tiếp)."""
+        _dl_combo_refresh["gen"] += 1
+        refresh_gen = _dl_combo_refresh["gen"]
+        prev_after = str(_dl_combo_refresh.get("after_id") or "")
+        if prev_after:
+            try:
+                root.after_cancel(prev_after)
+            except tk.TclError:
+                pass
+
+        def _fire() -> None:
+            if refresh_gen != _dl_combo_refresh["gen"]:
+                return
+            _dl_combo_refresh["after_id"] = ""
+            _run_download_job_combo_refresh(refresh_gen)
+
+        _dl_combo_refresh["after_id"] = root.after(250, _fire)
+
+    def _on_download_job_finished_event(_event: tk.Event | None = None) -> None:
+        refresh_download_job_combo()
+
+    root.bind(DOWNLOAD_JOB_FINISHED_TK_EVENT, _on_download_job_finished_event, add="+")
 
     _import_dl_busy = {"v": False}
 
@@ -791,20 +795,16 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         if _import_dl_busy["v"]:
             notify("Đang nạp video từ job — vui lòng chờ.")
             return
-        if not project:
-            messagebox.showinfo("Video Editor", "Tạo hoặc chọn project trước.")
+        if not _ensure_default_project_for_pipeline():
+            messagebox.showinfo("Video Editor", "Không tạo được dự án — bấm «1) Dự án mới».", parent=root)
             return
         picked = str(var_dl_job.get() or "").strip()
         jid = dl_job_map.get(picked, "").strip()
         if not jid:
             messagebox.showwarning("Video Editor", "Chưa chọn job tải.", parent=root)
             return
-        rows = [r for r in dl_store.list_downloaded_videos() if str(r.get("download_job_id") or "").strip() == jid]
-        if not rows:
-            messagebox.showwarning("Video Editor", "Job này chưa có video đã tải.", parent=root)
-            return
         _import_dl_busy["v"] = True
-        notify(f"Đang nạp {len(rows)} video từ job (chạy nền)…")
+        notify("Đang nạp video từ job (chạy nền)…")
         proj_snapshot = project
 
         def _merge_hashtags_from_download_row(row: dict[str, Any], desc: str) -> list[str]:
@@ -830,12 +830,29 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
             return out
 
         def _worker() -> None:
+            rows = [
+                r
+                for r in dl_store.list_downloaded_videos()
+                if str(r.get("download_job_id") or "").strip() == jid
+            ]
+            if not rows:
+                def _no_rows() -> None:
+                    _import_dl_busy["v"] = False
+                    messagebox.showwarning(
+                        "Video Editor",
+                        "Job này chưa có video đã tải — bấm «2) Nạp danh sách job» rồi thử lại.",
+                        parent=root,
+                    )
+
+                _schedule_on_main_thread(_no_rows)
+                return
             existing = {str(m.get("path") or "") for m in (proj_snapshot.get("media") or []) if isinstance(m, dict)}
             added = 0
             failed = 0
             source_video_ids: list[str] = []
             source_video_meta_by_id: dict[str, dict[str, Any]] = {}
             total = len(rows)
+            _schedule_on_main_thread(lambda t=total: notify(f"Đang nạp {t} video từ job…"))
             for idx, r in enumerate(rows, start=1):
                 src_vid = str(r.get("id") or "").strip()
                 vp = Path(str(r.get("video_path") or "")).expanduser().resolve()
@@ -911,6 +928,8 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
 
             def _done() -> None:
                 _import_dl_busy["v"] = False
+                if added > 0 or source_video_ids:
+                    clear_root_pending_download_job(root, paths=_dl_paths)
                 refresh_media_tree()
                 root.after(30, refresh_timeline)
                 notify(msg)
@@ -10712,4 +10731,4 @@ def build_video_editor_tab(parent: ttk.Frame, root: tk.Tk) -> tuple[Callable[[],
         except Exception:
             pass
 
-    return schedule_ve_background_audio_fill, shutdown_video_editor_subprocesses
+    return schedule_ve_background_audio_fill, shutdown_video_editor_subprocesses, refresh_download_job_combo

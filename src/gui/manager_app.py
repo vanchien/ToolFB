@@ -1069,9 +1069,11 @@ class _ManagerWindow:
         ve_host.grid(row=0, column=0, sticky="nsew")
         ve_host.columnconfigure(0, weight=1)
         ve_host.rowconfigure(0, weight=1)
-        self._schedule_ve_background_fill, self._shutdown_video_editor_tab = build_video_editor_tab(
-            ve_host, self._root
-        )
+        (
+            self._schedule_ve_background_fill,
+            self._shutdown_video_editor_tab,
+            self._refresh_ve_download_jobs,
+        ) = build_video_editor_tab(ve_host, self._root)
         self._tab_ve_notebook_child = tab_ve
 
         tab_dl = ttk.Frame(nb, padding=4)
@@ -1342,6 +1344,12 @@ class _ManagerWindow:
             if fn is not None:
                 try:
                     fn()
+                except Exception:
+                    pass
+            refresh_dl = getattr(self, "_refresh_ve_download_jobs", None)
+            if refresh_dl is not None:
+                try:
+                    refresh_dl()
                 except Exception:
                     pass
         dl_tab = self._tab_dl_notebook_child

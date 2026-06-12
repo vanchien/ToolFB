@@ -21,18 +21,27 @@ from src.services.facebook_reels_catalog import (
     normalize_facebook_reels_tab_url,
     scan_facebook_profile_reels_page,
 )
+from src.services.instagram_reels_catalog import (
+    normalize_instagram_reels_tab_url,
+    scan_instagram_profile_reels_page,
+)
 from src.services.universal_video_downloader import (
+    DOWNLOAD_JOB_FINISHED_TK_EVENT,
     UV_DOWNLOAD_SEQUENTIAL_THRESHOLD,
     UV_MAX_PLAYLIST_ENTRIES,
     UniversalVideoDownloader,
     _extract_hashtags_from_text,
+    arm_auto_import_download_job,
     classify_url_type,
     detect_platform,
     ensure_downloader_layout,
     extract_failed_download_pairs,
     load_universal_video_downloader_config,
     persist_facebook_reels_settings,
+    persist_instagram_reels_settings,
+    set_root_pending_download_job,
     write_failed_download_urls_log,
+    write_pending_video_editor_job,
 )
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.gui.ui_responsiveness import (
@@ -178,10 +187,19 @@ class AIVideoDialog:
         self._uv_yt_entry_rows: list[dict[str, str]] = []
         self._tree_tt_channel: ttk.Treeview | None = None
         self._uv_tt_entry_rows: list[dict[str, str]] = []
+        self._tree_ig_channel: ttk.Treeview | None = None
+        self._uv_ig_entry_rows: list[dict[str, str]] = []
         self._var_uv_yt_list_max = tk.StringVar(value="100")
         self._var_uv_yt_scan_status = tk.StringVar(value="")
         self._var_uv_tt_list_max = tk.StringVar(value="100")
         self._var_uv_tt_scan_status = tk.StringVar(value="")
+        self._var_uv_ig_list_max = tk.StringVar(value="100")
+        self._var_uv_ig_scan_status = tk.StringVar(value="")
+        self._var_uv_ig_cookie = tk.StringVar(value="")
+        self._var_uv_ig_show_browser = tk.BooleanVar(value=False)
+        self._var_uv_ig_max_scroll = tk.StringVar(value="60")
+        self._var_uv_ig_scan_minutes = tk.StringVar(value="15")
+        self._var_uv_ig_scroll_until_end = tk.BooleanVar(value=True)
         self._var_uv_job_name = tk.StringVar(value="")
         self._uv_last_saved_job_name: str = ""
         self._var_uv_lib_job_filter = tk.StringVar(value="Tất cả job")
@@ -207,8 +225,10 @@ class AIVideoDialog:
         self._uv_fb_tree_gen = 0
         self._uv_yt_tree_gen = 0
         self._uv_tt_tree_gen = 0
+        self._uv_ig_tree_gen = 0
         self._uv_fb_logical_select_all = False
         self._uv_yt_logical_select_all = False
+        self._uv_ig_logical_select_all = False
         self._uv_tt_logical_select_all = False
         self._uv_lib_tree_gen = 0
         self._uv_lib_refresh_gen = 0
@@ -618,10 +638,10 @@ class AIVideoDialog:
         ttk.Label(
             host,
             text=(
-                "Luồng: (1) nhập URL + thư mục lưu  (2) quét Reels / YouTube / TikTok  "
+                "Luồng: (1) nhập URL + thư mục lưu  (2) quét Reels / YouTube / TikTok / Instagram  "
                 "(3) «Chọn hết» nếu cần → «Tải … đã chọn»  (4) xem «Video đã tải».\n"
                 "Nhiều video đã chọn được tải trong một lần chạy yt-dlp (batch), nhanh hơn gọi tuần tự từng URL.\n"
-                "Mỗi khối Bước 2 (Facebook / YouTube / TikTok) có nút ▼/▶ để thu gọn khi cần chỗ màn hình."
+                "Mỗi khối Bước 2 (Facebook / YouTube / TikTok / Instagram) có nút ▼/▶ để thu gọn khi cần chỗ màn hình."
             ),
             wraplength=840,
             justify=tk.LEFT,
@@ -642,7 +662,7 @@ class AIVideoDialog:
             text=(
                 "Thứ tự tìm yt-dlp: PATH hệ thống → file trong tools/yt-dlp/ (bản .exe đóng gói) "
                 "→ python -m yt_dlp (chỉ khi chạy từ mã nguồn / pip). "
-                "Facebook Reels: dùng cookie JSON khi cần đăng nhập."
+                "Facebook Reels / Instagram profile: dùng cookie JSON khi cần đăng nhập (config universal_video_downloader.json)."
             ),
             wraplength=820,
             justify=tk.LEFT,
@@ -667,9 +687,9 @@ class AIVideoDialog:
         self._var_uv_info_json = tk.BooleanVar(value=bool(yt_cfg.get("write_info_json", True)))
         self._var_uv_thumbnail = tk.BooleanVar(value=bool(yt_cfg.get("write_thumbnail", False)))
         var_detect_hint = tk.StringVar(value="")
-        var_quick_guide = tk.StringVar(value="Mẹo nhanh: dán URL để tự nhận diện YouTube / Facebook / TikTok.")
+        var_quick_guide = tk.StringVar(value="Mẹo nhanh: dán URL để tự nhận diện YouTube / Facebook / TikTok / Instagram.")
         var_platform_badge = tk.StringVar(value="AUTO")
-        section_state: dict[str, Any] = {"fb_fr": None, "yt_fr": None, "tt_fr": None, "view": None}
+        section_state: dict[str, Any] = {"fb_fr": None, "yt_fr": None, "tt_fr": None, "ig_fr": None, "view": None}
 
         job_row = ttk.Frame(form)
         job_row.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -708,7 +728,7 @@ class AIVideoDialog:
         cb_platform = ttk.Combobox(
             quick,
             textvariable=self._var_uv_platform,
-            values=["Tự nhận diện", "youtube", "tiktok", "facebook", "unknown"],
+            values=["Tự nhận diện", "youtube", "tiktok", "instagram", "facebook", "unknown"],
             state="readonly",
             width=20,
         )
@@ -738,7 +758,7 @@ class AIVideoDialog:
             if not url:
                 var_detect_hint.set("Tự nhận diện: chờ nhập URL.")
                 var_quick_guide.set(
-                    "Ví dụ: YouTube /@tenkenh/shorts • Facebook /profile/reels hoặc ?sk=reels_tab • TikTok /@user/video/<id>"
+                    "Ví dụ: YouTube /@kênh/shorts • Facebook /profile/reels • TikTok /@user • Instagram /user/reels/ hoặc /reel/…"
                 )
                 _refresh_platform_actions("unknown", "unknown")
                 return
@@ -762,6 +782,10 @@ class AIVideoDialog:
             elif auto_platform == "tiktok":
                 var_quick_guide.set(
                     "TikTok: dán link profile/video và bấm «Tải TikTok URL» để chạy nhanh."
+                )
+            elif auto_platform == "instagram":
+                var_quick_guide.set(
+                    "Instagram: reel/post đơn → «Tải URL hiện tại»; profile/tab Reels → «Quét Instagram» (có thể cần cookie)."
                 )
             else:
                 var_quick_guide.set(
@@ -849,8 +873,35 @@ class AIVideoDialog:
             row=0, column=5, sticky="w", padx=(8, 0)
         )
 
+        ig_prep = ttk.LabelFrame(form, text="Chuẩn bị Instagram (nếu quét profile/Reels)", padding=8)
+        ig_prep.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ig_prep.columnconfigure(1, weight=1)
+        ttk.Label(
+            ig_prep,
+            text=(
+                "Quét tab Reels dùng Playwright (yt-dlp chưa hỗ trợ …/username/reels/). "
+                "Profile riêng tư: chọn file cookie Playwright (storage_state JSON)."
+            ),
+            foreground="#555",
+            wraplength=860,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        ig_prep_row = ttk.Frame(ig_prep)
+        ig_prep_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ig_prep_row.columnconfigure(1, weight=1)
+        ttk.Label(ig_prep_row, text="Cookie IG").grid(row=0, column=0, sticky="w")
+        ttk.Entry(ig_prep_row, textvariable=self._var_uv_ig_cookie, width=52).grid(
+            row=0, column=1, sticky="ew", padx=(6, 8)
+        )
+        ttk.Button(ig_prep_row, text="Chọn file…", command=self._on_uv_pick_ig_cookie).grid(row=0, column=2, sticky="w")
+        ttk.Checkbutton(
+            ig_prep_row,
+            text="Hiện browser khi quét",
+            variable=self._var_uv_ig_show_browser,
+        ).grid(row=0, column=3, sticky="w", padx=(10, 0))
+
         platform_ops = ttk.LabelFrame(form, text="Quét danh sách (theo URL / nền tảng ở trên)", padding=8)
-        platform_ops.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        platform_ops.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         var_platform_ops = tk.StringVar(value="Dán URL để hệ thống tự chọn đúng luồng thao tác.")
         ttk.Label(platform_ops, textvariable=var_platform_ops, wraplength=860, justify=tk.LEFT).pack(anchor="w")
         platform_scan_opts = ttk.Frame(platform_ops)
@@ -881,17 +932,30 @@ class AIVideoDialog:
         ttk.Label(tt_scan_opts, text=f"(1–{UV_CHANNEL_LIST_MAX})", foreground="#666", font=("Segoe UI", 8)).grid(
             row=0, column=2, sticky="w"
         )
+        ig_scan_opts = ttk.Frame(platform_scan_opts)
+        ttk.Label(ig_scan_opts, text="Reel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(ig_scan_opts, textvariable=self._var_uv_ig_list_max, width=6).grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(ig_scan_opts, text="Vòng").grid(row=0, column=2, sticky="w")
+        ttk.Entry(ig_scan_opts, textvariable=self._var_uv_ig_max_scroll, width=6).grid(row=0, column=3, sticky="w", padx=(6, 12))
+        ttk.Label(ig_scan_opts, text="Phút").grid(row=0, column=4, sticky="w")
+        ttk.Entry(ig_scan_opts, textvariable=self._var_uv_ig_scan_minutes, width=6).grid(row=0, column=5, sticky="w", padx=(6, 12))
+        ttk.Checkbutton(ig_scan_opts, text="Cuộn tới hết trang", variable=self._var_uv_ig_scroll_until_end).grid(
+            row=0, column=6, sticky="w", padx=(6, 12)
+        )
+        ttk.Button(ig_scan_opts, text="Lưu giới hạn", command=self._on_uv_save_ig_reel_limits).grid(row=0, column=7, sticky="w")
         platform_ops_btns = ttk.Frame(platform_ops)
         platform_ops_btns.pack(anchor="w", pady=(6, 0))
         btn_ops_generic_dl = ttk.Button(platform_ops_btns, text="Tải URL hiện tại", command=self._on_uv_download)
         btn_ops_fb_scan = ttk.Button(platform_ops_btns, text="1) Quét Reels Facebook", command=self._on_uv_scan_fb_reels)
         btn_ops_yt_scan = ttk.Button(platform_ops_btns, text="1) Quét danh sách YouTube", command=self._on_uv_scan_yt_channel)
         btn_ops_tt_scan = ttk.Button(platform_ops_btns, text="1) Quét kênh TikTok", command=self._on_uv_scan_tt_channel)
+        btn_ops_ig_scan = ttk.Button(platform_ops_btns, text="1) Quét Instagram", command=self._on_uv_scan_ig_channel)
         for b in (
             btn_ops_generic_dl,
             btn_ops_fb_scan,
             btn_ops_yt_scan,
             btn_ops_tt_scan,
+            btn_ops_ig_scan,
         ):
             self._uv_busy_disable_widgets.append(b)
 
@@ -901,6 +965,7 @@ class AIVideoDialog:
                 btn_ops_fb_scan,
                 btn_ops_yt_scan,
                 btn_ops_tt_scan,
+                btn_ops_ig_scan,
             ):
                 b.pack_forget()
             for b in buttons:
@@ -912,6 +977,7 @@ class AIVideoDialog:
             fb_fr = section_state.get("fb_fr")
             yt_fr = section_state.get("yt_fr")
             tt_fr = section_state.get("tt_fr")
+            ig_fr = section_state.get("ig_fr")
 
             def _set_badge(text: str, bg: str) -> None:
                 var_platform_badge.set(text)
@@ -920,11 +986,13 @@ class AIVideoDialog:
                 except Exception:
                     pass
 
-            def _show_sections(show_fb: bool, show_yt: bool, show_tt: bool, view_key: str) -> None:
+            def _show_sections(
+                show_fb: bool, show_yt: bool, show_tt: bool, show_ig: bool, view_key: str
+            ) -> None:
                 if section_state.get("view") == view_key:
                     return
                 section_state["view"] = view_key
-                for f in (fb_scan_opts, yt_scan_opts, tt_scan_opts):
+                for f in (fb_scan_opts, yt_scan_opts, tt_scan_opts, ig_scan_opts):
                     f.pack_forget()
                 if show_fb:
                     fb_scan_opts.pack(anchor="w")
@@ -932,6 +1000,8 @@ class AIVideoDialog:
                     yt_scan_opts.pack(anchor="w")
                 elif show_tt:
                     tt_scan_opts.pack(anchor="w")
+                elif show_ig:
+                    ig_scan_opts.pack(anchor="w")
                 if fb_prep_fr is not None:
                     if show_fb:
                         fb_prep_fr.grid()
@@ -952,13 +1022,18 @@ class AIVideoDialog:
                         tt_fr.grid()
                     else:
                         tt_fr.grid_remove()
+                if ig_fr is not None:
+                    if show_ig:
+                        ig_fr.grid()
+                    else:
+                        ig_fr.grid_remove()
                 self._sync_uv_download_scrollregion(scroll_to_content=False)
 
             if p == "youtube":
                 _set_badge("▶ YouTube", "#cc0000")
                 var_platform_ops.set("YouTube: quét danh sách (Bước 1). Chọn dòng → «Tải video đã chọn» (một lần yt-dlp nếu chọn nhiều).")
                 _show_platform_buttons([btn_ops_yt_scan])
-                _show_sections(show_fb=False, show_yt=True, show_tt=False, view_key="youtube")
+                _show_sections(show_fb=False, show_yt=True, show_tt=False, show_ig=False, view_key="youtube")
                 return
             if p == "facebook":
                 _set_badge("f Facebook", "#1877F2")
@@ -966,25 +1041,41 @@ class AIVideoDialog:
                     "Facebook: quét Reels (Bước 1) → «Tải hết danh sách» hoặc chọn dòng → «Tải reel đã chọn»."
                 )
                 _show_platform_buttons([btn_ops_fb_scan])
-                _show_sections(show_fb=True, show_yt=False, show_tt=False, view_key="facebook")
+                _show_sections(show_fb=True, show_yt=False, show_tt=False, show_ig=False, view_key="facebook")
                 return
             if p == "tiktok":
                 _set_badge("♪ TikTok", "#111111")
                 var_platform_ops.set("TikTok: quét kênh (Bước 1). Chọn dòng → «Tải TikTok đã chọn» (một lần yt-dlp nếu nhiều).")
                 _show_platform_buttons([btn_ops_tt_scan])
-                _show_sections(show_fb=False, show_yt=False, show_tt=True, view_key="tiktok")
+                _show_sections(show_fb=False, show_yt=False, show_tt=True, show_ig=False, view_key="tiktok")
+                return
+            if p == "instagram":
+                _set_badge("◎ IG", "#E1306C")
+                var_platform_ops.set(
+                    "Instagram: quét tab Reels bằng Playwright (Bước 1). Reel/post đơn → «Tải URL hiện tại». "
+                    "Profile riêng tư: cookie Playwright ở khối Chuẩn bị Instagram."
+                )
+                _show_platform_buttons([btn_ops_ig_scan, btn_ops_generic_dl])
+                _show_sections(show_fb=False, show_yt=False, show_tt=False, show_ig=True, view_key="instagram")
                 return
             _set_badge("◎ AUTO", "#6b7280")
             var_platform_ops.set("Chưa nhận diện nền tảng: có thể tải nhanh URL hiện tại hoặc nhập lại URL rõ hơn.")
             _show_platform_buttons([btn_ops_generic_dl])
-            _show_sections(show_fb=False, show_yt=False, show_tt=False, view_key="unknown")
+            _show_sections(show_fb=False, show_yt=False, show_tt=False, show_ig=False, view_key="unknown")
 
         ent_url.bind("<KeyRelease>", _refresh_detect_hint)
         cb_platform.bind("<<ComboboxSelected>>", _refresh_detect_hint)
         cb_url_type.bind("<<ComboboxSelected>>", _refresh_detect_hint)
 
         fb_cfg = ucfg.get("facebook_reels") or {}
+        ig_cfg = ucfg.get("instagram_reels") or {}
         self._var_uv_fb_cookie.set(str(fb_cfg.get("cookie_path") or "").strip())
+        self._var_uv_ig_cookie.set(str(ig_cfg.get("cookie_path") or "").strip())
+        self._var_uv_ig_list_max.set(str(int(ig_cfg.get("max_collect") or 120)))
+        self._var_uv_ig_max_scroll.set(str(int(ig_cfg.get("max_scroll_rounds") or 60)))
+        self._var_uv_ig_scan_minutes.set(str(int(ig_cfg.get("max_scan_minutes") or 15)))
+        self._var_uv_ig_scroll_until_end.set(bool(ig_cfg.get("scroll_until_end", True)))
+        self._var_uv_ig_show_browser.set(bool(ig_cfg.get("show_browser", False)))
         self._var_uv_fb_max_collect.set(str(int(fb_cfg.get("max_collect") or 300)))
         self._var_uv_fb_max_scroll.set(str(int(fb_cfg.get("max_scroll_rounds") or 100)))
         self._var_uv_fb_scan_minutes.set(str(int(fb_cfg.get("max_scan_minutes") or 30)))
@@ -1165,12 +1256,73 @@ class AIVideoDialog:
         sy_tt.grid(row=0, column=1, sticky="ns")
         sx_tt.grid(row=1, column=0, sticky="ew")
         install_treeview_shortcuts(self._tree_tt_channel, owner=self._top, info_callback=self._set_uv_status)
+
+        self._var_uv_ig_scan_status.set(
+            "Chưa quét. Dán URL profile Instagram hoặc …/username/reels/ ở ô URL phía trên (Playwright)."
+        )
+        ig_coll = _UvCollapsibleSection(
+            host,
+            title="Bước 2 (Instagram) — Quét tab Reels profile để chọn tải",
+            start_open=True,
+            on_toggle=_uv_step2_scroll_sync,
+        )
+        ig_coll.outer.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        ig_coll.outer.columnconfigure(0, weight=1)
+        ig_fr = ttk.Frame(ig_coll.body, padding=8)
+        ig_fr.pack(fill=tk.BOTH, expand=True)
+        ig_fr.columnconfigure(1, weight=1)
+        ttk.Label(
+            ig_fr,
+            text=(
+                "URL profile: https://www.instagram.com/username/ hoặc tab Reels …/username/reels/. "
+                "Reel/post đơn: dùng «Tải URL hiện tại» ở Bước 1."
+            ),
+            wraplength=820,
+            justify=tk.LEFT,
+            foreground="#555",
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(ig_fr, textvariable=self._var_uv_ig_scan_status, wraplength=860, justify=tk.LEFT).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0)
+        )
+        ig_act = ttk.Frame(ig_fr)
+        ig_act.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        btn_ig_select = ttk.Button(ig_act, text="2) Chọn hết", command=self._on_uv_ig_select_all)
+        btn_ig_select.pack(side=tk.LEFT, padx=(0, 8))
+        btn_ig_dl = ttk.Button(ig_act, text="3) Tải Instagram đã chọn", command=self._on_uv_download_ig_selected)
+        btn_ig_dl.pack(side=tk.LEFT, padx=(0, 8))
+        btn_ig_dl_all = ttk.Button(ig_act, text="Tải hết danh sách", command=self._on_uv_download_ig_all)
+        btn_ig_dl_all.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_ig_select, btn_ig_dl, btn_ig_dl_all))
+        ig_tree_fr = ttk.Frame(ig_fr)
+        ig_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ig_tree_fr.columnconfigure(0, weight=1)
+        self._tree_ig_channel = ttk.Treeview(
+            ig_tree_fr,
+            columns=("idx", "title", "url"),
+            show="headings",
+            height=8,
+            selectmode="extended",
+        )
+        self._tree_ig_channel.heading("idx", text="#")
+        self._tree_ig_channel.heading("title", text="Tiêu đề")
+        self._tree_ig_channel.heading("url", text="URL")
+        self._tree_ig_channel.column("idx", width=40, stretch=False)
+        self._tree_ig_channel.column("title", width=260, stretch=True)
+        self._tree_ig_channel.column("url", width=520, stretch=True)
+        sy_ig = ttk.Scrollbar(ig_tree_fr, orient="vertical", command=self._tree_ig_channel.yview)
+        sx_ig = ttk.Scrollbar(ig_tree_fr, orient="horizontal", command=self._tree_ig_channel.xview)
+        self._tree_ig_channel.configure(yscrollcommand=sy_ig.set, xscrollcommand=sx_ig.set)
+        self._tree_ig_channel.grid(row=0, column=0, sticky="ew")
+        sy_ig.grid(row=0, column=1, sticky="ns")
+        sx_ig.grid(row=1, column=0, sticky="ew")
+        install_treeview_shortcuts(self._tree_ig_channel, owner=self._top, info_callback=self._set_uv_status)
         section_state["fb_fr"] = fb_coll.outer
         section_state["yt_fr"] = yt_coll.outer
         section_state["tt_fr"] = tt_coll.outer
+        section_state["ig_fr"] = ig_coll.outer
 
         prog_fr = ttk.LabelFrame(host, text="Bước 3 — Theo dõi tiến trình", padding=8)
-        prog_fr.grid(row=6, column=0, sticky="ew", pady=(6, 0))
+        prog_fr.grid(row=7, column=0, sticky="ew", pady=(6, 0))
         prog_fr.columnconfigure(0, weight=1)
         self._var_uv_operation_status.set("Sẵn sàng — có thể thao tác.")
         ttk.Label(prog_fr, textvariable=self._var_uv_operation_status, wraplength=860, justify=tk.LEFT).grid(
@@ -1180,7 +1332,7 @@ class AIVideoDialog:
         self._uv_progress.grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
         act = ttk.Frame(host)
-        act.grid(row=7, column=0, sticky="w", pady=(8, 0))
+        act.grid(row=8, column=0, sticky="w", pady=(8, 0))
 
         row_main = ttk.Frame(act)
         row_main.pack(anchor="w")
@@ -1228,7 +1380,7 @@ class AIVideoDialog:
             self._uv_busy_disable_widgets.append(b)
 
         lib = ttk.LabelFrame(host, text="Bước 4 — Video đã tải", padding=8)
-        lib.grid(row=8, column=0, sticky="nsew", pady=(8, 0))
+        lib.grid(row=9, column=0, sticky="nsew", pady=(8, 0))
         lib.columnconfigure(0, weight=1)
         lib.rowconfigure(1, weight=1)
         lib_filter = ttk.Frame(lib)
@@ -1305,7 +1457,7 @@ class AIVideoDialog:
         ttk.Button(ab, text="Xóa mục chọn", command=self._on_uv_delete_selected).pack(side=tk.LEFT)
 
         logf = ttk.LabelFrame(host, text="Log tải (chi tiết)", padding=6)
-        logf.grid(row=9, column=0, sticky="nsew", pady=(8, 0))
+        logf.grid(row=10, column=0, sticky="nsew", pady=(8, 0))
         logf.columnconfigure(0, weight=1)
         logf.rowconfigure(0, weight=1)
         self._txt_uv_log = tk.Text(logf, wrap="word", height=6)
@@ -1316,7 +1468,7 @@ class AIVideoDialog:
         self._txt_uv_log.insert("1.0", "Log chi tiết khi tải URL sẽ hiện ở đây.\n")
         self._txt_uv_log.configure(state="disabled")
 
-        host.rowconfigure(8, weight=1)
+        host.rowconfigure(9, weight=1)
         _resize_job: dict[str, str | None] = {"after_id": None}
 
         def _visit_widgets(w: tk.Misc, fn: Callable[[tk.Misc], None]) -> None:
@@ -1339,6 +1491,11 @@ class AIVideoDialog:
                 self._tree_tt_channel.column("idx", width=44, stretch=False)
                 self._tree_tt_channel.column("title", width=max(120, int(w * 0.32)), stretch=True)
                 self._tree_tt_channel.column("url", width=max(180, int(w * 0.60)), stretch=True)
+            if self._tree_ig_channel is not None:
+                w = max(260, int(self._tree_ig_channel.winfo_width()))
+                self._tree_ig_channel.column("idx", width=44, stretch=False)
+                self._tree_ig_channel.column("title", width=max(120, int(w * 0.32)), stretch=True)
+                self._tree_ig_channel.column("url", width=max(180, int(w * 0.60)), stretch=True)
             if self._tree_uv is not None:
                 w = max(260, int(self._tree_uv.winfo_width()))
                 self._tree_uv.column("job", width=max(100, int(w * 0.12)), stretch=True)
@@ -1406,7 +1563,7 @@ class AIVideoDialog:
         if ut == "playlist_or_profile":
             if plat_low == "youtube":
                 ut = "playlist"
-            elif plat_low in ("facebook", "tiktok"):
+            elif plat_low in ("facebook", "tiktok", "instagram"):
                 ut = "profile"
             else:
                 ut = "playlist"
@@ -1435,6 +1592,8 @@ class AIVideoDialog:
             "youtube": "youtube",
             "facebook": "facebook",
             "tiktok": "tiktok",
+            "instagram": "instagram",
+            "ig": "instagram",
             "unknown": "unknown",
             "không rõ": "unknown",
         }
@@ -1584,6 +1743,67 @@ class AIVideoDialog:
                 persist_facebook_reels_settings(cookie_path=path)
             except OSError as exc:
                 messagebox.showwarning("Cookie", f"Đã chọn file nhưng không ghi được config: {exc}", parent=self._top)
+
+    def _parse_ig_reel_limits(self) -> tuple[int, int, int, bool]:
+        try:
+            mc = int(self._var_uv_ig_list_max.get().strip())
+        except ValueError:
+            mc = 120
+        try:
+            ms = int(self._var_uv_ig_max_scroll.get().strip())
+        except ValueError:
+            ms = 60
+        try:
+            mins = int(self._var_uv_ig_scan_minutes.get().strip())
+        except ValueError:
+            mins = 15
+        mc = max(10, min(UV_FB_MAX_COLLECT, mc))
+        ms = max(5, min(280, ms))
+        mins = max(1, min(180, mins))
+        till_end = bool(self._var_uv_ig_scroll_until_end.get())
+        return mc, ms, mins, till_end
+
+    def _on_uv_save_ig_reel_limits(self) -> None:
+        mc, ms, mins, till_end = self._parse_ig_reel_limits()
+        self._var_uv_ig_list_max.set(str(mc))
+        self._var_uv_ig_max_scroll.set(str(ms))
+        self._var_uv_ig_scan_minutes.set(str(mins))
+        self._var_uv_ig_scroll_until_end.set(till_end)
+        try:
+            persist_instagram_reels_settings(
+                max_collect=mc,
+                max_scroll_rounds=ms,
+                max_scan_minutes=mins,
+                scroll_until_end=till_end,
+            )
+        except OSError as exc:
+            messagebox.showerror("Cấu hình", str(exc), parent=self._top)
+            return
+        messagebox.showinfo("Cấu hình", "Đã lưu giới hạn quét Instagram vào config.", parent=self._top)
+
+    def _on_uv_pick_ig_cookie(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self._top,
+            title="Chọn cookie Instagram (Playwright storage_state JSON)",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if path:
+            self._var_uv_ig_cookie.set(path)
+            try:
+                persist_instagram_reels_settings(cookie_path=path)
+            except OSError as exc:
+                messagebox.showwarning("Cookie", f"Đã chọn file nhưng không ghi được config: {exc}", parent=self._top)
+
+    def _resolve_ig_cookie_path(self) -> str | None:
+        raw = str(self._var_uv_ig_cookie.get() or "").strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = project_root() / path
+        if path.is_file():
+            return str(path.resolve())
+        return None
 
     def _load_uv_fb_accounts(self) -> list[str]:
         out: list[str] = []
@@ -2752,6 +2972,367 @@ class AIVideoDialog:
 
         threading.Thread(target=_batch, daemon=True, name="uv_tt_channel_batch").start()
 
+    def _parse_ig_list_max(self) -> int:
+        try:
+            lim = int(self._var_uv_ig_list_max.get().strip())
+        except ValueError:
+            lim = 100
+        return max(1, min(UV_CHANNEL_LIST_MAX, lim))
+
+    def _refresh_ig_channel_tree(self, rows: list[dict[str, str]], *, append_from: int = 0) -> None:
+        self._uv_ig_entry_rows = list(rows)
+        tr = self._tree_ig_channel
+        if tr is None:
+            return
+        if append_from > 0 and append_from <= len(rows):
+            specs = [
+                {
+                    "iid": str(i),
+                    "values": (str(i + 1), str(rows[i].get("title") or ""), str(rows[i].get("url") or "")),
+                }
+                for i in range(append_from, len(rows))
+            ]
+            if specs:
+                self._uv_tree_append_specs_chunked(tr, specs, gen_attr="_uv_ig_tree_gen")
+            return
+        gen = self._uv_tree_gen_bump("_uv_ig_tree_gen")
+        tree_delete_all(tr)
+        if not rows:
+            self._sync_uv_download_scrollregion(scroll_to_content=False)
+            return
+        specs = [
+            {
+                "iid": str(i),
+                "values": (str(i + 1), str(r.get("title") or ""), str(r.get("url") or "")),
+            }
+            for i, r in enumerate(rows)
+        ]
+
+        def _done() -> None:
+            if self._uv_tree_gen_is_current("_uv_ig_tree_gen", gen):
+                self._sync_uv_download_scrollregion(scroll_to_content=True)
+
+        tree_insert_chunked(
+            self._top,
+            tr,
+            specs,
+            generation=gen,
+            is_current=lambda g: self._uv_tree_gen_is_current("_uv_ig_tree_gen", g),
+            on_complete=_done,
+            chunk=DEFAULT_TREE_CHUNK,
+        )
+
+    def _on_uv_ig_select_all(self) -> None:
+        tr = self._tree_ig_channel
+        if not tr:
+            return
+        n = len(self._uv_ig_entry_rows)
+        if n > UV_LOGICAL_SELECT_ALL_THRESHOLD:
+            self._uv_ig_logical_select_all = True
+            tr.selection_remove(tr.selection())
+            self._var_uv_ig_scan_status.set(f"Đã chọn logic {n} video — bấm «Tải Instagram đã chọn».")
+            return
+        self._uv_ig_logical_select_all = False
+        children = tr.get_children()
+        if len(children) > DEFAULT_TREE_SELECT_CHUNK:
+            tree_select_all_chunked(self._top, tr, chunk=DEFAULT_TREE_SELECT_CHUNK)
+        else:
+            tr.selection_set(children)
+
+    def _ig_urls_to_rows(self, urls: list[str]) -> list[dict[str, str]]:
+        return [{"title": f"Reel {i + 1}", "url": u} for i, u in enumerate(urls) if str(u or "").strip()]
+
+    def _on_uv_scan_ig_channel(self) -> None:
+        raw = self._var_uv_url.get().strip()
+        if not raw:
+            messagebox.showwarning("Quét Instagram", "Nhập URL profile Instagram ở ô URL phía trên.", parent=self._top)
+            return
+        if detect_platform(raw) != "instagram":
+            messagebox.showwarning(
+                "Quét Instagram",
+                "Cần URL Instagram profile hoặc tab Reels.\n"
+                "Ví dụ: https://www.instagram.com/username/ hoặc …/username/reels/",
+                parent=self._top,
+            )
+            return
+        ut = classify_url_type(raw)
+        if ut != "profile":
+            messagebox.showwarning(
+                "Quét Instagram",
+                "URL hiện tại không phải profile/tab Reels.\n"
+                "Reel/post đơn: dùng «Tải URL hiện tại».\n"
+                "Profile: https://www.instagram.com/username/",
+                parent=self._top,
+            )
+            return
+        page_url = normalize_instagram_reels_tab_url(raw)
+        self._var_uv_url.set(page_url)
+        max_reels, max_scroll, max_minutes, till_end = self._parse_ig_reel_limits()
+        self._var_uv_ig_list_max.set(str(max_reels))
+        self._var_uv_ig_max_scroll.set(str(max_scroll))
+        self._var_uv_ig_scan_minutes.set(str(max_minutes))
+        self._var_uv_ig_scroll_until_end.set(till_end)
+        try:
+            persist_instagram_reels_settings(
+                max_collect=max_reels,
+                max_scroll_rounds=max_scroll,
+                max_scan_minutes=max_minutes,
+                scroll_until_end=till_end,
+            )
+        except OSError:
+            pass
+        mode_txt = "cuộn tới hết trang" if till_end else "dừng theo vòng cuộn"
+        self._uv_ig_logical_select_all = False
+        self._uv_set_busy(
+            True,
+            f"Đang mở Playwright quét tab Reels Instagram ({mode_txt}, tối đa {max_minutes} phút)…",
+        )
+        self._refresh_ig_channel_tree([])
+        self._var_uv_ig_scan_status.set("Đang quét — bảng «URL reel» sẽ hiện dần…")
+        last_ui_count = {"n": 0}
+
+        def _status(msg: str) -> None:
+            self._top.after(0, lambda m=msg: self._var_uv_ig_scan_status.set(m))
+
+        def _partial(urls: list[str]) -> None:
+            snap = self._ig_urls_to_rows(urls)
+            now = time.monotonic()
+            grow = len(snap) - int(last_ui_count["n"])
+            if grow < 2 and now - self._uv_last_partial_ui_ts < 0.35:
+                return
+            self._uv_last_partial_ui_ts = now
+            prev = int(last_ui_count["n"])
+            last_ui_count["n"] = len(snap)
+
+            def _apply() -> None:
+                if prev <= 0:
+                    self._refresh_ig_channel_tree(snap)
+                else:
+                    self._refresh_ig_channel_tree(snap, append_from=prev)
+                if snap:
+                    self._var_uv_ig_scan_status.set(
+                        f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng)."
+                    )
+
+            self._top.after(0, _apply)
+
+        def _work() -> None:
+            show_browser = bool(self._var_uv_ig_show_browser.get())
+            cookie_path = self._resolve_ig_cookie_path()
+            res = scan_instagram_profile_reels_page(
+                page_url=page_url,
+                cookie_path=cookie_path,
+                max_reels=max_reels,
+                max_scroll_rounds=max_scroll,
+                max_scan_minutes=max_minutes,
+                scroll_until_end=till_end,
+                headless=not show_browser,
+                status=_status,
+                on_partial=_partial,
+            )
+
+            def _ui() -> None:
+                self._uv_set_busy(False)
+                if res.get("ok"):
+                    items = res.get("items") or []
+                    urls = [str(x.get("url") or "") for x in items if isinstance(x, dict)]
+                    rows = self._ig_urls_to_rows(urls)
+                    self._uv_finish_scan_tree_refresh(
+                        rows_or_urls=rows,
+                        refresh_fn=self._refresh_ig_channel_tree,
+                        backing_count=lambda: len(self._uv_ig_entry_rows),
+                        status_setter=self._var_uv_ig_scan_status.set,
+                        status_text=res.get("message") or f"{len(rows)} reel.",
+                        sync_backing=lambda r: setattr(self, "_uv_ig_entry_rows", list(r)),
+                    )
+                    messagebox.showinfo(
+                        "Quét Instagram",
+                        f"{res.get('message', '')}\n\n«Tải hết danh sách» hoặc chọn dòng → «Tải Instagram đã chọn».",
+                        parent=self._top,
+                    )
+                else:
+                    self._var_uv_ig_scan_status.set(str(res.get("message") or "Lỗi"))
+                    messagebox.showerror("Quét Instagram", str(res.get("message") or "Thất bại."), parent=self._top)
+
+            self._top.after(0, _ui)
+
+        threading.Thread(target=_work, daemon=True, name="uv_scan_ig_channel").start()
+
+    def _on_uv_download_ig_all(self) -> None:
+        n = len(self._uv_ig_entry_rows)
+        if not self._uv_confirm_download_all("Tải hết Instagram", n, item_label="video"):
+            return
+        self._uv_ig_logical_select_all = True
+        urls = [str(r.get("url") or "") for r in self._uv_ig_entry_rows]
+        urls = [u for u in urls if u]
+        if not urls:
+            messagebox.showwarning("Tải hết Instagram", "Danh sách không có URL hợp lệ.", parent=self._top)
+            return
+        self._run_uv_ig_channel_download_batch(urls)
+
+    def _on_uv_download_ig_selected(self) -> None:
+        tr = self._tree_ig_channel
+        if not tr or not self._uv_ig_entry_rows:
+            messagebox.showwarning(
+                "Tải Instagram",
+                "Chưa có danh sách — hãy «Quét Instagram» trước.",
+                parent=self._top,
+            )
+            return
+        if self._uv_ig_logical_select_all and self._uv_ig_entry_rows:
+            urls = [str(r.get("url") or "") for r in self._uv_ig_entry_rows]
+            urls = [u for u in urls if u]
+        else:
+            sel = tr.selection()
+            if not sel:
+                messagebox.showwarning("Tải Instagram", "Chọn ít nhất một dòng trong bảng.", parent=self._top)
+                return
+            idxs = sorted({int(i) for i in sel if str(i).isdigit()})
+            urls = [str(self._uv_ig_entry_rows[i].get("url") or "") for i in idxs if 0 <= i < len(self._uv_ig_entry_rows)]
+            urls = [u for u in urls if u]
+        if not urls:
+            messagebox.showwarning("Tải Instagram", "Không lấy được URL từ lựa chọn.", parent=self._top)
+            return
+        self._run_uv_ig_channel_download_batch(urls)
+
+    def _run_uv_ig_channel_download_batch(self, urls: list[str]) -> None:
+        down = self._uv_require_downloader(fail_title="Tải Instagram")
+        if down is None:
+            return
+        urls = self._uv_unique_nonempty_urls(urls)
+        if not urls:
+            messagebox.showwarning("Tải Instagram", "Danh sách URL rỗng hoặc trùng lặp.", parent=self._top)
+            return
+        self._persist_uv_last_job_name(interactive=False)
+        try:
+            opts = self._uv_options_dict()
+        except (ValueError, tk.TclError, TypeError) as exc:  # noqa: BLE001
+            messagebox.showerror("Tải Instagram", f"Tùy chọn không hợp lệ: {exc}", parent=self._top)
+            return
+        opts["platform"] = "instagram"
+        opts["url_type"] = "single_video"
+        opts["max_videos"] = 1
+        n = len(urls)
+        self._uv_set_busy(True, f"Chuẩn bị tải {n} video Instagram bằng yt-dlp…")
+
+        def _batch() -> None:
+            jid = ""
+            try:
+                st = down.get_ytdlp_status()
+                if not st.get("ok"):
+
+                    def _bad() -> None:
+                        self._uv_set_busy(False)
+                        self._apply_ytdlp_status_to_var(st)
+                        messagebox.showerror(
+                            "Tải Instagram",
+                            f"yt-dlp chưa chạy được: {st.get('message', '')}",
+                            parent=self._top,
+                        )
+
+                    self._top.after(0, _bad)
+                    return
+                down.clear_cancel()
+                root = self._uv_batch_job_source_url(urls)
+                if not root:
+
+                    def _no_root() -> None:
+                        self._uv_set_busy(False)
+                        messagebox.showwarning(
+                            "Tải Instagram",
+                            "Thiếu URL nguồn — dán URL profile Instagram ở ô URL phía trên.",
+                            parent=self._top,
+                        )
+
+                    self._top.after(0, _no_root)
+                    return
+                job = down.create_download_job(root, opts)
+                jid = str(job.get("id") or "")
+                self._top.after(0, lambda j=jid: setattr(self, "_last_download_job_id", j))
+                cancelled = False
+                if down.is_cancel_requested():
+                    cancelled = True
+                else:
+                    use_seq = n > UV_DOWNLOAD_SEQUENTIAL_THRESHOLD
+
+                    def _pulse_ig() -> None:
+                        if use_seq:
+                            self._var_uv_operation_status.set(f"Đang tải tuần tự {n} video Instagram (1/{n})…")
+                            self._append_uv_log(f"[INFO] Bắt đầu tải tuần tự {n} URL Instagram…")
+                        else:
+                            self._var_uv_operation_status.set(f"Đang tải batch {n} video Instagram (yt-dlp -a)…")
+                            self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL Instagram (1× yt-dlp -a …)")
+
+                    self._top.after(0, _pulse_ig)
+                    ph = self._uv_download_progress_hook()
+
+                    def _item_done_ig(idx: int, total: int, _url: str) -> None:
+                        if idx == 1 or idx % 8 == 0 or idx == total:
+                            self._top.after(
+                                0,
+                                lambda i=idx, t=total: self._var_uv_operation_status.set(
+                                    f"Đang tải Instagram {i}/{t}…"
+                                ),
+                            )
+
+                    try:
+                        if use_seq:
+                            jcur = down.run_download_urls_sequential_for_job(
+                                jid, urls, on_progress=ph, on_item_done=_item_done_ig
+                            ) or {}
+                        else:
+                            jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
+                        for it in jcur.get("failed_items") or []:
+                            uu = str(it.get("url") or "").strip()
+                            ee = str(it.get("error") or "")
+                            if uu:
+                                self._top.after(0, lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
+                    except Exception as exc:  # noqa: BLE001
+                        self._top.after(0, lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
+                jdone = down.finalize_batch_download_job(jid) if jid else {}
+                n_ok = len(jdone.get("downloaded_files") or [])
+                n_fail = len(jdone.get("failed_items") or [])
+                self._top.after(
+                    0,
+                    lambda ok=n_ok, ff=n_fail: self._append_uv_log(
+                        f"[INFO] Tổng kết job: thành công {ok} video, lỗi {ff}."
+                    ),
+                )
+                self._top.after(
+                    0,
+                    lambda ok=n_ok, ff=n_fail, tot=n: self._var_uv_operation_status.set(
+                        f"Hoàn tất tải: {ok}/{tot} video OK, {ff} lỗi."
+                    ),
+                )
+
+                def _done(cancelled_run: bool, ok_count: int, fail_count: int, job_done: dict[str, Any]) -> None:
+                    self._uv_set_busy(False)
+                    self._refresh_uv_library()
+                    self._show_uv_list_download_done(
+                        title="Tải Instagram",
+                        platform_key="instagram",
+                        job_id=jid,
+                        total=n,
+                        ok_count=ok_count,
+                        fail_count=fail_count,
+                        jdone=job_done,
+                        cancelled=cancelled_run,
+                        item_label="video",
+                    )
+
+                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
+            except Exception as exc:  # noqa: BLE001
+                if jid:
+                    try:
+                        down.finalize_batch_download_job(jid)
+                    except Exception:
+                        pass
+                self._top.after(0, self._uv_set_busy, False)
+                self._top.after(0, self._refresh_uv_library)
+                self._top.after(0, lambda e=exc: messagebox.showerror("Tải Instagram", str(e), parent=self._top))
+
+        threading.Thread(target=_batch, daemon=True, name="uv_ig_channel_batch").start()
+
     def _on_uv_check_url(self) -> None:
         url = self._var_uv_url.get().strip()
         if not url:
@@ -2873,6 +3454,8 @@ class AIVideoDialog:
                     lambda j=jid, ok=ok_count, ff=fail_count: self._show_uv_done_with_open_folder(
                         "Tải video",
                         f"Hoàn tất job {j}.\nThành công: {ok} video | Lỗi: {ff}.",
+                        job_id=j,
+                        ok_count=ok,
                     ),
                 )
             except Exception as e:  # noqa: BLE001
@@ -2961,13 +3544,12 @@ class AIVideoDialog:
                 return
         else:
             self._store_pending_job_for_video_editor(jid)
+            arm_auto_import_download_job(self._top)
+            self._notify_download_job_finished(jid, ok_count=1)
         if self._open_video_editor_tab_if_embedded():
             if jid:
-                messagebox.showinfo(
-                    "Tải video",
-                    f"Đã mở Video Editor và truyền job {jid}.",
-                    parent=self._top,
-                )
+                notify_msg = f"Đã mở Video Editor — job {jid} sẽ tự import vào Media."
+                messagebox.showinfo("Tải video", notify_msg, parent=self._top)
         else:
             msg = "Không tự chuyển tab được trong chế độ cửa sổ riêng."
             if jid:
@@ -2979,21 +3561,19 @@ class AIVideoDialog:
         jid = str(job_id or "").strip()
         if not jid:
             return
+        write_pending_video_editor_job(jid)
+
+    def _notify_download_job_finished(self, job_id: str, *, ok_count: int = 0) -> None:
+        """Đồng bộ tab Video Editor: pending job + làm mới combobox «Job tải»."""
+        jid = str(job_id or "").strip()
+        if not jid:
+            return
+        self._last_download_job_id = jid
+        if int(ok_count) > 0:
+            self._store_pending_job_for_video_editor(jid)
+            set_root_pending_download_job(self._top, jid)
         try:
-            root = ensure_downloader_layout()["root"]
-            p = root / "pending_video_editor_job.json"
-            p.write_text(
-                json.dumps(
-                    {
-                        "job_id": jid,
-                        "saved_at": datetime.now().replace(microsecond=0).isoformat(),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            self._top.event_generate(DOWNLOAD_JOB_FINISHED_TK_EVENT, when="tail")
         except Exception:
             pass
 
@@ -3084,7 +3664,34 @@ class AIVideoDialog:
         # 3) Fallback: thư mục output mặc định hiện tại
         return Path(self._var_uv_out_dir.get().strip() or ".")
 
-    def _show_uv_done_with_open_folder(self, title: str, summary: str) -> None:
+    def _show_uv_done_with_open_folder(
+        self,
+        title: str,
+        summary: str,
+        *,
+        job_id: str = "",
+        ok_count: int = 0,
+    ) -> None:
+        jid = str(job_id or "").strip()
+        if jid and int(ok_count) > 0:
+            self._notify_download_job_finished(jid, ok_count=ok_count)
+        if self._embedded_download_host is not None and jid and int(ok_count) > 0:
+            choice = messagebox.askyesnocancel(
+                title,
+                f"{summary}\n\nĐã cập nhật bảng «Video đã tải».\n\n"
+                "• Có = Mở Video Editor (tự import job vào Media)\n"
+                "• Không = Mở thư mục chứa file video\n"
+                "• Hủy = Đóng (job vẫn có trong combobox Editor khi bạn mở tab 5)",
+                parent=self._top,
+            )
+            if choice is True:
+                arm_auto_import_download_job(self._top)
+                self._open_video_editor_tab_if_embedded()
+                return
+            if choice is False:
+                self._on_uv_open_out_dir()
+                return
+            return
         open_now = messagebox.askyesno(
             title,
             f"{summary}\n\nĐã cập nhật bảng «Video đã tải».\nMở thư mục lưu video ngay?",
@@ -3147,6 +3754,8 @@ class AIVideoDialog:
         """Thông báo hoàn tất batch quét-list + ghi file .txt nếu có URL lỗi."""
         log_hint = self._uv_failed_log_hint(jdone, platform_key=platform_key, job_id=job_id)
         if cancelled:
+            if ok_count > 0:
+                self._notify_download_job_finished(job_id, ok_count=ok_count)
             messagebox.showinfo(
                 title,
                 f"Đã dừng theo «Tạm dừng / Hủy».\n"
@@ -3160,6 +3769,8 @@ class AIVideoDialog:
             f"Hoàn tất lệnh tải {total} {item_label} — job ({job_id}).\n"
             f"Thành công: {ok_count} | Lỗi: {fail_count}."
             + log_hint,
+            job_id=job_id,
+            ok_count=ok_count,
         )
 
     def warm_embedded_download_panel(self) -> None:
