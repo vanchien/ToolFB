@@ -48,7 +48,9 @@ from src.gui.ui_responsiveness import (
     DEFAULT_TREE_APPEND_CHUNK,
     DEFAULT_TREE_CHUNK,
     DEFAULT_TREE_SELECT_CHUNK,
+    register_main_thread_dispatcher,
     run_background_then_main,
+    schedule_on_main_thread,
     tree_delete_all,
     tree_insert_chunked,
     tree_select_all_chunked,
@@ -170,6 +172,7 @@ class AIVideoDialog:
             self._top.minsize(760, 520)
         else:
             self._top = self._embedded_download_host.winfo_toplevel()
+        register_main_thread_dispatcher(self._top)
         self._reverse_engine = VideoReversePromptEngine(log=self._append_reverse_log)
         self._reverse_paths = ensure_reverse_video_layout()
         self._ai_video_service = AIVideoGenerationService()
@@ -360,10 +363,14 @@ class AIVideoDialog:
             except tk.TclError:
                 pass
 
+    def _schedule_ui(self, fn: Callable[[], None]) -> None:
+        """Marshal callback lên main thread (an toàn Python 3.14+)."""
+        schedule_on_main_thread(self._top, fn)
+
     def _append_uv_log(self, msg: str) -> None:
         text = f"{msg}\n"
         if threading.current_thread() is not threading.main_thread():
-            self._top.after(0, lambda m=msg: self._append_uv_log(m))
+            self._schedule_ui(lambda m=msg: self._append_uv_log(m))
             return
         self._uv_log_buffer.append(text)
         if self._uv_log_flush_after_id is not None:
@@ -430,7 +437,7 @@ class AIVideoDialog:
                 else:
                     hint = f", tối đa ~{mv} mục" if mv > 1 else ""
                     msg = f"Đang tải — loại: {uv_type or '?'}{hint}…"
-                self._top.after(0, lambda m=msg: self._var_uv_operation_status.set(m))
+                self._schedule_ui(lambda m=msg: self._var_uv_operation_status.set(m))
                 return
             if ev == "file_complete":
                 c = int(d.get("completed") or 0)
@@ -446,28 +453,28 @@ class AIVideoDialog:
                 else:
                     msg = f"Đã nhận file {c} — {short}"
                     log_msg = f"[Tiến độ] File {c}: {short}"
-                self._top.after(0, lambda m=msg: self._var_uv_operation_status.set(m))
-                self._top.after(0, lambda lm=log_msg: self._append_uv_log(lm))
+                self._schedule_ui(lambda m=msg: self._var_uv_operation_status.set(m))
+                self._schedule_ui(lambda lm=log_msg: self._append_uv_log(lm))
                 return
             if ev == "stderr_activity":
                 ln = str(d.get("line") or "").replace("\n", " ").strip()
                 clip = ln[:150] + ("…" if len(ln) > 150 else "")
                 msg = f"Đang tải… {clip}"
-                self._top.after(0, lambda m=msg: self._var_uv_operation_status.set(m))
+                self._schedule_ui(lambda m=msg: self._var_uv_operation_status.set(m))
                 return
             if ev == "error_line":
                 ln = str(d.get("line") or "").replace("\n", " ").strip()
                 clip = ln[:180] + ("…" if len(ln) > 180 else "")
                 msg = f"Lỗi: {clip}"
-                self._top.after(0, lambda m=msg: self._var_uv_operation_status.set(m))
-                self._top.after(0, lambda lm=clip: self._append_uv_log(f"[yt-dlp] {lm}"))
+                self._schedule_ui(lambda m=msg: self._var_uv_operation_status.set(m))
+                self._schedule_ui(lambda lm=clip: self._append_uv_log(f"[yt-dlp] {lm}"))
 
         return _hook
 
     def _uv_set_busy(self, busy: bool, message: str = "") -> None:
         """Chạy trên luồng UI: thanh tiến trình + khóa nút để tránh Not Responding / double-click."""
         if threading.current_thread() is not threading.main_thread():
-            self._top.after(0, lambda b=busy, m=message: self._uv_set_busy(b, m))
+            self._schedule_ui(lambda b=busy, m=message: self._uv_set_busy(b, m))
             return
         if message:
             self._var_uv_operation_status.set(message)
@@ -507,10 +514,10 @@ class AIVideoDialog:
             if not down:
                 err = (self._uv_downloader_init_error or "").strip()
                 msg = f"Không khởi tạo module tải: {err}" if err else "yt-dlp: module tải chưa sẵn sàng."
-                self._top.after(0, lambda m=msg: self._var_uv_ytdlp_status.set(m))
+                self._schedule_ui(lambda m=msg: self._var_uv_ytdlp_status.set(m))
                 return
             st = down.get_ytdlp_status()
-            self._top.after(0, lambda s=st: self._apply_ytdlp_status_to_var(s))
+            self._schedule_ui(lambda s=st: self._apply_ytdlp_status_to_var(s))
 
         threading.Thread(target=_work, daemon=True, name="ytdlp_status_check").start()
 
@@ -539,7 +546,7 @@ class AIVideoDialog:
                         parent=self._top,
                     )
 
-            self._top.after(0, _done)
+            self._schedule_ui(_done)
 
         threading.Thread(target=_work, daemon=True, name="uv_verify_ytdlp").start()
 
@@ -571,7 +578,7 @@ class AIVideoDialog:
                     else:
                         messagebox.showerror("yt-dlp", tail or "pip thất bại.", parent=self._top)
 
-                self._top.after(0, _pip_ui)
+                self._schedule_ui(_pip_ui)
 
             threading.Thread(target=_pip_work, daemon=True, name="uv_ytdlp_pip_upgrade").start()
 
@@ -625,7 +632,7 @@ class AIVideoDialog:
                 )
                 self._refresh_uv_ytdlp_status()
 
-            self._top.after(0, _phase1)
+            self._schedule_ui(_phase1)
 
         threading.Thread(target=_work, daemon=True, name="uv_ytdlp_pypi_check").start()
 
@@ -2032,7 +2039,7 @@ class AIVideoDialog:
         self._var_uv_fb_scan_status.set("Đang quét — bảng «URL reel» sẽ hiện dần…")
 
         def _status(msg: str) -> None:
-            self._top.after(0, lambda m=msg: self._var_uv_fb_scan_status.set(m))
+            self._schedule_ui(lambda m=msg: self._var_uv_fb_scan_status.set(m))
 
         last_fb_count = {"n": 0}
 
@@ -2054,7 +2061,7 @@ class AIVideoDialog:
                 if snap:
                     self._var_uv_fb_scan_status.set(f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng).")
 
-            self._top.after(0, _apply)
+            self._schedule_ui(_apply)
 
         def _work() -> None:
             show_browser = bool(self._var_uv_fb_show_browser.get())
@@ -2076,7 +2083,7 @@ class AIVideoDialog:
                         parent=self._top,
                     ),
                 )
-                self._top.after(0, lambda: self._uv_set_busy(False))
+                self._schedule_ui(lambda: self._uv_set_busy(False))
                 return
             res = scan_facebook_profile_reels_page(
                 page_url=page_url,
@@ -2112,7 +2119,7 @@ class AIVideoDialog:
                     self._var_uv_fb_scan_status.set(str(res.get("message") or "Lỗi"))
                     messagebox.showerror("Quét Reels", str(res.get("message") or "Thất bại."), parent=self._top)
 
-            self._top.after(0, _ui)
+            self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_fb_reels").start()
 
@@ -2190,7 +2197,7 @@ class AIVideoDialog:
                             parent=self._top,
                         )
 
-                    self._top.after(0, _bad)
+                    self._schedule_ui(_bad)
                     return
                 down.clear_cancel()
                 root = self._uv_batch_job_source_url(urls)
@@ -2204,11 +2211,11 @@ class AIVideoDialog:
                             parent=self._top,
                         )
 
-                    self._top.after(0, _no_root)
+                    self._schedule_ui(_no_root)
                     return
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._top.after(0, lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
                 failed_urls: list[str] = []
                 cancelled = False
                 if down.is_cancel_requested():
@@ -2224,7 +2231,7 @@ class AIVideoDialog:
                             self._var_uv_operation_status.set(f"Đang tải batch {n} reel (yt-dlp -a)…")
                             self._append_uv_log(f"[INFO] Bắt đầu batch {n} reel (1× yt-dlp -a …)")
 
-                    self._top.after(0, _pulse)
+                    self._schedule_ui(_pulse)
                     ph = self._uv_download_progress_hook()
 
                     def _item_done(idx: int, total: int, _url: str) -> None:
@@ -2246,9 +2253,9 @@ class AIVideoDialog:
                             ee = str(it.get("error") or "")
                             if uu:
                                 failed_urls.append(uu)
-                                self._top.after(0, lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
+                                self._schedule_ui(lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
                     except Exception as exc:  # noqa: BLE001
-                        self._top.after(0, lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
+                        self._schedule_ui(lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
                 jdone = down.finalize_batch_download_job(jid) if jid else {}
                 n_ok = len(jdone.get("downloaded_files") or [])
                 n_fail = len(jdone.get("failed_items") or [])
@@ -2280,16 +2287,16 @@ class AIVideoDialog:
                         item_label="reel",
                     )
 
-                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
+                self._schedule_ui(lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
             except Exception as exc:  # noqa: BLE001
                 if jid:
                     try:
                         down.finalize_batch_download_job(jid)
                     except Exception:
                         pass
-                self._top.after(0, self._uv_set_busy, False)
-                self._top.after(0, self._refresh_uv_library)
-                self._top.after(0, lambda e=exc: messagebox.showerror("Tải reel", str(e), parent=self._top))
+                self._schedule_ui(lambda: self._uv_set_busy(False))
+                self._schedule_ui(self._refresh_uv_library)
+                self._schedule_ui(lambda e=exc: messagebox.showerror("Tải reel", str(e), parent=self._top))
 
         threading.Thread(target=_batch, daemon=True, name="uv_fb_reel_batch").start()
 
@@ -2430,7 +2437,7 @@ class AIVideoDialog:
                     self._refresh_yt_channel_tree(snap, append_from=prev)
                 self._var_uv_yt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video.")
 
-            self._top.after(0, _apply)
+            self._schedule_ui(_apply)
 
         def _work() -> None:
             res = down.list_flat_playlist_entries(raw, max_entries=lim, on_partial=_partial)
@@ -2467,7 +2474,7 @@ class AIVideoDialog:
                     self._var_uv_yt_scan_status.set(str(res.get("error") or "Lỗi"))
                     messagebox.showerror("Quét YouTube", str(res.get("error") or "Thất bại."), parent=self._top)
 
-            self._top.after(0, _ui)
+            self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_yt_channel").start()
 
@@ -2536,7 +2543,7 @@ class AIVideoDialog:
                             parent=self._top,
                         )
 
-                    self._top.after(0, _bad)
+                    self._schedule_ui(_bad)
                     return
                 down.clear_cancel()
                 root = self._uv_batch_job_source_url(urls)
@@ -2550,11 +2557,11 @@ class AIVideoDialog:
                             parent=self._top,
                         )
 
-                    self._top.after(0, _no_root)
+                    self._schedule_ui(_no_root)
                     return
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._top.after(0, lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
                 failed_urls: list[str] = []
                 cancelled = False
                 if down.is_cancel_requested():
@@ -2571,7 +2578,7 @@ class AIVideoDialog:
                             self._var_uv_operation_status.set(f"Đang tải batch {n} video YouTube (yt-dlp -a)…")
                             self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL YouTube (1× yt-dlp -a …)")
 
-                    self._top.after(0, _pulse_yt)
+                    self._schedule_ui(_pulse_yt)
                     ph = self._uv_download_progress_hook()
 
                     def _item_done_yt(idx: int, total: int, _url: str) -> None:
@@ -2595,9 +2602,9 @@ class AIVideoDialog:
                             ee = str(it.get("error") or "")
                             if uu:
                                 failed_urls.append(uu)
-                                self._top.after(0, lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
+                                self._schedule_ui(lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
                     except Exception as exc:  # noqa: BLE001
-                        self._top.after(0, lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
+                        self._schedule_ui(lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
                 jdone = down.finalize_batch_download_job(jid) if jid else {}
                 n_ok = len(jdone.get("downloaded_files") or [])
                 n_fail = len(jdone.get("failed_items") or [])
@@ -2629,16 +2636,16 @@ class AIVideoDialog:
                         item_label="video",
                     )
 
-                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
+                self._schedule_ui(lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
             except Exception as exc:  # noqa: BLE001
                 if jid:
                     try:
                         down.finalize_batch_download_job(jid)
                     except Exception:
                         pass
-                self._top.after(0, self._uv_set_busy, False)
-                self._top.after(0, self._refresh_uv_library)
-                self._top.after(0, lambda e=exc: messagebox.showerror("Tải YouTube", str(e), parent=self._top))
+                self._schedule_ui(lambda: self._uv_set_busy(False))
+                self._schedule_ui(self._refresh_uv_library)
+                self._schedule_ui(lambda e=exc: messagebox.showerror("Tải YouTube", str(e), parent=self._top))
 
         threading.Thread(target=_batch, daemon=True, name="uv_yt_channel_batch").start()
 
@@ -2764,7 +2771,7 @@ class AIVideoDialog:
                     self._refresh_tt_channel_tree(snap, append_from=prev)
                 self._var_uv_tt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video TikTok.")
 
-            self._top.after(0, _apply)
+            self._schedule_ui(_apply)
 
         def _work() -> None:
             res = down.list_flat_playlist_entries(raw, max_entries=lim, on_partial=_partial)
@@ -2800,7 +2807,7 @@ class AIVideoDialog:
                     self._var_uv_tt_scan_status.set(str(res.get("error") or "Lỗi"))
                     messagebox.showerror("Quét TikTok", str(res.get("error") or "Thất bại."), parent=self._top)
 
-            self._top.after(0, _ui)
+            self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_tt_channel").start()
 
@@ -2868,7 +2875,7 @@ class AIVideoDialog:
                         self._apply_ytdlp_status_to_var(st)
                         messagebox.showerror("Tải TikTok", f"yt-dlp chưa chạy được: {st.get('message', '')}", parent=self._top)
 
-                    self._top.after(0, _bad)
+                    self._schedule_ui(_bad)
                     return
                 down.clear_cancel()
                 root = self._uv_batch_job_source_url(urls)
@@ -2882,11 +2889,11 @@ class AIVideoDialog:
                             parent=self._top,
                         )
 
-                    self._top.after(0, _no_root)
+                    self._schedule_ui(_no_root)
                     return
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._top.after(0, lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
                 failed_urls: list[str] = []
                 cancelled = False
                 if down.is_cancel_requested():
@@ -2903,7 +2910,7 @@ class AIVideoDialog:
                             self._var_uv_operation_status.set(f"Đang tải batch {n} video TikTok (yt-dlp -a)…")
                             self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL TikTok (1× yt-dlp -a …)")
 
-                    self._top.after(0, _pulse_tt)
+                    self._schedule_ui(_pulse_tt)
                     ph = self._uv_download_progress_hook()
 
                     def _item_done_tt(idx: int, total: int, _url: str) -> None:
@@ -2927,9 +2934,9 @@ class AIVideoDialog:
                             ee = str(it.get("error") or "")
                             if uu:
                                 failed_urls.append(uu)
-                                self._top.after(0, lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
+                                self._schedule_ui(lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
                     except Exception as exc:  # noqa: BLE001
-                        self._top.after(0, lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
+                        self._schedule_ui(lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
                 jdone = down.finalize_batch_download_job(jid) if jid else {}
                 n_ok = len(jdone.get("downloaded_files") or [])
                 n_fail = len(jdone.get("failed_items") or [])
@@ -2961,16 +2968,16 @@ class AIVideoDialog:
                         item_label="video",
                     )
 
-                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
+                self._schedule_ui(lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
             except Exception as exc:  # noqa: BLE001
                 if jid:
                     try:
                         down.finalize_batch_download_job(jid)
                     except Exception:
                         pass
-                self._top.after(0, self._uv_set_busy, False)
-                self._top.after(0, self._refresh_uv_library)
-                self._top.after(0, lambda e=exc: messagebox.showerror("Tải TikTok", str(e), parent=self._top))
+                self._schedule_ui(lambda: self._uv_set_busy(False))
+                self._schedule_ui(self._refresh_uv_library)
+                self._schedule_ui(lambda e=exc: messagebox.showerror("Tải TikTok", str(e), parent=self._top))
 
         threading.Thread(target=_batch, daemon=True, name="uv_tt_channel_batch").start()
 
@@ -3094,7 +3101,7 @@ class AIVideoDialog:
         last_ui_count = {"n": 0}
 
         def _status(msg: str) -> None:
-            self._top.after(0, lambda m=msg: self._var_uv_ig_scan_status.set(m))
+            self._schedule_ui(lambda m=msg: self._var_uv_ig_scan_status.set(m))
 
         def _partial(urls: list[str]) -> None:
             snap = self._ig_urls_to_rows(urls)
@@ -3116,7 +3123,7 @@ class AIVideoDialog:
                         f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng)."
                     )
 
-            self._top.after(0, _apply)
+            self._schedule_ui(_apply)
 
         def _work() -> None:
             show_browser = bool(self._var_uv_ig_show_browser.get())
@@ -3156,7 +3163,7 @@ class AIVideoDialog:
                     self._var_uv_ig_scan_status.set(str(res.get("message") or "Lỗi"))
                     messagebox.showerror("Quét Instagram", str(res.get("message") or "Thất bại."), parent=self._top)
 
-            self._top.after(0, _ui)
+            self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_ig_channel").start()
 
@@ -3232,7 +3239,7 @@ class AIVideoDialog:
                             parent=self._top,
                         )
 
-                    self._top.after(0, _bad)
+                    self._schedule_ui(_bad)
                     return
                 down.clear_cancel()
                 root = self._uv_batch_job_source_url(urls)
@@ -3246,11 +3253,11 @@ class AIVideoDialog:
                             parent=self._top,
                         )
 
-                    self._top.after(0, _no_root)
+                    self._schedule_ui(_no_root)
                     return
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._top.after(0, lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
                 cancelled = False
                 if down.is_cancel_requested():
                     cancelled = True
@@ -3265,7 +3272,7 @@ class AIVideoDialog:
                             self._var_uv_operation_status.set(f"Đang tải batch {n} video Instagram (yt-dlp -a)…")
                             self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL Instagram (1× yt-dlp -a …)")
 
-                    self._top.after(0, _pulse_ig)
+                    self._schedule_ui(_pulse_ig)
                     ph = self._uv_download_progress_hook()
 
                     def _item_done_ig(idx: int, total: int, _url: str) -> None:
@@ -3288,9 +3295,9 @@ class AIVideoDialog:
                             uu = str(it.get("url") or "").strip()
                             ee = str(it.get("error") or "")
                             if uu:
-                                self._top.after(0, lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
+                                self._schedule_ui(lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
                     except Exception as exc:  # noqa: BLE001
-                        self._top.after(0, lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
+                        self._schedule_ui(lambda e=exc: self._append_uv_log(f"[ERROR] {e}"))
                 jdone = down.finalize_batch_download_job(jid) if jid else {}
                 n_ok = len(jdone.get("downloaded_files") or [])
                 n_fail = len(jdone.get("failed_items") or [])
@@ -3322,16 +3329,16 @@ class AIVideoDialog:
                         item_label="video",
                     )
 
-                self._top.after(0, lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
+                self._schedule_ui(lambda c=cancelled, ok=n_ok, ff=n_fail, jd=jdone: _done(c, ok, ff, jd))
             except Exception as exc:  # noqa: BLE001
                 if jid:
                     try:
                         down.finalize_batch_download_job(jid)
                     except Exception:
                         pass
-                self._top.after(0, self._uv_set_busy, False)
-                self._top.after(0, self._refresh_uv_library)
-                self._top.after(0, lambda e=exc: messagebox.showerror("Tải Instagram", str(e), parent=self._top))
+                self._schedule_ui(lambda: self._uv_set_busy(False))
+                self._schedule_ui(self._refresh_uv_library)
+                self._schedule_ui(lambda e=exc: messagebox.showerror("Tải Instagram", str(e), parent=self._top))
 
         threading.Thread(target=_batch, daemon=True, name="uv_ig_channel_batch").start()
 
@@ -3361,7 +3368,7 @@ class AIVideoDialog:
                         parent=self._top,
                     )
 
-                self._top.after(0, _bad)
+                self._schedule_ui(_bad)
                 return
             info = down.check_url(url)
 
@@ -3382,7 +3389,7 @@ class AIVideoDialog:
                 else:
                     messagebox.showerror("Kiểm tra URL", str(info.get("error") or "unknown"), parent=self._top)
 
-            self._top.after(0, _ui)
+            self._schedule_ui(_ui)
 
         threading.Thread(target=_job, daemon=True, name="uv_check_url").start()
 
@@ -3415,7 +3422,7 @@ class AIVideoDialog:
                         parent=self._top,
                     )
 
-                self._top.after(0, _bad)
+                self._schedule_ui(_bad)
                 return
             try:
                 job = down.create_download_job(url, opts)
@@ -3425,7 +3432,7 @@ class AIVideoDialog:
                     self._uv_set_busy(False)
                     messagebox.showerror("Tải video", str(err), parent=self._top)
 
-                self._top.after(0, _err_create)
+                self._schedule_ui(_err_create)
                 return
 
             jid = job["id"]
@@ -3437,7 +3444,7 @@ class AIVideoDialog:
                 )
                 self._append_uv_log(f"[INFO] Bắt đầu job {jid} …")
 
-            self._top.after(0, _start_bar)
+            self._schedule_ui(_start_bar)
 
             try:
                 down.clear_cancel()
@@ -3461,10 +3468,10 @@ class AIVideoDialog:
                     ),
                 )
             except Exception as e:  # noqa: BLE001
-                self._top.after(0, lambda err=e: messagebox.showerror("Tải video", str(err), parent=self._top))
+                self._schedule_ui(lambda err=e: messagebox.showerror("Tải video", str(err), parent=self._top))
             finally:
-                self._top.after(0, self._uv_set_busy, False)
-                self._top.after(0, self._refresh_uv_library)
+                self._schedule_ui(lambda: self._uv_set_busy(False))
+                self._schedule_ui(self._refresh_uv_library)
 
         threading.Thread(target=_prepare_and_run, daemon=True, name="uv_download").start()
 
@@ -3519,12 +3526,12 @@ class AIVideoDialog:
                         parent=self._top,
                     ),
                 )
-                self._top.after(0, lambda j=jid, ok=n_ok: self._notify_download_job_finished(j, ok_count=max(0, ok)))
+                self._schedule_ui(lambda j=jid, ok=n_ok: self._notify_download_job_finished(j, ok_count=max(0, ok)))
             except Exception as e:  # noqa: BLE001
-                self._top.after(0, lambda err=e: messagebox.showerror("Tải video", str(err), parent=self._top))
+                self._schedule_ui(lambda err=e: messagebox.showerror("Tải video", str(err), parent=self._top))
             finally:
-                self._top.after(0, self._uv_set_busy, False)
-                self._top.after(0, self._refresh_uv_library)
+                self._schedule_ui(lambda: self._uv_set_busy(False))
+                self._schedule_ui(self._refresh_uv_library)
 
         threading.Thread(target=_run, daemon=True, name="uv_resume").start()
 
@@ -4368,7 +4375,7 @@ class AIVideoDialog:
     def _append_reverse_log(self, msg: str) -> None:
         text = f"{msg}\n"
         if threading.current_thread() is not threading.main_thread():
-            self._top.after(0, lambda: self._append_reverse_log(msg))
+            self._schedule_ui(lambda: self._append_reverse_log(msg))
             return
         self._txt_reverse_log.configure(state="normal")
         self._txt_reverse_log.insert("end", text)
@@ -4772,8 +4779,8 @@ class AIVideoDialog:
                 fn()
             except Exception as exc:  # noqa: BLE001
                 self._append_reverse_log(f"[ERROR] {exc}")
-                self._top.after(0, lambda: self._set_reverse_wizard_state(step1=True, step2=True, step3=True, full=True))
-                self._top.after(0, lambda err=exc: messagebox.showerror("Reverse Video", f"{title} lỗi:\n{err}", parent=self._top))
+                self._schedule_ui(lambda: self._set_reverse_wizard_state(step1=True, step2=True, step3=True, full=True))
+                self._schedule_ui(lambda err=exc: messagebox.showerror("Reverse Video", f"{title} lỗi:\n{err}", parent=self._top))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -4800,9 +4807,9 @@ class AIVideoDialog:
             path = self._reverse_paths["analysis"] / f"{job.id}_pre_gemini.json"
             path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             self._append_reverse_log(f"[SUCCESS] Đã xong import + keyframes. File: {path}")
-            self._top.after(0, lambda: self._update_frame_stats(extracted=len(frames), selected=min(10, len(frames))))
-            self._top.after(0, self._sync_wizard_from_checkpoints)
-            self._top.after(0, self._save_reverse_session_state)
+            self._schedule_ui(lambda: self._update_frame_stats(extracted=len(frames), selected=min(10, len(frames))))
+            self._schedule_ui(self._sync_wizard_from_checkpoints)
+            self._schedule_ui(self._save_reverse_session_state)
 
         self._run_bg("Import + extract", _job)
 
@@ -4858,12 +4865,12 @@ class AIVideoDialog:
             path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             self._append_reverse_log(f"[SUCCESS] Build prompt thành công. File: {path}")
             total_prompts = len(series) if series else 1
-            self._top.after(0, self._load_prompt_preview_for_current_job)
+            self._schedule_ui(self._load_prompt_preview_for_current_job)
             self._append_reverse_log(
                 f"[INFO] Đã sẵn sàng sang B3 Bridge Launcher. Số prompt tạo video: {total_prompts} (series {'bật' if bool(series) else 'tắt'})."
             )
-            self._top.after(0, self._sync_wizard_from_checkpoints)
-            self._top.after(0, self._save_reverse_session_state)
+            self._schedule_ui(self._sync_wizard_from_checkpoints)
+            self._schedule_ui(self._save_reverse_session_state)
             self._top.after(
                 0,
                 lambda: messagebox.showinfo(
@@ -4884,8 +4891,8 @@ class AIVideoDialog:
         def _job() -> None:
             out = self._reverse_engine.run_pipeline(payload)
             self._append_reverse_log(f"[SUCCESS] Full pipeline done: {out.get('id')}")
-            self._top.after(0, self._sync_wizard_from_checkpoints)
-            self._top.after(0, self._save_reverse_session_state)
+            self._schedule_ui(self._sync_wizard_from_checkpoints)
+            self._schedule_ui(self._save_reverse_session_state)
             self._top.after(
                 0,
                 lambda: messagebox.showinfo("Reverse Video", f"Hoàn tất reverse prompt: {out.get('id')}", parent=self._top),
@@ -5032,7 +5039,7 @@ class AIVideoDialog:
                     "jobs": separate_job_files,
                 }
                 (batch_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            self._top.after(0, lambda rows=prompt_rows: self._set_prompt_preview_rows(rows))
+            self._schedule_ui(lambda rows=prompt_rows: self._set_prompt_preview_rows(rows))
 
             pushed_path = self._reverse_paths["analysis"] / f"{job_id}_pushed_ai_video.json"
             pushed_path.write_text(
@@ -5060,8 +5067,8 @@ class AIVideoDialog:
                 self._append_reverse_log(f"[INFO] Đã mở Veo3Studio qua Bridge Launcher: {exe}")
             else:
                 self._append_reverse_log(f"[WARNING] Không tìm thấy Veo3Studio.exe để mở tự động: {exe}")
-            self._top.after(0, self._sync_wizard_from_checkpoints)
-            self._top.after(0, self._save_reverse_session_state)
+            self._schedule_ui(self._sync_wizard_from_checkpoints)
+            self._schedule_ui(self._save_reverse_session_state)
             self._top.after(
                 0,
                 lambda: messagebox.showinfo(

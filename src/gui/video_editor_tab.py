@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import sys
-import queue
 import re
 import shutil
 import subprocess
@@ -27,7 +26,9 @@ from typing import Any, Callable
 from src.gui.ui_responsiveness import (
     ASYNC_PREP_MIN_ROWS,
     DEFAULT_TREE_CHUNK,
+    register_main_thread_dispatcher,
     run_background_then_main,
+    schedule_on_main_thread,
     tree_delete_all,
     tree_insert_chunked,
 )
@@ -84,6 +85,7 @@ from src.services.video_editor.stock_audio_library import (
 from src.services.universal_video_downloader import (
     DOWNLOAD_JOB_FINISHED_TK_EVENT,
     DownloadMetadataStore,
+    TOOLFB_PENDING_DOWNLOAD_JOB_ATTR,
     _extract_hashtags_from_text,
     build_download_job_combo_options,
     clear_root_pending_download_job,
@@ -92,6 +94,7 @@ from src.services.universal_video_downloader import (
     ensure_downloader_layout,
     get_root_pending_download_job,
     list_videos_for_download_job,
+    read_pending_video_editor_job,
 )
 from src.utils.ffmpeg_paths import (
     ffplay_resolve_skips_ensure_heavy_work,
@@ -373,6 +376,7 @@ def _ve_resolve_combo_display(
 def build_video_editor_tab(
     parent: ttk.Frame, root: tk.Tk
 ) -> tuple[Callable[[], None], Callable[[], None], Callable[[], None]]:
+    register_main_thread_dispatcher(root)
     ve_paths = ensure_video_editor_layout()
     pm = VideoEditorProjectManager(paths=ve_paths)
     mm = MediaManager(paths=ve_paths)
@@ -435,45 +439,11 @@ def build_video_editor_tab(
     stock_audio_refresh_ref: dict[str, Any] = {"fn": None}
     stock_preview_proc_ref: dict[str, Any] = {"proc": None, "after_id": None, "last_fp": ""}
 
-    _main_thread_ui_q: queue.Queue[Callable[[], None]] = queue.Queue()
-    _main_ui_pump_pending: dict[str, bool] = {"v": False}
     _tl_tree_insert_gen: dict[str, int] = {"v": 0}
 
     def _schedule_on_main_thread(fn: Callable[[], None]) -> None:
-        """Tkinter: không gọi root.after từ worker thread (Python 3.14+ có thể lỗi)."""
-        _main_thread_ui_q.put(fn)
-        if not _main_ui_pump_pending["v"]:
-            _main_ui_pump_pending["v"] = True
-
-            def _kick() -> None:
-                _pump_main_thread_ui_queue()
-
-            try:
-                root.after(0, _kick)
-            except tk.TclError:
-                _main_ui_pump_pending["v"] = False
-
-    _MAIN_UI_DRAIN_PER_TICK = 48
-
-    def _pump_main_thread_ui_queue() -> None:
-        n = 0
-        try:
-            while n < _MAIN_UI_DRAIN_PER_TICK:
-                cb = _main_thread_ui_q.get_nowait()
-                n += 1
-                try:
-                    cb()
-                except Exception:
-                    pass
-        except queue.Empty:
-            pass
-        try:
-            if not _main_thread_ui_q.empty():
-                root.after(50, _pump_main_thread_ui_queue)
-            else:
-                _main_ui_pump_pending["v"] = False
-        except tk.TclError:
-            _main_ui_pump_pending["v"] = False
+        """Wrapper — pump queue trên main thread (Python 3.14+)."""
+        schedule_on_main_thread(root, fn)
 
     _project_combo_busy = {"v": False}
 
@@ -784,25 +754,34 @@ def build_video_editor_tab(
         keep_label = str(var_dl_job.get() or "").strip()
         keep_current_jid = dl_job_map.get(keep_label, "").strip()
         show_empty = bool(var_show_empty_jobs.get())
+        try:
+            mem_pending_jid = str(getattr(root, TOOLFB_PENDING_DOWNLOAD_JOB_ATTR, "") or "").strip()
+        except Exception:
+            mem_pending_jid = ""
 
         def _worker() -> None:
-            dl_paths = ensure_downloader_layout()
-            store = DownloadMetadataStore(paths=dl_paths)
-            vals, new_map = build_download_job_combo_options(
-                store.list_jobs(),
-                store.list_downloaded_videos(),
-                show_empty=show_empty,
-            )
-            pending_jid = get_root_pending_download_job(root, paths=dl_paths)
-            _schedule_on_main_thread(
-                lambda: _apply_download_job_combo_ui(
-                    vals=vals,
-                    new_map=new_map,
-                    keep_current_jid=keep_current_jid,
-                    pending_jid=pending_jid,
-                    refresh_gen=refresh_gen,
+            try:
+                dl_paths = ensure_downloader_layout()
+                store = DownloadMetadataStore(paths=dl_paths)
+                vals, new_map = build_download_job_combo_options(
+                    store.list_jobs(),
+                    store.list_downloaded_videos(),
+                    show_empty=show_empty,
                 )
-            )
+                pending_jid = mem_pending_jid or read_pending_video_editor_job(
+                    paths=dl_paths, consume=False
+                )
+                _schedule_on_main_thread(
+                    lambda: _apply_download_job_combo_ui(
+                        vals=vals,
+                        new_map=new_map,
+                        keep_current_jid=keep_current_jid,
+                        pending_jid=pending_jid,
+                        refresh_gen=refresh_gen,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[VE] Làm mới combobox job tải (nền): {}", exc)
 
         threading.Thread(target=_worker, name="ve_refresh_dl_jobs", daemon=True).start()
 
@@ -1601,10 +1580,7 @@ def build_video_editor_tab(
                 except Exception:
                     logger.exception("on_ready ffplay async")
 
-            try:
-                root.after(0, _apply)
-            except Exception:
-                pass
+            _schedule_on_main_thread(_apply)
 
         if notify_busy:
             try:
@@ -9555,7 +9531,7 @@ def build_video_editor_tab(
         _sync_aspect_combo_from_project()
 
     sync_p2_ui_ref["fn"] = sync_p2_ui
-    root.after(0, lambda: _set_p2_advanced_visible(False))
+    schedule_on_main_thread(root, lambda: _set_p2_advanced_visible(False))
 
     exp_fr = ttk.LabelFrame(right, text="Xuất video (Export)", padding=4)
     right.add(exp_fr, weight=1)

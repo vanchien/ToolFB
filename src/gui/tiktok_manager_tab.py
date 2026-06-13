@@ -20,6 +20,7 @@ from src.gui.ui_responsiveness import (
     ASYNC_PREP_MIN_ROWS,
     DEFAULT_TREE_CHUNK,
     run_background_then_main,
+    schedule_on_main_thread,
     tree_delete_all,
     tree_insert_chunked,
 )
@@ -102,8 +103,8 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
                 pass
 
         try:
-            root.after(0, _ui)
-        except tk.TclError:
+            schedule_on_main_thread(root, _ui)
+        except Exception:
             pass
 
     _acc_tree_gen = {"v": 0}
@@ -548,7 +549,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
                 else:
                     messagebox.showwarning("TikTok", err or "Chưa đăng nhập.", parent=root)
 
-            root.after(0, ui)
+            schedule_on_main_thread(root, ui)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -709,7 +710,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
             return
         cur.update(partial)
         job_store.upsert(cur)
-        root.after(0, refresh_jobs)
+        schedule_on_main_thread(root, refresh_jobs)
 
     def on_run_selected_job() -> None:
         sel = tree_job.selection()
@@ -740,7 +741,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
                 def warn() -> None:
                     messagebox.showwarning("TikTok", msg, parent=root)
 
-                root.after(0, warn)
+                schedule_on_main_thread(root, warn)
 
         threading.Thread(target=runner, daemon=True).start()
 

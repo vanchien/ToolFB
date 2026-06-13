@@ -37,6 +37,7 @@ DOWNLOAD_JOB_FINISHED_TK_EVENT = "<<ToolFB_DownloadJobFinished>>"
 PENDING_VE_JOB_FILE = "pending_video_editor_job.json"
 TOOLFB_PENDING_DOWNLOAD_JOB_ATTR = "_toolfb_pending_download_job_id"
 TOOLFB_VE_AUTO_IMPORT_DOWNLOAD_ATTR = "_toolfb_ve_auto_import_download"
+_DOWNLOADER_MERGE_LOCK = threading.Lock()
 
 
 def pending_video_editor_job_path(*, paths: dict[str, Path] | None = None) -> Path:
@@ -116,6 +117,11 @@ def set_root_pending_download_job(root: Any, job_id: str) -> None:
 
 
 def get_root_pending_download_job(root: Any, *, paths: dict[str, Path] | None = None) -> str:
+    """
+    Đọc job chờ từ attr Tk (main thread) hoặc file pending.
+
+    **Chỉ gọi với ``root`` trên main thread** — worker dùng ``read_pending_video_editor_job(paths=…)``.
+    """
     try:
         jid = str(getattr(root, TOOLFB_PENDING_DOWNLOAD_JOB_ATTR, "") or "").strip()
     except Exception:
@@ -790,93 +796,94 @@ def _merge_downloader_metadata_canonical() -> None:
 
     Máy khách: metadata có thể nằm rải rác (exe_gui, portable_clean, bundle, cập nhật cũ).
     """
-    canonical_root = (project_root() / "data" / "downloader").resolve()
-    canonical_root.mkdir(parents=True, exist_ok=True)
-    jobs_file = canonical_root / "download_jobs.json"
-    videos_file = canonical_root / "downloaded_videos.json"
-    archive_file = canonical_root / "archive.txt"
+    with _DOWNLOADER_MERGE_LOCK:
+        canonical_root = (project_root() / "data" / "downloader").resolve()
+        canonical_root.mkdir(parents=True, exist_ok=True)
+        jobs_file = canonical_root / "download_jobs.json"
+        videos_file = canonical_root / "downloaded_videos.json"
+        archive_file = canonical_root / "archive.txt"
 
-    jobs_by_id: dict[str, dict[str, Any]] = {}
-    videos_by_key: dict[str, dict[str, Any]] = {}
-    archive_lines: list[str] = []
-    archive_seen: set[str] = set()
-    sources: list[Path] = []
-    best_pending: dict[str, Any] | None = None
-    best_pending_ts = 0.0
+        jobs_by_id: dict[str, dict[str, Any]] = {}
+        videos_by_key: dict[str, dict[str, Any]] = {}
+        archive_lines: list[str] = []
+        archive_seen: set[str] = set()
+        sources: list[Path] = []
+        best_pending: dict[str, Any] | None = None
+        best_pending_ts = 0.0
 
-    for dl_root in discover_downloader_data_roots():
-        jf = dl_root / "download_jobs.json"
-        vf = dl_root / "downloaded_videos.json"
-        af = dl_root / "archive.txt"
-        pf = dl_root / PENDING_VE_JOB_FILE
-        sources.append(dl_root)
-        for row in _read_json_object_list_file(jf):
-            jid = str(row.get("id") or "").strip()
-            if not jid:
-                continue
-            prev = jobs_by_id.get(jid)
-            if prev is None or _should_replace_metadata_row(
-                prev, row, "updated_at", "completed_at", "created_at"
-            ):
-                jobs_by_id[jid] = row
-        for row in _read_json_object_list_file(vf):
-            vkey = _video_row_merge_key(row)
-            if not vkey.strip("\0"):
-                continue
-            prev = videos_by_key.get(vkey)
-            if prev is None or _should_replace_metadata_row(prev, row, "created_at", "upload_date"):
-                videos_by_key[vkey] = row
-        if pf.is_file():
+        for dl_root in discover_downloader_data_roots():
+            jf = dl_root / "download_jobs.json"
+            vf = dl_root / "downloaded_videos.json"
+            af = dl_root / "archive.txt"
+            pf = dl_root / PENDING_VE_JOB_FILE
+            sources.append(dl_root)
+            for row in _read_json_object_list_file(jf):
+                jid = str(row.get("id") or "").strip()
+                if not jid:
+                    continue
+                prev = jobs_by_id.get(jid)
+                if prev is None or _should_replace_metadata_row(
+                    prev, row, "updated_at", "completed_at", "created_at"
+                ):
+                    jobs_by_id[jid] = row
+            for row in _read_json_object_list_file(vf):
+                vkey = _video_row_merge_key(row)
+                if not vkey.strip("\0"):
+                    continue
+                prev = videos_by_key.get(vkey)
+                if prev is None or _should_replace_metadata_row(prev, row, "created_at", "upload_date"):
+                    videos_by_key[vkey] = row
+            if pf.is_file():
+                try:
+                    raw = json.loads(pf.read_text(encoding="utf-8"))
+                except Exception:
+                    raw = None
+                if isinstance(raw, dict) and str(raw.get("job_id") or "").strip():
+                    ts = _parse_download_job_time(raw.get("saved_at"))
+                    if ts >= best_pending_ts:
+                        best_pending_ts = ts
+                        best_pending = raw
+            if af.is_file():
+                try:
+                    for line in af.read_text(encoding="utf-8").splitlines():
+                        s = line.strip()
+                        if s and s not in archive_seen:
+                            archive_seen.add(s)
+                            archive_lines.append(s)
+                except OSError:
+                    pass
+
+        if len(sources) <= 1 and not jobs_by_id and not videos_by_key and not best_pending:
+            return
+
+        jobs_out = sorted(
+            jobs_by_id.values(),
+            key=lambda j: (
+                _parse_download_job_time(j.get("updated_at")),
+                _parse_download_job_time(j.get("completed_at")),
+                _parse_download_job_time(j.get("created_at")),
+            ),
+            reverse=True,
+        )
+        videos_out = list(videos_by_key.values())
+
+        with json_file_lock(jobs_file):
+            _atomic_write_text(jobs_file, json.dumps(jobs_out, ensure_ascii=False, indent=2) + "\n")
+        with json_file_lock(videos_file):
+            _atomic_write_text(videos_file, json.dumps(videos_out, ensure_ascii=False, indent=2) + "\n")
+        if archive_lines:
+            with json_file_lock(archive_file):
+                _atomic_write_text(archive_file, "\n".join(archive_lines) + ("\n" if archive_lines else ""))
+        if best_pending:
+            pending_path = canonical_root / PENDING_VE_JOB_FILE
             try:
-                raw = json.loads(pf.read_text(encoding="utf-8"))
-            except Exception:
-                raw = None
-            if isinstance(raw, dict) and str(raw.get("job_id") or "").strip():
-                ts = _parse_download_job_time(raw.get("saved_at"))
-                if ts >= best_pending_ts:
-                    best_pending_ts = ts
-                    best_pending = raw
-        if af.is_file():
-            try:
-                for line in af.read_text(encoding="utf-8").splitlines():
-                    s = line.strip()
-                    if s and s not in archive_seen:
-                        archive_seen.add(s)
-                        archive_lines.append(s)
+                with json_file_lock(pending_path):
+                    _atomic_write_text(
+                        pending_path,
+                        json.dumps(best_pending, ensure_ascii=False, indent=2) + "\n",
+                    )
             except OSError:
                 pass
-
-    if len(sources) <= 1 and not jobs_by_id and not videos_by_key and not best_pending:
-        return
-
-    jobs_out = sorted(
-        jobs_by_id.values(),
-        key=lambda j: (
-            _parse_download_job_time(j.get("updated_at")),
-            _parse_download_job_time(j.get("completed_at")),
-            _parse_download_job_time(j.get("created_at")),
-        ),
-        reverse=True,
-    )
-    videos_out = list(videos_by_key.values())
-
-    with json_file_lock(jobs_file):
-        _atomic_write_text(jobs_file, json.dumps(jobs_out, ensure_ascii=False, indent=2) + "\n")
-    with json_file_lock(videos_file):
-        _atomic_write_text(videos_file, json.dumps(videos_out, ensure_ascii=False, indent=2) + "\n")
-    if archive_lines:
-        with json_file_lock(archive_file):
-            _atomic_write_text(archive_file, "\n".join(archive_lines) + ("\n" if archive_lines else ""))
-    if best_pending:
-        pending_path = canonical_root / PENDING_VE_JOB_FILE
-        try:
-            with json_file_lock(pending_path):
-                _atomic_write_text(
-                    pending_path,
-                    json.dumps(best_pending, ensure_ascii=False, indent=2) + "\n",
-                )
-        except OSError:
-            pass
 
 
 def ensure_downloader_layout() -> dict[str, Path]:

@@ -14,7 +14,7 @@ from loguru import logger
 
 from src.gui.cookie_capture import run_fb_cookie_capture_dialog
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
-from src.gui.ui_responsiveness import run_background_then_main
+from src.gui.ui_responsiveness import run_background_then_main, schedule_on_main_thread
 from src.models.mapped_account import MappedAccount
 from src.services.human_interaction_profile import PROFILES, resolve_profile
 from src.services.human_interaction_pool import HumanInteractionPool, validate_pool_start
@@ -1379,7 +1379,7 @@ def build_human_interaction_tab(
                 except tk.TclError:
                     pass
 
-        root.after(0, _ui)
+        schedule_on_main_thread(root, _ui)
 
     def _load_mapped(*, persist_secrets: bool) -> list[MappedAccount]:
         acc_lines, px_lines = _resolve_input_lines()
@@ -1687,7 +1687,9 @@ def build_human_interaction_tab(
                 logger.exception("[Human GUI] pool.join lỗi: {}", exc)
             finally:
                 gen = pool_generation
-                root.after(0, lambda ok=join_ok, g=gen: _after_pool_join(join_ok=ok))
+                schedule_on_main_thread(
+                    root, lambda ok=join_ok, g=gen: _after_pool_join(join_ok=ok)
+                )
 
         threading.Thread(
             target=_watch,

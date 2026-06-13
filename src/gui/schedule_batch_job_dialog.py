@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
+from src.gui.ui_responsiveness import schedule_on_main_thread
 from src.ai.image_generation import build_imagen_prompt_from_post
 from src.services.ai_image_service import AIImageService
 from src.services.ai_text_service import AITextService
@@ -1155,10 +1156,10 @@ class ScheduleBatchJobDialog:
                     "Chưa phát hiện ffmpeg/ffprobe trong PATH.\n"
                     "Hãy cài ffmpeg (hoặc mở lại app sau khi cài) để bật cắt frame video chính xác."
                 )
-            self._top.after(0, lambda: self._on_ffmpeg_check_done(ok, msg, detail))
+            schedule_on_main_thread(self._top, lambda: self._on_ffmpeg_check_done(ok, msg, detail))
         except Exception as exc:  # noqa: BLE001
-            self._top.after(
-                0,
+            schedule_on_main_thread(
+                self._top,
                 lambda e=exc: self._on_ffmpeg_check_done(False, "Lỗi kiểm tra ffmpeg.", str(e)),
             )
 
@@ -1992,7 +1993,7 @@ class ScheduleBatchJobDialog:
             err_title = "Preview"
             err_msg = str(exc)
         try:
-            self._top.after(0, lambda: self._on_preview_done(rows, err_title, err_msg))
+            schedule_on_main_thread(self._top, lambda: self._on_preview_done(rows, err_title, err_msg))
         except tk.TclError:
             return
 

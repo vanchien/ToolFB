@@ -42,7 +42,9 @@ from src.gui.schedule_job_dialog import SchedulePostJobDialog
 from src.gui.ui_responsiveness import (
     ASYNC_PREP_MIN_ROWS,
     DEFAULT_TREE_CHUNK,
+    register_main_thread_dispatcher,
     run_background_then_main,
+    schedule_on_main_thread,
     tree_delete_all,
     tree_insert_chunked,
 )
@@ -180,7 +182,7 @@ class _GuiLogStream:
             self._text.see("end")
             self._text.configure(state="disabled")
 
-        self._root.after(0, append)
+        schedule_on_main_thread(self._root, append)
         return len(s)
 
     def flush(self) -> None:
@@ -285,6 +287,7 @@ class _ManagerWindow:
         self._show_browser = os.environ.get("HEADLESS", "1").strip().lower() in {"0", "false", "off", "no"}
 
         self._root = tk.Tk()
+        register_main_thread_dispatcher(self._root)
         self._app_version_str = read_local_version(project_root())
         self._root.title(f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1346,8 +1349,10 @@ class _ManagerWindow:
         def _work() -> None:
             try:
                 ensure_downloader_layout()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                from loguru import logger
+
+                logger.warning("[DL] Gộp metadata nền khi mở app: {}", exc)
 
         threading.Thread(target=_work, daemon=True, name="dl_meta_merge").start()
 
@@ -2427,7 +2432,7 @@ class _ManagerWindow:
 
                     def _status(msg: str) -> None:
                         try:
-                            self._root.after(0, lambda m=msg: status_var.set(m))
+                            schedule_on_main_thread(self._root, lambda m=msg: status_var.set(m))
                         except Exception:
                             pass
 
@@ -2786,7 +2791,7 @@ class _ManagerWindow:
                     parent=self._root,
                 )
 
-            self._root.after(0, _migrate_done)
+            schedule_on_main_thread(self._root, _migrate_done)
 
         threading.Thread(target=_migrate_worker, name="migrate_user_data", daemon=True).start()
 
@@ -2825,7 +2830,7 @@ class _ManagerWindow:
                 self._root.after(50, self._fill_ve_pending_export_jobs_tree)
 
             try:
-                self._root.after(0, _done)
+                schedule_on_main_thread(self._root, _done)
             except tk.TclError:
                 self._schedule_jobs_load_busy = False
 
@@ -2896,7 +2901,7 @@ class _ManagerWindow:
             self._suppress_ve_pending_job_cb["v"] = False
 
         self._sync_ve_pending_selected_id_from_combo()
-        self._root.after(0, self._refresh_ve_pending_job_detail)
+        schedule_on_main_thread(self._root, self._refresh_ve_pending_job_detail)
 
     def _fill_ve_pending_export_jobs_tree(self) -> None:
         """Nạp danh sách job chờ vào combobox (đọc JSON ngoài main thread)."""
@@ -2949,7 +2954,7 @@ class _ManagerWindow:
                 self._apply_ve_pending_export_jobs_ui(rows_out)
 
             try:
-                self._root.after(0, _done)
+                schedule_on_main_thread(self._root, _done)
             except tk.TclError:
                 pass
 
@@ -4688,7 +4693,7 @@ class _ManagerWindow:
                 )
 
             try:
-                self._root.after(0, _done)
+                schedule_on_main_thread(self._root, _done)
             except tk.TclError:
                 pass
 
@@ -4968,7 +4973,7 @@ class _ManagerWindow:
 
             def _on_prog(done: int, total: int, jid: str) -> None:
                 try:
-                    self._root.after(0, lambda d=done, t=total, j=jid: _set_progress(d, t, j))
+                    schedule_on_main_thread(self._root, lambda d=done, t=total, j=jid: _set_progress(d, t, j))
                 except tk.TclError:
                     pass
 
@@ -5214,7 +5219,7 @@ class _ManagerWindow:
 
             def progress(i: int, tot: int, jid: str, regen: list[str]) -> None:
                 msg = f"Đang tái tạo… {i}/{tot} (job {jid[:8]}: {', '.join(regen) or '—'})"
-                self._root.after(0, lambda m=msg: self._lbl_jobs_regen_status.configure(text=m))
+                schedule_on_main_thread(self._root, lambda m=msg: self._lbl_jobs_regen_status.configure(text=m))
 
             try:
                 results = regenerate_many_jobs(
@@ -5280,7 +5285,7 @@ class _ManagerWindow:
                     parent=self._root,
                 )
 
-            self._root.after(0, done)
+            schedule_on_main_thread(self._root, done)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5813,10 +5818,10 @@ class _ManagerWindow:
 
                 # wait_sec=0 => không auto-close, chờ user tự đóng browser.
                 info = open_nanobanana_login_browser(wait_sec=0)
-                self._root.after(0, lambda: self._finish_nanobanana_login(web_url, info, None))
+                schedule_on_main_thread(self._root, lambda: self._finish_nanobanana_login(web_url, info, None))
             except Exception as exc:  # noqa: BLE001
                 # Chốt giá trị exc vào default arg để tránh NameError closure trong callback Tkinter.
-                self._root.after(0, lambda err=exc: self._finish_nanobanana_login(web_url, None, err))
+                schedule_on_main_thread(self._root, lambda err=exc: self._finish_nanobanana_login(web_url, None, err))
 
         threading.Thread(target=worker, name="nanobanana_login_browser", daemon=True).start()
 
@@ -8088,7 +8093,7 @@ class _ManagerWindow:
                 else:
                     messagebox.showwarning(title, body, parent=self._root)
 
-            self._root.after(0, _verify_done)
+            schedule_on_main_thread(self._root, _verify_done)
 
         threading.Thread(target=_verify_worker, name="verify_profile", daemon=True).start()
 
@@ -8163,7 +8168,7 @@ class _ManagerWindow:
                 else:
                     messagebox.showwarning(title, body, parent=self._root)
 
-            self._root.after(0, _proxy_done)
+            schedule_on_main_thread(self._root, _proxy_done)
 
         threading.Thread(target=_proxy_worker, name="check_proxy", daemon=True).start()
 
@@ -8830,7 +8835,7 @@ class _ManagerWindow:
                 info += "\n\nLưu ý: hãy đăng nhập lại Google khi chạy VEO3 lần tới."
                 messagebox.showinfo("Reset profile VEO3", info, parent=self._root)
 
-            self._root.after(0, _reset_done)
+            schedule_on_main_thread(self._root, _reset_done)
 
         threading.Thread(target=_reset_veo3_worker, name="reset_veo3_profile", daemon=True).start()
 
@@ -8909,7 +8914,7 @@ class _ManagerWindow:
                     self._hide_apply_update_button()
 
             try:
-                self._root.after(0, on_main)
+                schedule_on_main_thread(self._root, on_main)
             except Exception:
                 pass
 
@@ -8953,7 +8958,7 @@ class _ManagerWindow:
                             parent=self._root,
                         )
 
-                self._root.after(0, done_pull)
+                schedule_on_main_thread(self._root, done_pull)
             except Exception as exc:
                 err_text = str(exc)
 
@@ -8964,7 +8969,7 @@ class _ManagerWindow:
                     self._clear_ui_busy()
                     messagebox.showerror("Cập nhật (git)", err_text, parent=self._root)
 
-                self._root.after(0, done_err)
+                schedule_on_main_thread(self._root, done_err)
 
         threading.Thread(target=worker_pull, name="apply_git_pull", daemon=True).start()
 
@@ -8990,7 +8995,7 @@ class _ManagerWindow:
                     self._btn_apply_update.configure(state=tk.NORMAL)
                     self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
 
-                self._root.after(0, done_ok)
+                schedule_on_main_thread(self._root, done_ok)
             except Exception as exc:  # noqa: BLE001
                 err_text = str(exc)
 
@@ -9001,7 +9006,7 @@ class _ManagerWindow:
                     self._clear_ui_busy()
                     messagebox.showerror("Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root)
 
-                self._root.after(0, done_err)
+                schedule_on_main_thread(self._root, done_err)
 
         threading.Thread(target=worker_download, name="apply_update_download", daemon=True).start()
 
@@ -9057,7 +9062,7 @@ class _ManagerWindow:
                             parent=self._root,
                         )
 
-                    self._root.after(0, done_git)
+                    schedule_on_main_thread(self._root, done_git)
                 except Exception as exc:  # noqa: BLE001
                     err_text = str(exc)
 
@@ -9068,7 +9073,7 @@ class _ManagerWindow:
                         self._clear_ui_busy()
                         messagebox.showerror("Cập nhật (git)", f"Lỗi:\n{err_text}", parent=self._root)
 
-                    self._root.after(0, done_err)
+                    schedule_on_main_thread(self._root, done_err)
 
             self._set_ui_busy("check_updates")
             self._btn_check_updates.configure(state=tk.DISABLED)
@@ -9149,7 +9154,7 @@ class _ManagerWindow:
                             parent=self._root,
                         )
 
-                self._root.after(0, done_ok)
+                schedule_on_main_thread(self._root, done_ok)
             except Exception as exc:  # noqa: BLE001
                 err_text = str(exc)
 
@@ -9160,7 +9165,7 @@ class _ManagerWindow:
                     self._clear_ui_busy()
                     messagebox.showerror("Cập nhật", f"Kiểm tra bản mới thất bại:\n{err_text}", parent=self._root)
 
-                self._root.after(0, done_err)
+                schedule_on_main_thread(self._root, done_err)
 
         threading.Thread(target=worker, name="check_updates", daemon=True).start()
 
@@ -9267,7 +9272,7 @@ class _ManagerWindow:
                                 parent=self._root,
                             )
 
-                        self._root.after(0, on_bad)
+                        schedule_on_main_thread(self._root, on_bad)
                         return
                     if not info.has_new_commits:
 
@@ -9286,7 +9291,7 @@ class _ManagerWindow:
                                 parent=self._root,
                             )
 
-                        self._root.after(0, on_uptodate)
+                        schedule_on_main_thread(self._root, on_uptodate)
                         return
 
                     ui_evt = threading.Event()
@@ -9296,7 +9301,7 @@ class _ManagerWindow:
                         self._lbl_state.configure(text="Update (git): đang pull…")
                         ui_evt.set()
 
-                    self._root.after(0, on_ui_pulling)
+                    schedule_on_main_thread(self._root, on_ui_pulling)
                     ui_evt.wait(timeout=60)
                     ok, msg = apply_git_pull_ff(root, result=info)
 
@@ -9327,7 +9332,7 @@ class _ManagerWindow:
                                 parent=self._root,
                             )
 
-                    self._root.after(0, done_pull)
+                    schedule_on_main_thread(self._root, done_pull)
                 except Exception as exc:  # noqa: BLE001
                     err_text = str(exc)
 
@@ -9339,7 +9344,7 @@ class _ManagerWindow:
                         self._clear_ui_busy()
                         messagebox.showerror("Cập nhật (git)", err_text, parent=self._root)
 
-                    self._root.after(0, done_err)
+                    schedule_on_main_thread(self._root, done_err)
 
             threading.Thread(target=worker_git_apply, name="apply_update_git", daemon=True).start()
             return
@@ -9386,7 +9391,7 @@ class _ManagerWindow:
                             parent=self._root,
                         )
 
-                    self._root.after(0, on_no)
+                    schedule_on_main_thread(self._root, on_no)
                     return
 
                 ui_evt = threading.Event()
@@ -9400,7 +9405,7 @@ class _ManagerWindow:
                     )
                     ui_evt.set()
 
-                self._root.after(0, on_ui_start)
+                schedule_on_main_thread(self._root, on_ui_start)
                 ui_evt.wait(timeout=60)
                 backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
 
@@ -9411,7 +9416,7 @@ class _ManagerWindow:
                     self._btn_apply_update.configure(state=tk.NORMAL)
                     self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
 
-                self._root.after(0, on_done)
+                schedule_on_main_thread(self._root, on_done)
             except Exception as exc:  # noqa: BLE001
                 err_text = str(exc)
 
@@ -9422,7 +9427,7 @@ class _ManagerWindow:
                     self._clear_ui_busy()
                     messagebox.showerror("Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root)
 
-                self._root.after(0, on_err)
+                schedule_on_main_thread(self._root, on_err)
 
         threading.Thread(target=worker_manifest_apply, name="apply_update_manifest", daemon=True).start()
 
@@ -9577,6 +9582,6 @@ class _ManagerWindow:
         self._stop_ui_watchdog()
         self._detach_log_sink()
         try:
-            self._root.after(0, self._root.destroy)
+            schedule_on_main_thread(self._root, self._root.destroy)
         except Exception:  # noqa: BLE001
             self._root.destroy()

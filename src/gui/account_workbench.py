@@ -23,6 +23,7 @@ from tkinter import filedialog, messagebox, ttk
 from loguru import logger
 
 from src.gui.cookie_capture import account_cookie_path_field, cookie_storage_dest, run_fb_cookie_capture_dialog
+from src.gui.ui_responsiveness import schedule_on_main_thread
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.services.totp_service import generate_totp_code
 from src.utils.browser_exe_discover import find_browser_exe_in_directory as _find_browser_exe_in_directory
@@ -1990,7 +1991,7 @@ class AccountFormDialog:
 
             try:
                 if bool(self._top.winfo_exists()):
-                    self._top.after(0, _notify)
+                    schedule_on_main_thread(self._top, _notify)
             except tk.TclError:
                 return
 
