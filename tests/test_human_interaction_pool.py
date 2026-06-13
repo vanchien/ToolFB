@@ -123,3 +123,45 @@ def test_pool_drains_more_than_max_concurrent() -> None:
     assert set(order) == {a.account_id for a in accounts}
     assert pool._completed_accounts == 6
     assert max_running["n"] <= 4
+
+
+def test_stop_drained_queue_calls_task_done() -> None:
+    """Hủy item trong hàng đợi phải ``task_done`` — ``join`` không kẹt vì ``unfinished_tasks``."""
+    pending = [_fake_mapped(f"s{i}", proxy=f"127.0.0.1:91{i:02d}") for i in range(3)]
+
+    def fast_fail(mapped, **kwargs):  # noqa: ANN001
+        return "proxy_error"
+
+    with patch(
+        "src.services.human_interaction_pool.run_human_interaction_worker",
+        side_effect=fast_fail,
+    ):
+        pool = HumanInteractionPool(pending, max_concurrent=1, login_only=True)
+        pool.start()
+        time.sleep(0.15)
+        pool.stop()
+        assert pool.join(timeout=15.0) is True
+    assert pool._work_q.unfinished_tasks == 0
+
+
+def test_join_waits_after_stop_until_workers_finish() -> None:
+    acc = _fake_mapped("slow1")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_worker(mapped, **kwargs):  # noqa: ANN001
+        started.set()
+        release.wait(timeout=5.0)
+        return "cancelled"
+
+    with patch(
+        "src.services.human_interaction_pool.run_human_interaction_worker",
+        side_effect=slow_worker,
+    ):
+        pool = HumanInteractionPool([acc], max_concurrent=1, login_only=True)
+        pool.start()
+        assert started.wait(timeout=5.0)
+        pool.stop()
+        release.set()
+        assert pool.join(timeout=20.0) is True
+        assert pool._join_workers_alive is False

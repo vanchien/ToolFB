@@ -12,6 +12,7 @@ from src.services.universal_video_downloader import (
     UV_DOWNLOAD_SEQUENTIAL_THRESHOLD,
     UV_MAX_PLAYLIST_ENTRIES,
     UV_PLAYLIST_SCAN_CHUNK,
+    DownloadMetadataStore,
     UniversalVideoDownloader,
     UniversalYTDLPWrapper,
     extract_failed_download_pairs,
@@ -112,46 +113,50 @@ def test_sequential_download_reuses_videos_rows_cache(tmp_path: Path) -> None:
     }
     paths["jobs_file"].write_text("[]\n", encoding="utf-8")
     paths["videos_file"].write_text("[]\n", encoding="utf-8")
+    paths_pp = {k: Path(v) for k, v in paths.items()}
 
     down = UniversalVideoDownloader(log=lambda _m: None)
-    down._paths = paths  # type: ignore[assignment]
-    down._store._paths = paths  # type: ignore[attr-defined]
+    down._store = DownloadMetadataStore(paths=paths_pp)
 
-    job = down.create_download_job(
-        "https://www.youtube.com/@x",
-        {
-            "platform": "youtube",
-            "url_type": "single_video",
-            "max_videos": 1,
-            "output_dir": str(tmp_path / "out"),
-            "organize_by_platform": False,
-            "organize_by_uploader": False,
-            "skip_existing": False,
-            "write_info_json": False,
-            "write_thumbnail": False,
-        },
-    )
-    jid = str(job["id"])
-    urls = ["https://youtu.be/a", "https://youtu.be/b", "https://youtu.be/c"]
-    list_calls: list[int] = []
+    with patch(
+        "src.services.universal_video_downloader.ensure_downloader_layout",
+        return_value=paths_pp,
+    ):
+        job = down.create_download_job(
+            "https://www.youtube.com/@x",
+            {
+                "platform": "youtube",
+                "url_type": "single_video",
+                "max_videos": 1,
+                "output_dir": str(tmp_path / "out"),
+                "organize_by_platform": False,
+                "organize_by_uploader": False,
+                "skip_existing": False,
+                "write_info_json": False,
+                "write_thumbnail": False,
+            },
+        )
+        jid = str(job["id"])
+        urls = ["https://youtu.be/a", "https://youtu.be/b", "https://youtu.be/c"]
+        list_calls: list[int] = []
 
-    real_list = down._store.list_downloaded_videos
+        real_list = down._store.list_downloaded_videos
 
-    def _counting_list() -> list[dict[str, Any]]:
-        list_calls.append(1)
-        return real_list()
+        def _counting_list() -> list[dict[str, Any]]:
+            list_calls.append(1)
+            return real_list()
 
-    with patch.object(down._store, "list_downloaded_videos", side_effect=_counting_list):
-        with patch.object(
-            down,
-            "run_download_url_for_job",
-            side_effect=lambda job_id, url, **kw: down._store.get_job(job_id) or {},
-        ) as run_one:
-            down.run_download_urls_sequential_for_job(jid, urls)
+        with patch.object(down._store, "list_downloaded_videos", side_effect=_counting_list):
+            with patch.object(
+                down,
+                "run_download_url_for_job",
+                side_effect=lambda job_id, url, **kw: down._store.get_job(job_id) or {},
+            ) as run_one:
+                down.run_download_urls_sequential_for_job(jid, urls)
 
-    assert run_one.call_count == 3
-    assert list_calls, "phải đọc metadata ít nhất một lần"
-    assert len(list_calls) <= 2, "cache phải giảm số lần đọc file videos.json"
+        assert run_one.call_count == 3
+        assert list_calls, "phải đọc metadata ít nhất một lần"
+        assert len(list_calls) <= 2, "cache phải giảm số lần đọc file videos.json"
 
 
 def test_run_download_url_for_job_accepts_cached_rows(tmp_path: Path) -> None:
@@ -163,47 +168,51 @@ def test_run_download_url_for_job_accepts_cached_rows(tmp_path: Path) -> None:
     }
     paths["jobs_file"].write_text("[]\n", encoding="utf-8")
     paths["videos_file"].write_text("[]\n", encoding="utf-8")
+    paths_pp = {k: Path(v) for k, v in paths.items()}
 
     down = UniversalVideoDownloader(log=lambda _m: None)
-    down._paths = paths  # type: ignore[assignment]
-    down._store._paths = paths  # type: ignore[attr-defined]
+    down._store = DownloadMetadataStore(paths=paths_pp)
 
-    job = down.create_download_job(
-        "https://youtu.be/x",
-        {
-            "platform": "youtube",
-            "url_type": "single_video",
-            "max_videos": 1,
-            "output_dir": str(tmp_path / "out"),
-            "organize_by_platform": False,
-            "organize_by_uploader": False,
-            "skip_existing": True,
-            "write_info_json": False,
-            "write_thumbnail": False,
-        },
-    )
-    jid = str(job["id"])
-    cache: list[dict[str, Any]] = []
-    list_calls = 0
+    with patch(
+        "src.services.universal_video_downloader.ensure_downloader_layout",
+        return_value=paths_pp,
+    ):
+        job = down.create_download_job(
+            "https://youtu.be/x",
+            {
+                "platform": "youtube",
+                "url_type": "single_video",
+                "max_videos": 1,
+                "output_dir": str(tmp_path / "out"),
+                "organize_by_platform": False,
+                "organize_by_uploader": False,
+                "skip_existing": True,
+                "write_info_json": False,
+                "write_thumbnail": False,
+            },
+        )
+        jid = str(job["id"])
+        cache: list[dict[str, Any]] = []
+        list_calls = 0
 
-    def _no_list() -> list[dict[str, Any]]:
-        nonlocal list_calls
-        list_calls += 1
-        return cache
+        def _no_list() -> list[dict[str, Any]]:
+            nonlocal list_calls
+            list_calls += 1
+            return cache
 
-    fake_ret = {"success": True, "filepaths": [], "skipped_only": True}
+        fake_ret = {"success": True, "filepaths": [], "skipped_only": True}
 
-    with patch.object(down._store, "list_downloaded_videos", side_effect=_no_list):
-        with patch.object(down._yt, "download", return_value=fake_ret):
-            with patch.object(down, "_attach_existing_sources_to_job", return_value=0):
-                down.run_download_url_for_job(
-                    jid,
-                    "https://youtu.be/x",
-                    videos_rows=cache,
-                    skip_output_dir_validate=True,
-                )
+        with patch.object(down._store, "list_downloaded_videos", side_effect=_no_list):
+            with patch.object(down._yt, "download", return_value=fake_ret):
+                with patch.object(down, "_attach_existing_sources_to_job", return_value=0):
+                    down.run_download_url_for_job(
+                        jid,
+                        "https://youtu.be/x",
+                        videos_rows=cache,
+                        skip_output_dir_validate=True,
+                    )
 
-    assert list_calls == 0
+        assert list_calls == 0
 
 
 def test_extract_failed_pairs_dedup() -> None:

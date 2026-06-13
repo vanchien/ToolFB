@@ -30,6 +30,12 @@ class HumanInteractionProfile:
     dwell_scale: float = 1.15
     module_pause_min_sec: float = 2.0
     module_pause_max_sec: float = 4.0
+    # Giới hạn số module thực sự chạy mỗi lượt (tránh 1 TK kéo dài 20+ phút)
+    max_modules_per_run: int = 3
+    reels_clip_min_ms: int = 5000
+    reels_clip_max_ms: int = 9500
+    page_load_pause_min_sec: float = 1.0
+    page_load_pause_max_sec: float = 2.2
 
 
 PROFILES: dict[str, HumanInteractionProfile] = {
@@ -39,16 +45,21 @@ PROFILES: dict[str, HumanInteractionProfile] = {
         reels_prob=0.65,
         search_prob=0.45,
         post_prob=0.15,
-        deep_delay_min_sec=35.0,
-        deep_delay_max_sec=62.0,
-        sync_wait_sec=6.0,
-        scroll_rounds_min=22,
-        scroll_rounds_max=34,
-        scroll_rounds_short_min=12,
-        scroll_rounds_short_max=18,
-        dwell_scale=1.35,
-        module_pause_min_sec=2.8,
-        module_pause_max_sec=5.2,
+        deep_delay_min_sec=14.0,
+        deep_delay_max_sec=24.0,
+        sync_wait_sec=4.0,
+        scroll_rounds_min=12,
+        scroll_rounds_max=18,
+        scroll_rounds_short_min=7,
+        scroll_rounds_short_max=11,
+        dwell_scale=1.0,
+        module_pause_min_sec=1.4,
+        module_pause_max_sec=2.6,
+        max_modules_per_run=3,
+        reels_clip_min_ms=6500,
+        reels_clip_max_ms=12_000,
+        page_load_pause_min_sec=1.4,
+        page_load_pause_max_sec=2.8,
     ),
     "normal": HumanInteractionProfile(
         name="normal",
@@ -56,16 +67,21 @@ PROFILES: dict[str, HumanInteractionProfile] = {
         reels_prob=0.60,
         search_prob=0.40,
         post_prob=0.20,
-        deep_delay_min_sec=20.0,
-        deep_delay_max_sec=38.0,
-        sync_wait_sec=3.5,
-        scroll_rounds_min=14,
-        scroll_rounds_max=22,
-        scroll_rounds_short_min=8,
-        scroll_rounds_short_max=13,
-        dwell_scale=1.1,
-        module_pause_min_sec=1.6,
-        module_pause_max_sec=3.2,
+        deep_delay_min_sec=7.0,
+        deep_delay_max_sec=14.0,
+        sync_wait_sec=2.0,
+        scroll_rounds_min=8,
+        scroll_rounds_max=13,
+        scroll_rounds_short_min=5,
+        scroll_rounds_short_max=8,
+        dwell_scale=0.82,
+        module_pause_min_sec=0.7,
+        module_pause_max_sec=1.5,
+        max_modules_per_run=3,
+        reels_clip_min_ms=4500,
+        reels_clip_max_ms=9000,
+        page_load_pause_min_sec=1.0,
+        page_load_pause_max_sec=2.0,
     ),
     "fast": HumanInteractionProfile(
         name="fast",
@@ -73,16 +89,21 @@ PROFILES: dict[str, HumanInteractionProfile] = {
         reels_prob=0.50,
         search_prob=0.30,
         post_prob=0.10,
-        deep_delay_min_sec=16.0,
-        deep_delay_max_sec=32.0,
-        sync_wait_sec=3.0,
-        scroll_rounds_min=14,
-        scroll_rounds_max=20,
-        scroll_rounds_short_min=7,
-        scroll_rounds_short_max=11,
-        dwell_scale=1.05,
-        module_pause_min_sec=1.4,
-        module_pause_max_sec=2.6,
+        deep_delay_min_sec=4.0,
+        deep_delay_max_sec=9.0,
+        sync_wait_sec=1.5,
+        scroll_rounds_min=6,
+        scroll_rounds_max=10,
+        scroll_rounds_short_min=4,
+        scroll_rounds_short_max=7,
+        dwell_scale=0.72,
+        module_pause_min_sec=0.5,
+        module_pause_max_sec=1.1,
+        max_modules_per_run=2,
+        reels_clip_min_ms=3500,
+        reels_clip_max_ms=6500,
+        page_load_pause_min_sec=0.7,
+        page_load_pause_max_sec=1.4,
     ),
 }
 
@@ -124,10 +145,20 @@ def resolve_profile(name: str | None, *, settings: dict[str, Any] | None = None)
         "module_pause_max_sec",
         "deep_delay_min_sec",
         "deep_delay_max_sec",
+        "max_modules_per_run",
+        "reels_clip_min_ms",
+        "reels_clip_max_ms",
+        "page_load_pause_min_sec",
+        "page_load_pause_max_sec",
     ):
         if key in settings:
             try:
-                overrides[key] = float(settings[key]) if "scale" in key or "sec" in key else int(settings[key])
+                if key in ("max_modules_per_run", "reels_clip_min_ms", "reels_clip_max_ms"):
+                    overrides[key] = int(settings[key])
+                elif "scale" in key or "sec" in key:
+                    overrides[key] = float(settings[key])
+                else:
+                    overrides[key] = int(settings[key])
             except (TypeError, ValueError):
                 pass
     return replace(base, **overrides) if overrides else base

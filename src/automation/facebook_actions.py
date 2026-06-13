@@ -1014,6 +1014,20 @@ def facebook_session_appears_logged_in(page: Page) -> bool:
             if "/login" not in u and "/checkpoint" not in u and "two_step" not in u:
                 logger.info("[FB] Cookie c_user+xs, không form đăng nhập — coi như đã đăng nhập (bỏ qua chờ DOM feed).")
                 return True
+        # Profile đăng nhập tay: đôi khi có c_user trước khi xs/DOM feed kịp load.
+        if has_c_user and "facebook.com" in u:
+            if "/login" not in u and "/checkpoint" not in u and "two_step" not in u:
+                try:
+                    page.wait_for_timeout(900)
+                except Exception:
+                    pass
+                names2 = _facebook_context_cookie_names(page)
+                if "c_user" in names2:
+                    logger.info(
+                        "[FB] Cookie c_user ổn định (url={}) — coi như đã đăng nhập (không chờ DOM feed).",
+                        (page.url or "")[:80],
+                    )
+                    return True
     except Exception:
         pass
     try:

@@ -8,6 +8,7 @@ Ràng buộc: số proxy ≥ số luồng đồng thời; **mỗi IP:port chỉ 
 from __future__ import annotations
 
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, TypedDict
@@ -802,6 +803,368 @@ def map_accounts_with_proxies(
         mc,
     )
     return mapped_list
+
+
+def _collect_used_proxy_keys(
+    all_accounts: list[MappedAccount],
+    *,
+    exclude_account_ids: set[str],
+    registry_index: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """``{ip:port → account_id}`` — proxy đã gắn (trừ tài khoản đang đổi proxy)."""
+    used: dict[str, str] = {}
+    exclude_aliases: set[str] = set()
+    for aid in exclude_account_ids:
+        exclude_aliases |= _account_alias_ids(aid)
+    if registry_index:
+        for key, owner in registry_index.items():
+            if owner in exclude_aliases:
+                continue
+            used.setdefault(key, owner)
+    for ma in all_accounts:
+        if ma.account_id in exclude_account_ids:
+            continue
+        if not ma.use_proxy:
+            continue
+        key = proxy_identity_key_for_account(ma)
+        if key:
+            used[key] = ma.account_id
+    return used
+
+
+def reassign_proxies_from_pool(
+    targets: list[MappedAccount],
+    *,
+    all_accounts: list[MappedAccount],
+    proxy_lines: list[str],
+) -> dict[str, Any]:
+    """
+    Gán proxy mới từ danh sách (tab Đăng nhập) cho các tài khoản lỗi proxy.
+
+    - Không trùng IP:port với TK khác (login + tương tác + accounts.json).
+    - Bỏ qua proxy hiện tại của TK (đã lỗi) và proxy đã dùng bởi TK khác.
+
+    Returns:
+        ``{updated: [account_id], skipped: [(account_id, reason)], assignments: {id: proxy_line}}``
+    """
+    if not targets:
+        return {"updated": [], "skipped": [], "assignments": {}}
+    pool = [ln.strip() for ln in proxy_lines if str(ln or "").strip()]
+    if not pool:
+        raise AccountProxyMappingError("Danh sách proxy trống — nhập ở tab Đăng nhập.")
+
+    target_ids = {ma.account_id for ma in targets}
+    registry_index = load_registry_proxy_index()
+    used_keys = _collect_used_proxy_keys(
+        all_accounts,
+        exclude_account_ids=target_ids,
+        registry_index=registry_index,
+    )
+
+    updated: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    assignments: dict[str, str] = {}
+
+    for ma in targets:
+        current_key = proxy_identity_key_for_account(ma) if ma.use_proxy else ""
+        assigned = False
+        for raw_line in pool:
+            try:
+                net = parse_proxy_line_to_network(raw_line)
+            except ValueError as exc:
+                logger.debug("[Human/Proxy] Bỏ qua dòng proxy: {}", exc)
+                continue
+            pkey = proxy_identity_key_for_network(net)
+            if not pkey:
+                continue
+            if pkey == current_key:
+                continue
+            owner = used_keys.get(pkey)
+            if owner:
+                aliases = _account_alias_ids(
+                    ma.account_id,
+                    facebook_uid=ma.auth.username if ma.auth.username.isdigit() else "",
+                )
+                if owner not in aliases:
+                    continue
+            ma.network = net
+            ma.use_proxy = True
+            ma.status = "pending"
+            ma.status_detail = "Đã đổi proxy — chờ chạy lại"
+            used_keys[pkey] = ma.account_id
+            updated.append(ma.account_id)
+            assignments[ma.account_id] = raw_line[:120]
+            assigned = True
+            logger.info(
+                "[Human/Proxy] Đổi proxy account={} → {}",
+                ma.account_id,
+                pkey,
+            )
+            break
+        if not assigned:
+            skipped.append(
+                (
+                    ma.account_id,
+                    "Không còn proxy trống trong list (trùng IP hoặc hết dòng).",
+                )
+            )
+
+    if updated:
+        try:
+            assert_proxy_exclusive_among_accounts(
+                all_accounts,
+                registry_index=registry_index,
+                context="sau cập nhật proxy",
+            )
+        except AccountProxyMappingError:
+            pass
+
+    return {"updated": updated, "skipped": skipped, "assignments": assignments}
+
+
+def persist_mapped_proxy_to_accounts_json(mapped: MappedAccount) -> bool:
+    """Ghi proxy mới vào ``accounts.json`` nếu có bản ghi khớp id/UID."""
+    from src.utils.db_manager import AccountsDatabaseManager
+
+    aid = str(mapped.account_id or "").strip()
+    if not aid:
+        return False
+    try:
+        db = AccountsDatabaseManager()
+        rows = db.load_all()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("persist_mapped_proxy: {}", exc)
+        return False
+    rec = next((r for r in rows if str(r.get("id") or "").strip() == aid), None)
+    if rec is None:
+        uid = str(mapped.auth.username or "").strip()
+        if uid.isdigit():
+            rec = next(
+                (r for r in rows if str(r.get("facebook_uid") or "").strip() == uid),
+                None,
+            )
+    if rec is None:
+        return False
+    reg_id = str(rec.get("id") or "").strip()
+    if not reg_id:
+        return False
+    px = (
+        network_to_proxy_config(mapped.network)
+        if mapped.use_proxy
+        else {"host": "", "port": 0, "user": "", "pass": ""}
+    )
+    try:
+        db.update_account_fields(
+            reg_id,
+            {
+                "proxy": px,
+                "use_proxy": bool(mapped.use_proxy and str(px.get("host") or "").strip()),
+            },
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Human/Proxy] Không ghi accounts.json id={}: {}", reg_id, exc)
+        return False
+
+
+class ExportMappedRegistryResult(TypedDict):
+    """Kết quả đưa tài khoản tab Tương tác vào ``accounts.json``."""
+
+    added: list[str]
+    updated: list[str]
+    skipped: list[tuple[str, str]]
+
+
+def _registry_profile_id_from_path(portable: str) -> str:
+    """Lấy ``acc_…`` từ cuối ``portable_path`` nếu có."""
+    tail = str(portable or "").replace("\\", "/").rstrip("/").split("/")[-1].strip()
+    if tail.startswith("acc_"):
+        return tail
+    return ""
+
+
+def _find_registry_row_for_mapped(
+    rows: list[dict[str, Any]],
+    mapped: MappedAccount,
+) -> dict[str, Any] | None:
+    """Tìm bản ghi ``accounts.json`` theo ``id`` hoặc ``facebook_uid``."""
+    aid = str(mapped.account_id or "").strip()
+    if aid:
+        hit = next((r for r in rows if str(r.get("id") or "").strip() == aid), None)
+        if hit is not None:
+            return hit
+    uid = mapped.display_uid()
+    if uid.isdigit():
+        return next(
+            (r for r in rows if str(r.get("facebook_uid") or "").strip() == uid),
+            None,
+        )
+    return None
+
+
+def mapped_account_eligible_for_registry_export(mapped: MappedAccount) -> tuple[bool, str]:
+    """Chỉ xuất TK đã có phiên cookie (đăng nhập OK hoặc file cookie hợp lệ)."""
+    if mapped.status in ("login_ok", "success"):
+        return True, ""
+    try:
+        from src.services.facebook_session_persist import cookie_file_has_session
+
+        sync_mapped_account_storage_from_registry(mapped)
+        ck = str(mapped.cookie_path or "").strip()
+        if ck and cookie_file_has_session(ck):
+            return True, ""
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Human/Export] Kiểm tra cookie {}: {}", mapped.account_id, exc)
+    st = mapped.status or "pending"
+    return False, f"Trạng thái «{st}» — chưa có cookie phiên đăng nhập"
+
+
+def mapped_account_to_registry_record(
+    mapped: MappedAccount,
+    *,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Chuyển ``MappedAccount`` → bản ghi ``accounts.json`` (profile/cookie/proxy có sẵn trên đĩa).
+
+    ``import_type=folder`` để ``upsert`` không tạo profile Playwright mới.
+    """
+    apply_mapped_secrets_to_vault(mapped)
+    sync_mapped_account_storage_from_registry(mapped)
+    acc = mapped_account_to_account_dict(mapped)
+    for key in list(acc.keys()):
+        if str(key).startswith("_mapped_"):
+            acc.pop(key, None)
+
+    bt = normalize_browser_storage(str(acc.get("browser_type") or mapped.browser_type or "firefox"))
+    portable = str(
+        acc.get("portable_path") or acc.get("profile_path") or mapped.storage.profile_path or ""
+    ).strip()
+    if not portable:
+        portable = default_portable_path(str(acc.get("id") or mapped.account_id), bt)
+    cookie = str(acc.get("cookie_path") or mapped.cookie_path or "").strip()
+    if not cookie:
+        cookie = default_cookie_path(str(acc.get("id") or mapped.account_id))
+
+    reg_id = str(acc.get("id") or "").strip()
+    if existing and str(existing.get("id") or "").strip():
+        reg_id = str(existing.get("id") or "").strip()
+    elif not reg_id or reg_id.startswith("UID_"):
+        from_path = _registry_profile_id_from_path(portable)
+        reg_id = from_path or reg_id or f"acc_{uuid.uuid4().hex[:10]}"
+        if reg_id.startswith("UID_"):
+            reg_id = f"acc_{uuid.uuid4().hex[:10]}"
+
+    uid = str(acc.get("facebook_uid") or "").strip()
+    if not uid.isdigit():
+        disp = mapped.display_uid()
+        uid = disp if disp.isdigit() else ""
+
+    name = str(acc.get("name") or "").strip()
+    if existing:
+        ex_name = str(existing.get("name") or "").strip()
+        if ex_name and ex_name not in ("Tài khoản mới", mapped.account_id) and not ex_name.startswith("UID_"):
+            name = ex_name
+    if not name or name.startswith("UID_") or name == mapped.account_id:
+        if uid.isdigit():
+            name = uid
+        elif mapped.auth.email and "@" in mapped.auth.email:
+            name = mapped.auth.email.split("@", 1)[0]
+        else:
+            name = reg_id
+
+    px = acc.get("proxy") if isinstance(acc.get("proxy"), dict) else network_to_proxy_config(mapped.network)
+    use_px = bool(acc.get("use_proxy", mapped.use_proxy) and str(px.get("host") or "").strip())
+
+    from src.utils.account_credentials import default_password_ref, default_totp_secret_ref
+
+    vault_id = str(mapped.account_id or reg_id).strip()
+    rec: dict[str, Any] = {
+        "id": reg_id,
+        "name": name,
+        "browser_type": bt,
+        "portable_path": portable,
+        "profile_path": portable,
+        "cookie_path": cookie,
+        "proxy": px,
+        "use_proxy": use_px,
+        "import_type": "folder",
+        "facebook_uid": uid,
+        "email": str(mapped.auth.email or acc.get("email") or "").strip(),
+        "recovery_email": str(mapped.auth.recovery_email or acc.get("recovery_email") or "").strip(),
+        "totp_enabled": bool(mapped.auth.two_fa_secret or acc.get("totp_enabled")),
+        "password_ref": str(acc.get("password_ref") or default_password_ref(vault_id)),
+        "totp_secret_ref": str(acc.get("totp_secret_ref") or default_totp_secret_ref(vault_id)),
+        "session_status": "active",
+        "login_status": "active",
+        "status": "success" if mapped.status in ("login_ok", "success") else str(mapped.status or "pending"),
+        "notes": str((existing or {}).get("notes") or acc.get("notes") or "").strip(),
+    }
+    if existing:
+        for key in (
+            "schedule_time",
+            "topic",
+            "content_style",
+            "post_image_path",
+            "last_post_at",
+            "browser_exe_path",
+        ):
+            val = existing.get(key)
+            if val is not None and str(val).strip() != "":
+                rec[key] = val
+    return rec
+
+
+def export_mapped_accounts_to_registry(
+    mapped_list: list[MappedAccount],
+    *,
+    db: Any | None = None,
+) -> ExportMappedRegistryResult:
+    """
+    Ghi danh sách tài khoản tab Tương tác vào ``accounts.json`` để dùng tab «Tài khoản» / lịch đăng.
+
+    Returns:
+        ``{added, updated, skipped}`` — id registry sau khi ghi.
+    """
+    from src.utils.db_manager import AccountsDatabaseManager
+
+    manager = db or AccountsDatabaseManager()
+    added: list[str] = []
+    updated: list[str] = []
+    skipped: list[tuple[str, str]] = []
+
+    try:
+        rows = manager.load_all()
+    except Exception as exc:  # noqa: BLE001
+        raise AccountProxyMappingError(f"Không đọc được accounts.json: {exc}") from exc
+
+    for mapped in mapped_list:
+        ok, reason = mapped_account_eligible_for_registry_export(mapped)
+        if not ok:
+            skipped.append((mapped.account_id, reason))
+            continue
+        existing = _find_registry_row_for_mapped(rows, mapped)
+        try:
+            rec = mapped_account_to_registry_record(mapped, existing=existing)
+            manager.validate_account(rec)
+            manager.upsert(rec)  # type: ignore[arg-type]
+            reg_id = str(rec.get("id") or "").strip()
+            if existing:
+                updated.append(reg_id)
+            else:
+                added.append(reg_id)
+            rows = manager.load_all()
+            logger.info(
+                "[Human/Export] {} → accounts.json id={} uid={}",
+                "Cập nhật" if existing else "Thêm",
+                reg_id,
+                rec.get("facebook_uid") or mapped.display_uid(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            skipped.append((mapped.account_id, str(exc)[:160]))
+            logger.warning("[Human/Export] Bỏ qua {}: {}", mapped.account_id, exc)
+
+    return {"added": added, "updated": updated, "skipped": skipped}
 
 
 def map_from_text_files(

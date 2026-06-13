@@ -384,13 +384,13 @@ class HumanAction:
                 dy = random.randint(440, 920)
             self._scroll_by(dy)
             has_media = random.random() < 0.52
-            base_lo = 6500 if has_media else 4200
-            base_hi = 14_500 if has_media else 9000
+            base_lo = 2800 if has_media else 2200
+            base_hi = 9000 if has_media else 5500
             dwell_ms = int(random.randint(base_lo, base_hi) * scale)
-            if random.random() < 0.35:
-                dwell_ms += int(random.randint(3500, 8500) * scale)
-            if random.random() < 0.28:
-                time.sleep(random.uniform(1.2, 3.2) * scale)
+            if random.random() < 0.22:
+                dwell_ms += int(random.randint(1800, 4500) * scale)
+            if random.random() < 0.22:
+                time.sleep(random.uniform(0.7, 1.8) * scale)
             self.page.wait_for_timeout(dwell_ms)
             if on_like and random.random() < max(0.0, min(1.0, like_rate)):
                 try:

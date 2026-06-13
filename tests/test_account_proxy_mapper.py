@@ -20,6 +20,7 @@ from src.utils.account_proxy_mapper import (
     parse_proxy_line_to_network,
     proxy_dict_to_network,
     proxy_identity_key_for_network,
+    reassign_proxies_from_pool,
 )
 from src.services.human_interaction_pool import validate_pool_start
 
@@ -132,6 +133,16 @@ def test_validate_pool_start_rejects_duplicate_proxies() -> None:
         validate_pool_start(2, 2, 2, unique_proxy_count=1, accounts=mapped)
 
 
+def test_validate_pool_start_rejects_duplicate_account_ids() -> None:
+    px = parse_proxy_line_to_network("1.2.3.4:80:u:p")
+    mapped = [
+        MappedAccount(account_id="UID_1", network=px, use_proxy=True),
+        MappedAccount(account_id="UID_1", network=parse_proxy_line_to_network("5.6.7.8:80:u:p"), use_proxy=True),
+    ]
+    with pytest.raises(AccountProxyMappingError, match="Trùng account_id"):
+        validate_pool_start(2, 2, 2, unique_proxy_count=2, accounts=mapped)
+
+
 def test_ensure_mapped_proxy_live_normalizes_socks5() -> None:
     ma = MappedAccount(
         account_id="UID_1",
@@ -224,6 +235,52 @@ def test_enrich_merges_registry_proxy_auth_for_capsolver() -> None:
     assert acc["proxy"]["user"] == "admin254"
     assert acc["proxy"]["pass"] == "admin254"
     assert acc["use_proxy"] is True
+
+
+def test_reassign_proxies_from_pool_skips_duplicate_and_failed() -> None:
+    ma1 = MappedAccount(
+        account_id="UID_1",
+        network=parse_proxy_line_to_network("1.1.1.1:80::"),
+        use_proxy=True,
+        status="proxy_error",
+    )
+    ma2 = MappedAccount(
+        account_id="UID_2",
+        network=parse_proxy_line_to_network("2.2.2.2:80::"),
+        use_proxy=True,
+        status="running",
+    )
+    pool = ["1.1.1.1:80::", "2.2.2.2:80::", "3.3.3.3:80::"]
+    res = reassign_proxies_from_pool(
+        [ma1],
+        all_accounts=[ma1, ma2],
+        proxy_lines=pool,
+    )
+    assert "UID_1" in res["updated"]
+    assert proxy_identity_key_for_network(ma1.network) == "3.3.3.3:80"
+    assert ma1.status == "pending"
+
+
+def test_reassign_proxies_exhausted_pool() -> None:
+    ma1 = MappedAccount(
+        account_id="UID_1",
+        network=parse_proxy_line_to_network("1.1.1.1:80::"),
+        use_proxy=True,
+        status="proxy_error",
+    )
+    ma2 = MappedAccount(
+        account_id="UID_2",
+        network=parse_proxy_line_to_network("2.2.2.2:80::"),
+        use_proxy=True,
+        status="running",
+    )
+    res = reassign_proxies_from_pool(
+        [ma1],
+        all_accounts=[ma1, ma2],
+        proxy_lines=["2.2.2.2:80::"],
+    )
+    assert not res["updated"]
+    assert res["skipped"][0][0] == "UID_1"
 
 
 def test_proxy_dict_from_accounts_json_parses_url_string() -> None:

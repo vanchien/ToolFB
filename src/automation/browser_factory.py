@@ -277,6 +277,7 @@ def _acquire_shared_playwright() -> Playwright:
     with _shared_pw_lock:
         pw = _shared_pw_by_thread.get(thread_id)
         if pw is None:
+            prepare_playwright_sync_thread(label="shared_acquire")
             pw = sync_playwright().start()
             _shared_pw_by_thread[thread_id] = pw
             _shared_pw_ref_by_thread[thread_id] = 0
@@ -286,6 +287,39 @@ def _acquire_shared_playwright() -> Playwright:
             )
         _shared_pw_ref_by_thread[thread_id] = _shared_pw_ref_by_thread.get(thread_id, 0) + 1
         return pw
+
+
+def prepare_playwright_sync_thread(*, label: str = "") -> None:
+    """
+    Chuẩn bị thread hiện tại cho Playwright Sync API.
+
+    Playwright từ chối chạy nếu asyncio event loop đang *running* trên thread này
+    (thường do đóng browser sai thread hoặc Python 3.12+).
+    """
+    import asyncio
+
+    tag = f" ({label})" if label else ""
+    try:
+        asyncio.get_running_loop()
+        logger.warning(
+            "[Playwright] Thread {}{} có asyncio loop đang chạy — thay loop mới",
+            threading.get_ident(),
+            tag,
+        )
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        return
+    except RuntimeError:
+        pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            return
+        if not loop.is_running():
+            loop.close()
+            asyncio.set_event_loop(asyncio.new_event_loop())
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _release_shared_playwright() -> None:
@@ -341,18 +375,24 @@ def sync_close_persistent_context(
     *,
     log_label: str = "",
     timeout_sec: float = 0.0,
+    same_thread: bool = True,
 ) -> None:
     """
     Đóng ``BrowserContext`` persistent: đóng từng ``Page`` còn mở rồi ``context.close()``.
 
     Giảm race driver Node (``EPIPE``) khi Chromium còn phát sự kiện sau khi pipe đã đóng.
-    ``timeout_sec`` > 0: giới hạn thời gian đóng (tránh kẹt slot pool tương tác).
+    ``timeout_sec`` > 0 và ``same_thread=False``: giới hạn thời gian đóng trên thread phụ.
+    ``same_thread=True`` (mặc định): bắt buộc với Playwright Sync API.
     """
     if context is None:
         return
 
     def _close_inner() -> None:
         _sync_close_persistent_context_impl(context, log_label=log_label)
+
+    if same_thread:
+        _close_inner()
+        return
 
     if timeout_sec and float(timeout_sec) > 0:
         import concurrent.futures
@@ -421,6 +461,20 @@ def _sync_close_persistent_context_impl(context: BrowserContext, *, log_label: s
                 delattr(context, attr)
             except Exception:
                 pass
+    if profile_dir is not None and sys.platform == "win32":
+        force_kill = os.environ.get("FB_FORCE_KILL_FIREFOX_ON_CLOSE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "off",
+            "no",
+        )
+        if force_kill:
+            try:
+                from src.utils.win_browser_window import terminate_firefox_for_profile
+
+                terminate_firefox_for_profile(Path(profile_dir), grace_ms=500)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Ep dong Firefox profile ({}): {}", label, exc)
 
 
 def apply_viewport_from_env_to_page(page: Page, playwright: Playwright | None = None) -> None:
@@ -529,6 +583,7 @@ class BrowserFactory:
         playwright: Optional[Playwright] = None,
         *,
         headless: bool = False,
+        playwright_shared: bool | None = None,
     ) -> None:
         """
         Khởi tạo factory.
@@ -537,18 +592,25 @@ class BrowserFactory:
             accounts: Bộ đọc accounts.json; mặc định dùng đường dẫn chuẩn trong dự án.
             playwright: Instance Playwright đã start; nếu None factory dùng shared hoặc tự start (xem env).
             headless: Mặc định chạy không/kèm cửa sổ (có thể ghi đè mỗi lần gọi ``get_browser_context``).
+            playwright_shared: ``True`` = một driver Node/luồng worker (pool tương tác). ``None`` = đọc env.
         """
         self._accounts = accounts or AccountsDatabaseManager()
         self._playwright_closed = False
         self._pw_mode: Literal["injected", "shared", "owned"]
+        use_shared = (
+            bool(playwright_shared)
+            if playwright_shared is not None
+            else _env_bool("FB_PLAYWRIGHT_SHARED", False)
+        )
         if playwright is not None:
             self._pw_mode = "injected"
             self._playwright = playwright
-        elif _env_bool("FB_PLAYWRIGHT_SHARED", False):
+        elif use_shared:
             self._pw_mode = "shared"
             self._playwright = _acquire_shared_playwright()
         else:
             self._pw_mode = "owned"
+            prepare_playwright_sync_thread(label="owned_factory")
             self._playwright = sync_playwright().start()
             logger.info(
                 "Playwright riêng cho phiên tài khoản (owned) — thread_id={}",

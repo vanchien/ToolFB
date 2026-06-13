@@ -265,7 +265,7 @@ def auto_save_session_for_account(
             sync_registry=True,
             log_label=log_label or "auto_save",
         )
-    if not saved:
+    else:
         saved = persist_facebook_session(
             page,
             account,
@@ -380,7 +380,7 @@ def ensure_session_before_interaction(
     """
     Cổng bắt buộc trước module tương tác: xác nhận đã vào Facebook.
 
-    Nếu chưa đăng nhập → gọi ``recover_fn()`` (đăng nhập lại) → xác nhận lần nữa.
+    Thứ tự: xác nhận phiên → nạp lại cookie file (không form) → ``recover_fn()`` nếu vẫn lỗi.
 
     Returns:
         ``(True, mô_tả)`` khi được phép tương tác; ``(False, lý_do)`` nếu không.
@@ -390,7 +390,7 @@ def ensure_session_before_interaction(
         confirm_facebook_session_logged_in,
     )
 
-    cp = cookie_path if cookie_path is not None else account.get("cookie_path")
+    cp = ensure_account_cookie_path(account, cookie_path)
     ok, detail = confirm_facebook_session_logged_in(page, account)
     if ok:
         account["login_confirm_detail"] = detail
@@ -401,6 +401,17 @@ def ensure_session_before_interaction(
             )
             return True, detail
         return False, "Không lưu được cookie sau xác nhận phiên"
+
+    if cookie_file_has_session(cp):
+        ok_reuse, detail_reuse = try_reuse_saved_cookie_session(page, account, cookie_path=cp)
+        if ok_reuse:
+            account["login_confirm_detail"] = detail_reuse
+            if _finalize_successful_recovery(page, account, cp, log_label="interaction_cookie_reuse"):
+                logger.info(
+                    "[FB session] Tái sử dụng cookie file trước tương tác account={}",
+                    account.get("id"),
+                )
+                return True, detail_reuse
 
     logger.info(
         "[FB session] Chưa xác nhận đăng nhập trước tương tác account={}: {}",
@@ -425,6 +436,116 @@ def ensure_session_before_interaction(
         )
         return True, detail2
     return False, detail2 or "Không lưu cookie sau đăng nhập lại"
+
+
+def try_reuse_saved_cookie_session(
+    page: Page,
+    account: dict[str, Any],
+    *,
+    cookie_path: str | Path | None = None,
+    timeout_ms: int = 22_000,
+) -> tuple[bool, str]:
+    """
+    Nạp cookie file đã lưu + xác nhận phiên — **không** mở form email/password.
+
+    Returns:
+        ``(True, mô_tả)`` khi vào được Facebook; ``(False, lý_do)`` nếu không.
+    """
+    from src.automation.facebook_actions import login_with_cookie
+    from src.services.facebook_session_recovery import confirm_facebook_session_logged_in
+
+    cp = ensure_account_cookie_path(account, cookie_path)
+    if not cookie_file_has_session(cp):
+        return False, "Không có file cookie c_user"
+
+    ok0, det0 = confirm_facebook_session_logged_in(
+        page, account, timeout_ms=min(8_000, timeout_ms)
+    )
+    if ok0:
+        return True, det0
+
+    try:
+        login_with_cookie(page, cp)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[FB session] try_reuse login_with_cookie: {}", exc)
+        return False, str(exc)[:120]
+
+    ok1, det1 = confirm_facebook_session_logged_in(page, account, timeout_ms=timeout_ms)
+    if ok1:
+        return True, det1
+
+    ok2, det2 = probe_existing_facebook_session(
+        page, account, cookie_path=cp, timeout_ms=timeout_ms
+    )
+    return ok2, det2 or det1 or "Chưa vào được sau nạp cookie"
+
+
+def probe_existing_facebook_session(
+    page: Page,
+    account: dict[str, Any],
+    *,
+    cookie_path: str | Path | None = None,
+    timeout_ms: int = 30_000,
+) -> tuple[bool, str]:
+    """
+    Quét phiên đã có trong profile (đăng nhập tay / phiên cũ) trước khi nạp cookie file hay form login.
+
+    Returns:
+        ``(True, mô_tả)`` khi ``confirm_facebook_session_logged_in`` thành công; ``(False, lý_do)`` nếu không.
+    """
+    from src.automation.facebook_actions import (
+        _facebook_context_cookie_names,
+        _force_www_facebook_if_mobile_redirect,
+        prime_facebook_session_page,
+    )
+    from src.services.facebook_session_recovery import confirm_facebook_session_logged_in
+
+    u = (page.url or "").lower()
+    if "facebook.com" not in u:
+        try:
+            prime_facebook_session_page(page)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FB session] probe prime: {}", exc)
+    else:
+        _force_www_facebook_if_mobile_redirect(page)
+
+    per_try = max(6_000, int(timeout_ms) // 3)
+    last_detail = "Profile chưa có cookie c_user"
+    for attempt in range(3):
+        try:
+            page.wait_for_timeout(900 if attempt == 0 else 600)
+        except Exception:
+            pass
+        names = _facebook_context_cookie_names(page)
+        if "c_user" not in names:
+            if attempt < 2:
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=45_000)
+                    _force_www_facebook_if_mobile_redirect(page)
+                except Exception as reload_exc:  # noqa: BLE001
+                    logger.debug("[FB session] probe reload: {}", reload_exc)
+                continue
+            return False, last_detail
+
+        if attempt > 0:
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=45_000)
+                _force_www_facebook_if_mobile_redirect(page)
+                page.wait_for_timeout(800)
+            except Exception as reload_exc:  # noqa: BLE001
+                logger.debug("[FB session] probe reload (c_user): {}", reload_exc)
+
+        ok, detail = confirm_facebook_session_logged_in(page, account, timeout_ms=per_try)
+        if ok:
+            logger.info(
+                "[FB session] Probe phát hiện phiên profile account={}: {}",
+                account.get("id"),
+                detail,
+            )
+            return True, detail
+        last_detail = detail or last_detail
+
+    return False, last_detail
 
 
 def restore_facebook_session(
@@ -481,10 +602,18 @@ def restore_facebook_session(
                 logger.warning("[FB session] login_with_cookie thất bại account={}: {}", aid, exc)
             if facebook_session_appears_logged_in(page):
                 return True, "cookie"
+        ok_probe, probe_detail = probe_existing_facebook_session(
+            page,
+            account,
+            cookie_path=cp,
+            timeout_ms=28_000,
+        )
+        if ok_probe:
+            return True, "profile_probe"
         url = (page.url or "")[:100]
         if "/login" in url.lower():
             return False, "Trang login — profile chưa có phiên (kiểm tra portable_path trong accounts.json)"
-        return False, "Chưa thấy phiên hợp lệ sau profile + cookie file"
+        return False, probe_detail or "Chưa thấy phiên hợp lệ sau profile + cookie file"
     finally:
         if prev_mobile is not None:
             os.environ["TOOLFB_NAV_MOBILE_FB"] = prev_mobile

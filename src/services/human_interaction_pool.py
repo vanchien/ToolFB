@@ -12,6 +12,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -56,7 +57,9 @@ class HumanInteractionPool:
         self._threads: list[threading.Thread] = []
         self._monitor_thread: threading.Thread | None = None
         self._in_use_proxies: set[str] = set()
+        self._in_use_accounts: set[str] = set()
         self._proxy_lock = threading.Lock()
+        self._account_lock = threading.Lock()
         self._work_q: queue.Queue[MappedAccount | None] = queue.Queue()
         self._grid_slots = compute_grid_layout(self._max_concurrent, max_cols=max(1, int(max_cols)))
         self._state_lock = threading.Lock()
@@ -68,6 +71,7 @@ class HumanInteractionPool:
         self._shutting_down = False
         self._total_accounts = len(self._accounts)
         self._completed_accounts = 0
+        self._join_workers_alive = False
         # Đăng nhập: luôn chạy đủ N luồng, không tự hạ concurrency.
         if self._login_only:
             self._recent_results.clear()
@@ -116,6 +120,8 @@ class HumanInteractionPool:
             if item is not None:
                 cancelled += 1
                 self._emit_status(item, "cancelled", "Đã hủy — người dùng bấm Dừng")
+            # Mỗi ``put`` phải có ``task_done`` — kể cả item bị hủy trước khi worker ``get()``.
+            self._work_q.task_done()
         if cancelled:
             logger.info("[Human pool] Đã hủy {} tài khoản còn trong hàng đợi.", cancelled)
         for _ in range(self._max_concurrent):
@@ -192,6 +198,47 @@ class HumanInteractionPool:
                 logger.debug("[Human pool] workload_end: {}", exc)
             self._workload_registered = False
 
+    def _drain_queue_task_done(self) -> None:
+        """``task_done`` mọi item còn trong queue (sentinel None sau stop) — tránh join kẹt."""
+        while True:
+            try:
+                self._work_q.get_nowait()
+            except queue.Empty:
+                break
+            self._work_q.task_done()
+
+    def _terminate_pool_browser_processes(self) -> None:
+        """Ép đóng Firefox còn sót sau khi worker join (Windows + profile portable)."""
+        if os.name != "nt":
+            return
+        from src.utils.win_browser_window import terminate_firefox_for_profile
+
+        seen: set[str] = set()
+        for ma in self._accounts:
+            prof = str(getattr(getattr(ma, "storage", None), "profile_path", "") or "").strip()
+            if not prof:
+                try:
+                    from src.utils.account_proxy_mapper import mapped_account_to_account_dict
+
+                    acc = mapped_account_to_account_dict(ma)
+                    prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+                except Exception:
+                    prof = ""
+            if not prof:
+                continue
+            key = str(Path(prof).resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                terminate_firefox_for_profile(prof, grace_ms=150)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human pool] terminate profile {}: {}", prof[-48:], exc)
+
+    def has_live_workers(self) -> bool:
+        """True nếu còn worker thread đang chạy (có thể vẫn mở browser)."""
+        return any(t.is_alive() for t in self._threads)
+
     def join(self, timeout: float | None = None) -> bool:
         """
         Chờ hết hàng đợi, đóng worker threads và monitor.
@@ -208,13 +255,15 @@ class HumanInteractionPool:
 
         self._shutting_down = True
         completed = True
+        workers_alive = False
         try:
-            while self._work_q.unfinished_tasks > 0 and not self._stop.is_set():
+            # Chờ hết task trong hàng đợi — kể cả sau khi user bấm Dừng (không thoát sớm vì _stop).
+            while self._work_q.unfinished_tasks > 0:
                 rem = _remaining()
                 if rem is not None and rem <= 0:
                     completed = False
                     logger.warning(
-                        "[Human pool] join timeout — còn {} task trong hàng đợi, ép dừng worker.",
+                        "[Human pool] join timeout — còn {} task chưa task_done.",
                         self._work_q.unfinished_tasks,
                     )
                     break
@@ -225,6 +274,10 @@ class HumanInteractionPool:
                 self._state_cv.notify_all()
             self._signal_workers_exit()
 
+            thread_grace = max(
+                15.0,
+                float(os.environ.get("FB_POOL_JOIN_THREAD_GRACE_SEC", "45")),
+            )
             for t in list(self._threads):
                 rem = _remaining()
                 if rem is None:
@@ -232,12 +285,24 @@ class HumanInteractionPool:
                 elif rem > 0:
                     t.join(timeout=rem)
                 else:
-                    t.join(timeout=2.0)
+                    t.join(timeout=thread_grace)
                     completed = False
                 if t.is_alive():
                     completed = False
+                    workers_alive = True
                     logger.warning("[Human pool] Worker {} vẫn chạy sau join.", t.name)
         finally:
+            self._join_workers_alive = workers_alive
+            if self._work_q.unfinished_tasks > 0:
+                logger.warning(
+                    "[Human pool] join — còn {} task, drain queue.",
+                    self._work_q.unfinished_tasks,
+                )
+                self._drain_queue_task_done()
+            try:
+                self._terminate_pool_browser_processes()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human pool] terminate pool browsers: {}", exc)
             self._threads.clear()
             self._release_runtime()
             self._shutting_down = False
@@ -266,6 +331,26 @@ class HumanInteractionPool:
             return
         with self._proxy_lock:
             self._in_use_proxies.discard(key)
+
+    def _account_key(self, mapped: MappedAccount) -> str:
+        return str(mapped.account_id or "").strip()
+
+    def _acquire_account(self, mapped: MappedAccount) -> bool:
+        key = self._account_key(mapped)
+        if not key:
+            return True
+        with self._account_lock:
+            if key in self._in_use_accounts:
+                return False
+            self._in_use_accounts.add(key)
+            return True
+
+    def _release_account(self, mapped: MappedAccount) -> None:
+        key = self._account_key(mapped)
+        if not key:
+            return
+        with self._account_lock:
+            self._in_use_accounts.discard(key)
 
     def _emit_status(self, mapped: MappedAccount, status: str, detail: str) -> None:
         mapped.status = status
@@ -370,17 +455,21 @@ class HumanInteractionPool:
         warm_ms = max(0, int(float(os.environ.get("FB_POOL_WORKER_WARMUP_MS", "350"))))
         if worker_index > 0 and warm_ms > 0:
             self._sleep_interruptible((worker_index * warm_ms) / 1000.0, self._stop)
-        while not self._stop.is_set():
+        while True:
             try:
                 mapped = self._work_q.get(timeout=0.5)
             except queue.Empty:
+                if self._stop.is_set():
+                    self._drain_queue_task_done()
+                    break
                 continue
             if mapped is None:
+                self._work_q.task_done()
                 break
             if self._stop.is_set():
                 self._emit_status(mapped, "cancelled", "Đã hủy — người dùng bấm Dừng")
                 self._work_q.task_done()
-                break
+                continue
 
             mapped.grid_slot_index = slot.index
             if not self._enter_slot():
@@ -406,6 +495,19 @@ class HumanInteractionPool:
                     else:
                         self._emit_status(mapped, "waiting", "Chờ proxy trống — đưa lại hàng đợi")
                         self._sleep_interruptible(random.uniform(1.0, 2.8), self._stop)
+                        if not self._stop.is_set():
+                            self._work_q.put(mapped)
+                        else:
+                            self._emit_status(mapped, "cancelled", "Đã hủy — người dùng bấm Dừng")
+                    continue
+
+                if not self._acquire_account(mapped):
+                    self._release_proxy(mapped)
+                    if self._stop.is_set():
+                        self._emit_status(mapped, "cancelled", "Đã hủy — người dùng bấm Dừng")
+                    else:
+                        self._emit_status(mapped, "waiting", "Chờ tài khoản trống — đưa lại hàng đợi")
+                        self._sleep_interruptible(random.uniform(0.8, 2.0), self._stop)
                         if not self._stop.is_set():
                             self._work_q.put(mapped)
                         else:
@@ -443,6 +545,7 @@ class HumanInteractionPool:
             finally:
                 if not counted_done:
                     self._release_concurrency_slot()
+                self._release_account(mapped)
                 self._release_proxy(mapped)
                 self._work_q.task_done()
 
@@ -481,6 +584,23 @@ def validate_pool_start(
     if accounts:
         mapped = [a for a in accounts if isinstance(a, MappedAccount)]
         if mapped:
+            seen_ids: set[str] = set()
+            dup_ids: list[str] = []
+            for item in mapped:
+                aid = str(getattr(item, "account_id", "") or "").strip()
+                if not aid:
+                    continue
+                if aid in seen_ids:
+                    if aid not in dup_ids:
+                        dup_ids.append(aid)
+                else:
+                    seen_ids.add(aid)
+            if dup_ids:
+                raise AccountProxyMappingError(
+                    "Trùng account_id trong hàng đợi (mỗi TK chỉ chạy một luồng): "
+                    + ", ".join(dup_ids[:8])
+                    + ("…" if len(dup_ids) > 8 else "")
+                )
             missing = accounts_without_proxy(mapped)
             if missing:
                 raise AccountProxyMappingError(

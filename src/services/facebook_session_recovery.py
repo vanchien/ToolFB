@@ -507,13 +507,46 @@ def _read_facebook_c_user(page: Page) -> str:
     return ""
 
 
+def _normalize_facebook_uid(value: str | None) -> str:
+    """Chuẩn hóa UID Facebook (``UID_100…`` → ``100…``) để so khớp cookie ``c_user``."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    m = re.fullmatch(r"UID_(\d+)", s, re.I)
+    if m:
+        return m.group(1)
+    if s.isdigit():
+        return s
+    digits = re.sub(r"\D", "", s)
+    if digits and s.upper().startswith("UID_"):
+        return digits
+    return s
+
+
+def _facebook_uids_match(actual: str, expected: str) -> bool:
+    """So khớp ``c_user`` với UID cấu hình (bỏ tiền tố ``UID_``, chỉ so phần số)."""
+    exp = _normalize_facebook_uid(expected)
+    if not exp:
+        return True
+    act = _normalize_facebook_uid(actual)
+    if not act:
+        return False
+    return act == exp
+
+
 def _expected_facebook_uid(account: dict[str, Any] | None) -> str:
     if not account:
         return ""
     bundle = load_account_credential_bundle(account)
     if bundle and bundle.facebook_uid:
-        return str(bundle.facebook_uid).strip()
-    return str(account.get("facebook_uid") or "").strip()
+        return _normalize_facebook_uid(bundle.facebook_uid)
+    uid = str(account.get("facebook_uid") or "").strip()
+    if uid:
+        return _normalize_facebook_uid(uid)
+    aid = str(account.get("id") or "").strip()
+    if re.fullmatch(r"UID_\d+", aid, re.I):
+        return _normalize_facebook_uid(aid)
+    return ""
 
 
 def confirm_facebook_session_logged_in(
@@ -587,7 +620,7 @@ def confirm_facebook_session_logged_in(
             continue
 
         c_user = _read_facebook_c_user(page)
-        if expected_uid and c_user and c_user != expected_uid:
+        if expected_uid and c_user and not _facebook_uids_match(c_user, expected_uid):
             last_detail = f"Cookie c_user={c_user} không khớp UID {expected_uid}"
             stable_hits = 0
             page.wait_for_timeout(500)
@@ -611,7 +644,7 @@ def confirm_facebook_session_logged_in(
 
     if _session_logged_in(page):
         c_user = _read_facebook_c_user(page)
-        if expected_uid and c_user and c_user != expected_uid:
+        if expected_uid and c_user and not _facebook_uids_match(c_user, expected_uid):
             _log_facebook_session_diagnostic(page, stage="confirm_uid_mismatch")
             return False, f"UID cookie ({c_user}) khác UID cấu hình ({expected_uid})"
         if c_user:
@@ -1929,6 +1962,7 @@ def try_recover_facebook_session(
     *,
     cookie_path: str | Path | None = None,
     force_fresh_login: bool = False,
+    allow_form_login: bool = True,
     should_stop: Callable[[], bool] | None = None,
 ) -> bool:
     """
@@ -1936,6 +1970,7 @@ def try_recover_facebook_session(
 
     Args:
         force_fresh_login: True = xóa cookie profile và đăng nhập lại từ form (Test Login).
+        allow_form_login: False = chỉ probe/nạp cookie file, không mở form email/password.
 
     Returns:
         True nếu phiên hợp lệ sau recovery.
@@ -1997,19 +2032,69 @@ def try_recover_facebook_session(
         elif _session_logged_in(page):
             return _finalize_successful_recovery(page, account, cookie_path, log_label="reuse_session")
 
+        if not force_fresh_login:
+            from src.services.facebook_session_persist import probe_existing_facebook_session
+
+            ok_probe, _probe_detail = probe_existing_facebook_session(
+                page,
+                account,
+                cookie_path=cookie_path,
+                timeout_ms=22_000,
+            )
+            if ok_probe:
+                return _finalize_successful_recovery(
+                    page, account, cookie_path, log_label="probe_session"
+                )
+
         if not force_fresh_login and cookie_path:
             from src.automation.facebook_actions import login_with_cookie
+            from src.services.facebook_session_persist import cookie_file_has_session
 
-            try:
-                login_with_cookie(page, cookie_path)
-                if _session_logged_in(page):
-                    return _finalize_successful_recovery(
-                        page, account, cookie_path, log_label="cookie_file"
+            if cookie_file_has_session(cookie_path):
+                try:
+                    login_with_cookie(page, cookie_path)
+                    ok_cookie, _cookie_detail = confirm_facebook_session_logged_in(
+                        page, account, timeout_ms=22_000
                     )
-            except FileNotFoundError:
-                logger.info("[FB recovery] Không có file cookie tại {} — tiếp tục form login.", cookie_path)
-            except Exception as cookie_exc:  # noqa: BLE001
-                logger.warning("[FB recovery] Nạp cookie thất bại: {}", cookie_exc)
+                    if ok_cookie:
+                        return _finalize_successful_recovery(
+                            page, account, cookie_path, log_label="cookie_file"
+                        )
+                    from src.services.facebook_session_persist import probe_existing_facebook_session
+
+                    ok_probe2, _probe2 = probe_existing_facebook_session(
+                        page,
+                        account,
+                        cookie_path=cookie_path,
+                        timeout_ms=18_000,
+                    )
+                    if ok_probe2:
+                        return _finalize_successful_recovery(
+                            page, account, cookie_path, log_label="cookie_probe"
+                        )
+                except FileNotFoundError:
+                    logger.info(
+                        "[FB recovery] Không có file cookie tại {} — tiếp tục form login.",
+                        cookie_path,
+                    )
+                except Exception as cookie_exc:  # noqa: BLE001
+                    logger.warning("[FB recovery] Nạp cookie thất bại: {}", cookie_exc)
+
+        if (
+            not force_fresh_login
+            and not allow_form_login
+            and cookie_path
+        ):
+            from src.services.facebook_session_persist import cookie_file_has_session
+
+            if cookie_file_has_session(cookie_path):
+                logger.info(
+                    "[FB recovery] File cookie còn c_user nhưng chưa vào được — không mở form login "
+                    "(allow_form_login=False) account_id={}",
+                    aid,
+                )
+                _set_session_status(account, "login_failed")
+                return False
 
         state: PostLoginState
         if facebook_page_looks_like_totp_prompt(page):

@@ -142,6 +142,50 @@ def _firefox_pids_for_profile(profile_key: str) -> list[int]:
     return pids
 
 
+def terminate_firefox_for_profile(
+    profile_dir: str | Path,
+    *,
+    grace_ms: int = 700,
+) -> int:
+    """
+    Đóng firefox.exe còn sót sau ``context.close()`` (Windows + profile portable).
+
+    Returns:
+        Số process đã terminate.
+    """
+    if sys.platform != "win32":
+        return 0
+    prof_key = str(Path(profile_dir).resolve()).lower().replace("/", "\\")
+    if not prof_key:
+        return 0
+    if grace_ms > 0:
+        time.sleep(max(0.0, int(grace_ms) / 1000.0))
+    pids = _firefox_pids_for_profile(prof_key)
+    if not pids:
+        return 0
+    killed = 0
+    import subprocess
+
+    for pid in pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F", "/T"],
+                capture_output=True,
+                timeout=12,
+                check=False,
+            )
+            killed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("taskkill firefox pid={}: {}", pid, exc)
+    if killed:
+        logger.info(
+            "Đã ép đóng {} Firefox (profile~{})",
+            killed,
+            prof_key[-52:],
+        )
+    return killed
+
+
 def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int) -> bool:
     import ctypes
     from ctypes import wintypes

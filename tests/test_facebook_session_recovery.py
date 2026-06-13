@@ -9,7 +9,9 @@ from src.services.facebook_session_recovery import (
     _TOTP_URL_MARKERS,
     _TRUST_DEVICE_PRIMARY_SELECTORS,
     _auth_url_is_pre_captcha_gate,
+    _facebook_uids_match,
     _login_form_wait_ms,
+    _normalize_facebook_uid,
     facebook_auth_flow_was_active,
     facebook_page_blocks_recovery_email,
     facebook_page_is_hard_checkpoint,
@@ -176,3 +178,17 @@ def test_recovery_email_vault_roundtrip(tmp_path, monkeypatch) -> None:
     assert bundle is not None
     assert bundle.has_recovery_email
     assert bundle.recovery_email == "backup@example.com"
+
+
+def test_normalize_facebook_uid_strips_prefix() -> None:
+    assert _normalize_facebook_uid("UID_100092564235770") == "100092564235770"
+    assert _normalize_facebook_uid("100092564235770") == "100092564235770"
+    assert _normalize_facebook_uid("uid_99") == "99"
+    assert _normalize_facebook_uid("") == ""
+
+
+def test_facebook_uids_match_ignores_uid_prefix() -> None:
+    assert _facebook_uids_match("100092564235770", "UID_100092564235770")
+    assert _facebook_uids_match("UID_100092564235770", "100092564235770")
+    assert not _facebook_uids_match("111", "222")
+    assert _facebook_uids_match("111", "")

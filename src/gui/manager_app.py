@@ -1278,7 +1278,11 @@ class _ManagerWindow:
         nb.add(tab_human, text="  9. Tương tác người dùng  ")
         tab_human.columnconfigure(0, weight=1)
         tab_human.rowconfigure(0, weight=1)
-        build_human_interaction_tab(tab_human, self._root)
+        build_human_interaction_tab(
+            tab_human,
+            self._root,
+            on_accounts_registry_changed=self._on_human_accounts_exported,
+        )
 
         # --- Platform view (Facebook vs TikTok) ---
         self._tab_facebook_accounts = tab_acc
@@ -1805,6 +1809,37 @@ class _ManagerWindow:
             messagebox.showerror("Lỗi", f"Không đọc được accounts.json:\n{exc}")
 
         run_background_then_main(self._root, _worker, _on_main, on_error=_on_err)
+
+    def _on_human_accounts_exported(self, registry_ids: list[str]) -> None:
+        """Sau khi tab Tương tác ghi accounts.json — mở tab Tài khoản và làm mới bảng."""
+        if getattr(self, "_platform_view_is_tiktok", None):
+            self._platform_view_var.set("Facebook")
+            self._apply_platform_view("Facebook")
+        tab_acc = getattr(self, "_tab_facebook_accounts", None)
+        if tab_acc is not None and self._notebook_has_tab(tab_acc):
+            try:
+                self._nb.select(tab_acc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Không chuyển tab Tài khoản: {}", exc)
+        self._refresh_tree()
+        if registry_ids:
+            self._root.after(600, lambda: self._select_accounts_in_tree(registry_ids))
+
+    def _select_accounts_in_tree(self, account_ids: list[str]) -> None:
+        """Chọn các dòng tài khoản vừa export từ tab Tương tác."""
+        want = {str(x).strip() for x in account_ids if str(x).strip()}
+        if not want:
+            return
+        try:
+            picked: list[str] = []
+            for iid in self._tree_accounts.get_children():
+                if str(iid) in want:
+                    picked.append(str(iid))
+            if picked:
+                self._tree_accounts.selection_set(picked)
+                self._tree_accounts.see(picked[0])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Chọn dòng accounts sau export: {}", exc)
 
     def _acc_tree_col_at_event_x(self, event_x: int) -> str | None:
         cid = self._tree_accounts.identify_column(event_x)

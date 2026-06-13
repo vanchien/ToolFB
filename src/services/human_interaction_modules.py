@@ -64,6 +64,18 @@ def _module_micro_pause(cfg: HumanInteractionProfile, *, label: str = "") -> Non
     time.sleep(random.uniform(cfg.module_pause_min_sec, cfg.module_pause_max_sec))
 
 
+def _page_load_pause(cfg: HumanInteractionProfile) -> None:
+    """Chờ ngắn sau goto — theo preset, tránh sleep cố định 3–5s mỗi module."""
+    time.sleep(random.uniform(cfg.page_load_pause_min_sec, cfg.page_load_pause_max_sec))
+
+
+def _reels_clip_wait(page: Page, cfg: HumanInteractionProfile) -> None:
+    """Xem một clip Reels — thời lượng theo preset."""
+    lo = max(1500, int(cfg.reels_clip_min_ms))
+    hi = max(lo, int(cfg.reels_clip_max_ms))
+    page.wait_for_timeout(random.randint(lo, hi))
+
+
 def _scroll_feed_top_to_bottom(
     ha: HumanAction,
     cfg: HumanInteractionProfile,
@@ -174,7 +186,7 @@ def module_newsfeed_like(page: Page, *, probability: float = 0.70, cfg: HumanInt
     try:
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         _module_micro_pause(profile, label="newsfeed_load")
-        time.sleep(random.uniform(3.0, 5.5))
+        _page_load_pause(profile)
 
         def on_like(p: Page) -> None:
             _try_like_visible_post(p, _human(p, profile))
@@ -192,15 +204,21 @@ def module_newsfeed_like(page: Page, *, probability: float = 0.70, cfg: HumanInt
             on_comment=on_comment if profile.ai_comments else None,
         )
         human_pause(label="cuối newsfeed", kind="step")
-        time.sleep(random.uniform(1.5, 3.0))
+        time.sleep(random.uniform(0.8, 1.6))
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Human] Newsfeed/Like lỗi: {}", exc)
         return False
 
 
-def _wait_search_results_ready(page: Page, *, timeout_ms: int = 22_000) -> None:
+def _wait_search_results_ready(
+    page: Page,
+    cfg: HumanInteractionProfile | None = None,
+    *,
+    timeout_ms: int = 15_000,
+) -> None:
     """Chờ trang / dropdown kết quả tìm kiếm ổn định trước click tab hoặc link."""
+    profile = cfg or resolve_profile("normal")
     deadline = time.monotonic() + max(3.0, timeout_ms / 1000.0)
     settled = False
     while time.monotonic() < deadline:
@@ -219,10 +237,15 @@ def _wait_search_results_ready(page: Page, *, timeout_ms: int = 22_000) -> None:
             break
         page.wait_for_timeout(450)
     human_pause(kind="step", label="kết quả tìm kiếm")
-    time.sleep(random.uniform(3.0, 5.5))
+    _page_load_pause(profile)
 
 
-def _open_search_and_type(page: Page, ha: HumanAction, keyword: str) -> bool:
+def _open_search_and_type(
+    page: Page,
+    ha: HumanAction,
+    keyword: str,
+    cfg: HumanInteractionProfile,
+) -> bool:
     """Click ô tìm kiếm, gõ **đủ** từ khóa (chậm), verify, Enter, chờ kết quả."""
     search = None
     for sel in _SEARCH_INPUT_SELECTORS:
@@ -241,7 +264,7 @@ def _open_search_and_type(page: Page, ha: HumanAction, keyword: str) -> bool:
     time.sleep(random.uniform(0.9, 1.6))
     ha.smart_type_search(search, keyword, label="search fb", already_focused=True)
     human_pause(kind="input", label="sau Enter tìm kiếm")
-    _wait_search_results_ready(page)
+    _wait_search_results_ready(page, cfg)
     return True
 
 
@@ -262,11 +285,11 @@ def module_search_reels(page: Page, *, probability: float = 0.55, cfg: HumanInte
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         _module_micro_pause(profile, label="home_before_search")
         _scroll_feed_top_to_bottom(ha, profile, short=True, like_rate=profile.like_rate_pct * 0.25)
-        if not _open_search_and_type(page, ha, kw):
+        if not _open_search_and_type(page, ha, kw, profile):
             return False
         _scroll_feed_top_to_bottom(ha, profile, short=True)
         human_pause(kind="step", label="trước tab Reels")
-        time.sleep(random.uniform(1.8, 3.2))
+        time.sleep(random.uniform(0.9, 1.6))
         reels_tab = page.locator(
             '[role="tab"]:has-text("Reels"), [role="tab"]:has-text("Video"), '
             'a[href*="reels"], span:text-is("Reels")'
@@ -279,12 +302,11 @@ def module_search_reels(page: Page, *, probability: float = 0.55, cfg: HumanInte
             logger.debug("[Human] Không thấy tab Reels — thử click kết quả đầu")
             first = page.locator('[role="article"] a, [role="link"]').first
             ha.smart_click(first, label="kết quả tìm kiếm")
-        watch_ms = random.randint(14_000, 24_000)
-        page.wait_for_timeout(watch_ms)
-        for _ in range(random.randint(2, 4)):
+        _reels_clip_wait(page, profile)
+        for _ in range(random.randint(1, 3)):
             page.keyboard.press("ArrowDown")
             human_pause(kind="action", label="xem reel")
-            page.wait_for_timeout(random.randint(10_000, 18_000))
+            _reels_clip_wait(page, profile)
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Human] Tìm Reels lỗi: {}", exc)
@@ -301,14 +323,14 @@ def module_reels_watch(page: Page, *, probability: float = 0.60, cfg: HumanInter
     logger.info("[Human] Module Reels xem tiếp")
     try:
         if "reel" not in (page.url or "").lower():
-            if not module_search_reels(page, probability=1.0, cfg=profile):
-                page.goto("https://www.facebook.com/reel/", wait_until="domcontentloaded", timeout=60_000)
+            page.goto("https://www.facebook.com/reel/", wait_until="domcontentloaded", timeout=45_000)
+            _page_load_pause(profile)
         _module_micro_pause(profile, label="reels_load")
         _scroll_feed_top_to_bottom(ha, profile, short=True, like_rate=profile.like_rate_pct * 0.45)
-        for _ in range(random.randint(2, 5)):
+        for _ in range(random.randint(1, 3)):
             page.keyboard.press("ArrowDown")
             human_pause(kind="action", label="reel tiếp")
-            page.wait_for_timeout(random.randint(12_000, 20_000))
+            _reels_clip_wait(page, profile)
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Human] Reels lỗi: {}", exc)
@@ -329,11 +351,11 @@ def module_search_fanpage(page: Page, *, probability: float = 0.40, cfg: HumanIn
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         _module_micro_pause(profile, label="home_search_page")
         _scroll_feed_top_to_bottom(ha, profile, short=True, like_rate=profile.like_rate_pct * 0.2)
-        if not _open_search_and_type(page, ha, kw):
+        if not _open_search_and_type(page, ha, kw, profile):
             return False
         _scroll_feed_top_to_bottom(ha, profile, short=True)
         human_pause(kind="step", label="trước tab Pages")
-        time.sleep(random.uniform(1.6, 2.8))
+        time.sleep(random.uniform(0.8, 1.5))
         pages_tab = page.locator('[role="tab"]:has-text("Pages"), [role="tab"]:has-text("Trang")').first
         try:
             if pages_tab.is_visible(timeout=4000):
@@ -411,22 +433,29 @@ def run_shuffled_interaction_modules(
     modules = [
         ("newsfeed", lambda: module_newsfeed_like(page, probability=cfg.newsfeed_prob, cfg=cfg)),
         ("search_reels", lambda: module_search_reels(page, probability=cfg.reels_prob, cfg=cfg)),
-        ("reels", lambda: module_reels_watch(page, probability=max(0.35, cfg.reels_prob - 0.15), cfg=cfg)),
+        ("reels", lambda: module_reels_watch(page, probability=max(0.22, cfg.reels_prob - 0.28), cfg=cfg)),
         ("search_page", lambda: module_search_fanpage(page, probability=cfg.search_prob, cfg=cfg)),
         ("post", lambda: module_post_story(page, probability=cfg.post_prob, cfg=cfg)),
     ]
     random.shuffle(modules)
+    max_mod = max(1, int(getattr(cfg, "max_modules_per_run", 3) or 3))
     ran_any = False
+    success_count = 0
     for name, fn in modules:
+        if success_count >= max_mod:
+            logger.info("[Human] Đã đủ {} module/lượt — bỏ qua phần còn lại", max_mod)
+            break
         if on_status:
             on_status("running", f"Module: {name}")
         _module_micro_pause(cfg, label=f"trước {name}")
         if fn():
             ran_any = True
-            deep_delay_between_modules(
-                min_sec=cfg.deep_delay_min_sec,
-                max_sec=cfg.deep_delay_max_sec,
-            )
+            success_count += 1
+            if success_count < max_mod:
+                deep_delay_between_modules(
+                    min_sec=cfg.deep_delay_min_sec,
+                    max_sec=cfg.deep_delay_max_sec,
+                )
     if not ran_any:
         logger.info("[Human] Không module nào chạy (xác suất) — scroll nhẹ")
         try:
