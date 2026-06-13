@@ -1,7 +1,7 @@
 {
-  "version": "1.0.83",
+  "version": "1.0.84",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "fc8510f30c70166037b9b4eece77676858cb0bf105ac678917086d9ae0f5cbd4",
-  "notes": "Fix job tai khong hien Video Editor: gop metadata exe_gui/data vao data/downloader; hien duong dan metadata tren tab Editor.",
-  "generated_at": "2026-06-12T16:38:06"
+  "sha256": "73808032846f7aa1a4c4400e3f686657e0950cee1d11ede5519b4ee9f47dea20",
+  "notes": "Tab Tuong tac: tai su dung cookie/phien (khong form login khi file cookie con c_user); chuan hoa UID; pool join/teardown Firefox; export TK sang accounts.json; nut Luu cookie->chay; cap nhat proxy loi; Playwright shared/thread fix. 457 tests pass.",
+  "generated_at": "2026-06-13T17:23:46"
 }
