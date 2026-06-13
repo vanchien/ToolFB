@@ -1,7 +1,7 @@
 {
-  "version": "1.0.85",
+  "version": "1.0.86",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "aba84db2dc59aa92142d2dafd3024bf38bf12a6240902c774d0d70cf8963bf73",
-  "notes": "Fix job tai Video Editor: gop metadata exe_gui/portable_clean/bundle/dist; merge theo timestamp; fallback downloaded_files; refresh combobox khi tao xong; 462 tests pass.",
-  "generated_at": "2026-06-13T22:00:18"
+  "sha256": "ea5f00cafc6184ab2e5b703c96e545e30e27f1738ae40116bb3eef70e3a7b781",
+  "notes": "Python 3.14: marshal UI qua schedule_on_main_thread (fix crash main loop tu worker). Dong bo luong Download -> Video Editor, warm metadata khi mo app.",
+  "generated_at": "2026-06-13T22:46:55"
 }
