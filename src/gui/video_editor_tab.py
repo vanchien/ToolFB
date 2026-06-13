@@ -91,6 +91,7 @@ from src.services.universal_video_downloader import (
     downloader_metadata_summary,
     ensure_downloader_layout,
     get_root_pending_download_job,
+    list_videos_for_download_job,
 )
 from src.utils.ffmpeg_paths import (
     ffplay_resolve_skips_ensure_heavy_work,
@@ -785,13 +786,13 @@ def build_video_editor_tab(
         show_empty = bool(var_show_empty_jobs.get())
 
         def _worker() -> None:
-            store = DownloadMetadataStore()
+            dl_paths = ensure_downloader_layout()
+            store = DownloadMetadataStore(paths=dl_paths)
             vals, new_map = build_download_job_combo_options(
                 store.list_jobs(),
                 store.list_downloaded_videos(),
                 show_empty=show_empty,
             )
-            dl_paths = ensure_downloader_layout()
             pending_jid = get_root_pending_download_job(root, paths=dl_paths)
             _schedule_on_main_thread(
                 lambda: _apply_download_job_combo_ui(
@@ -831,6 +832,12 @@ def build_video_editor_tab(
         root.after(1500, refresh_download_job_combo)
 
     root.bind(DOWNLOAD_JOB_FINISHED_TK_EVENT, _on_download_job_finished_event, add="+")
+
+    try:
+        ensure_downloader_layout()
+    except Exception:
+        pass
+    root.after(150, refresh_download_job_combo)
 
     _import_dl_busy = {"v": False}
 
@@ -874,11 +881,10 @@ def build_video_editor_tab(
             return out
 
         def _worker() -> None:
-            rows = [
-                r
-                for r in DownloadMetadataStore().list_downloaded_videos()
-                if str(r.get("download_job_id") or "").strip() == jid
-            ]
+            dl_paths = ensure_downloader_layout()
+            store = DownloadMetadataStore(paths=dl_paths)
+            job_row = store.get_job(jid)
+            rows = list_videos_for_download_job(jid, job=job_row, store=store)
             if not rows:
                 def _no_rows() -> None:
                     _import_dl_busy["v"] = False

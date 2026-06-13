@@ -3519,6 +3519,7 @@ class AIVideoDialog:
                         parent=self._top,
                     ),
                 )
+                self._top.after(0, lambda j=jid, ok=n_ok: self._notify_download_job_finished(j, ok_count=max(0, ok)))
             except Exception as e:  # noqa: BLE001
                 self._top.after(0, lambda err=e: messagebox.showerror("Tải video", str(err), parent=self._top))
             finally:
@@ -3681,8 +3682,8 @@ class AIVideoDialog:
         ok_count: int = 0,
     ) -> None:
         jid = str(job_id or "").strip()
-        if jid and int(ok_count) > 0:
-            self._notify_download_job_finished(jid, ok_count=ok_count)
+        if jid:
+            self._notify_download_job_finished(jid, ok_count=max(0, int(ok_count)))
         if self._embedded_download_host is not None and jid and int(ok_count) > 0:
             choice = messagebox.askyesnocancel(
                 title,
@@ -3762,8 +3763,8 @@ class AIVideoDialog:
         """Thông báo hoàn tất batch quét-list + ghi file .txt nếu có URL lỗi."""
         log_hint = self._uv_failed_log_hint(jdone, platform_key=platform_key, job_id=job_id)
         if cancelled:
-            if ok_count > 0:
-                self._notify_download_job_finished(job_id, ok_count=ok_count)
+            if job_id:
+                self._notify_download_job_finished(job_id, ok_count=max(0, int(ok_count)))
             messagebox.showinfo(
                 title,
                 f"Đã dừng theo «Tạm dừng / Hủy».\n"
@@ -3786,6 +3787,12 @@ class AIVideoDialog:
         if self._embedded_download_host is None or self._uv_embedded_warm_done:
             return
         self._uv_embedded_warm_done = True
+        try:
+            from src.services.universal_video_downloader import ensure_downloader_layout
+
+            ensure_downloader_layout()
+        except Exception:
+            pass
         self._refresh_uv_ytdlp_status()
         self._top.after(80, self._refresh_uv_library)
         self._top.after(120, lambda: self._sync_uv_download_scrollregion(scroll_to_content=False))

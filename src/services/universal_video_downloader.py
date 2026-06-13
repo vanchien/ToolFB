@@ -66,19 +66,39 @@ def write_pending_video_editor_job(job_id: str, *, paths: dict[str, Path] | None
 
 
 def read_pending_video_editor_job(*, paths: dict[str, Path] | None = None, consume: bool = False) -> str:
-    p = pending_video_editor_job_path(paths=paths)
-    if not p.is_file():
-        return ""
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    """Đọc job chờ Video Editor — quét mọi thư mục metadata (hoặc một ``paths`` cụ thể)."""
+    if paths is None:
+        ensure_downloader_layout()
+        scan_roots = discover_downloader_data_roots()
+    else:
+        scan_roots = [Path(paths["root"]).resolve()]
+    best_jid = ""
+    best_ts = 0.0
+    for dl_root in scan_roots:
+        pf = dl_root / PENDING_VE_JOB_FILE
+        if not pf.is_file():
+            continue
+        try:
+            raw = json.loads(pf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        jid = str(raw.get("job_id") or "").strip()
+        if not jid:
+            continue
+        ts = _parse_download_job_time(raw.get("saved_at"))
+        if ts >= best_ts:
+            best_ts = ts
+            best_jid = jid
+    if best_jid:
         if consume:
-            p.unlink(missing_ok=True)
-        return ""
-    jid = str((raw or {}).get("job_id") or "").strip() if isinstance(raw, dict) else ""
-    if consume and jid:
-        p.unlink(missing_ok=True)
-    return jid
+            try:
+                pending_video_editor_job_path(paths=paths).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return best_jid
+    return ""
 
 
 def clear_pending_video_editor_job(*, paths: dict[str, Path] | None = None) -> None:
@@ -663,9 +683,41 @@ def _to_ytdlp_cookie_file(cookie_path: str | None) -> tuple[str | None, Path | N
     return str(tmp), tmp
 
 
+_RELEASE_BUNDLE_DIR_NAMES = ("ToolFB_release_bundle",)
+_APP_VARIANT_DIR_NAMES = ("exe_gui", "portable_clean", "ToolFB_portable_clean")
+
+
+def _row_recency_ts(row: dict[str, Any], *keys: str) -> float:
+    """Timestamp mới nhất từ các trường ISO trong một bản ghi metadata."""
+    best = 0.0
+    for key in keys:
+        best = max(best, _parse_download_job_time(row.get(key)))
+    return best
+
+
+def _should_replace_metadata_row(existing: dict[str, Any], new: dict[str, Any], *time_keys: str) -> bool:
+    """True nếu ``new`` mới hơn hoặc bằng ``existing`` (gộp đa nguồn)."""
+    ex = _row_recency_ts(existing, *time_keys)
+    nw = _row_recency_ts(new, *time_keys)
+    return nw >= ex
+
+
+def _video_row_merge_key(row: dict[str, Any]) -> str:
+    """Khóa gộp video: job + đường dẫn chuẩn hóa (tránh trùng khi copy metadata)."""
+    jid = str(row.get("download_job_id") or "").strip()
+    vp = str(row.get("video_path") or "").strip()
+    try:
+        vp = str(Path(vp).expanduser().resolve()).lower()
+    except OSError:
+        vp = vp.lower()
+    return f"{jid}\0{vp}"
+
+
 def downloader_layout_candidate_roots() -> list[Path]:
     """
-    Các thư mục gốc có thể chứa ``data/downloader`` (release zip: ``exe_gui/`` vs gốc cài đặt).
+    Mọi thư mục gốc app có thể chứa ``data/downloader``.
+
+    Bao phủ: dev repo, ``exe_gui`` / ``portable_clean``, bundle zip, ``dist/``, thư mục cha.
     """
     seen: set[str] = set()
     out: list[Path] = []
@@ -673,32 +725,70 @@ def downloader_layout_candidate_roots() -> list[Path]:
 
     def add(root: Path) -> None:
         try:
-            key = str(root.resolve())
+            r = root.resolve()
+            key = str(r)
         except OSError:
             return
         if key in seen:
             return
+        if not r.is_dir():
+            return
         seen.add(key)
-        out.append(root.resolve())
+        out.append(r)
 
-    add(pr)
-    if pr.name.lower() == "exe_gui":
-        add(pr.parent)
-    else:
-        add(pr / "exe_gui")
-    add(pr / "portable_clean")
+    def add_standard_layout(base: Path) -> None:
+        add(base)
+        for variant in _APP_VARIANT_DIR_NAMES:
+            add(base / variant)
+        for bundle in _RELEASE_BUNDLE_DIR_NAMES:
+            b = base / bundle
+            add(b)
+            for variant in _APP_VARIANT_DIR_NAMES:
+                add(b / variant)
+
+    add_standard_layout(pr)
     if pr.parent.is_dir():
-        add(pr.parent)
-        add(pr.parent / "exe_gui")
+        add_standard_layout(pr.parent)
+    if pr.parent.parent.is_dir():
+        add(pr.parent.parent)
+        add_standard_layout(pr.parent.parent)
+    # Build local: dist/ToolFB_release_bundle/{exe_gui,portable_clean}
+    add_standard_layout(pr / "dist")
     return out
+
+
+def discover_downloader_data_roots() -> list[Path]:
+    """Các thư mục ``…/data/downloader`` có file metadata (để gộp / đọc pending)."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for base in downloader_layout_candidate_roots():
+        dl_root = (base / "data" / "downloader").resolve()
+        key = str(dl_root)
+        if key in seen:
+            continue
+        if not dl_root.is_dir():
+            continue
+        has_file = any(
+            (dl_root / name).is_file()
+            for name in (
+                "download_jobs.json",
+                "downloaded_videos.json",
+                PENDING_VE_JOB_FILE,
+                "archive.txt",
+            )
+        )
+        if not has_file:
+            continue
+        seen.add(key)
+        roots.append(dl_root)
+    return roots
 
 
 def _merge_downloader_metadata_canonical() -> None:
     """
     Gộp ``download_jobs.json`` / ``downloaded_videos.json`` về ``project_root()/data/downloader``.
 
-    Máy khách thường chạy ``exe_gui/ToolFB_GUI.exe`` (data trong ``exe_gui/data/``) rồi cập nhật
-    hoặc mở ``ToolFB_GUI.exe`` ở thư mục cha — metadata bị tách đôi, combobox Video Editor trống.
+    Máy khách: metadata có thể nằm rải rác (exe_gui, portable_clean, bundle, cập nhật cũ).
     """
     canonical_root = (project_root() / "data" / "downloader").resolve()
     canonical_root.mkdir(parents=True, exist_ok=True)
@@ -707,29 +797,45 @@ def _merge_downloader_metadata_canonical() -> None:
     archive_file = canonical_root / "archive.txt"
 
     jobs_by_id: dict[str, dict[str, Any]] = {}
-    videos_by_id: dict[str, dict[str, Any]] = {}
+    videos_by_key: dict[str, dict[str, Any]] = {}
     archive_lines: list[str] = []
     archive_seen: set[str] = set()
     sources: list[Path] = []
+    best_pending: dict[str, Any] | None = None
+    best_pending_ts = 0.0
 
-    for base in downloader_layout_candidate_roots():
-        dl_root = (base / "data" / "downloader").resolve()
-        if not dl_root.is_dir():
-            continue
+    for dl_root in discover_downloader_data_roots():
         jf = dl_root / "download_jobs.json"
         vf = dl_root / "downloaded_videos.json"
         af = dl_root / "archive.txt"
-        if not jf.is_file() and not vf.is_file():
-            continue
+        pf = dl_root / PENDING_VE_JOB_FILE
         sources.append(dl_root)
         for row in _read_json_object_list_file(jf):
             jid = str(row.get("id") or "").strip()
-            if jid:
+            if not jid:
+                continue
+            prev = jobs_by_id.get(jid)
+            if prev is None or _should_replace_metadata_row(
+                prev, row, "updated_at", "completed_at", "created_at"
+            ):
                 jobs_by_id[jid] = row
         for row in _read_json_object_list_file(vf):
-            vid = str(row.get("id") or "").strip()
-            if vid:
-                videos_by_id[vid] = row
+            vkey = _video_row_merge_key(row)
+            if not vkey.strip("\0"):
+                continue
+            prev = videos_by_key.get(vkey)
+            if prev is None or _should_replace_metadata_row(prev, row, "created_at", "upload_date"):
+                videos_by_key[vkey] = row
+        if pf.is_file():
+            try:
+                raw = json.loads(pf.read_text(encoding="utf-8"))
+            except Exception:
+                raw = None
+            if isinstance(raw, dict) and str(raw.get("job_id") or "").strip():
+                ts = _parse_download_job_time(raw.get("saved_at"))
+                if ts >= best_pending_ts:
+                    best_pending_ts = ts
+                    best_pending = raw
         if af.is_file():
             try:
                 for line in af.read_text(encoding="utf-8").splitlines():
@@ -740,7 +846,7 @@ def _merge_downloader_metadata_canonical() -> None:
             except OSError:
                 pass
 
-    if len(sources) <= 1 and not jobs_by_id and not videos_by_id:
+    if len(sources) <= 1 and not jobs_by_id and not videos_by_key and not best_pending:
         return
 
     jobs_out = sorted(
@@ -752,7 +858,7 @@ def _merge_downloader_metadata_canonical() -> None:
         ),
         reverse=True,
     )
-    videos_out = list(videos_by_id.values())
+    videos_out = list(videos_by_key.values())
 
     with json_file_lock(jobs_file):
         _atomic_write_text(jobs_file, json.dumps(jobs_out, ensure_ascii=False, indent=2) + "\n")
@@ -761,6 +867,16 @@ def _merge_downloader_metadata_canonical() -> None:
     if archive_lines:
         with json_file_lock(archive_file):
             _atomic_write_text(archive_file, "\n".join(archive_lines) + ("\n" if archive_lines else ""))
+    if best_pending:
+        pending_path = canonical_root / PENDING_VE_JOB_FILE
+        try:
+            with json_file_lock(pending_path):
+                _atomic_write_text(
+                    pending_path,
+                    json.dumps(best_pending, ensure_ascii=False, indent=2) + "\n",
+                )
+        except OSError:
+            pass
 
 
 def ensure_downloader_layout() -> dict[str, Path]:
@@ -784,6 +900,58 @@ def ensure_downloader_layout() -> dict[str, Path]:
             if not paths["archive"].is_file():
                 _atomic_write_text(paths["archive"], "")
     return paths
+
+
+def list_videos_for_download_job(
+    job_id: str,
+    *,
+    job: dict[str, Any] | None = None,
+    store: DownloadMetadataStore | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Video đã tải thuộc job — từ ``downloaded_videos.json``; fallback ``job.downloaded_files``.
+
+    Dùng khi metadata video chưa kịp ghi nhưng job đã có đường dẫn file trên đĩa.
+    """
+    jid = str(job_id or "").strip()
+    if not jid:
+        return []
+    paths = ensure_downloader_layout()
+    meta_store = store or DownloadMetadataStore(paths=paths)
+    rows = [
+        r
+        for r in meta_store.list_downloaded_videos()
+        if str(r.get("download_job_id") or "").strip() == jid
+    ]
+    if rows:
+        return rows
+    job_row = job if isinstance(job, dict) else meta_store.get_job(jid)
+    if not isinstance(job_row, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for fp in job_row.get("downloaded_files") or []:
+        vp = str(fp or "").strip()
+        if not vp:
+            continue
+        try:
+            p = Path(vp).expanduser().resolve()
+        except OSError:
+            continue
+        if not p.is_file():
+            continue
+        out.append(
+            {
+                "id": f"src_fallback_{uuid.uuid4().hex[:8]}",
+                "download_job_id": jid,
+                "download_job_name": str(job_row.get("name") or ""),
+                "platform": str(job_row.get("platform") or ""),
+                "video_path": str(p),
+                "title": p.stem,
+                "status": "downloaded",
+                "created_at": str(job_row.get("completed_at") or job_row.get("updated_at") or ""),
+            }
+        )
+    return out
 
 
 def downloader_metadata_summary() -> dict[str, Any]:

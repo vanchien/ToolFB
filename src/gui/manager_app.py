@@ -1296,6 +1296,7 @@ class _ManagerWindow:
 
         self._nb.bind("<<NotebookTabChanged>>", self._on_manager_notebook_tab_changed, add="+")
         self._root.after_idle(self._on_manager_notebook_tab_changed)
+        self._root.after_idle(self._warm_downloader_metadata_merge)
 
         body.add(nb_host, weight=5)
 
@@ -1338,6 +1339,17 @@ class _ManagerWindow:
         Chạy vòng lặp sự kiện Tk cho tới khi đóng cửa sổ.
         """
         self._root.mainloop()
+
+    def _warm_downloader_metadata_merge(self) -> None:
+        """Gộp metadata tải video (exe_gui / portable_clean / bundle) ngay khi mở app."""
+
+        def _work() -> None:
+            try:
+                ensure_downloader_layout()
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True, name="dl_meta_merge").start()
 
     def _on_manager_notebook_tab_changed(self, _event: tk.Event | None = None) -> None:
         """Trì hoãn tác vụ nền (Video Editor / tab Tải) tới lần đầu người dùng mở đúng tab."""

@@ -11,8 +11,11 @@ from src.services.universal_video_downloader import (
     _read_json_object_list_file,
     build_download_job_combo_options,
     clear_pending_video_editor_job,
+    discover_downloader_data_roots,
+    downloader_layout_candidate_roots,
     downloader_metadata_summary,
     ensure_downloader_layout,
+    list_videos_for_download_job,
     read_pending_video_editor_job,
     write_pending_video_editor_job,
 )
@@ -130,6 +133,160 @@ def test_merge_downloader_metadata_from_exe_gui_folder(tmp_path: Path, monkeypat
     assert len(videos) == 1
     meta = downloader_metadata_summary()
     assert int(meta["job_count"]) >= 1
+    reset_project_root_cache()
+    monkeypatch.delenv("TOOLFB_DATA_DIR", raising=False)
+
+
+def test_merge_downloader_metadata_from_portable_clean_sibling(tmp_path: Path, monkeypatch) -> None:
+    """Chạy .exe trong exe_gui/ vẫn thấy job tải từ portable_clean/ (cùng bundle)."""
+    bundle = tmp_path / "ToolFB_release_bundle"
+    portable = bundle / "portable_clean"
+    exe_gui = bundle / "exe_gui"
+    pc_dl = portable / "data" / "downloader"
+    pc_dl.mkdir(parents=True)
+    (pc_dl / "download_jobs.json").write_text(
+        json.dumps(
+            [{"id": "dl_pc1", "platform": "youtube", "status": "completed", "created_at": "2026-06-03T10:00:00"}],
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (pc_dl / "downloaded_videos.json").write_text(
+        json.dumps(
+            [{"id": "v_pc", "download_job_id": "dl_pc1", "video_path": str(tmp_path / "clip.mp4")}],
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (pc_dl / "pending_video_editor_job.json").write_text(
+        json.dumps({"job_id": "dl_pc1", "saved_at": "2026-06-03T12:00:00"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    exe_gui.mkdir(parents=True)
+    monkeypatch.setenv("TOOLFB_DATA_DIR", str(exe_gui))
+    reset_project_root_cache()
+    _merge_downloader_metadata_canonical()
+    paths = ensure_downloader_layout()
+    jobs = _read_json_object_list_file(paths["jobs_file"])
+    assert any(str(j.get("id")) == "dl_pc1" for j in jobs)
+    assert read_pending_video_editor_job(paths=paths, consume=False) == "dl_pc1"
+    reset_project_root_cache()
+    monkeypatch.delenv("TOOLFB_DATA_DIR", raising=False)
+
+
+def test_merge_prefers_newer_job_row(tmp_path: Path, monkeypatch) -> None:
+    install = tmp_path / "App"
+    exe_gui = install / "exe_gui"
+    legacy_dl = exe_gui / "data" / "downloader"
+    legacy_dl.mkdir(parents=True)
+    (legacy_dl / "download_jobs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "dl_same",
+                    "platform": "youtube",
+                    "status": "completed",
+                    "created_at": "2026-06-01T10:00:00",
+                    "updated_at": "2026-06-01T10:00:00",
+                    "name": "old",
+                }
+            ],
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    canon_dl = install / "data" / "downloader"
+    canon_dl.mkdir(parents=True)
+    (canon_dl / "download_jobs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "dl_same",
+                    "platform": "youtube",
+                    "status": "completed",
+                    "created_at": "2026-06-01T09:00:00",
+                    "updated_at": "2026-06-03T12:00:00",
+                    "name": "new",
+                }
+            ],
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TOOLFB_DATA_DIR", str(install))
+    reset_project_root_cache()
+    _merge_downloader_metadata_canonical()
+    jobs = _read_json_object_list_file((install / "data" / "downloader" / "download_jobs.json"))
+    assert jobs[0]["name"] == "new"
+    reset_project_root_cache()
+    monkeypatch.delenv("TOOLFB_DATA_DIR", raising=False)
+
+
+def test_list_videos_fallback_downloaded_files(tmp_path: Path, monkeypatch) -> None:
+    install = tmp_path / "App"
+    dl_root = install / "data" / "downloader"
+    dl_root.mkdir(parents=True)
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+    (dl_root / "download_jobs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "dl_fb",
+                    "platform": "youtube",
+                    "status": "completed",
+                    "downloaded_files": [str(vid)],
+                }
+            ],
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (dl_root / "downloaded_videos.json").write_text("[]\n", encoding="utf-8")
+    monkeypatch.setenv("TOOLFB_DATA_DIR", str(install))
+    reset_project_root_cache()
+    rows = list_videos_for_download_job("dl_fb")
+    assert len(rows) == 1
+    assert Path(rows[0]["video_path"]).name == "clip.mp4"
+    reset_project_root_cache()
+    monkeypatch.delenv("TOOLFB_DATA_DIR", raising=False)
+
+
+def test_discover_finds_dist_release_bundle_layout(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "ToolFB"
+    bundle = repo / "dist" / "ToolFB_release_bundle" / "exe_gui"
+    dl = bundle / "data" / "downloader"
+    dl.mkdir(parents=True)
+    (dl / "download_jobs.json").write_text(
+        json.dumps([{"id": "dl_dist", "status": "completed"}], ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TOOLFB_DATA_DIR", str(repo))
+    reset_project_root_cache()
+    roots = discover_downloader_data_roots()
+    assert any("dl_dist" in json.dumps(_read_json_object_list_file(r / "download_jobs.json")) for r in roots)
+    reset_project_root_cache()
+    monkeypatch.delenv("TOOLFB_DATA_DIR", raising=False)
+
+
+def test_pending_job_read_from_legacy_root(tmp_path: Path, monkeypatch) -> None:
+    install = tmp_path / "bundle"
+    legacy = install / "portable_clean" / "data" / "downloader"
+    legacy.mkdir(parents=True)
+    (legacy / "pending_video_editor_job.json").write_text(
+        json.dumps({"job_id": "dl_pend", "saved_at": "2026-06-04T10:00:00"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    exe_gui = install / "exe_gui"
+    exe_gui.mkdir(parents=True)
+    monkeypatch.setenv("TOOLFB_DATA_DIR", str(exe_gui))
+    reset_project_root_cache()
+    assert read_pending_video_editor_job(consume=False) == "dl_pend"
     reset_project_root_cache()
     monkeypatch.delenv("TOOLFB_DATA_DIR", raising=False)
 
