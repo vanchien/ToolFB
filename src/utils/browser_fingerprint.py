@@ -92,6 +92,11 @@ def firefox_anti_detection_user_prefs(*, webrtc_block: bool = True) -> dict[str,
         "devtools.jsonview.enabled": False,
         "browser.safebrowsing.malware.enabled": False,
         "browser.safebrowsing.phishing.enabled": False,
+        # Giữ cookie + lịch sử giữa các lần mở profile portable (không xóa khi thoát).
+        "browser.privatebrowsing.autostart": False,
+        "privacy.clearOnShutdown.cookies": False,
+        "privacy.clearOnShutdown.history": False,
+        "privacy.sanitize.sanitizeOnShutdown": False,
     }
     if webrtc_block:
         prefs.update(

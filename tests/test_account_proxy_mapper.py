@@ -11,6 +11,7 @@ from src.utils.account_proxy_mapper import (
     AccountProxyMappingError,
     duplicate_proxy_assignments,
     enrich_account_dict_from_registry,
+    ensure_account_dict_proxy_live,
     ensure_mapped_proxy_live,
     filter_lines_by_live_proxy,
     map_accounts_with_proxies,
@@ -18,6 +19,7 @@ from src.utils.account_proxy_mapper import (
     network_to_proxy_config,
     parse_account_line,
     parse_proxy_line_to_network,
+    prepare_account_dict_for_browser_run,
     proxy_dict_to_network,
     proxy_identity_key_for_network,
     reassign_proxies_from_pool,
@@ -156,6 +158,35 @@ def test_ensure_mapped_proxy_live_normalizes_socks5() -> None:
     assert str(px["host"]).startswith("socks5://")
 
 
+def test_ensure_account_dict_proxy_live_normalizes_socks5() -> None:
+    acc = {
+        "id": "acc_test",
+        "use_proxy": True,
+        "proxy": {"host": "1.2.3.4", "port": 1080, "user": "u", "pass": "p"},
+    }
+    with patch("src.utils.proxy_check.check_proxy", return_value=(True, "9.9.9.9", "socks5")):
+        ok, msg = ensure_account_dict_proxy_live(acc)
+    assert ok is True
+    assert str(acc["proxy"]["host"]).startswith("socks5://")
+
+
+def test_prepare_account_dict_for_browser_run_raises_on_dead_proxy() -> None:
+    acc = {
+        "id": "acc_test",
+        "use_proxy": True,
+        "portable_path": "data/profiles/firefox/acc_test",
+        "proxy": {"host": "1.2.3.4", "port": 1080, "user": "", "pass": ""},
+    }
+    with patch("src.utils.account_proxy_mapper.enrich_account_dict_from_registry"):
+        with patch("src.utils.account_browser_profile.ensure_account_browser_profile_ready"):
+            with patch(
+                "src.utils.account_proxy_mapper.ensure_account_dict_proxy_live",
+                return_value=(False, "TIMEOUT"),
+            ):
+                with pytest.raises(ValueError, match="Proxy chưa kết nối"):
+                    prepare_account_dict_for_browser_run(acc)
+
+
 def test_enrich_registry_sets_canonical_id_for_uid_import() -> None:
     """Dòng ghép ``UID_…`` + profile ``acc_…`` trong JSON — id dict phải khớp marker profile."""
     acc: dict = {
@@ -291,3 +322,70 @@ def test_proxy_dict_from_accounts_json_parses_url_string() -> None:
     assert px["pass"] == "secret"
     assert "157.15.38.223" in str(px["host"])
     assert px["port"] == 29620
+
+
+def test_assert_proxy_allows_uid_and_registry_same_account(tmp_path, monkeypatch) -> None:
+    """UID_ trên tab Tương tác + acc_ trong registry — cùng proxy, cùng facebook_uid."""
+    from src.models.mapped_account import MappedAccountAuth, MappedAccountNetwork, MappedAccountStorage
+    from src.utils.account_proxy_mapper import (
+        assert_proxy_exclusive_among_accounts,
+        enrich_account_dict_from_registry,
+        mapped_account_to_account_dict,
+    )
+
+    reg = [
+        {
+            "id": "acc_04e7df5e18",
+            "facebook_uid": "100092564235770",
+            "portable_path": "data/profiles/firefox/acc_04e7df5e18",
+            "profile_path": "data/profiles/firefox/acc_04e7df5e18",
+            "cookie_path": "data/cookies/acc_04e7df5e18.json",
+            "proxy": {
+                "host": "socks5://157.66.252.120",
+                "port": 20402,
+                "user": "admin254",
+                "pass": "admin254",
+            },
+            "use_proxy": True,
+        }
+    ]
+
+    class _FakeDb:
+        def load_all(self):
+            return reg
+
+    monkeypatch.setattr("src.utils.db_manager.AccountsDatabaseManager", _FakeDb)
+
+    net = MappedAccountNetwork(
+        proxy_server="socks5://157.66.252.120:20402",
+        proxy_username="admin254",
+        proxy_password="admin254",
+    )
+    login_ma = MappedAccount(
+        account_id="acc_04e7df5e18",
+        auth=MappedAccountAuth(username="100092564235770", password="pw"),
+        network=net,
+        use_proxy=True,
+        storage=MappedAccountStorage(profile_path="data/profiles/firefox/acc_04e7df5e18"),
+    )
+    interaction_ma = MappedAccount(
+        account_id="UID_100092564235770",
+        auth=MappedAccountAuth(username="huiylhtg7503@hotmail.com", password="pw"),
+        network=net,
+        use_proxy=True,
+        storage=MappedAccountStorage(profile_path="data/profiles/firefox/UID_100092564235770"),
+    )
+
+    registry_index = {"157.66.252.120:20402": "acc_04e7df5e18"}
+    assert_proxy_exclusive_among_accounts(
+        [login_ma, interaction_ma],
+        registry_index=registry_index,
+        context="mở profile trình duyệt",
+    )
+
+    acc = mapped_account_to_account_dict(interaction_ma)
+    enrich_account_dict_from_registry(acc)
+    assert acc["id"] == "acc_04e7df5e18"
+    assert acc["portable_path"] == "data/profiles/firefox/acc_04e7df5e18"
+    assert acc["cookie_path"] == "data/cookies/acc_04e7df5e18.json"
+

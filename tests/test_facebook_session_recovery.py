@@ -192,3 +192,33 @@ def test_facebook_uids_match_ignores_uid_prefix() -> None:
     assert _facebook_uids_match("UID_100092564235770", "100092564235770")
     assert not _facebook_uids_match("111", "222")
     assert _facebook_uids_match("111", "")
+
+
+def test_finalize_successful_recovery_confirm_path_saves_cookie(tmp_path, monkeypatch) -> None:
+    """Nhánh confirm OK phải gọi save_session_to_cookie_path (không UnboundLocalError)."""
+    from unittest.mock import MagicMock, patch
+
+    from src.services.facebook_session_recovery import _finalize_successful_recovery
+
+    page = MagicMock()
+    account = {"id": "UID_test1"}
+    ck = tmp_path / "cookies" / "UID_test1.json"
+    monkeypatch.setattr(
+        "src.services.facebook_session_persist.ensure_account_cookie_path",
+        lambda acc, path=None: str(ck),
+    )
+    monkeypatch.setattr(
+        "src.services.facebook_session_persist.cookie_file_has_session",
+        lambda path: True,
+    )
+    with patch(
+        "src.services.facebook_session_recovery.confirm_facebook_session_logged_in",
+        return_value=(True, "Vào bảng tin OK"),
+    ):
+        with patch(
+            "src.services.facebook_session_recovery.save_session_to_cookie_path",
+        ) as save_mock:
+            ok = _finalize_successful_recovery(page, account, cookie_path=str(ck))
+    assert ok is True
+    save_mock.assert_called_once_with(page, str(ck))
+    assert account.get("session_status") == "ready"

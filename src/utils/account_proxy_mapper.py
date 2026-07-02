@@ -176,14 +176,63 @@ def proxy_identity_key_for_account(ma: MappedAccount) -> str:
     return proxy_identity_key_for_network(ma.network)
 
 
+def _extract_facebook_uid(
+    account_id: str = "",
+    *,
+    username: str = "",
+    facebook_uid: str = "",
+) -> str:
+    """UID số Facebook từ ``UID_…`` / username / ``facebook_uid``."""
+    for raw in (facebook_uid, account_id, username):
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if s.isdigit():
+            return s
+        if s.upper().startswith("UID_"):
+            num = s.split("_", 1)[-1]
+            if num.isdigit():
+                return num
+    return ""
+
+
 def _account_alias_ids(account_id: str, *, facebook_uid: str = "") -> set[str]:
     """Các id có thể cùng một tài khoản (import UID_ vs registry acc_)."""
     keys: set[str] = {str(account_id or "").strip()}
-    uid = str(facebook_uid or "").strip()
+    uid = _extract_facebook_uid(account_id, username="", facebook_uid=facebook_uid)
     if uid.isdigit():
         keys.add(f"UID_{uid}")
         keys.add(uid)
+    try:
+        from src.utils.db_manager import AccountsDatabaseManager
+
+        for rec in AccountsDatabaseManager().load_all():
+            rid = str(rec.get("id") or "").strip()
+            fb = str(rec.get("facebook_uid") or "").strip()
+            if not rid:
+                continue
+            linked = {rid}
+            if fb.isdigit():
+                linked.add(fb)
+                linked.add(f"UID_{fb}")
+            if keys & linked:
+                keys |= linked
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Human/Proxy] alias registry lookup: {}", exc)
     return {k for k in keys if k}
+
+
+def _proxy_owner_conflict(owner_id: str, offender: MappedAccount) -> bool:
+    """True nếu hai id khác tài khoản thật (cùng UID/registry vẫn OK)."""
+    if not owner_id:
+        return False
+    uid = _extract_facebook_uid(
+        offender.account_id,
+        username=offender.auth.username,
+    )
+    owner_aliases = _account_alias_ids(owner_id)
+    offender_aliases = _account_alias_ids(offender.account_id, facebook_uid=uid)
+    return not bool(owner_aliases & offender_aliases)
 
 
 def load_registry_proxy_index() -> dict[str, str]:
@@ -258,12 +307,8 @@ def assert_proxy_exclusive_among_accounts(
         key = proxy_identity_key_for_account(ma)
         if not key:
             continue
-        aliases = _account_alias_ids(
-            ma.account_id,
-            facebook_uid=ma.auth.username if ma.auth.username.isdigit() else "",
-        )
         prev = owner_by_key.get(key)
-        if prev and prev not in aliases:
+        if prev and _proxy_owner_conflict(prev, ma):
             raise AccountProxyMappingError(
                 format_proxy_exclusive_error(key, prev, offender_id=ma.account_id, context=context)
             )
@@ -303,6 +348,75 @@ def ensure_mapped_proxy_live(mapped: MappedAccount) -> tuple[bool, str]:
     return ok, msg
 
 
+def ensure_account_dict_proxy_live(acc: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Kiểm tra proxy LIVE cho dict ``accounts.json`` (luồng đăng lịch / đăng ngay).
+
+    Chuẩn hóa mọi định dạng proxy, tự nhận HTTP/SOCKS5/SOCKS4 và cập nhật ``acc['proxy']`` in-place.
+    """
+    from src.automation.browser_factory import account_use_proxy_enabled
+    from src.utils.proxy_check import (
+        apply_proxy_scheme_to_config,
+        check_proxy,
+        proxy_dict_from_accounts_json,
+        proxy_host_port_configured,
+    )
+
+    if not account_use_proxy_enabled(acc):
+        return True, "Không dùng proxy"
+    px = proxy_dict_from_accounts_json(acc.get("proxy"))
+    acc["proxy"] = px
+    host = str(px.get("host") or "").strip()
+    port = int(px.get("port") or 0)
+    if not proxy_host_port_configured(px):  # type: ignore[arg-type]
+        return False, "use_proxy=true nhưng proxy thiếu host/port hợp lệ"
+    ok, msg, scheme = check_proxy(
+        host,
+        port,
+        user=str(px.get("user") or ""),
+        password=str(px.get("pass") or ""),
+        preferred_scheme=str(px.get("scheme_hint") or "") or None,
+    )
+    if ok and scheme != "none":
+        px = apply_proxy_scheme_to_config(px, scheme)
+        acc["proxy"] = px
+        logger.info(
+            "[Post/Proxy] account={} — {} LIVE, host={}",
+            acc.get("id"),
+            scheme.upper(),
+            px.get("host"),
+        )
+    return ok, msg
+
+
+def prepare_account_dict_for_browser_run(
+    acc: dict[str, Any],
+    *,
+    require_proxy_live: bool = True,
+) -> dict[str, Any]:
+    """
+    Chuẩn bị account dict end-to-end trước ``launch_persistent_context`` (đăng lịch, đăng ngay).
+
+    Registry → profile có lịch sử → cookie → kiểm tra proxy LIVE (giống tab Tương tác).
+    """
+    from src.utils.account_browser_profile import ensure_account_browser_profile_ready
+
+    base = dict(acc)
+    enrich_account_dict_from_registry(base)
+    ensure_account_browser_profile_ready(base)
+    if require_proxy_live:
+        ok_px, px_msg = ensure_account_dict_proxy_live(base)
+        if not ok_px:
+            raise ValueError(f"Proxy chưa kết nối được: {px_msg}")
+    logger.info(
+        "[Post] Chuẩn bị chạy account={} profile={} cookie={}",
+        base.get("id"),
+        base.get("portable_path") or base.get("profile_path") or "(mặc định)",
+        base.get("cookie_path") or "(chưa có)",
+    )
+    return base
+
+
 def enrich_account_dict_from_registry(acc: dict[str, Any]) -> None:
     """
     Gắn profile portable, cookie, trình duyệt từ ``accounts.json`` nếu ``id`` đã tồn tại.
@@ -319,7 +433,24 @@ def enrich_account_dict_from_registry(acc: dict[str, Any]) -> None:
         rows = db.load_all()
         rec = next((r for r in rows if str(r.get("id") or "") == aid), None)
         if not rec:
-            fb_uid = str(acc.get("facebook_uid") or "").strip()
+            uid_from_id = _extract_facebook_uid(aid)
+            if uid_from_id.isdigit():
+                rec = next(
+                    (r for r in rows if str(r.get("facebook_uid") or "").strip() == uid_from_id),
+                    None,
+                )
+                if rec:
+                    logger.info(
+                        "[Human] Ghép registry theo UID trong id={} → registry id={}",
+                        aid,
+                        rec.get("id"),
+                    )
+        if not rec:
+            fb_uid = _extract_facebook_uid(
+                aid,
+                username=str(acc.get("email") or ""),
+                facebook_uid=str(acc.get("facebook_uid") or ""),
+            )
             if fb_uid.isdigit():
                 rec = next(
                     (r for r in rows if str(r.get("facebook_uid") or "").strip() == fb_uid),
@@ -338,6 +469,10 @@ def enrich_account_dict_from_registry(acc: dict[str, Any]) -> None:
         return
     reg_id = str(rec.get("id") or "").strip()
     if reg_id:
+        orig_id = str(acc.get("id") or "").strip()
+        if orig_id and orig_id != reg_id and not acc.get("display_account_id"):
+            acc["display_account_id"] = orig_id
+        acc["registry_id"] = reg_id
         # Profile trên đĩa gắn ``acc_…`` trong accounts.json — không dùng ``UID_…`` từ dòng ghép.
         acc["id"] = reg_id
         name = str(acc.get("name") or "").strip()
@@ -398,6 +533,115 @@ def enrich_account_dict_from_registry(acc: dict[str, Any]) -> None:
     )
 
 
+def _facebook_uid_for_storage(mapped: MappedAccount) -> str:
+    """Chuẩn hóa UID số từ username / account_id (bỏ tiền tố ``UID_``)."""
+    return _extract_facebook_uid(mapped.account_id, username=mapped.auth.username)
+
+
+def prepare_mapped_account_for_browser_run(mapped: MappedAccount) -> dict[str, Any]:
+    """
+    Chuẩn bị một lượt chạy end-to-end: registry → profile có lịch sử → cookie → mkdir an toàn.
+
+    Gọi trước ``launch_persistent_context`` (pool, worker, mở profile).
+    """
+    from src.utils.account_browser_profile import ensure_account_browser_profile_ready
+
+    acc = sync_mapped_account_storage_from_registry(mapped)
+    ensure_account_browser_profile_ready(acc)
+    prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+    ck = str(acc.get("cookie_path") or mapped.cookie_path or "").strip()
+    if prof:
+        mapped.storage.profile_path = prof
+        acc["portable_path"] = prof
+        acc["profile_path"] = prof
+    if ck:
+        mapped.cookie_path = ck
+        acc["cookie_path"] = ck
+    logger.info(
+        "[Human] Chuẩn bị chạy account={} (registry={}) profile={} cookie={}",
+        mapped.account_id,
+        acc.get("registry_id") or acc.get("id") or mapped.account_id,
+        prof or "(mặc định)",
+        ck or "(chưa có)",
+    )
+    return acc
+
+
+def refresh_mapped_accounts_storage(mapped_list: list[MappedAccount]) -> None:
+    """
+    Đồng bộ ``profile_path`` / ``cookie_path`` mọi dòng từ registry + profile trên đĩa.
+
+    Gọi sau restore GUI, sau pool kết thúc, trước lưu settings — lần chạy sau mở đúng profile cũ.
+    """
+    for ma in mapped_list:
+        try:
+            sync_mapped_account_storage_from_registry(ma)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Human] refresh storage {}: {}", ma.account_id, exc)
+
+
+def persist_mapped_storage_to_registry(
+    mapped: MappedAccount,
+    acc: dict[str, Any] | None = None,
+) -> None:
+    """
+    Ghi ``portable_path`` / ``cookie_path`` đã resolve vào ``accounts.json`` (theo registry / UID).
+
+    Gọi sau worker đóng browser — giữ liên kết acc_… ↔ profile Firefox cho lần mở sau.
+    """
+    if acc is None:
+        acc = mapped_account_to_account_dict(mapped)
+    from src.utils.account_browser_profile import resolve_account_portable_profile
+
+    resolve_account_portable_profile(acc)
+    portable = str(
+        acc.get("portable_path") or acc.get("profile_path") or mapped.storage.profile_path or ""
+    ).strip()
+    cookie = str(acc.get("cookie_path") or mapped.cookie_path or "").strip()
+    if portable:
+        mapped.storage.profile_path = portable
+        acc["portable_path"] = portable
+        acc["profile_path"] = portable
+    if cookie:
+        mapped.cookie_path = cookie
+        acc["cookie_path"] = cookie
+    if not portable and not cookie:
+        return
+    try:
+        from src.utils.db_manager import AccountsDatabaseManager
+
+        db = AccountsDatabaseManager()
+        rows = db.load_all()
+        reg_id = str(acc.get("registry_id") or acc.get("id") or mapped.account_id or "").strip()
+        rec = next((r for r in rows if str(r.get("id") or "") == reg_id), None)
+        if not rec:
+            uid = _extract_facebook_uid(mapped.account_id, username=mapped.auth.username)
+            if uid.isdigit():
+                rec = next(
+                    (r for r in rows if str(r.get("facebook_uid") or "").strip() == uid),
+                    None,
+                )
+        if not rec:
+            return
+        actual_id = str(rec.get("id") or "").strip()
+        updates: dict[str, Any] = {}
+        if portable:
+            updates["portable_path"] = portable
+            updates["profile_path"] = portable
+        if cookie:
+            updates["cookie_path"] = cookie
+        if updates:
+            db.update_account_fields(actual_id, updates)
+            logger.info(
+                "[Human] Đã lưu profile registry id={} (hiển thị={}) → {}",
+                actual_id,
+                mapped.account_id,
+                portable or cookie,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Human] persist registry {}: {}", mapped.account_id, exc)
+
+
 def sync_mapped_account_storage_from_registry(mapped: MappedAccount) -> dict[str, Any]:
     """
     Đồng bộ ``profile_path`` / ``cookie_path`` từ ``accounts.json`` (theo id hoặc ``facebook_uid``).
@@ -405,13 +649,16 @@ def sync_mapped_account_storage_from_registry(mapped: MappedAccount) -> dict[str
     Giữ ``mapped.account_id`` (UID hiển thị GUI) — chỉ cập nhật đường dẫn lưu trữ phiên thực tế.
     """
     acc = mapped_account_to_account_dict(mapped)
+    from src.utils.account_browser_profile import resolve_account_portable_profile
+
+    resolve_account_portable_profile(acc)
     portable = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
     if portable:
         mapped.storage.profile_path = portable
     bt = str(acc.get("browser_type") or "").strip()
     if bt:
         mapped.browser_type = bt
-    uid = str(mapped.auth.username or "").strip()
+    uid = _facebook_uid_for_storage(mapped) or str(mapped.auth.username or "").strip()
     from src.services.facebook_session_persist import resolve_best_cookie_path_for_account
 
     mapped.cookie_path = resolve_best_cookie_path_for_account(
@@ -432,28 +679,21 @@ def mapped_account_to_account_dict(mapped: MappedAccount) -> dict[str, Any]:
     """
     aid = mapped.account_id
     bt = normalize_browser_storage(mapped.browser_type)
-    profile = mapped.storage.profile_path or default_portable_path(aid, bt)
-    cookie = mapped.cookie_path or default_cookie_path(aid)
+    facebook_uid = _extract_facebook_uid(aid, username=mapped.auth.username)
     px = network_to_proxy_config(mapped.network) if mapped.use_proxy else {"host": "", "port": 0, "user": "", "pass": ""}
-    uid = mapped.auth.username
-    if uid and uid.isdigit():
-        facebook_uid = uid
-    elif uid.startswith("UID_"):
-        facebook_uid = uid[4:]
-    else:
-        facebook_uid = uid if uid and not "@" in uid else ""
 
     out: dict[str, Any] = {
         "id": aid,
+        "display_account_id": aid,
         "name": aid,
         "browser_type": bt,
-        "portable_path": profile,
-        "profile_path": profile,
-        "cookie_path": cookie,
+        "portable_path": "",
+        "profile_path": "",
+        "cookie_path": "",
         "proxy": px,
         "use_proxy": bool(mapped.use_proxy and px.get("host")),
         "facebook_uid": facebook_uid,
-        "email": mapped.auth.email or (uid if "@" in uid else ""),
+        "email": mapped.auth.email or (mapped.auth.username if "@" in str(mapped.auth.username or "") else ""),
         "recovery_email": mapped.auth.recovery_email,
         "totp_enabled": bool(mapped.auth.two_fa_secret),
         "password_ref": f"account:{aid}",
@@ -463,6 +703,12 @@ def mapped_account_to_account_dict(mapped: MappedAccount) -> dict[str, Any]:
         "_mapped_email_password": mapped.auth.email_password,
     }
     enrich_account_dict_from_registry(out)
+    reg_id = str(out.get("registry_id") or out.get("id") or aid).strip()
+    if not str(out.get("portable_path") or "").strip():
+        out["portable_path"] = mapped.storage.profile_path or default_portable_path(reg_id, bt)
+        out["profile_path"] = out["portable_path"]
+    if not str(out.get("cookie_path") or "").strip():
+        out["cookie_path"] = mapped.cookie_path or default_cookie_path(reg_id)
     return out
 
 
@@ -742,7 +988,7 @@ def map_accounts_with_proxies(
                 cand = _account_id_from_auth(auth, i)
                 if reg_owner not in _account_alias_ids(
                     cand,
-                    facebook_uid=auth.username if auth.username.isdigit() else "",
+                    facebook_uid=_extract_facebook_uid(cand, username=auth.username),
                 ):
                     raise AccountProxyMappingError(
                         format_proxy_exclusive_error(
@@ -778,6 +1024,10 @@ def map_accounts_with_proxies(
         )
         if persist_secrets:
             apply_mapped_secrets_to_vault(ma)
+        try:
+            sync_mapped_account_storage_from_registry(ma)
+        except Exception as sync_exc:  # noqa: BLE001
+            logger.warning("[Human] Sync registry sau ghép dòng {}: {}", aid, sync_exc)
         if pkey:
             seen_proxy_keys[pkey] = aid
         mapped_list.append(ma)

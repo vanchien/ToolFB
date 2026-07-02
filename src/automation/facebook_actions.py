@@ -86,6 +86,7 @@ def prime_facebook_session_page(page: Page) -> None:
         pass
     page.goto(u, wait_until="domcontentloaded", timeout=90_000)
     _force_www_facebook_if_mobile_redirect(page)
+    navigate_away_from_login_if_session_active(page)
 
 
 def _screenshots_dir() -> Path:
@@ -182,6 +183,57 @@ def _force_www_facebook_if_mobile_redirect(page: Page) -> None:
         page.goto(dst, wait_until="domcontentloaded", timeout=90_000)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không ép lại được từ mobile host về www.facebook.com: {}", exc)
+
+
+def _page_shows_facebook_login_surface(page: Page) -> bool:
+    """True nếu URL hoặc form cho thấy đang ở màn hình đăng nhập Facebook."""
+    u = (page.url or "").lower()
+    if "facebook.com" not in u:
+        return False
+    if "/login" in u or u.rstrip("/").endswith("facebook.com/login"):
+        return True
+    try:
+        pw = page.locator(
+            "input[name='pass'], input#pass, form[method='post'] input[type='password']"
+        ).first
+        if pw.is_visible(timeout=600):
+            royal = page.locator(
+                "form[data-testid='royal_login_form'], #login_form, form[action*='login']"
+            )
+            if royal.count() > 0 and royal.first.is_visible(timeout=400):
+                return True
+            return "/login" in u
+    except Exception:
+        pass
+    return False
+
+
+def navigate_away_from_login_if_session_active(page: Page) -> bool:
+    """
+  Profile persistent đã có cookie ``c_user`` nhưng tab đang ở /login — về bảng tin, không form login.
+
+    Returns:
+        True nếu đã điều hướng khỏi login; False nếu không có phiên hoặc không ở login.
+    """
+    from src.services.facebook_session_recovery import _read_facebook_c_user
+
+    if not _read_facebook_c_user(page):
+        return False
+    if not _page_shows_facebook_login_surface(page):
+        return False
+    home = _fb_normalize_client_url("https://www.facebook.com/")
+    assert_safe_facebook_navigation_url(home, label="session_active_home")
+    logger.info(
+        "[FB] Profile đã có c_user — bỏ trang login, mở bảng tin (url cũ={})",
+        (page.url or "")[:90],
+    )
+    page.goto(home, wait_until="domcontentloaded", timeout=90_000)
+    _force_www_facebook_if_mobile_redirect(page)
+    try:
+        page.wait_for_timeout(700)
+    except Exception:
+        pass
+    return True
 
 
 def _fb_normalize_client_url(url: str) -> str:
@@ -1247,6 +1299,16 @@ def login_with_cookie(page: Page, cookie_path: str | Path) -> None:
     """
     path = _resolve_path(cookie_path)
     try:
+        from src.services.facebook_session_persist import profile_session_ready_for_interaction
+
+        ok_prof, prof_detail = profile_session_ready_for_interaction(page)
+        if ok_prof:
+            logger.info(
+                "[FB] login_with_cookie — bỏ qua nạp file, profile đã có phiên: {}",
+                prof_detail,
+            )
+            _enable_view_only_guard(page)
+            return
         cookies = _load_playwright_cookies(path)
         start_fb = _fb_normalize_client_url("https://www.facebook.com/")
         assert_safe_facebook_navigation_url(start_fb, label="login_with_cookie")

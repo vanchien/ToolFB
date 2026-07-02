@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Callable
+from collections.abc import Callable
+from typing import Any
 
 from loguru import logger
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
+
+from src.automation.browser_factory import is_playwright_target_closed_error
 
 from src.automation.facebook_actions import human_pause
 from src.services.human_ai_comment import generate_facebook_comment
@@ -19,6 +22,50 @@ from src.services.human_interaction_profile import HumanInteractionProfile, reso
 from src.utils.human_action import HumanAction
 
 StatusCallback = Callable[[str, str], None]
+StopCallback = Callable[[], bool]
+
+
+def _page_usable(page: Page) -> bool:
+    try:
+        return page.is_closed() is False
+    except Exception:
+        return False
+
+
+def _raise_if_browser_closed(page: Page) -> None:
+    if not _page_usable(page):
+        raise RuntimeError("Target page, context or browser has been closed")
+
+
+def _re_raise_browser_closed(exc: BaseException) -> None:
+    if is_playwright_target_closed_error(exc):
+        raise exc
+
+
+def _interruptible_sleep(
+    seconds: float,
+    *,
+    page: Page | None = None,
+    should_stop: StopCallback | None = None,
+) -> bool:
+    """Ngủ có thể ngắt bởi «Dừng». Trả ``False`` nếu người dùng đã dừng pool."""
+    end = time.monotonic() + max(0.0, float(seconds))
+    while time.monotonic() < end:
+        if should_stop and should_stop():
+            return False
+        chunk = min(0.4, end - time.monotonic())
+        if chunk <= 0:
+            break
+        ms = max(50, int(chunk * 1000))
+        if page is not None and _page_usable(page):
+            try:
+                page.wait_for_timeout(ms)
+            except Exception as exc:  # noqa: BLE001
+                _re_raise_browser_closed(exc)
+                time.sleep(chunk)
+        else:
+            time.sleep(chunk)
+    return not bool(should_stop and should_stop())
 
 _REELS_KEYWORDS = (
     "reels hài",
@@ -49,24 +96,54 @@ _SEARCH_RESULTS_SELECTORS = (
 )
 
 
-def deep_delay_between_modules(*, min_sec: float, max_sec: float) -> None:
-    """Nghỉ sâu giữa các module lớn."""
+def deep_delay_between_modules(
+    *,
+    min_sec: float,
+    max_sec: float,
+    should_stop: StopCallback | None = None,
+) -> None:
+    """Nghỉ sâu giữa các module lớn — có thể ngắt bởi «Dừng»."""
     lo = max(0.1, float(min_sec))
     hi = max(lo, float(max_sec))
     sec = random.uniform(lo, hi)
     logger.info("[Human] Deep delay {:.1f}s giữa các module", sec)
-    time.sleep(sec)
+    _interruptible_sleep(sec, should_stop=should_stop)
 
 
-def _module_micro_pause(cfg: HumanInteractionProfile, *, label: str = "") -> None:
-    """Tạm dừng ngắn trước/sau thao tác trong một module."""
+def _module_micro_pause(
+    cfg: HumanInteractionProfile,
+    *,
+    label: str = "",
+    should_stop: StopCallback | None = None,
+) -> bool:
+    """Tạm dừng ngắn trước/sau thao tác trong một module. Trả ``False`` nếu đã bấm Dừng."""
+    if should_stop and should_stop():
+        return False
     human_pause(kind="action", label=label or "module")
-    time.sleep(random.uniform(cfg.module_pause_min_sec, cfg.module_pause_max_sec))
+    sec = random.uniform(cfg.module_pause_min_sec, cfg.module_pause_max_sec)
+    return _interruptible_sleep(sec, should_stop=should_stop)
 
 
-def _page_load_pause(cfg: HumanInteractionProfile) -> None:
-    """Chờ ngắn sau goto — theo preset, tránh sleep cố định 3–5s mỗi module."""
-    time.sleep(random.uniform(cfg.page_load_pause_min_sec, cfg.page_load_pause_max_sec))
+def _page_load_pause(
+    cfg: HumanInteractionProfile,
+    *,
+    should_stop: StopCallback | None = None,
+) -> bool:
+    """Chờ ngắn sau goto — theo preset. Trả ``False`` nếu đã bấm Dừng."""
+    sec = random.uniform(cfg.page_load_pause_min_sec, cfg.page_load_pause_max_sec)
+    return _interruptible_sleep(sec, should_stop=should_stop)
+
+
+def _interruptible_step_pause(
+    *,
+    label: str = "",
+    should_stop: StopCallback | None = None,
+) -> bool:
+    """``human_pause(kind=step)`` có thể ngắt — thay cho ``time.sleep`` cố định giữa bước."""
+    if should_stop and should_stop():
+        return False
+    human_pause(kind="step", label=label)
+    return _interruptible_sleep(random.uniform(0.4, 1.2), should_stop=should_stop)
 
 
 def _reels_clip_wait(page: Page, cfg: HumanInteractionProfile) -> None:
@@ -85,14 +162,17 @@ def _scroll_feed_top_to_bottom(
     comment_rate: float = 0.0,
     on_like: Callable[[Page], None] | None = None,
     on_comment: Callable[[Page], None] | None = None,
-) -> None:
+    should_stop: StopCallback | None = None,
+) -> bool:
     """Cuộn từ đầu trang xuống — số vòng theo preset (safe/normal/fast)."""
+    if should_stop and should_stop():
+        return False
     if short:
         lo, hi = cfg.scroll_rounds_short_min, cfg.scroll_rounds_short_max
     else:
         lo, hi = cfg.scroll_rounds_min, cfg.scroll_rounds_max
     rounds = random.randint(max(4, lo), max(lo, hi))
-    ha.natural_scroll_feed(
+    ok = ha.natural_scroll_feed(
         rounds=rounds,
         like_rate=like_rate,
         comment_rate=comment_rate,
@@ -101,8 +181,11 @@ def _scroll_feed_top_to_bottom(
         downward_bias=0.97,
         scroll_from_top=True,
         dwell_scale=cfg.dwell_scale,
+        should_stop=should_stop,
     )
-    human_pause(kind="step", label="sau cuộn feed")
+    if not ok or (should_stop and should_stop()):
+        return False
+    return _interruptible_step_pause(label="sau cuộn feed", should_stop=should_stop)
 
 
 def _human(page: Page, cfg: HumanInteractionProfile) -> HumanAction:
@@ -120,23 +203,186 @@ def _visible_article_text(page: Page) -> str:
     return ""
 
 
-def _try_like_visible_post(page: Page, ha: HumanAction) -> None:
-    like = page.locator(
-        '[aria-label*="Like" i]:not([aria-pressed="true"]), '
-        '[aria-label*="Thích" i]:not([aria-pressed="true"]), '
-        '[role="button"][aria-label*="Like" i], '
-        '[role="button"][aria-label*="Thích" i]'
-    ).first
+def _clear_feed_like_tags(page: Page) -> None:
+    """Xóa marker tạm sau thao tác Like."""
     try:
-        if like.is_visible(timeout=1500):
-            ha.smart_click(like, label="like bài")
-            human_pause(kind="click", label="like bài")
-    except PlaywrightTimeoutError:
+        page.evaluate(
+            """() => {
+                document.querySelectorAll('[data-toolfb-like-btn]').forEach(el => {
+                    el.removeAttribute('data-toolfb-like-btn');
+                });
+                document.querySelectorAll('[data-toolfb-feed-article]').forEach(el => {
+                    el.removeAttribute('data-toolfb-feed-article');
+                });
+            }"""
+        )
+    except Exception:
         pass
 
 
+def _tag_visible_post_like_target(page: Page) -> bool:
+    """
+    Đánh dấu nút Like của **bài chính** đang hiển thị giữa feed.
+
+    Bỏ qua bài lồng nhau (comment), sidebar và nút Like bình luận.
+    """
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    document.querySelectorAll('[data-toolfb-like-btn]').forEach(el => {
+                        el.removeAttribute('data-toolfb-like-btn');
+                    });
+                    document.querySelectorAll('[data-toolfb-feed-article]').forEach(el => {
+                        el.removeAttribute('data-toolfb-feed-article');
+                    });
+                    const isTopLevelArticle = (el) => {
+                        let p = el.parentElement;
+                        while (p) {
+                            if (p !== el && p.getAttribute('role') === 'article') return false;
+                            p = p.parentElement;
+                        }
+                        return true;
+                    };
+                    const likeLabelOk = (label) => {
+                        const s = (label || '').trim().toLowerCase();
+                        if (!s) return false;
+                        if (s.includes('comment') || s.includes('bình luận')) return false;
+                        return s === 'like' || s === 'thích'
+                            || s.startsWith('like ') || s.startsWith('thích ');
+                    };
+                    const arts = [...document.querySelectorAll(
+                        '[role="main"] [role="article"], [role="feed"] [role="article"]'
+                    )].filter(isTopLevelArticle).slice(0, 20);
+                    const vh = window.innerHeight;
+                    const vmid = vh * 0.45;
+                    let bestArt = null, bestScore = -1;
+                    for (const el of arts) {
+                        const r = el.getBoundingClientRect();
+                        if (r.height < 48 || r.bottom < 80 || r.top > vh - 40) continue;
+                        const visTop = Math.max(0, r.top);
+                        const visBot = Math.min(vh, r.bottom);
+                        const area = Math.max(0, visBot - visTop) * Math.max(0, r.width);
+                        const centerDist = Math.abs((r.top + r.bottom) / 2 - vmid);
+                        const score = area - centerDist * 3;
+                        if (score > bestScore) { bestScore = score; bestArt = el; }
+                    }
+                    if (!bestArt) return false;
+                    bestArt.setAttribute('data-toolfb-feed-article', '1');
+                    const ar = bestArt.getBoundingClientRect();
+                    const footerY = ar.top + ar.height * 0.32;
+                    const buttons = [...bestArt.querySelectorAll('[role="button"][aria-label]')]
+                        .filter(btn => {
+                            if (btn.getAttribute('aria-pressed') === 'true') return false;
+                            if (!likeLabelOk(btn.getAttribute('aria-label'))) return false;
+                            const br = btn.getBoundingClientRect();
+                            if (br.width < 18 || br.height < 18) return false;
+                            if (br.bottom < 80 || br.top > vh - 30) return false;
+                            return br.top >= footerY;
+                        });
+                    if (!buttons.length) {
+                        const fallback = [...bestArt.querySelectorAll('[role="button"][aria-label]')]
+                            .filter(btn => {
+                                if (btn.getAttribute('aria-pressed') === 'true') return false;
+                                return likeLabelOk(btn.getAttribute('aria-label'));
+                            });
+                        if (!fallback.length) return false;
+                        fallback[0].setAttribute('data-toolfb-like-btn', '1');
+                        return true;
+                    }
+                    buttons.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+                    buttons[0].setAttribute('data-toolfb-like-btn', '1');
+                    return true;
+                }"""
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Human] tag like target: {}", exc)
+        return False
+
+
+def _article_most_visible_in_viewport(page: Page) -> Any | None:
+    """Bài feed chính trong viewport — dùng marker DOM đồng bộ với JS chọn Like."""
+    if not _tag_visible_post_like_target(page):
+        return None
+    loc = page.locator('[data-toolfb-feed-article="1"]').first
+    try:
+        if loc.is_visible(timeout=1200):
+            return loc
+    except Exception:
+        pass
+    return None
+
+
+def _locate_like_in_article(article: Any) -> Any | None:
+    """Nút Like/Thích trong một bài — bỏ qua đã thích (``aria-pressed=true``)."""
+    loc = article.page.locator('[data-toolfb-like-btn="1"]').first
+    try:
+        if loc.is_visible(timeout=900):
+            pressed = loc.get_attribute("aria-pressed")
+            if pressed and str(pressed).lower() == "true":
+                return None
+            return loc
+    except Exception:
+        pass
+    selectors = (
+        '[role="button"][aria-label="Like"]:not([aria-pressed="true"])',
+        '[role="button"][aria-label="Thích"]:not([aria-pressed="true"])',
+        '[role="button"][aria-label^="Like " i]:not([aria-pressed="true"])',
+        '[role="button"][aria-label^="Thích " i]:not([aria-pressed="true"])',
+    )
+    for sel in selectors:
+        btn = article.locator(sel).first
+        try:
+            if btn.is_visible(timeout=500):
+                return btn
+        except Exception:
+            continue
+    return None
+
+
+def _try_like_visible_post(page: Page, ha: HumanAction) -> bool:
+    """Like bài đang hiển thị giữa feed — không Like sidebar / comment."""
+    try:
+        if not _tag_visible_post_like_target(page):
+            logger.debug("[Human] Không tìm được nút Like bài chính trong viewport")
+            return False
+        like = page.locator('[data-toolfb-like-btn="1"]').first
+        if not like.is_visible(timeout=1500):
+            logger.debug("[Human] Nút Like đã tag không còn visible")
+            return False
+        pressed = like.get_attribute("aria-pressed")
+        if pressed and str(pressed).lower() == "true":
+            logger.debug("[Human] Bài đã Like — bỏ qua")
+            return False
+        like.scroll_into_view_if_needed(timeout=4000)
+        try:
+            like.click(delay=random.randint(55, 180), timeout=6000)
+            human_pause(kind="click", label="like bài")
+            pressed_after = like.get_attribute("aria-pressed")
+            if pressed_after and str(pressed_after).lower() == "true":
+                logger.info("[Human] Đã Like bài trong viewport (xác nhận aria-pressed)")
+                return True
+            if ha.smart_click(like, label="like bài viewport (fallback)"):
+                human_pause(kind="click", label="like bài")
+                logger.info("[Human] Đã Like bài trong viewport")
+                return True
+        except PlaywrightTimeoutError:
+            pass
+    except PlaywrightTimeoutError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        _re_raise_browser_closed(exc)
+        logger.debug("[Human] Like viewport: {}", exc)
+    finally:
+        _clear_feed_like_tags(page)
+    return False
+
+
 def _try_comment_visible_post(page: Page, ha: HumanAction, *, use_ai: bool) -> None:
-    article = page.locator('[role="article"]').first
+    article = _article_most_visible_in_viewport(page)
+    if article is None:
+        article = page.locator('[role="article"]').first
     post_text = _visible_article_text(page)
     if use_ai:
         comment = generate_facebook_comment(post_text)
@@ -171,7 +417,13 @@ def _try_comment_visible_post(page: Page, ha: HumanAction, *, use_ai: bool) -> N
         pass
 
 
-def module_newsfeed_like(page: Page, *, probability: float = 0.70, cfg: HumanInteractionProfile | None = None) -> bool:
+def module_newsfeed_like(
+    page: Page,
+    *,
+    probability: float = 0.70,
+    cfg: HumanInteractionProfile | None = None,
+    should_stop: StopCallback | None = None,
+) -> bool:
     """Lướt Newsfeed tự nhiên + Like/Comment theo tỷ lệ cấu hình."""
     if random.random() > probability:
         logger.info("[Human] Bỏ qua module Newsfeed/Like (xác suất)")
@@ -185,28 +437,39 @@ def module_newsfeed_like(page: Page, *, probability: float = 0.70, cfg: HumanInt
     )
     try:
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
-        _module_micro_pause(profile, label="newsfeed_load")
-        _page_load_pause(profile)
+        if not _module_micro_pause(profile, label="newsfeed_load", should_stop=should_stop):
+            return False
+        if not _page_load_pause(profile, should_stop=should_stop):
+            return False
 
         def on_like(p: Page) -> None:
+            if should_stop and should_stop():
+                return
             _try_like_visible_post(p, _human(p, profile))
 
         def on_comment(p: Page) -> None:
+            if should_stop and should_stop():
+                return
             if profile.ai_comments:
                 _try_comment_visible_post(p, _human(p, profile), use_ai=True)
 
-        _scroll_feed_top_to_bottom(
+        if not _scroll_feed_top_to_bottom(
             ha,
             profile,
             like_rate=profile.like_rate_pct,
             comment_rate=profile.comment_rate_pct if profile.ai_comments else 0.0,
             on_like=on_like,
             on_comment=on_comment if profile.ai_comments else None,
-        )
-        human_pause(label="cuối newsfeed", kind="step")
-        time.sleep(random.uniform(0.8, 1.6))
+            should_stop=should_stop,
+        ):
+            return False
+        if should_stop and should_stop():
+            return False
+        if not _interruptible_step_pause(label="cuối newsfeed", should_stop=should_stop):
+            return False
         return True
     except Exception as exc:  # noqa: BLE001
+        _re_raise_browser_closed(exc)
         logger.warning("[Human] Newsfeed/Like lỗi: {}", exc)
         return False
 
@@ -268,7 +531,13 @@ def _open_search_and_type(
     return True
 
 
-def module_search_reels(page: Page, *, probability: float = 0.55, cfg: HumanInteractionProfile | None = None) -> bool:
+def module_search_reels(
+    page: Page,
+    *,
+    probability: float = 0.55,
+    cfg: HumanInteractionProfile | None = None,
+    should_stop: StopCallback | None = None,
+) -> bool:
     """
     Tìm Reels qua ô Search (không vào thẳng URL /reel/).
 
@@ -284,10 +553,14 @@ def module_search_reels(page: Page, *, probability: float = 0.55, cfg: HumanInte
     try:
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         _module_micro_pause(profile, label="home_before_search")
-        _scroll_feed_top_to_bottom(ha, profile, short=True, like_rate=profile.like_rate_pct * 0.25)
+        _scroll_feed_top_to_bottom(
+            ha, profile, short=True, like_rate=profile.like_rate_pct * 0.25, should_stop=should_stop
+        )
+        if should_stop and should_stop():
+            return False
         if not _open_search_and_type(page, ha, kw, profile):
             return False
-        _scroll_feed_top_to_bottom(ha, profile, short=True)
+        _scroll_feed_top_to_bottom(ha, profile, short=True, should_stop=should_stop)
         human_pause(kind="step", label="trước tab Reels")
         time.sleep(random.uniform(0.9, 1.6))
         reels_tab = page.locator(
@@ -309,11 +582,18 @@ def module_search_reels(page: Page, *, probability: float = 0.55, cfg: HumanInte
             _reels_clip_wait(page, profile)
         return True
     except Exception as exc:  # noqa: BLE001
+        _re_raise_browser_closed(exc)
         logger.warning("[Human] Tìm Reels lỗi: {}", exc)
         return False
 
 
-def module_reels_watch(page: Page, *, probability: float = 0.60, cfg: HumanInteractionProfile | None = None) -> bool:
+def module_reels_watch(
+    page: Page,
+    *,
+    probability: float = 0.60,
+    cfg: HumanInteractionProfile | None = None,
+    should_stop: StopCallback | None = None,
+) -> bool:
     """Xem Reels sau khi đã vào luồng video (ArrowDown + dwell)."""
     if random.random() > probability:
         logger.info("[Human] Bỏ qua module Reels xem tiếp (xác suất)")
@@ -326,18 +606,27 @@ def module_reels_watch(page: Page, *, probability: float = 0.60, cfg: HumanInter
             page.goto("https://www.facebook.com/reel/", wait_until="domcontentloaded", timeout=45_000)
             _page_load_pause(profile)
         _module_micro_pause(profile, label="reels_load")
-        _scroll_feed_top_to_bottom(ha, profile, short=True, like_rate=profile.like_rate_pct * 0.45)
+        _scroll_feed_top_to_bottom(
+            ha, profile, short=True, like_rate=profile.like_rate_pct * 0.45, should_stop=should_stop
+        )
         for _ in range(random.randint(1, 3)):
             page.keyboard.press("ArrowDown")
             human_pause(kind="action", label="reel tiếp")
             _reels_clip_wait(page, profile)
         return True
     except Exception as exc:  # noqa: BLE001
+        _re_raise_browser_closed(exc)
         logger.warning("[Human] Reels lỗi: {}", exc)
         return False
 
 
-def module_search_fanpage(page: Page, *, probability: float = 0.40, cfg: HumanInteractionProfile | None = None) -> bool:
+def module_search_fanpage(
+    page: Page,
+    *,
+    probability: float = 0.40,
+    cfg: HumanInteractionProfile | None = None,
+    should_stop: StopCallback | None = None,
+) -> bool:
     """Tìm Page qua ô Search (không URL trực tiếp)."""
     if random.random() > probability:
         logger.info("[Human] Bỏ qua module Tìm Page (xác suất)")
@@ -350,10 +639,12 @@ def module_search_fanpage(page: Page, *, probability: float = 0.40, cfg: HumanIn
     try:
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         _module_micro_pause(profile, label="home_search_page")
-        _scroll_feed_top_to_bottom(ha, profile, short=True, like_rate=profile.like_rate_pct * 0.2)
+        _scroll_feed_top_to_bottom(
+            ha, profile, short=True, like_rate=profile.like_rate_pct * 0.2, should_stop=should_stop
+        )
         if not _open_search_and_type(page, ha, kw, profile):
             return False
-        _scroll_feed_top_to_bottom(ha, profile, short=True)
+        _scroll_feed_top_to_bottom(ha, profile, short=True, should_stop=should_stop)
         human_pause(kind="step", label="trước tab Pages")
         time.sleep(random.uniform(0.8, 1.5))
         pages_tab = page.locator('[role="tab"]:has-text("Pages"), [role="tab"]:has-text("Trang")').first
@@ -365,9 +656,12 @@ def module_search_fanpage(page: Page, *, probability: float = 0.40, cfg: HumanIn
         link = page.locator('[role="article"] a[href*="/"]').first
         ha.smart_click(link, label="page link")
         _module_micro_pause(profile, label="page_visit")
-        _scroll_feed_top_to_bottom(ha, profile, short=False, like_rate=profile.like_rate_pct * 0.4)
+        _scroll_feed_top_to_bottom(
+            ha, profile, short=False, like_rate=profile.like_rate_pct * 0.4, should_stop=should_stop
+        )
         return True
     except Exception as exc:  # noqa: BLE001
+        _re_raise_browser_closed(exc)
         logger.warning("[Human] Tìm Page lỗi: {}", exc)
         return False
 
@@ -387,6 +681,7 @@ def module_post_story(
     probability: float = 0.20,
     media_dir: str | None = None,
     cfg: HumanInteractionProfile | None = None,
+    should_stop: StopCallback | None = None,
 ) -> bool:
     """Soạn bài nhẹ (không publish tự động)."""
     if random.random() > probability:
@@ -398,7 +693,7 @@ def module_post_story(
     try:
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
         _module_micro_pause(profile, label="composer_open")
-        _scroll_feed_top_to_bottom(ha, profile, short=True)
+        _scroll_feed_top_to_bottom(ha, profile, short=True, should_stop=should_stop)
         box = page.locator(
             '[role="textbox"][contenteditable="true"], '
             '[aria-label*="Bạn đang nghĩ" i], [aria-label*="What\'s on your mind" i]'
@@ -418,6 +713,7 @@ def module_post_story(
         logger.info("[Human] Đã soạn caption (không publish tự động): {}", caption[:40])
         return True
     except Exception as exc:  # noqa: BLE001
+        _re_raise_browser_closed(exc)
         logger.warning("[Human] Đăng bài lỗi: {}", exc)
         return False
 
@@ -427,39 +723,58 @@ def run_shuffled_interaction_modules(
     *,
     profile: HumanInteractionProfile | None = None,
     on_status: StatusCallback | None = None,
+    should_stop: StopCallback | None = None,
 ) -> None:
     """Xáo trộn module và chạy với Deep Delay giữa các module đã chạy."""
     cfg = profile or resolve_profile("normal")
     modules = [
-        ("newsfeed", lambda: module_newsfeed_like(page, probability=cfg.newsfeed_prob, cfg=cfg)),
-        ("search_reels", lambda: module_search_reels(page, probability=cfg.reels_prob, cfg=cfg)),
-        ("reels", lambda: module_reels_watch(page, probability=max(0.22, cfg.reels_prob - 0.28), cfg=cfg)),
-        ("search_page", lambda: module_search_fanpage(page, probability=cfg.search_prob, cfg=cfg)),
-        ("post", lambda: module_post_story(page, probability=cfg.post_prob, cfg=cfg)),
+        ("newsfeed", lambda: module_newsfeed_like(page, probability=cfg.newsfeed_prob, cfg=cfg, should_stop=should_stop)),
+        ("search_reels", lambda: module_search_reels(page, probability=cfg.reels_prob, cfg=cfg, should_stop=should_stop)),
+        ("reels", lambda: module_reels_watch(page, probability=max(0.22, cfg.reels_prob - 0.28), cfg=cfg, should_stop=should_stop)),
+        ("search_page", lambda: module_search_fanpage(page, probability=cfg.search_prob, cfg=cfg, should_stop=should_stop)),
+        ("post", lambda: module_post_story(page, probability=cfg.post_prob, cfg=cfg, should_stop=should_stop)),
     ]
     random.shuffle(modules)
     max_mod = max(1, int(getattr(cfg, "max_modules_per_run", 3) or 3))
     ran_any = False
     success_count = 0
     for name, fn in modules:
+        if should_stop and should_stop():
+            logger.info("[Human] Dừng tương tác — người dùng bấm Dừng (trước module {})", name)
+            break
         if success_count >= max_mod:
             logger.info("[Human] Đã đủ {} module/lượt — bỏ qua phần còn lại", max_mod)
             break
+        _raise_if_browser_closed(page)
         if on_status:
             on_status("running", f"Module: {name}")
         _module_micro_pause(cfg, label=f"trước {name}")
-        if fn():
-            ran_any = True
-            success_count += 1
-            if success_count < max_mod:
-                deep_delay_between_modules(
-                    min_sec=cfg.deep_delay_min_sec,
-                    max_sec=cfg.deep_delay_max_sec,
-                )
+        try:
+            if fn():
+                ran_any = True
+                success_count += 1
+                if success_count < max_mod:
+                    deep_delay_between_modules(
+                        min_sec=cfg.deep_delay_min_sec,
+                        max_sec=cfg.deep_delay_max_sec,
+                        should_stop=should_stop,
+                    )
+            elif should_stop and should_stop():
+                logger.info("[Human] Dừng tương tác — người dùng bấm Dừng (sau module {})", name)
+                break
+        except Exception as exc:  # noqa: BLE001
+            if is_playwright_target_closed_error(exc) or not _page_usable(page):
+                raise
+            logger.warning("[Human] Module {} lỗi (bỏ qua): {}", name, exc)
     if not ran_any:
         logger.info("[Human] Không module nào chạy (xác suất) — scroll nhẹ")
         try:
+            _raise_if_browser_closed(page)
             page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=45_000)
-            _scroll_feed_top_to_bottom(_human(page, cfg), cfg, like_rate=cfg.like_rate_pct)
+            _scroll_feed_top_to_bottom(
+                _human(page, cfg), cfg, like_rate=cfg.like_rate_pct, should_stop=should_stop
+            )
         except Exception as exc:  # noqa: BLE001
+            if is_playwright_target_closed_error(exc):
+                raise
             logger.warning("[Human] Fallback scroll: {}", exc)

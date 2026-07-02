@@ -7924,7 +7924,26 @@ class _ManagerWindow:
                 ctx_f = state.get("ctx") or ctx_hold
                 fac_f = state.get("factory") or factory
                 try:
-                    sync_close_persistent_context(ctx_f, log_label=f"manual_profile:{aid}")
+                    if ctx_f is not None and ctx_f.pages:
+                        pg = ctx_f.pages[0]
+                        if not pg.is_closed():
+                            from src.services.facebook_session_persist import sync_firefox_profile_before_close
+
+                            acc_row = self._accounts.get_by_id(aid) or {"id": aid}
+                            sync_firefox_profile_before_close(
+                                ctx_f,
+                                pg,
+                                dict(acc_row),
+                                log_label=f"manual_profile:{aid}",
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Flush profile manual {}: {}", aid, exc)
+                try:
+                    sync_close_persistent_context(
+                        ctx_f,
+                        log_label=f"manual_profile:{aid}",
+                        force_kill_firefox=False,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Đóng context manual profile ({}): {}", aid, exc)
                 if fac_f is not None:
@@ -9572,6 +9591,23 @@ class _ManagerWindow:
                 sess["shutdown"].set()
             except Exception:  # noqa: BLE001
                 pass
+        close_grace = max(
+            15.0,
+            float(os.environ.get("FB_APP_CLOSE_GRACE_SEC", "60")),
+        )
+        try:
+            human_shutdown = getattr(self._root, "_toolfb_human_shutdown", None)
+            if callable(human_shutdown):
+                human_shutdown(timeout_sec=close_grace)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Graceful shutdown tab Tương tác: {}", exc)
+        for sess in list(self._manual_profile_sessions):
+            th = sess.get("thread")
+            if th is not None and th.is_alive():
+                try:
+                    th.join(timeout=min(30.0, close_grace))
+                except Exception:  # noqa: BLE001
+                    pass
         self._manual_profile_sessions.clear()
         try:
             shutdown_ve = getattr(self, "_shutdown_video_editor_tab", None)

@@ -33,6 +33,7 @@ Desktop.ini
 
 # Temp / scrape output (local only)
 releases_tmp.json
+dist_publish_log*.txt
 
 # Project runtime — không đẩy lên GitHub (profiles, cookies, download cache, DB…)
 data/

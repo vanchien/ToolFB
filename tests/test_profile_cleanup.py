@@ -52,6 +52,36 @@ def test_cleanup_deletes_only_orphan(tmp_path: Path) -> None:
     assert len(deleted) == 4
 
 
+def test_cleanup_skips_profile_with_owner_marker(tmp_path: Path) -> None:
+    """Thư mục có ``.toolfb_account_id`` — không xóa dù không có trong accounts.json."""
+    root = tmp_path / "proj"
+    marked = root / "data" / "profiles" / "firefox" / "acc_marked"
+    marked.mkdir(parents=True)
+    (marked / ".toolfb_account_id").write_text("acc_marked\n", encoding="utf-8")
+
+    acc = _minimal_account("data/profiles/firefox/acc_keep")
+    deleted = cleanup_orphan_profile_directories([acc], project_root=root, dry_run=False)
+    assert marked.is_dir()
+    assert not any("acc_marked" in p for p in deleted)
+
+
+def test_cleanup_skips_session_orphan_even_if_unreferenced(tmp_path: Path) -> None:
+    """Profile có cookies.sqlite — không xóa dù không có trong accounts.json."""
+    root = tmp_path / "proj"
+    orphan_sess = root / "data" / "profiles" / "firefox" / "UID_999"
+    keep = root / "data" / "profiles" / "firefox" / "acc_keep"
+    orphan_sess.mkdir(parents=True)
+    keep.mkdir(parents=True)
+    (orphan_sess / "cookies.sqlite").write_bytes(b"x" * 128)
+    (orphan_sess / "places.sqlite").write_bytes(b"y" * 2048)
+
+    acc = _minimal_account("data/profiles/firefox/acc_keep")
+    deleted = cleanup_orphan_profile_directories([acc], project_root=root, dry_run=False)
+    assert orphan_sess.is_dir()
+    assert keep.is_dir()
+    assert not any("UID_999" in p for p in deleted)
+
+
 def test_cleanup_skips_when_no_accounts(tmp_path: Path) -> None:
     prof = tmp_path / "data" / "profiles" / "firefox" / "x"
     prof.mkdir(parents=True)

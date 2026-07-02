@@ -1948,13 +1948,19 @@ class AccountFormDialog:
             err_msg = ""
             ok = False
             try:
+                from src.utils.account_proxy_mapper import prepare_account_dict_for_browser_run
+
+                acc_run = prepare_account_dict_for_browser_run(
+                    dict(preview),
+                    require_proxy_live=False,
+                )
                 factory = BrowserFactory(accounts=self._manager, headless=False)
-                ctx = factory.launch_persistent_context_from_account_dict(preview, headless=False)
+                ctx = factory.launch_persistent_context_from_account_dict(acc_run, headless=False)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 prime_facebook_session_page(page)
                 ok = try_recover_facebook_session(
                     page,
-                    preview,
+                    acc_run,
                     cookie_path=ck_rel,
                     force_fresh_login=fresh,
                 )

@@ -1783,6 +1783,33 @@ def _finalize_successful_recovery(
     """
     ok, detail = confirm_facebook_session_logged_in(page, account)
     if not ok:
+        from src.services.facebook_session_persist import profile_session_ready_for_interaction
+
+        ok_prof, det_prof = profile_session_ready_for_interaction(page, account)
+        if ok_prof:
+            account["login_confirm_detail"] = det_prof
+            from src.services.facebook_session_persist import (
+                cookie_file_has_session,
+                ensure_account_cookie_path,
+                sync_session_to_accounts_registry,
+            )
+
+            ck_rel = ensure_account_cookie_path(account, cookie_path)
+            save_session_to_cookie_path(page, ck_rel)
+            try:
+                sync_session_to_accounts_registry(account, ck_rel)
+            except Exception as sync_exc:  # noqa: BLE001
+                logger.warning("[FB recovery] Không sync accounts.json: {}", sync_exc)
+            if cookie_file_has_session(ck_rel):
+                _clear_auth_flow_active(account)
+                _set_session_status(account, "ready")
+                logger.info(
+                    "[FB recovery] Đã lưu cookie (profile có phiên) account_id={}{} → {}",
+                    account.get("id", ""),
+                    f" ({log_label})" if log_label else "",
+                    ck_rel,
+                )
+                return True
         logger.warning(
             "[FB recovery] Chưa xác nhận đăng nhập account_id={}{}: {}",
             account.get("id", ""),

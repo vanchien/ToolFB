@@ -21,7 +21,6 @@ from playwright.sync_api import BrowserContext, Page
 
 from src.automation.browser_factory import BrowserFactory, sync_close_persistent_context
 from src.services.facebook_session_recovery import confirm_facebook_session_logged_in
-from src.utils.account_browser_profile import ensure_account_browser_profile_ready
 from src.utils.db_manager import AccountsDatabaseManager
 from src.utils.paths import project_root
 
@@ -50,7 +49,7 @@ def prepare_manual_login_session(
     progress: Callable[[str], None] | None = None,
 ) -> str:
     """
-    Chuẩn bị phiên đăng nhập thủ công: registry, profile, cookie, mở Facebook (không auto recovery).
+    Chuẩn bị phiên: profile persistent → cookie file → (không auto form khi mở tay).
 
     Returns:
         Mô tả ngắn hiển thị trên hộp thoại GUI.
@@ -60,32 +59,55 @@ def prepare_manual_login_session(
         if progress:
             progress(msg)
 
-    from src.automation.facebook_actions import (
-        facebook_session_appears_logged_in,
-        prime_facebook_session_page,
+    from src.services.facebook_session_persist import (
+        cookie_file_has_session,
+        establish_facebook_session,
+        prepare_persistent_session_after_launch,
+        resolve_best_cookie_path_for_account,
     )
+    from src.utils.account_browser_profile import resolve_account_portable_profile
 
-    notes: list[str] = ["Profile + proxy + stealth"]
     if not _page_usable(page):
         return "Trình duyệt đã đóng"
-    _prog("Đang mở facebook.com — kiểm tra phiên profile…")
-    prime_facebook_session_page(page)
+
+    resolve_account_portable_profile(acc)
+    ck = resolve_best_cookie_path_for_account(
+        acc,
+        facebook_uid=str(acc.get("facebook_uid") or ""),
+        extra_candidates=[cookie_path] if cookie_path else None,
+    )
+    acc["cookie_path"] = ck
+    prof = str(acc.get("portable_path") or acc.get("profile_path") or "")
+    notes: list[str] = [f"Profile: {prof[-48:] or 'mặc định'}"]
+
+    _prog("Chờ Firefox nạp profile đã lưu…")
+    ok_prep, prep_mode = prepare_persistent_session_after_launch(
+        context,
+        page,
+        acc,
+        cookie_path=ck,
+    )
+    if ok_prep:
+        ok, detail = True, prep_mode or "profile"
+    else:
+        _prog("Đang mở facebook.com — profile → cookie đã lưu…")
+        ok, detail = establish_facebook_session(
+            page,
+            acc,
+            cookie_path=ck,
+            allow_form_login=False,
+            form_recover_fn=None,
+        )
     try:
         page.bring_to_front()
     except Exception:
         pass
-    if facebook_session_appears_logged_in(page):
-        notes.append("đã đăng nhập sẵn trong profile")
+    if ok:
+        notes.append(detail[:80] if detail else "đã vào Facebook")
+    elif cookie_file_has_session(ck):
+        notes.append("có cookie file — đăng nhập tay hoặc bấm Lưu sau khi vào feed")
     else:
-        from src.services.facebook_session_persist import cookie_file_has_session, restore_facebook_session
-
-        ok, mode = restore_facebook_session(page, acc, cookie_path=cookie_path, prime=False)
-        if ok:
-            notes.append(f"phiên từ {mode}")
-        elif cookie_file_has_session(cookie_path):
-            notes.append("chưa vào được — đăng nhập tay hoặc bấm Lưu sau khi vào feed")
-        else:
-            notes.append("sẵn sàng đăng nhập / 2FA / captcha tay")
+        notes.append("chưa có phiên — đăng nhập / 2FA / captcha tay trên Firefox")
     return " · ".join(notes)
 
 
@@ -118,6 +140,10 @@ def run_fb_cookie_capture_dialog(
     grid_viewport: tuple[int, int] | None = None,
     window_position: tuple[int, int] | None = None,
     dialog_title: str | None = None,
+    session_registry: dict[str, Any] | None = None,
+    close_button_label: str = "Hủy (đóng trình duyệt)",
+    show_save_cookie_button: bool = True,
+    ready_hint: str | None = None,
 ) -> None:
     """
     Mở trình duyệt persistent theo ``acc_preview``; user đăng nhập tay → «Lưu cookie».
@@ -134,6 +160,8 @@ def run_fb_cookie_capture_dialog(
     action_holder: list[str] = []
     success_detail: list[str] = []
     prep_holder: list[str] = []
+    if session_registry is not None:
+        session_registry[log_label] = {"cmd_q": cmd_q, "done_evt": done_evt}
 
     try:
         tip_parent = parent.winfo_toplevel()
@@ -179,8 +207,9 @@ def run_fb_cookie_capture_dialog(
 
     bf = ttk.Frame(tip, padding=8)
     bf.pack(side=tk.BOTTOM, fill=tk.X)
-    ttk.Button(bf, text="Lưu cookie vào file", command=lambda: send("save")).pack(side=tk.RIGHT, padx=4)
-    ttk.Button(bf, text="Hủy (đóng trình duyệt)", command=lambda: send("cancel")).pack(side=tk.RIGHT)
+    if show_save_cookie_button:
+        ttk.Button(bf, text="Lưu cookie vào file", command=lambda: send("save")).pack(side=tk.RIGHT, padx=4)
+    ttk.Button(bf, text=close_button_label, command=lambda: send("close")).pack(side=tk.RIGHT)
 
     lbl_tip = ttk.Label(
         tip,
@@ -206,7 +235,7 @@ def run_fb_cookie_capture_dialog(
     tip.after_idle(_fit_tip_window)
 
     def on_tip_close() -> None:
-        send("cancel")
+        send("close")
 
     tip.protocol("WM_DELETE_WINDOW", on_tip_close)
 
@@ -216,7 +245,25 @@ def run_fb_cookie_capture_dialog(
         try:
             logger.info("[FB manual open] Worker bắt đầu account={}", log_label)
             progress_q.put("Chuẩn bị profile Firefox…")
-            ensure_account_browser_profile_ready(acc_preview)
+            from src.services.facebook_session_persist import resolve_best_cookie_path_for_account
+            from src.utils.account_proxy_mapper import prepare_account_dict_for_browser_run
+
+            acc_run = prepare_account_dict_for_browser_run(dict(acc_preview))
+            ck_resolved = resolve_best_cookie_path_for_account(
+                acc_run,
+                facebook_uid=str(acc_run.get("facebook_uid") or ""),
+                extra_candidates=[ck_rel],
+            )
+            acc_run["cookie_path"] = ck_resolved
+            acc_preview.clear()
+            acc_preview.update(acc_run)
+            prof_log = str(acc_run.get("portable_path") or acc_run.get("profile_path") or "")
+            logger.info(
+                "[FB manual open] account={} profile={} cookie={}",
+                log_label,
+                prof_log,
+                ck_resolved,
+            )
             progress_q.put("Khởi động Playwright…")
             logger.info("[FB manual open] Bắt đầu launch Firefox account={}", log_label)
             factory = BrowserFactory(accounts=manager, headless=False)
@@ -260,7 +307,7 @@ def run_fb_cookie_capture_dialog(
                 page,
                 ctx,
                 acc_preview,
-                cookie_path=ck_rel,
+                cookie_path=ck_resolved,
                 progress=lambda m: progress_q.put(m),
             )
             prep_holder.append(summary)
@@ -271,9 +318,9 @@ def run_fb_cookie_capture_dialog(
             while not cmd:
                 if not _page_usable(page):
                     err_holder.append(
-                        "Trình duyệt đã đóng — mở lại từ «Mở trình duyệt» hoặc bấm «Hủy» trước khi đóng."
+                        "Trình duyệt đã đóng — mở lại từ «Mở profile» hoặc bấm «Đóng» trước khi đóng."
                     )
-                    cmd = "cancel"
+                    cmd = "close"
                     break
                 try:
                     cmd = cmd_q.get(timeout=0.45)
@@ -289,18 +336,16 @@ def run_fb_cookie_capture_dialog(
                             detail or "Chưa xác nhận đăng nhập — hãy vào bảng tin Facebook rồi bấm Lưu lại."
                         )
                     else:
-                        from src.services.facebook_session_persist import (
-                            ensure_account_cookie_path,
-                            persist_confirmed_facebook_session,
-                        )
+                        from src.services.facebook_session_persist import auto_save_session_for_account
 
-                        ensure_account_cookie_path(acc_preview, ck_rel)
-                        if persist_confirmed_facebook_session(
+                        saved, _ = auto_save_session_for_account(
                             page,
                             acc_preview,
                             cookie_path=ck_rel,
                             log_label="manual_capture",
-                        ):
+                            require_confirm=True,
+                        )
+                        if saved:
                             success_detail.append(detail)
                         else:
                             err_holder.append(
@@ -314,7 +359,28 @@ def run_fb_cookie_capture_dialog(
                 err_holder.append(msg)
             logger.exception("login_capture_cookie: {}", log_label)
         finally:
-            sync_close_persistent_context(ctx, log_label=log_label)
+            if session_registry is not None:
+                session_registry.pop(log_label, None)
+            if ctx is not None:
+                try:
+                    pg = ctx.pages[0] if ctx.pages else None
+                    if pg is not None and not pg.is_closed():
+                        from src.services.facebook_session_persist import sync_firefox_profile_before_close
+
+                        sync_firefox_profile_before_close(
+                            ctx,
+                            pg,
+                            acc_preview,
+                            cookie_path=str(acc_preview.get("cookie_path") or ck_rel),
+                            log_label="manual_close",
+                        )
+                except Exception:
+                    pass
+            sync_close_persistent_context(
+                ctx,
+                log_label=log_label,
+                force_kill_firefox=False,
+            )
             if factory is not None:
                 try:
                     factory.close()
@@ -345,10 +411,15 @@ def run_fb_cookie_capture_dialog(
         except queue.Empty:
             pass
         if prep_holder and lbl_tip.winfo_exists():
+            hint = ready_hint or (
+                "Hoàn tất đăng nhập / 2FA / captcha trên Firefox, rồi bấm «Lưu cookie vào file»."
+                if show_save_cookie_button
+                else "Dùng Firefox với profile đã lưu — bấm «Đóng» khi xong."
+            )
             lbl_tip.configure(
                 text=(
                     f"✓ {prep_holder[0]}\n"
-                    "Hoàn tất đăng nhập / 2FA / captcha trên Firefox, rồi bấm «Lưu cookie vào file».\n"
+                    f"{hint}\n"
                     f"{tip_extra}"
                 )
             )
@@ -379,3 +450,46 @@ def run_fb_cookie_capture_dialog(
             on_dialog_done()
 
     parent.after(200, poll)
+
+
+def run_fb_profile_browser_dialog(
+    parent: tk.Misc,
+    manager: AccountsDatabaseManager,
+    acc_preview: dict[str, Any],
+    ck_rel: str,
+    *,
+    log_label: str,
+    session_registry: dict[str, Any] | None = None,
+    on_dialog_done: Callable[[], None] | None = None,
+    on_launch_failed: Callable[[str], None] | None = None,
+    on_after_save: Callable[[], None] | None = None,
+    grid_viewport: tuple[int, int] | None = None,
+    window_position: tuple[int, int] | None = None,
+    dialog_title: str | None = None,
+    tip_extra: str = "",
+) -> None:
+    """
+    Mở Firefox theo profile portable đã chọn — xem/làm tay, đóng hoặc lưu cookie.
+
+    Không chạy pool tự động; dùng cho tab «Tương tác» / kiểm tra profile.
+    """
+    prof = str(acc_preview.get("portable_path") or acc_preview.get("profile_path") or "").strip()
+    extra = tip_extra or f"Profile: {prof or '(mặc định)'} — proxy từ dòng đã chọn."
+    run_fb_cookie_capture_dialog(
+        parent,
+        manager,
+        acc_preview,
+        ck_rel,
+        log_label=log_label,
+        tip_extra=extra,
+        on_after_save=on_after_save,
+        on_dialog_done=on_dialog_done,
+        on_launch_failed=on_launch_failed,
+        grid_viewport=grid_viewport,
+        window_position=window_position,
+        dialog_title=dialog_title or f"Profile — {log_label}",
+        session_registry=session_registry,
+        close_button_label="Đóng trình duyệt",
+        show_save_cookie_button=True,
+        ready_hint="Đã mở Facebook — đóng khi xong hoặc «Lưu cookie» nếu vừa đăng nhập.",
+    )

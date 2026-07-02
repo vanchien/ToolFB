@@ -16,11 +16,52 @@ def test_normal_profile_shorter_than_before() -> None:
     assert normal.reels_clip_max_ms <= 9000
 
 
+def test_locate_like_uses_tagged_button() -> None:
+    from unittest.mock import MagicMock
+
+    article = MagicMock()
+    like_btn = MagicMock()
+    like_btn.is_visible.return_value = True
+    like_btn.get_attribute.return_value = "false"
+    article.page.locator.return_value.first = like_btn
+
+    from src.services.human_interaction_modules import _locate_like_in_article
+
+    found = _locate_like_in_article(article)
+    assert found is like_btn
+    article.page.locator.assert_called_with('[data-toolfb-like-btn="1"]')
+
+
+def test_article_viewport_requires_tag() -> None:
+    from unittest.mock import MagicMock, patch
+
+    page = MagicMock()
+    loc = MagicMock()
+    loc.is_visible.return_value = True
+    page.locator.return_value.first = loc
+
+    from src.services.human_interaction_modules import _article_most_visible_in_viewport
+
+    with patch(
+        "src.services.human_interaction_modules._tag_visible_post_like_target",
+        return_value=False,
+    ):
+        assert _article_most_visible_in_viewport(page) is None
+
+    with patch(
+        "src.services.human_interaction_modules._tag_visible_post_like_target",
+        return_value=True,
+    ):
+        assert _article_most_visible_in_viewport(page) is loc
+    page.locator.assert_called_with('[data-toolfb-feed-article="1"]')
+
+
 def test_run_shuffled_caps_modules_per_run() -> None:
     page = MagicMock()
+    page.is_closed.return_value = False
     cfg = resolve_profile("fast")
 
-    def _always_ok(_page, *, probability=1.0, cfg=None):  # noqa: ANN001, ARG001
+    def _always_ok(_page, *, probability=1.0, cfg=None, should_stop=None):  # noqa: ANN001, ARG001
         return True
 
     with patch("src.services.human_interaction_modules.module_newsfeed_like", side_effect=_always_ok) as m1, patch(
@@ -39,6 +80,7 @@ def test_run_shuffled_caps_modules_per_run() -> None:
         "src.services.human_interaction_modules.deep_delay_between_modules",
     ) as deep, patch(
         "src.services.human_interaction_modules._module_micro_pause",
+        return_value=True,
     ), patch(
         "src.services.human_interaction_modules.random.shuffle",
         side_effect=lambda xs: xs,

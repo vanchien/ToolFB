@@ -351,6 +351,17 @@ def _context_or_page_already_closed_msg(exc: BaseException) -> bool:
     return "has been closed" in m or ("target page" in m and "closed" in m)
 
 
+def is_playwright_target_closed_error(exc: BaseException) -> bool:
+    """
+    True khi page/context/browser đã đóng (crash, OOM, đóng cửa sổ).
+
+    Không đồng nhất với người dùng bấm «Dừng» trên pool.
+    """
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    return _context_or_page_already_closed_msg(exc)
+
+
 def _cleanup_firefox_profile_lock_files(user_data_dir: Path) -> None:
     """
     Xóa lock file mồ côi của Firefox profile trước khi launch.
@@ -376,6 +387,7 @@ def sync_close_persistent_context(
     log_label: str = "",
     timeout_sec: float = 0.0,
     same_thread: bool = True,
+    force_kill_firefox: bool | None = None,
 ) -> None:
     """
     Đóng ``BrowserContext`` persistent: đóng từng ``Page`` còn mở rồi ``context.close()``.
@@ -383,12 +395,17 @@ def sync_close_persistent_context(
     Giảm race driver Node (``EPIPE``) khi Chromium còn phát sự kiện sau khi pipe đã đóng.
     ``timeout_sec`` > 0 và ``same_thread=False``: giới hạn thời gian đóng trên thread phụ.
     ``same_thread=True`` (mặc định): bắt buộc với Playwright Sync API.
+    ``force_kill_firefox=False``: không ``terminate`` Firefox — giữ ``cookies.sqlite`` profile.
     """
     if context is None:
         return
 
     def _close_inner() -> None:
-        _sync_close_persistent_context_impl(context, log_label=log_label)
+        _sync_close_persistent_context_impl(
+            context,
+            log_label=log_label,
+            force_kill_firefox=force_kill_firefox,
+        )
 
     if same_thread:
         _close_inner()
@@ -413,7 +430,12 @@ def sync_close_persistent_context(
     _close_inner()
 
 
-def _sync_close_persistent_context_impl(context: BrowserContext, *, log_label: str = "") -> None:
+def _sync_close_persistent_context_impl(
+    context: BrowserContext,
+    *,
+    log_label: str = "",
+    force_kill_firefox: bool | None = None,
+) -> None:
     label = (log_label or "").strip() or "(context)"
     relay = getattr(context, "_toolfb_socks_relay", None)  # noqa: SLF001
     profile_lock = getattr(context, "_toolfb_profile_lock", None)
@@ -462,17 +484,21 @@ def _sync_close_persistent_context_impl(context: BrowserContext, *, log_label: s
             except Exception:
                 pass
     if profile_dir is not None and sys.platform == "win32":
-        force_kill = os.environ.get("FB_FORCE_KILL_FIREFOX_ON_CLOSE", "1").strip().lower() not in (
-            "0",
-            "false",
-            "off",
-            "no",
-        )
+        if force_kill_firefox is None:
+            force_kill = os.environ.get("FB_FORCE_KILL_FIREFOX_ON_CLOSE", "0").strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
+        else:
+            force_kill = bool(force_kill_firefox)
         if force_kill:
             try:
                 from src.utils.win_browser_window import terminate_firefox_for_profile
 
-                terminate_firefox_for_profile(Path(profile_dir), grace_ms=500)
+                grace = max(500, int(float(os.environ.get("FB_FIREFOX_KILL_GRACE_MS", "2500"))))
+                terminate_firefox_for_profile(Path(profile_dir), grace_ms=grace)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Ep dong Firefox profile ({}): {}", label, exc)
 
@@ -678,10 +704,16 @@ class BrowserFactory:
             from src.utils.account_browser_profile import assert_profile_directory_owned_by
 
             assert_profile_directory_owned_by(
-                str(account.get("id", "")).strip(),
+                str(account.get("registry_id") or account.get("id", "")).strip(),
+                resolved,
+                account=dict(account),
+            )
+            logger.info(
+                "Profile portable | account={} | registry={} | path={}",
+                account.get("display_account_id") or account.get("id"),
+                account.get("registry_id") or account.get("id"),
                 resolved,
             )
-            logger.debug("Profile portable: {}", resolved)
             return resolved
         allow_create = _env_bool("FB_AUTO_CREATE_PROFILE_DIR", False)
         if allow_create:

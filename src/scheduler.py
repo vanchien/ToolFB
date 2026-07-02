@@ -27,6 +27,7 @@ from src.ai.content_creator import generate_post
 from src.automation.browser_factory import (
     BrowserFactory,
     _project_root,
+    account_use_proxy_enabled,
     apply_viewport_from_env_to_page,
     sync_close_persistent_context,
 )
@@ -37,6 +38,7 @@ from src.automation.facebook_actions import (
     register_view_only_page_hooks,
 )
 from src.services.job_post_runtime import (
+    STEP_LOAD_ACCOUNT,
     STEP_OPEN_BROWSER,
     STEP_VALIDATE_ACCOUNT,
     STEP_VALIDATE_JOB,
@@ -64,6 +66,8 @@ from src.utils.schedule_job_content import (
     strip_image_note_from_text,
 )
 from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
+from src.utils.account_proxy_mapper import prepare_account_dict_for_browser_run
+from src.utils.proxy_check import verify_browser_facebook_via_proxy
 from src.services.cross_platform_schedule_ctx import unified_chain_is_active
 from src.services.schedule_queue_dispatcher import (
     compute_smart_delay_ms,
@@ -1547,8 +1551,17 @@ def run_scheduled_post_for_account(
             return False
         account_run_slot = _acquire_account_run_slot(account_id)
         session_status_before = str(acc.get("session_status") or "active").strip() or "active"
+        try:
+            log_job_step(STEP_LOAD_ACCOUNT, "Chuẩn bị tài khoản (registry, profile, proxy).", account_id=account_id)
+            acc_prepared = prepare_account_dict_for_browser_run(dict(acc))
+        except ValueError as exc:
+            msg = format_post_job_error("account", str(exc))
+            append_failed_account_log(account_id, f"Chuẩn bị account: {msg}")
+            logger.error("Chuẩn bị account thất bại: {}", exc)
+            err_msg = msg
+            return False
         acc_runtime, runtime_profile_dir = _prepare_account_for_parallel_run(
-            account=dict(acc),
+            account=acc_prepared,
             account_id=account_id,
             schedule_post_job_id=schedule_post_job_id,
             run_slot=account_run_slot,
@@ -1806,6 +1819,16 @@ def run_scheduled_post_for_account(
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             register_view_only_page_hooks(page)
             apply_viewport_from_env_to_page(page, playwright=factory.playwright)
+            if account_use_proxy_enabled(acc_runtime):
+                log_job_step(
+                    STEP_OPEN_BROWSER,
+                    "Kiểm tra proxy qua trình duyệt (Facebook).",
+                    account_id=account_id,
+                )
+                ok_bf, px_bf = verify_browser_facebook_via_proxy(page)
+                if not ok_bf:
+                    raise RuntimeError(px_bf)
+                logger.info("[Đăng bài] {} account={}", px_bf, account_id)
             ck_raw = acc_runtime.get("cookie_path")
             cookie_arg = str(ck_raw).strip() if ck_raw else None
             logger.info(

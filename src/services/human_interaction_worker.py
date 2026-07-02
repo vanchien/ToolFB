@@ -18,6 +18,8 @@ from collections.abc import Callable
 
 
 
+from typing import Any
+
 from loguru import logger
 
 from playwright.sync_api import Page
@@ -26,6 +28,7 @@ from playwright.sync_api import Page
 
 from src.automation.browser_factory import (
     BrowserFactory,
+    is_playwright_target_closed_error,
     prepare_playwright_sync_thread,
     sync_close_persistent_context,
 )
@@ -43,11 +46,10 @@ from src.services.facebook_session_recovery import (
 
 from src.services.human_interaction_modules import run_shuffled_interaction_modules
 
-from src.utils.account_browser_profile import ensure_account_browser_profile_ready
 from src.utils.account_proxy_mapper import (
     apply_mapped_secrets_to_vault,
     ensure_mapped_proxy_live,
-    sync_mapped_account_storage_from_registry,
+    prepare_mapped_account_for_browser_run,
 )
 from src.utils.proxy_check import verify_browser_facebook_via_proxy
 from src.utils.grid_layout_manager import GridWindowSlot
@@ -124,6 +126,21 @@ def _try_email_otp_checkpoint(page: Page, mapped: MappedAccount) -> bool:
 
 
 
+
+
+def _format_worker_error(exc: BaseException) -> str:
+    """Thông báo lỗi ngắn gọn cho GUI — tránh dump Playwright Call log dài."""
+    msg = str(exc or "").strip()
+    low = msg.lower()
+    if "timeout" in low and ("goto" in low or "navigation" in low):
+        return "Facebook tải chậm (timeout) — kiểm tra proxy/mạng, bấm «Chạy lại»"
+    if "timeout" in low and "launch" in low:
+        return "Mở Firefox chậm — giảm số luồng hoặc thử lại"
+    if "target closed" in low or "has been closed" in low:
+        return "Trình duyệt đóng bất ngờ"
+    if "ns_error" in low or "net::" in low:
+        return f"Lỗi mạng/proxy: {msg[:140]}"
+    return msg[:200]
 
 
 def run_human_interaction_worker(
@@ -218,13 +235,6 @@ def run_human_interaction_worker(
     if mapped.use_proxy:
         logger.info("[Human] Proxy đã LIVE (kiểm tra trước mở browser) account={}", mapped.account_id)
 
-
-
-    acc = sync_mapped_account_storage_from_registry(mapped)
-    ensure_account_browser_profile_ready(acc)
-
-
-
     grid_vp = None
 
     win_pos = None
@@ -250,14 +260,15 @@ def run_human_interaction_worker(
     _status("running", "Khởi tạo trình duyệt")
 
     factory: BrowserFactory | None = None
-
     context = None
-    cookie_path = str(mapped.cookie_path or acc.get("cookie_path") or "")
     session_persisted = False
+    acc: dict[str, Any] = {}
+    cookie_path = ""
 
     try:
-
         prepare_playwright_sync_thread(label=f"human:{mapped.account_id}")
+        acc = prepare_mapped_account_for_browser_run(mapped)
+        cookie_path = str(mapped.cookie_path or acc.get("cookie_path") or "")
         factory = BrowserFactory(headless=headless, playwright_shared=True)
 
         context = factory.launch_persistent_context_from_account_dict(
@@ -279,6 +290,15 @@ def run_human_interaction_worker(
 
         page: Page = context.pages[0] if context.pages else context.new_page()
         os.environ.pop("TOOLFB_NAV_MOBILE_FB", None)
+
+        from src.services.facebook_session_persist import (
+            apply_saved_cookie_path_to_mapped,
+            auto_save_session_for_account,
+            cookie_file_has_session,
+            establish_facebook_session,
+            prepare_persistent_session_after_launch,
+            resolve_best_cookie_path_for_account,
+        )
 
         def _persist_session_immediately(*, log_label: str, require_confirm: bool = True) -> bool:
             """Lưu cookie ngay khi vào được Facebook — dừng giữa chừng vẫn không cần login lại."""
@@ -313,6 +333,31 @@ def run_human_interaction_worker(
                 _status("running", f"Đã lưu cookie · {cookie_path[-42:]}")
             return bool(saved)
 
+        mapped.storage.profile_path = str(acc.get("portable_path") or acc.get("profile_path") or mapped.storage.profile_path or "")
+        cookie_path = resolve_best_cookie_path_for_account(
+            acc,
+            facebook_uid=str(mapped.auth.username or acc.get("facebook_uid") or ""),
+            extra_candidates=[mapped.cookie_path] if mapped.cookie_path else None,
+        )
+        mapped.cookie_path = str(cookie_path or mapped.cookie_path or "")
+        acc["cookie_path"] = mapped.cookie_path
+        logger.info(
+            "[Human] Browser account={} profile={} cookie={}",
+            mapped.account_id,
+            acc.get("portable_path") or "",
+            mapped.cookie_path,
+        )
+
+        _status("running", "Khôi phục phiên profile/cookie đã lưu…")
+        ok_prep, prep_mode = prepare_persistent_session_after_launch(
+            context,
+            page,
+            acc,
+            cookie_path=cookie_path,
+        )
+        if ok_prep:
+            _persist_session_immediately(log_label=f"prep_{prep_mode}", require_confirm=False)
+
         if grid_slot is not None:
             prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
             if prof:
@@ -337,29 +382,6 @@ def run_human_interaction_worker(
                 except Exception as place_exc:  # noqa: BLE001
                     logger.warning("[Human] Lỗi xếp lưới cửa sổ: {}", place_exc)
 
-        mapped.storage.profile_path = str(acc.get("portable_path") or acc.get("profile_path") or mapped.storage.profile_path or "")
-        mapped.cookie_path = str(acc.get("cookie_path") or mapped.cookie_path or "")
-        logger.info(
-            "[Human] Browser account={} profile={} cookie={}",
-            mapped.account_id,
-            acc.get("portable_path"),
-            acc.get("cookie_path"),
-        )
-
-        from src.services.facebook_session_persist import (
-            auto_save_session_for_account,
-            cookie_file_has_session,
-            resolve_best_cookie_path_for_account,
-            restore_facebook_session,
-        )
-
-        cookie_path = resolve_best_cookie_path_for_account(
-            acc,
-            facebook_uid=str(mapped.auth.username or ""),
-            extra_candidates=[mapped.cookie_path] if mapped.cookie_path else None,
-        )
-        mapped.cookie_path = str(cookie_path or mapped.cookie_path or "")
-
         if mapped.use_proxy:
             _status("running", "Kiểm tra proxy qua trình duyệt (Facebook)")
             ok_bf, px_bf = verify_browser_facebook_via_proxy(page)
@@ -374,48 +396,11 @@ def run_human_interaction_worker(
             logger.info("[Human] {} account={}", px_bf, mapped.account_id)
 
         session_label = (
-            "Kiểm tra phiên — tái sử dụng (tab Tương tác, không form login)"
+            "Kiểm tra phiên Facebook (profile → cookie → form nếu cần)"
             if not login_only
-            else "Mở facebook.com — kiểm tra phiên profile (accounts.json)"
+            else "Mở facebook.com — profile → cookie → form nếu cần"
         )
         _status("running", session_label)
-        ok_session, session_mode = restore_facebook_session(page, acc, cookie_path=cookie_path)
-        recovered = False
-        if ok_session:
-            from src.services.facebook_session_recovery import confirm_facebook_session_logged_in
-
-            ok_conf, conf_detail = confirm_facebook_session_logged_in(page, acc, timeout_ms=18_000)
-            if ok_conf:
-                _status("running", f"Đã vào Facebook ({session_mode}) — tái sử dụng phiên")
-                recovered = True
-                if session_mode == "profile_probe":
-                    if _persist_session_immediately(log_label="session_profile_probe"):
-                        session_persisted = True
-                elif cookie_file_has_session(cookie_path):
-                    session_persisted = True
-            else:
-                logger.info(
-                    "[Human] restore báo {} nhưng chưa xác nhận phiên account={}: {}",
-                    session_mode,
-                    mapped.account_id,
-                    conf_detail,
-                )
-        elif not login_only:
-            logger.warning(
-                "[Human] Tab Tương tác — chưa có phiên profile/cookie account={} ({})",
-                mapped.account_id,
-                session_mode,
-            )
-        elif cookie_file_has_session(cookie_path):
-            logger.info("[Human] Profile chưa phiên — đã thử cookie file account={}", mapped.account_id)
-        else:
-            logger.info(
-                "[Human] Chưa có phiên profile/cookie — sẽ recovery account={} profile={}",
-                mapped.account_id,
-                acc.get("portable_path"),
-            )
-
-        _status("running", "Phiên OK" if recovered else ("Đăng nhập Facebook" if login_only else "Chờ phiên"))
 
         try:
             from src.utils.capsolver_config import (
@@ -453,95 +438,18 @@ def run_human_interaction_worker(
         def _notify_manual_captcha(msg: str) -> None:
             _status("running", msg[:220])
 
-        allow_form_login = bool(mapped.soft_login_if_needed or login_only)
+        has_cookie_file = cookie_file_has_session(cookie_path)
+        has_password = bool(str(getattr(mapped.auth, "password", "") or "").strip())
+        # Profile/cookie thất bại + có pass → luôn thử form (không phụ thuộc soft_login hay file cookie)
+        allow_form_login = bool(
+            login_only or (has_password and not ok_prep and not cookie_file_has_session(cookie_path))
+        )
 
-        def _run_full_login_recovery() -> bool:
-            """Đăng nhập lại đầy đủ (form / 2FA / captcha) — chỉ khi profile chưa có phiên."""
-            nonlocal recovered
-
-            def _recovery_success(log_label: str, *, persist: bool = True) -> bool:
-                nonlocal recovered, session_persisted
-                recovered = True
-                if persist:
-                    if _persist_session_immediately(log_label=log_label):
-                        session_persisted = True
-                else:
-                    session_persisted = True
-                return True
-
+        def _form_login_recover() -> bool:
+            """Form / 2FA / captcha — sau khi profile + cookie file đã thử."""
             if _stopped():
                 return False
-            # Tab Human: luôn tái sử dụng cookie/profile — không xóa phiên (tránh force_fresh).
-            force_fresh = False
-            from src.services.facebook_session_persist import (
-                probe_existing_facebook_session,
-                try_reuse_saved_cookie_session,
-            )
-
-            _status("running", "Quét phiên profile (đăng nhập tay?)…")
-            ok_probe, probe_detail = probe_existing_facebook_session(
-                page,
-                acc,
-                cookie_path=cookie_path,
-                timeout_ms=25_000,
-            )
-            if ok_probe:
-                logger.info(
-                    "[Human] Phát hiện phiên profile account={}: {}",
-                    mapped.account_id,
-                    probe_detail,
-                )
-                return _recovery_success("profile_probe")
-            if cookie_file_has_session(cookie_path):
-                _status("running", "Nạp lại cookie đã lưu — không form login")
-                logger.info(
-                    "[Human] Recovery — nạp cookie file account={} → {}",
-                    mapped.account_id,
-                    cookie_path,
-                )
-                ok_reuse, reuse_detail = try_reuse_saved_cookie_session(
-                    page,
-                    acc,
-                    cookie_path=cookie_path,
-                    timeout_ms=22_000,
-                )
-                if ok_reuse:
-                    logger.info(
-                        "[Human] Vào Facebook qua cookie file account={}: {}",
-                        mapped.account_id,
-                        reuse_detail,
-                    )
-                    return _recovery_success("cookie_reuse")
-                logger.warning(
-                    "[Human] Cookie file chưa vào được account={}: {}",
-                    mapped.account_id,
-                    reuse_detail,
-                )
-            try:
-                from src.automation.facebook_actions import prime_facebook_session_page
-
-                if "facebook.com/login" in (page.url or "").lower():
-                    prime_facebook_session_page(page)
-            except Exception:
-                pass
-            try:
-                with manual_captcha_notifier(_notify_manual_captcha):
-                    recovered = try_recover_facebook_session(
-                        page,
-                        acc,
-                        cookie_path=cookie_path,
-                        should_stop=should_stop,
-                        force_fresh_login=force_fresh,
-                        allow_form_login=allow_form_login,
-                    )
-            except RuntimeError as rec_exc:
-                msg = str(rec_exc).replace(" need_manual_check", "").strip()
-                logger.warning("[Human] Recovery account={}: {}", mapped.account_id, msg)
-                return False
-            if recovered:
-                return _recovery_success("try_recover", persist=False)
-            if _stopped():
-                return False
+            _status("running", "Đăng nhập form Facebook (profile/cookie chưa đủ phiên)…")
             from src.services.facebook_session_recovery import (
                 _page_on_meta_auth_or_captcha_flow,
                 continue_facebook_auth_flow,
@@ -549,124 +457,87 @@ def run_human_interaction_worker(
                 facebook_page_looks_like_totp_prompt,
             )
 
-            if (
-                _page_on_meta_auth_or_captcha_flow(page)
-                or facebook_page_looks_like_totp_prompt(page)
-                or facebook_auth_flow_was_active(acc)
-            ):
-                logger.info(
-                    "[Human] Tiếp tục luồng 2FA/captcha account={}",
-                    mapped.account_id,
-                )
-                try:
-                    with manual_captcha_notifier(_notify_manual_captcha):
-                        recovered = continue_facebook_auth_flow(
-                            page, acc, cookie_path=cookie_path, should_stop=should_stop
-                        )
-                except RuntimeError:
-                    return False
-                if recovered:
-                    return _recovery_success("auth_flow_continue", persist=False)
-                return False
-            _try_email_otp_checkpoint(page, mapped)
             try:
                 with manual_captcha_notifier(_notify_manual_captcha):
-                    recovered = try_recover_facebook_session(
+                    if try_recover_facebook_session(
                         page,
                         acc,
                         cookie_path=cookie_path,
                         should_stop=should_stop,
                         force_fresh_login=False,
-                        allow_form_login=allow_form_login,
+                        allow_form_login=True,
+                    ):
+                        return True
+                    if (
+                        _page_on_meta_auth_or_captcha_flow(page)
+                        or facebook_page_looks_like_totp_prompt(page)
+                        or facebook_auth_flow_was_active(acc)
+                    ):
+                        if continue_facebook_auth_flow(
+                            page, acc, cookie_path=cookie_path, should_stop=should_stop
+                        ):
+                            return True
+                    _try_email_otp_checkpoint(page, mapped)
+                    return bool(
+                        try_recover_facebook_session(
+                            page,
+                            acc,
+                            cookie_path=cookie_path,
+                            should_stop=should_stop,
+                            force_fresh_login=False,
+                            allow_form_login=True,
+                        )
                     )
-            except RuntimeError:
+            except RuntimeError as rec_exc:
+                logger.warning("[Human] Form login account={}: {}", mapped.account_id, rec_exc)
                 return False
-            if recovered:
-                return _recovery_success("try_recover_retry", persist=False)
-            return False
 
-        if login_only and not recovered:
-            if not _run_full_login_recovery():
-                if _stopped():
-                    _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-                    return _finish("cancelled")
-                _status("login_failed", "Không đăng nhập được / chưa vào tài khoản")
-                return _finish("login_failed")
-        elif not login_only and not recovered:
+        if ok_prep:
+            ok_sess, sess_detail = True, prep_mode or "profile"
+            logger.info(
+                "[Human] Bỏ qua establish — đã khôi phục phiên account={} mode={}",
+                mapped.account_id,
+                prep_mode,
+            )
+        else:
+            ok_sess, sess_detail = establish_facebook_session(
+                page,
+                acc,
+                cookie_path=cookie_path,
+                allow_form_login=allow_form_login,
+                form_recover_fn=_form_login_recover if allow_form_login else None,
+            )
+
+        if not ok_sess:
             if _stopped():
                 _status("cancelled", "Đã hủy — người dùng bấm Dừng")
                 return _finish("cancelled")
-            has_saved_cookie = cookie_file_has_session(cookie_path)
-            if mapped.soft_login_if_needed or has_saved_cookie:
-                if mapped.soft_login_if_needed and not mapped.auth.password:
-                    _status(
-                        "login_failed",
-                        "Chưa có phiên và thiếu mật khẩu — bổ sung pass trong dòng import",
-                    )
-                    return _finish("login_failed")
-                if has_saved_cookie:
-                    _status("running", "Tái sử dụng cookie/profile đã lưu — không đăng nhập lại từ đầu")
-                    logger.info(
-                        "[Human] Cookie phiên hợp lệ account={} file={} — thử profile/cookie trước form login",
-                        mapped.account_id,
-                        cookie_path,
-                    )
-                else:
-                    _status(
-                        "running",
-                        "Chưa vào được Facebook — thử đăng nhập nhẹ (giữ cookie, không xóa phiên)",
-                    )
-                    logger.info(
-                        "[Human] Soft login account={} — chỉ khi profile/cookie không đủ phiên",
-                        mapped.account_id,
-                    )
-                if not _run_full_login_recovery():
-                    if _stopped():
-                        _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-                        return _finish("cancelled")
-                    from src.services.facebook_session_persist import probe_existing_facebook_session
+            hint = (
+                " — thử «Lưu cookie» hoặc bổ sung pass để đăng nhập form"
+                if has_cookie_file and not has_password
+                else ""
+            )
+            _status(
+                "login_failed",
+                (sess_detail or "Không đăng nhập được")[:220] + hint[:80],
+            )
+            return _finish("login_failed")
 
-                    _status("running", "Quét lại phiên profile trước khi báo lỗi…")
-                    ok_late, late_detail = probe_existing_facebook_session(
-                        page,
-                        acc,
-                        cookie_path=cookie_path,
-                        timeout_ms=22_000,
-                    )
-                    if ok_late:
-                        recovered = True
-                        if _persist_session_immediately(log_label="profile_probe_late"):
-                            session_persisted = True
-                        logger.info(
-                            "[Human] Phát hiện phiên sau recovery account={}: {}",
-                            mapped.account_id,
-                            late_detail,
-                        )
-                    else:
-                        _status("login_failed", "Không đăng nhập được sau khi thử nạp cookie/profile")
-                        return _finish("login_failed")
-                if recovered:
-                    _status("running", f"Đăng nhập OK — cookie đã lưu · {(cookie_path or '')[-40:]}")
-            else:
-                _status(
-                    "login_failed",
-                    "Chưa có phiên đăng nhập — chạy tab «Đăng nhập» hoặc kiểm tra profile/cookie trong accounts.json",
-                )
-                return _finish("login_failed")
+        recovered = True
+        session_persisted = True
+        _persist_session_immediately(log_label="after_establish", require_confirm=False)
+        ck_sync = apply_saved_cookie_path_to_mapped(mapped, acc)
+        cookie_path = str(ck_sync or acc.get("cookie_path") or mapped.cookie_path or cookie_path or "")
+        mapped.cookie_path = cookie_path
+        _status("running", f"Đã vào Facebook — {sess_detail[:80]}")
+        logger.info(
+            "[Human] Phiên OK account={}: {}",
+            mapped.account_id,
+            sess_detail,
+        )
 
         if login_only:
-            from src.automation.facebook_actions import _force_www_facebook_if_mobile_redirect
-            from src.services.facebook_session_recovery import confirm_facebook_session_logged_in
-
-            _force_www_facebook_if_mobile_redirect(page)
-            ok_confirm, confirm_msg = confirm_facebook_session_logged_in(page, acc)
-            if not ok_confirm:
-                _status(
-                    "login_failed",
-                    (confirm_msg or "Chưa xác nhận vào tài khoản Facebook (www)")[:220],
-                )
-                return _finish("login_failed")
-            if not session_persisted:
+            if not cookie_file_has_session(cookie_path):
                 saved_lo, ck_lo = auto_save_session_for_account(
                     page,
                     acc,
@@ -675,67 +546,19 @@ def run_human_interaction_worker(
                     log_label="login_only",
                     require_confirm=True,
                 )
-            else:
-                saved_lo = cookie_file_has_session(cookie_path)
-                ck_lo = cookie_path
-            if not saved_lo or not cookie_file_has_session(ck_lo):
+                if saved_lo:
+                    cookie_path = str(ck_lo or cookie_path)
+                    mapped.cookie_path = cookie_path
+            if not cookie_file_has_session(cookie_path):
                 _status("login_failed", "Không lưu được cookie phiên — thử đăng nhập lại")
                 return _finish("login_failed")
-            cookie_path = ck_lo
-            mapped.cookie_path = str(cookie_path)
-            session_persisted = True
             cookie_note = f" | Cookie: {cookie_path}"
-            _status("login_ok", (confirm_msg + cookie_note)[:220])
+            _status("login_ok", (sess_detail + cookie_note)[:220])
             return _finish("login_ok")
 
-        from src.services.facebook_session_persist import (
-            apply_saved_cookie_path_to_mapped,
-            ensure_session_before_interaction,
-        )
-
-        _status("running", "Xác nhận phiên (đăng nhập lại nếu cần)")
-        from src.services.facebook_session_persist import try_reuse_saved_cookie_session
-        from src.services.facebook_session_recovery import confirm_facebook_session_logged_in
-
-        if session_persisted:
-            ok_gate, gate_detail = confirm_facebook_session_logged_in(page, acc)
-            if not ok_gate and cookie_file_has_session(cookie_path):
-                _status("running", "Nạp lại cookie đã lưu trước khi tương tác…")
-                ok_gate, gate_detail = try_reuse_saved_cookie_session(
-                    page, acc, cookie_path=cookie_path
-                )
-            if not ok_gate:
-                ok_gate, gate_detail = ensure_session_before_interaction(
-                    page,
-                    acc,
-                    cookie_path=cookie_path,
-                    recover_fn=_run_full_login_recovery,
-                )
-        else:
-            ok_gate, gate_detail = ensure_session_before_interaction(
-                page,
-                acc,
-                cookie_path=cookie_path,
-                recover_fn=_run_full_login_recovery,
-            )
-        if ok_gate and not session_persisted:
-            session_persisted = True
-        if not ok_gate:
-            if _stopped():
-                _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-                return _finish("cancelled")
-            _status(
-                "login_failed",
-                (gate_detail or "Phiên hết hạn — đăng nhập lại ở tab «Đăng nhập»")[:220],
-            )
-            return _finish("login_failed")
-
-        ck_sync = apply_saved_cookie_path_to_mapped(mapped, acc)
-        mapped.cookie_path = str(ck_sync or acc.get("cookie_path") or mapped.cookie_path or cookie_path or "")
-        cookie_path = str(mapped.cookie_path or cookie_path or "")
         _status(
             "running",
-            f"Đã xác nhận đăng nhập — bắt đầu tương tác · {gate_detail[:60]}",
+            f"Đã xác nhận đăng nhập — bắt đầu tương tác · {sess_detail[:60]}",
         )
 
         _status("running", "Tương tác giống người dùng")
@@ -748,7 +571,16 @@ def run_human_interaction_worker(
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[Human] Con trỏ ảo context: {}", exc)
 
-        run_shuffled_interaction_modules(page, profile=cfg, on_status=on_status)
+        run_shuffled_interaction_modules(
+            page,
+            profile=cfg,
+            on_status=on_status,
+            should_stop=should_stop,
+        )
+
+        if _stopped():
+            _status("cancelled", "Đã hủy — người dùng bấm Dừng")
+            return _finish("cancelled")
 
         _status("running", "Lưu cookie phiên sau tương tác")
 
@@ -765,12 +597,15 @@ def run_human_interaction_worker(
         if saved_done:
             mapped.cookie_path = str(ck_done or mapped.cookie_path)
             session_persisted = True
+            apply_saved_cookie_path_to_mapped(mapped, acc)
             mapped.status = "login_ok"
+            prof_note = str(mapped.storage.profile_path or "")[-42:]
             _status(
                 "success",
-                f"Hoàn thành — đã cập nhật cookie · {mapped.cookie_path[-48:]}",
+                f"Hoàn thành — cookie + profile · …{prof_note}",
             )
         else:
+            apply_saved_cookie_path_to_mapped(mapped, acc)
             if cookie_file_has_session(mapped.cookie_path):
                 mapped.status = "login_ok"
             _status("success", "Hoàn thành tương tác (chưa lưu được cookie — kiểm tra phiên)")
@@ -778,13 +613,23 @@ def run_human_interaction_worker(
         return _finish("success")
 
     except Exception as exc:  # noqa: BLE001
-        msg = str(exc)
-        if _stopped() or "has been closed" in msg or type(exc).__name__ == "TargetClosedError":
-            logger.info("[Human] Worker dừng/đóng browser account={}: {}", mapped.account_id, msg[:120])
-            _status("cancelled", "Đã hủy — người dùng bấm Dừng hoặc đóng trình duyệt")
+        if _stopped():
+            logger.info("[Human] Worker hủy theo «Dừng» account={}", mapped.account_id)
+            _status("cancelled", "Đã hủy — người dùng bấm Dừng")
             return _finish("cancelled")
+        if is_playwright_target_closed_error(exc):
+            logger.warning(
+                "[Human] Trình duyệt đóng bất ngờ account={}: {}",
+                mapped.account_id,
+                str(exc)[:160],
+            )
+            _status(
+                "error",
+                "Trình duyệt đóng bất ngờ — pool sẽ đóng sạch và thử lại lượt",
+            )
+            return _finish("browser_closed")
         logger.exception("[Human] Worker lỗi account={}: {}", mapped.account_id, exc)
-        _status("error", msg[:200])
+        _status("error", _format_worker_error(exc))
         return _finish("error")
 
     finally:
@@ -798,31 +643,49 @@ def run_human_interaction_worker(
         # Playwright Sync API: mở/đóng bắt buộc trên cùng worker thread (không spawn thread phụ).
         if ctx is not None:
             try:
-                from src.services.facebook_session_persist import auto_save_session_for_account
+                from src.services.facebook_session_persist import (
+                    apply_saved_cookie_path_to_mapped,
+                    sync_firefox_profile_before_close,
+                )
 
                 pg = ctx.pages[0] if ctx.pages else None
-                if pg is not None and not pg.is_closed() and not already_saved:
-                    saved_fin, ck_fin = auto_save_session_for_account(
-                        pg,
-                        acc_ref,
-                        cookie_path=ck_path,
-                        mapped=mapped,
-                        log_label="on_close",
-                        require_confirm=True,
-                    )
-                    if saved_fin:
-                        logger.debug(
-                            "[Human] Lưu cookie khi đóng account={} → {}",
-                            acc_id,
-                            ck_fin,
+                if pg is not None and not pg.is_closed():
+                    if not already_saved:
+                        sync_firefox_profile_before_close(
+                            ctx,
+                            pg,
+                            acc_ref,
+                            cookie_path=ck_path,
+                            mapped=mapped,
+                            log_label="on_close",
+                        )
+                    else:
+                        sync_firefox_profile_before_close(
+                            ctx,
+                            pg,
+                            acc_ref,
+                            cookie_path=ck_path,
+                            mapped=mapped,
+                            log_label="after_success",
                         )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[Human] Lưu cookie khi đóng: {}", exc)
+            try:
+                apply_saved_cookie_path_to_mapped(mapped, acc_ref)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human] Sync mapped sau đóng: {}", exc)
+            try:
+                from src.utils.account_proxy_mapper import persist_mapped_storage_to_registry
+
+                persist_mapped_storage_to_registry(mapped, acc_ref)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human] Lưu profile registry {}: {}", acc_id, exc)
             try:
                 sync_close_persistent_context(
                     ctx,
                     log_label=acc_id,
                     same_thread=True,
+                    force_kill_firefox=False,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Human] Đóng context: {}", exc)

@@ -51,14 +51,45 @@ def _resolve_account_path(project_root: Path, raw: str) -> Optional[Path]:
 
 
 def collect_referenced_profile_paths(project_root: Path, accounts: Iterable[dict[str, Any]]) -> set[Path]:
-    """Mọi thư mục ``portable_path`` / ``profile_path`` hợp lệ trên đĩa."""
+    """
+    Mọi thư mục profile gắn với tài khoản — không chỉ ``portable_path`` trong JSON.
+
+    Bổ sung alias UID_/acc_/facebook_uid và mọi ứng viên ``iter_profile_dirs_for_account``
+    để startup không xóa nhầm profile có lịch sử khi tab dùng ``UID_…`` nhưng registry là ``acc_…``.
+    """
     refs: set[Path] = set()
     root = project_root.resolve()
-    for acc in accounts:
+    rows = list(accounts)
+    for acc in rows:
         for key in ("portable_path", "profile_path"):
             r = _resolve_account_path(root, str(acc.get(key) or ""))
             if r is not None:
                 refs.add(r)
+        try:
+            from src.utils.account_browser_profile import iter_profile_dirs_for_account
+
+            for pdir in iter_profile_dirs_for_account(acc, project_root_dir=root):
+                if pdir.is_dir():
+                    refs.add(pdir.resolve())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("collect_referenced iter_profile_dirs: {}", exc)
+    # Marker ``.toolfb_account_id`` — giữ mọi profile đã gán chủ (kể cả path chưa sync JSON).
+    try:
+        from src.utils.account_browser_profile import _account_id_variants_for_storage  # noqa: PLC2701
+
+        all_variants: set[str] = set()
+        for acc in rows:
+            all_variants.update(_account_id_variants_for_storage(acc))
+        profiles_root = profiles_data_dir(root)
+        for leaf in iter_profile_leaf_dirs(profiles_root):
+            marker = leaf / ".toolfb_account_id"
+            if not marker.is_file():
+                continue
+            owner = marker.read_text(encoding="utf-8").strip()
+            if owner and owner in all_variants:
+                refs.add(leaf.resolve())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("collect_referenced markers: {}", exc)
     return refs
 
 
@@ -191,6 +222,27 @@ def cleanup_orphan_profile_directories(
         if not _is_strict_child(profiles_root, folder):
             logger.warning("Bỏ qua thư mục không nằm dưới data/profiles: {}", folder)
             continue
+        try:
+            from src.utils.account_browser_profile import portable_profile_likely_has_session
+
+            if portable_profile_likely_has_session(str(folder), project_root_dir=proot):
+                logger.info(
+                    "Giữ profile có phiên/lịch sử — không xóa dù chưa khớp accounts.json: {}",
+                    folder,
+                )
+                continue
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Kiểm tra phiên profile {}: {}", folder, exc)
+        marker = folder / ".toolfb_account_id"
+        if marker.is_file():
+            owner = marker.read_text(encoding="utf-8").strip()
+            if owner:
+                logger.info(
+                    "Giữ profile có marker chủ «{}» — không xóa mồ côi: {}",
+                    owner,
+                    folder,
+                )
+                continue
         stem = folder.name
         if dry_run:
             deleted.append(str(folder))

@@ -12,12 +12,16 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from src.gui.cookie_capture import run_fb_cookie_capture_dialog
+from src.gui.cookie_capture import run_fb_cookie_capture_dialog, run_fb_profile_browser_dialog
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.gui.ui_responsiveness import run_background_then_main, schedule_on_main_thread
 from src.models.mapped_account import MappedAccount
 from src.services.human_interaction_profile import PROFILES, resolve_profile
-from src.services.human_interaction_pool import HumanInteractionPool, validate_pool_start
+from src.services.human_interaction_pool import (
+    HumanInteractionPool,
+    compute_pool_join_timeout_sec,
+    validate_pool_start,
+)
 from src.utils.account_proxy_mapper import (
     AccountProxyMappingError,
     apply_mapped_secrets_to_vault,
@@ -33,6 +37,7 @@ from src.utils.account_proxy_mapper import (
     persist_mapped_proxy_to_accounts_json,
     read_lines_file,
     reassign_proxies_from_pool,
+    refresh_mapped_accounts_storage,
 )
 from src.utils.account_browser_profile import (
     default_cookie_path,
@@ -250,11 +255,11 @@ def build_human_interaction_tab(
         "stop_wait_tip": None,
         "capture_sessions": set(),
         "capture_slot_by_account": {},
+        "profile_browser_sessions": {},
         "accounts_path": "",
         "proxies_path": "",
         "_save_debounce_id": None,
         "pool_login_only": False,
-        "pool_chain": None,
         "pool_generation": 0,
         "btn_stop_all": [],
         "_pulse_after": None,
@@ -732,6 +737,10 @@ def build_human_interaction_tab(
             nb_in.select(tab_file)
 
     def _mapped_snapshot_for_save() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not state.get("pool"):
+            refresh_mapped_accounts_storage(
+                list(state.get("mapped_login") or []) + list(state.get("mapped_interaction") or [])
+            )
         login = [ma.to_dict() for ma in (state.get("mapped_login") or [])]
         interaction = [ma.to_dict() for ma in (state.get("mapped_interaction") or [])]
         return login, interaction
@@ -786,6 +795,7 @@ def build_human_interaction_tab(
                 logger.warning("Bỏ qua dòng tương tác lưu lỗi: {}", exc)
         if not login_restored and not interaction_restored:
             return
+        refresh_mapped_accounts_storage(login_restored + interaction_restored)
         state["mapped_login"] = login_restored
         state["mapped_interaction"] = interaction_restored
         _refresh_trees()
@@ -1006,12 +1016,7 @@ def build_human_interaction_tab(
             _configure_stop_buttons(text="Đang dừng…", enabled=False)
             return
         if pool:
-            chain = state.get("pool_chain")
-            if chain and isinstance(chain, dict):
-                phase = int(chain.get("phase") or 1)
-                mode = f"Lưu cookie ({phase}/2)" if phase == 1 else f"Tương tác ({phase}/2)"
-            else:
-                mode = "Đăng nhập" if state.get("pool_login_only") else "Tương tác"
+            mode = "Đăng nhập" if state.get("pool_login_only") else "Tương tác"
             try:
                 snap = pool.health_snapshot()
                 run_n = snap.get("running", 0)
@@ -1034,7 +1039,11 @@ def build_human_interaction_tab(
         _apply_banner_colors(bg=_C_IDLE_BG, fg=_C_IDLE_FG, led="#94a3b8")
         _configure_stop_buttons(text="■ DỪNG", enabled=False)
 
-    def _finish_pool_cleanup(*, pool_ref: HumanInteractionPool | None = None, generation: int | None = None) -> None:
+    def _finish_pool_cleanup(
+        *,
+        pool_ref: HumanInteractionPool | None = None,
+        generation: int | None = None,
+    ) -> None:
         if generation is not None and state.get("pool_generation") != generation:
             logger.info(
                 "[Human GUI] Bỏ cleanup pool gen={} (hiện tại={})",
@@ -1049,7 +1058,6 @@ def build_human_interaction_tab(
         state["pool"] = None
         state["pool_stopping"] = False
         state["pool_login_only"] = False
-        state.pop("pool_chain", None)
         state.pop("manual_captcha_shown", None)
         tip = state.get("stop_wait_tip")
         if tip is not None:
@@ -1068,22 +1076,42 @@ def build_human_interaction_tab(
         *,
         join_ok: bool,
         workers_alive: bool,
+        user_cancelled: bool = False,
     ) -> None:
         """Cập nhật dòng còn «Đang chạy»/«Chờ» khi pool đã join — tránh UI lệch banner."""
         terminal = frozenset(
             {"success", "login_ok", "login_failed", "proxy_error", "error", "cancelled"}
         )
+        # Đồng bộ cả hàng đợi tab (không chỉ batch vừa chạy) — tránh TK «Đang chạy» treo.
+        batch_ids = {ma.account_id for ma in accounts}
+        targets: list[MappedAccount] = list(accounts)
+        for ma in (state.get("mapped_interaction") or []) + (state.get("mapped_login") or []):
+            if ma.account_id in batch_ids:
+                continue
+            if str(ma.status or "").strip() in ("running", "waiting"):
+                targets.append(ma)
         n_fixed = 0
-        for ma in accounts:
+        for ma in targets:
             st = str(ma.status or "").strip()
             if st in terminal:
                 continue
+            detail = str(ma.status_detail or "")
+            if st == "pending" and (
+                "Chưa tới lượt" in detail or "Chưa chạy — pool" in detail
+            ):
+                continue
             if st in ("running", "waiting", "pending", ""):
                 n_fixed += 1
-                if not join_ok or workers_alive:
+                if user_cancelled:
                     ma.status = "cancelled"
+                    ma.status_detail = "Đã hủy — người dùng bấm Dừng"
+                elif st == "running":
+                    ma.status = "pending"
+                    ma.status_detail = "Dừng giữa module — bấm «Chạy» lại (cookie/profile giữ nguyên)"
+                elif not join_ok or workers_alive:
+                    ma.status = "pending"
                     ma.status_detail = (
-                        "Dừng giữa chừng — luồng/browser có thể còn mở; đóng Firefox thủ công nếu cần"
+                        "Chưa chạy xong — pool hết thời gian chờ, bấm «Chạy» để tiếp tục"
                     )
                 else:
                     ma.status = "error"
@@ -1123,6 +1151,18 @@ def build_human_interaction_tab(
         ttk.Button(dlg, text="Ẩn", command=dlg.destroy, width=10).pack(pady=(0, 12))
         state["stop_wait_tip"] = dlg
 
+    def _force_pool_stale_cleanup(*, accounts: list[MappedAccount] | None = None) -> None:
+        """Giải phóng pool kẹt sau timeout dừng — cho phép chạy lượt mới."""
+        pool = state.get("pool")
+        if pool is not None:
+            try:
+                pool.join(timeout=8.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human GUI] force cleanup join: {}", exc)
+        if accounts:
+            _reconcile_accounts_after_pool(accounts, join_ok=False, workers_alive=True, user_cancelled=False)
+        _finish_pool_cleanup()
+
     def _wait_pool_idle_then(
         on_ready: Any,
         *,
@@ -1150,10 +1190,12 @@ def build_human_interaction_tab(
         if (_time.monotonic() - t0) * 1000.0 >= timeout_ms:
             messagebox.showerror(
                 "Dừng tiến trình",
-                "Hết thời gian chờ dừng — thử bấm «Dừng» lại hoặc khởi động lại app.",
+                "Hết thời gian chờ dừng — đã ép đóng pool.\n"
+                "Có thể chạy lại ngay; đóng Firefox thủ công nếu còn cửa sổ.",
                 parent=parent,
             )
-            state["pool_stopping"] = False
+            _force_pool_stale_cleanup()
+            on_ready()
             return
         root.after(250, lambda: _wait_pool_idle_then(on_ready, timeout_ms=timeout_ms, started_at=t0))
 
@@ -1529,11 +1571,16 @@ def build_human_interaction_tab(
             return
 
         if not login_only:
-            from src.utils.account_proxy_mapper import sync_mapped_account_storage_from_registry
+            from src.utils.account_proxy_mapper import prepare_mapped_account_for_browser_run
 
             for ma in accounts:
-                sync_mapped_account_storage_from_registry(ma)
+                try:
+                    prepare_mapped_account_for_browser_run(ma)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[Human GUI] Chuẩn bị TK {}: {}", ma.account_id, exc)
             ready, blocked, blocked_reasons = _filter_accounts_for_interaction(accounts)
+            if ready:
+                _refresh_trees()
             if ready and blocked:
                 picked = _ask_smart_interaction_run(ready, blocked, blocked_reasons)
                 if not picked:
@@ -1581,15 +1628,39 @@ def build_human_interaction_tab(
 
         for ma in accounts:
             if not login_only:
-                sync_mapped_account_storage_from_registry(ma)
+                try:
+                    from src.utils.account_proxy_mapper import prepare_mapped_account_for_browser_run
+
+                    prepare_mapped_account_for_browser_run(ma)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[Human GUI] Chuẩn bị trước pool {}: {}", ma.account_id, exc)
             ck = str(ma.cookie_path or "").strip()
+            prof = str(getattr(ma.storage, "profile_path", "") or "").strip()
+            prev_st = str(ma.status or "").strip()
+            prev_det = str(ma.status_detail or "")
+            has_pw = bool(str(getattr(ma.auth, "password", "") or "").strip())
+            rerunnable = prev_st in ("cancelled", "login_failed", "error", "pending") or (
+                "Chưa chạy" in prev_det
+                or "Dừng giữa chừng" in prev_det
+                or "nạp cookie" in prev_det
+            )
             if not login_only and cookie_file_has_session(ck):
                 ma.status = "login_ok"
                 ma.status_detail = "Tái sử dụng cookie phiên đã lưu"
                 ma.soft_login_if_needed = False
+            elif not login_only and prev_st in ("login_ok", "success") and prof:
+                ma.soft_login_if_needed = False
+                if not prev_det.strip():
+                    ma.status_detail = "Tái sử dụng phiên profile portable"
+            elif not login_only and rerunnable:
+                ma.status = "pending"
+                ma.status_detail = "Sẵn sàng chạy lại"
+                ma.soft_login_if_needed = bool(has_pw and not cookie_file_has_session(ck))
             else:
                 ma.status = "pending"
                 ma.status_detail = ""
+                if not login_only and has_pw:
+                    ma.soft_login_if_needed = False
         _refresh_tree()
         _save_settings()
 
@@ -1634,11 +1705,23 @@ def build_human_interaction_tab(
         def _after_pool_join(*, join_ok: bool) -> None:
             """Chạy trên main thread — dừng banner, cập nhật UI, thông báo."""
             workers_alive = bool(getattr(pool, "_join_workers_alive", False))
+            user_cancelled = bool(getattr(pool, "is_stopped", lambda: False)())
             _reconcile_accounts_after_pool(
                 accounts,
                 join_ok=join_ok,
                 workers_alive=workers_alive,
+                user_cancelled=user_cancelled,
             )
+            refresh_mapped_accounts_storage(
+                list(state.get("mapped_login") or [])
+                + list(state.get("mapped_interaction") or [])
+            )
+            chain_cb = on_pool_finished
+            if chain_cb is not None:
+                try:
+                    chain_cb(join_ok, accounts)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("[Human GUI] on_pool_finished lỗi: {}", exc)
             _finish_pool_cleanup(pool_ref=pool, generation=pool_generation)
             _save_settings()
             logger.info(
@@ -1647,11 +1730,7 @@ def build_human_interaction_tab(
                 workers_alive,
                 pool_generation,
             )
-            if on_pool_finished is not None:
-                try:
-                    on_pool_finished(join_ok, accounts)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("[Human GUI] on_pool_finished lỗi: {}", exc)
+            if chain_cb is not None:
                 return
             if login_only:
                 ok_n = sum(1 for m in accounts if m.status == "login_ok")
@@ -1678,8 +1757,17 @@ def build_human_interaction_tab(
                 messagebox.showinfo("Hoàn tất", msg, parent=parent)
 
         def _watch() -> None:
-            per_acc = 150.0 if login_only else 120.0
-            join_timeout = max(120.0, min(7200.0, len(accounts) * per_acc + 60.0))
+            join_timeout = compute_pool_join_timeout_sec(
+                len(accounts),
+                max_concurrent=min(mc, len(accounts)),
+                login_only=login_only,
+            )
+            logger.info(
+                "[Human GUI] Pool join timeout {:.0f}s | {} TK | {} luồng",
+                join_timeout,
+                len(accounts),
+                min(mc, len(accounts)),
+            )
             join_ok = False
             try:
                 join_ok = bool(pool.join(timeout=join_timeout))
@@ -1713,71 +1801,15 @@ def build_human_interaction_tab(
             ),
         )
 
-    def _on_chain_interaction_finished(join_ok: bool, accounts: list[MappedAccount]) -> None:
-        """Kết thúc phase 2 — lưu cookie rồi tương tác."""
-        state.pop("pool_chain", None)
-        ok_n = sum(1 for m in accounts if m.status in ("success", "login_ok"))
-        msg = f"Hoàn tất lưu cookie + tương tác: {ok_n}/{len(accounts)} thành công."
-        if not join_ok:
-            msg += "\n\nMột số luồng chưa thoát hết — kiểm tra Firefox còn mở."
-        messagebox.showinfo("Hoàn tất", msg, parent=parent)
+    def _on_save_cookie_only() -> None:
+        """
+        Chỉ lưu cookie — không tự chạy tương tác.
 
-    def _on_chain_login_finished(join_ok: bool, accounts: list[MappedAccount]) -> None:
-        """Phase 1 xong — chuyển sang tương tác cho TK đã lưu cookie."""
-        chain = state.get("pool_chain")
-        if not chain:
-            return
+        • Pool đang chạy → không dừng, luồng hiện tại tự lưu cookie.
+        • Pool rảnh → đăng nhập + lưu cookie rồi dừng (không chạy module).
+        """
+        from src.services.facebook_session_persist import cookie_file_has_session
 
-        ok_list = [m for m in accounts if m.status == "login_ok"]
-        fail_n = len(accounts) - len(ok_list)
-        _refresh_trees()
-
-        if not ok_list:
-            state.pop("pool_chain", None)
-            messagebox.showwarning(
-                "Không lưu được cookie",
-                f"Không tài khoản nào lưu cookie thành công ({fail_n} lỗi/hủy).\n"
-                "Kiểm tra proxy, đăng nhập/captcha rồi thử lại.",
-                parent=parent,
-            )
-            return
-
-        if fail_n > 0:
-            if not messagebox.askyesno(
-                "Một phần thất bại",
-                f"Đã lưu cookie: {len(ok_list)}/{len(accounts)}.\n"
-                f"Tiếp tục tương tác cho {len(ok_list)} tài khoản OK?",
-                parent=parent,
-            ):
-                state.pop("pool_chain", None)
-                messagebox.showinfo(
-                    "Đã lưu cookie",
-                    f"{len(ok_list)} tài khoản đã lưu cookie — có thể «Chạy đã chọn» sau.",
-                    parent=parent,
-                )
-                return
-
-        chain["phase"] = 2
-        state["pool_chain"] = chain
-        for ma in ok_list:
-            ma.status = "pending"
-            ma.status_detail = "Cookie đã lưu — chờ tương tác"
-        _mark_soft_login(ok_list, enabled=False)
-        _refresh_trees()
-        _save_settings()
-        logger.info("[Human GUI] Chain phase 2: tương tác {} TK sau lưu cookie", len(ok_list))
-
-        def _start_phase2() -> None:
-            _start_pool(
-                ok_list,
-                login_only=False,
-                on_pool_finished=_on_chain_interaction_finished,
-            )
-
-        root.after(300, _start_phase2)
-
-    def _on_save_cookie_then_run() -> None:
-        """Ưu tiên lưu cookie (đăng nhập/làm mới phiên) rồi tự chạy tương tác."""
         if not state.get("mapped_interaction"):
             messagebox.showwarning(
                 "Chưa có tài khoản tương tác",
@@ -1794,40 +1826,54 @@ def build_human_interaction_tab(
                 parent=parent,
             )
             return
-        missing_pw = [m for m in selected if not m.auth.password]
+
+        if _pool_busy():
+            var_run_status.set(
+                f"▶  Đang chạy — cookie tự lưu trong luồng ({len(selected)} dòng chọn)"
+            )
+            logger.info(
+                "[Human GUI] Lưu cookie — pool đang chạy, không dừng ({} TK chọn)",
+                len(selected),
+            )
+            return
+
+        need_save: list[MappedAccount] = []
+        for ma in selected:
+            sync_mapped_account_storage_from_registry(ma)
+            ck = str(ma.cookie_path or "").strip()
+            if cookie_file_has_session(ck):
+                ma.status = "login_ok"
+                ma.status_detail = "Cookie đã có — không cần mở browser"
+            else:
+                need_save.append(ma)
+
+        _refresh_trees()
+        _save_settings()
+
+        if not need_save:
+            n = len(selected)
+            var_run_status.set(f"⏸  {n} TK đã có cookie — không mở browser")
+            logger.info("[Human GUI] Lưu cookie — {} TK đã có cookie sẵn", n)
+            return
+
+        missing_pw = [m for m in need_save if not m.auth.password]
         if missing_pw:
             uids = ", ".join(m.display_uid() for m in missing_pw[:5])
             extra = f" (+{len(missing_pw) - 5})" if len(missing_pw) > 5 else ""
             messagebox.showwarning(
                 "Thiếu mật khẩu",
-                f"{len(missing_pw)} dòng thiếu pass — cần pass nếu phải đăng nhập lại:\n{uids}{extra}",
+                f"{len(missing_pw)} dòng chưa có cookie và thiếu pass:\n{uids}{extra}",
                 parent=parent,
             )
             return
-        n = len(selected)
-        if not messagebox.askyesno(
-            "Lưu cookie → chạy tương tác",
-            f"Bước 1/2: mở browser và lưu cookie cho {n} tài khoản đã chọn.\n"
-            f"Bước 2/2: tự động chạy tương tác sau khi lưu cookie thành công.\n\n"
-            "Tiếp tục?",
-            parent=parent,
-        ):
-            return
 
-        def _begin_chain() -> None:
-            state["pool_chain"] = {"accounts": list(selected), "phase": 1}
-            for ma in selected:
-                ma.status = "pending"
-                ma.status_detail = "Chờ lưu cookie (bước 1/2)"
-            _refresh_trees()
-            _save_settings()
-            _start_pool(
-                list(selected),
-                login_only=True,
-                on_pool_finished=_on_chain_login_finished,
-            )
-
-        _ensure_pool_stopped_or_ask("lưu cookie rồi chạy tương tác", _begin_chain)
+        for ma in need_save:
+            ma.status = "pending"
+            ma.status_detail = "Lưu cookie…"
+        _refresh_trees()
+        var_run_status.set(f"▶  Lưu cookie {len(need_save)} TK — xong sẽ dừng")
+        logger.info("[Human GUI] Lưu cookie: đăng nhập {} TK (không chạy tương tác)", len(need_save))
+        _start_pool(list(need_save), login_only=True)
 
     def _proceed_login_selected(selected: list[MappedAccount]) -> None:
         if not selected:
@@ -1943,16 +1989,28 @@ def build_human_interaction_tab(
 
         run_background_then_main(root, work, ok, on_error=err)
 
-    def _launch_manual_browser_capture(ma: MappedAccount, slot: GridWindowSlot, acc: dict[str, Any], ck_rel: str) -> None:
-        """Mở một cửa sổ đăng nhập thủ công tại ô lưới ``slot``."""
+    def _launch_profile_browser(
+        ma: MappedAccount,
+        slot: GridWindowSlot,
+        acc: dict[str, Any],
+        ck_rel: str,
+        *,
+        for_interaction: bool = False,
+    ) -> None:
+        """Mở Firefox persistent theo profile tại ô lưới ``slot``."""
         sessions: set[str] = state.setdefault("capture_sessions", set())
         slot_map: dict[str, int] = state.setdefault("capture_slot_by_account", {})
+        profile_sessions: dict[str, Any] = state.setdefault("profile_browser_sessions", {})
         sessions.add(ma.account_id)
         slot_map[ma.account_id] = slot.index
         ma.grid_slot_index = slot.index
         ma.status = "running"
         if not str(ma.status_detail or "").strip():
-            ma.status_detail = f"Mở thủ công — ô {slot.index + 1} (tick captcha/2FA trên Firefox)"
+            ma.status_detail = (
+                f"Mở profile — ô {slot.index + 1}"
+                if for_interaction
+                else f"Mở thủ công — ô {slot.index + 1} (tick captcha/2FA trên Firefox)"
+            )
         _refresh_trees()
         _refresh_grid_hint()
 
@@ -1964,9 +2022,10 @@ def build_human_interaction_tab(
         def _release_capture() -> None:
             sessions.discard(ma.account_id)
             slot_map.pop(ma.account_id, None)
+            profile_sessions.pop(ma.account_id, None)
             if ma.status == "running":
                 ma.status = "pending"
-                ma.status_detail = "Đã đóng cửa sổ — mở lại hoặc dùng «Đăng nhập đã chọn»"
+                ma.status_detail = "Đã đóng profile — có thể «Mở profile» lại"
             _refresh_trees()
             _refresh_grid_hint()
 
@@ -1982,62 +2041,73 @@ def build_human_interaction_tab(
                 _save_settings()
                 return
             ma.status = "login_ok"
-            ma.status_detail = f"Đã lưu cookie (thủ công, ô {slot.index + 1})"
-            _promote_to_interaction(ma)
-            logger.info("[Human GUI] Mở trình duyệt — đã lưu cookie account={}", ma.account_id)
+            ma.status_detail = f"Đã lưu cookie (profile, ô {slot.index + 1})"
+            if for_interaction:
+                _promote_to_interaction(ma)
+            logger.info("[Human GUI] Profile — đã lưu cookie account={}", ma.account_id)
             _refresh_trees()
             _save_settings()
-            try:
-                _select_main_page(page_interaction)
-            except tk.TclError:
-                pass
+            if for_interaction:
+                try:
+                    _select_main_page(page_interaction)
+                except tk.TclError:
+                    pass
 
-        run_fb_cookie_capture_dialog(
-            root,
-            AccountsDatabaseManager(),
-            acc,
-            ck_rel,
+        tip_extra = (
+            f"Ô lưới {slot.index + 1}: {slot.width}×{slot.height} @ ({slot.x}, {slot.y}). "
+            "Profile + proxy từ dòng đã chọn."
+        )
+        dialog_kw = dict(
+            parent=root,
+            manager=AccountsDatabaseManager(),
+            acc_preview=acc,
+            ck_rel=ck_rel,
             log_label=ma.account_id,
-            tip_extra=(
-                f"Ô lưới {slot.index + 1}: {slot.width}×{slot.height} @ ({slot.x}, {slot.y}). "
-                "Profile + proxy từ dòng đã chọn."
-            ),
+            tip_extra=tip_extra,
             on_after_save=_after_save,
             on_dialog_done=_release_capture,
             on_launch_failed=_on_launch_failed,
             grid_viewport=(slot.width, slot.height),
             window_position=(slot.x, slot.y),
-            dialog_title=f"Đăng nhập — {ma.display_uid()} (ô {slot.index + 1})",
+            session_registry=profile_sessions,
         )
-
-    def _on_open_browser_login() -> None:
-        """Mở Firefox theo lưới — một hoặc nhiều dòng chọn, đăng nhập tay, lưu cookie."""
-        if _pool_busy():
-            _ensure_pool_stopped_or_ask(
-                "mở trình duyệt đăng nhập thủ công",
-                _on_open_browser_login,
+        if for_interaction:
+            run_fb_profile_browser_dialog(
+                **dialog_kw,
+                dialog_title=f"Profile — {ma.display_uid()} (ô {slot.index + 1})",
             )
-            return
-        _open_browser_login_impl()
+        else:
+            run_fb_cookie_capture_dialog(
+                **dialog_kw,
+                dialog_title=f"Đăng nhập — {ma.display_uid()} (ô {slot.index + 1})",
+            )
 
-    def _open_browser_login_impl() -> None:
-        if not state.get("mapped_login") and not _ensure_login_queue_loaded(persist_secrets=True):
-            return
-        _select_main_page(page_login)
+    def _launch_manual_browser_capture(ma: MappedAccount, slot: GridWindowSlot, acc: dict[str, Any], ck_rel: str) -> None:
+        """Alias tab Đăng nhập."""
+        _launch_profile_browser(ma, slot, acc, ck_rel, for_interaction=False)
+
+    def _open_profile_browsers_impl(*, for_interaction: bool = False) -> None:
+        if for_interaction:
+            if not state.get("mapped_interaction"):
+                messagebox.showwarning(
+                    "Chưa có tài khoản",
+                    "Tab «Tương tác» đang trống.",
+                    parent=parent,
+                )
+                return
+            _select_main_page(page_interaction)
+        else:
+            if not state.get("mapped_login") and not _ensure_login_queue_loaded(persist_secrets=True):
+                return
+            _select_main_page(page_login)
+
         selected = _selected_mapped()
         if not selected:
-            login_rows = state.get("mapped_login") or []
-            if len(login_rows) == 1:
-                tree_login.selection_set(login_rows[0].account_id)
-                selected = login_rows
-        if len(selected) > 1:
-            messagebox.showinfo(
-                "Mở trình duyệt",
-                "Mỗi lần chỉ mở 1 cửa sổ Firefox.\n"
-                "Chọn đúng một dòng (bỏ chọn dòng kia) rồi bấm «Mở trình duyệt» lại.",
-                parent=root,
-            )
-            return
+            rows = state.get("mapped_interaction" if for_interaction else "mapped_login") or []
+            if len(rows) == 1:
+                tr = tree_interaction if for_interaction else tree_login
+                tr.selection_set(rows[0].account_id)
+                selected = rows
         if not selected:
             messagebox.showwarning(
                 "Chưa chọn dòng",
@@ -2052,7 +2122,7 @@ def build_human_interaction_tab(
         if not pending:
             messagebox.showinfo(
                 "Đã mở",
-                "Các dòng đã chọn đang có cửa sổ mở — hãy «Lưu cookie» hoặc «Hủy» trước.",
+                "Các dòng đã chọn đang có cửa sổ mở — bấm «Đóng profile» hoặc «Đóng» trên hộp thoại.",
                 parent=parent,
             )
             return
@@ -2061,7 +2131,7 @@ def build_human_interaction_tab(
         if not free_slots:
             messagebox.showwarning(
                 "Đủ cửa sổ",
-                f"Đang mở {_active_capture_count()}/{mc} cửa sổ thủ công.\n"
+                f"Đang mở {_active_capture_count()}/{mc} cửa sổ.\n"
                 "Đóng bớt hoặc tăng «Số luồng» trước khi mở thêm.",
                 parent=parent,
             )
@@ -2082,11 +2152,13 @@ def build_human_interaction_tab(
         pairs = list(zip(pending, free_slots, strict=True))
 
         def work() -> list[tuple[MappedAccount, GridWindowSlot, dict[str, Any], str]]:
+            from src.utils.account_proxy_mapper import prepare_mapped_account_for_browser_run
+
             pending_only = [ma for ma, _ in pairs]
             assert_proxy_exclusive_among_accounts(
                 _all_mapped_accounts() + pending_only,
                 registry_index=load_registry_proxy_index(),
-                context="mở trình duyệt thủ công",
+                context="mở profile trình duyệt",
             )
             out: list[tuple[MappedAccount, GridWindowSlot, dict[str, Any], str]] = []
             for ma, slot in pairs:
@@ -2094,36 +2166,77 @@ def build_human_interaction_tab(
                 ok_px, px_msg = ensure_mapped_proxy_live(ma)
                 if not ok_px:
                     raise ValueError(f"{ma.display_uid()}: proxy chưa LIVE — {px_msg}")
-                acc = mapped_account_to_account_dict(ma)
-                from src.utils.account_browser_profile import ensure_account_browser_profile_ready
-
-                ensure_account_browser_profile_ready(acc)
-                ck_rel = str(acc.get("cookie_path") or "").strip() or default_cookie_path(ma.account_id)
-                acc["cookie_path"] = ck_rel
-                ma.cookie_path = ck_rel
-                ma.storage.profile_path = str(acc.get("portable_path") or ma.storage.profile_path or "")
+                acc = prepare_mapped_account_for_browser_run(ma)
+                ck_rel = str(acc.get("cookie_path") or ma.cookie_path or "").strip()
                 out.append((ma, slot, acc, ck_rel))
             return out
 
         def ok(rows: list[tuple[MappedAccount, GridWindowSlot, dict[str, Any], str]]) -> None:
             _save_settings()
-            ma, slot, acc, ck_rel = rows[0]
-            ma.status = "running"
-            ma.status_detail = "Proxy LIVE — đang mở Firefox…"
+            for ma, slot, acc, ck_rel in rows:
+                ma.status = "running"
+                ma.status_detail = "Proxy LIVE — đang mở Firefox…"
             _refresh_trees()
-            logger.info(
-                "[Human GUI] Mở trình duyệt thủ công account={} ô={} profile={}",
-                ma.account_id,
-                slot.index + 1,
-                acc.get("portable_path") or "",
-            )
             root.update_idletasks()
-            _launch_manual_browser_capture(ma, slot, acc, ck_rel)
+            for ma, slot, acc, ck_rel in rows:
+                logger.info(
+                    "[Human GUI] Mở profile account={} ô={} profile={}",
+                    ma.account_id,
+                    slot.index + 1,
+                    acc.get("portable_path") or "",
+                )
+                _launch_profile_browser(ma, slot, acc, ck_rel, for_interaction=for_interaction)
 
         def err(exc: BaseException) -> None:
             messagebox.showerror("Không mở được trình duyệt", str(exc), parent=parent)
 
         run_background_then_main(root, work, ok, on_error=err)
+
+    def _on_open_browser_login() -> None:
+        """Tab Đăng nhập — mở Firefox đăng nhập tay."""
+        if _pool_busy():
+            _ensure_pool_stopped_or_ask("mở trình duyệt đăng nhập thủ công", _on_open_browser_login)
+            return
+        _open_profile_browsers_impl(for_interaction=False)
+
+    def _on_open_profile_browser() -> None:
+        """Tab Tương tác — mở Firefox theo profile đã chọn."""
+        if _pool_busy():
+            _ensure_pool_stopped_or_ask("mở profile trình duyệt", _on_open_profile_browser)
+            return
+        _open_profile_browsers_impl(for_interaction=True)
+
+    def _on_close_profile_browser() -> None:
+        """Đóng cửa sổ Firefox profile đang mở (dòng đã chọn)."""
+        selected = _selected_mapped()
+        if not selected:
+            messagebox.showwarning(
+                "Chưa chọn dòng",
+                "Chọn dòng đang mở profile để đóng.",
+                parent=parent,
+            )
+            return
+        sessions = state.get("profile_browser_sessions") or {}
+        closed = 0
+        for ma in selected:
+            sess = sessions.get(ma.account_id)
+            if not sess:
+                continue
+            try:
+                sess["cmd_q"].put("close")
+                closed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human GUI] Đóng profile {}: {}", ma.account_id, exc)
+        if closed == 0:
+            messagebox.showinfo(
+                "Chưa mở profile",
+                "Không có cửa sổ Firefox đang mở cho dòng đã chọn.\n"
+                "Dùng «Mở profile» hoặc đóng trên hộp thoại.",
+                parent=parent,
+            )
+            return
+        logger.info("[Human GUI] Yêu cầu đóng {} cửa sổ profile", closed)
+        var_run_status.set(f"Đang đóng {closed} cửa sổ profile…")
 
     def _on_merge() -> None:
         def work() -> tuple[list[MappedAccount], int, int]:
@@ -2843,21 +2956,31 @@ def build_human_interaction_tab(
     ).pack(side=tk.LEFT, padx=(8, 2))
     _flat_btn(
         run_btns,
-        text="💾 Lưu cookie → chạy",
-        command=_on_save_cookie_then_run,
-        bg="#0891b2",
-        active_bg="#0e7490",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=(8, 2))
-    _flat_btn(
-        interaction_row_btns,
-        text="💾 Lưu cookie → chạy",
-        command=_on_save_cookie_then_run,
+        text="💾 Lưu cookie",
+        command=_on_save_cookie_only,
         bg="#0891b2",
         active_bg="#0e7490",
         fg="white",
-        padx=8,
+        padx=10,
     ).pack(side=tk.LEFT, padx=(8, 2))
+    _flat_btn(
+        run_btns,
+        text="🌐 Mở profile",
+        command=_on_open_profile_browser,
+        bg="#6366f1",
+        active_bg="#4f46e5",
+        fg="white",
+        padx=8,
+    ).pack(side=tk.LEFT, padx=2)
+    _flat_btn(
+        run_btns,
+        text="✕ Đóng profile",
+        command=_on_close_profile_browser,
+        bg="#64748b",
+        active_bg="#475569",
+        fg="white",
+        padx=8,
+    ).pack(side=tk.LEFT, padx=2)
     _flat_btn(
         interaction_row_btns,
         text="→ Tab Tài khoản",
@@ -2928,5 +3051,31 @@ def build_human_interaction_tab(
     root.after_idle(_restore_mapped_session)
     root.after_idle(_init_login_paned_sash)
     root.after_idle(_init_interaction_paned_sash)
+
+    def shutdown_gracefully(timeout_sec: float = 60.0) -> None:
+        """
+        Đóng pool / cửa sổ profile an toàn trước khi thoát app — giữ lịch sử Firefox mọi TK.
+        """
+        try:
+            _save_settings()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Human GUI] save settings on exit: {}", exc)
+        profile_sessions = state.get("profile_browser_sessions") or {}
+        for aid, sess in list(profile_sessions.items()):
+            try:
+                cmd_q = sess.get("cmd_q")
+                if cmd_q is not None:
+                    cmd_q.put("close")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human GUI] đóng profile {} on exit: {}", aid, exc)
+        pool = state.get("pool")
+        if pool is not None:
+            try:
+                pool.shutdown_gracefully(timeout=timeout_sec)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human GUI] graceful pool shutdown: {}", exc)
+            state["pool"] = None
+
+    setattr(root, "_toolfb_human_shutdown", shutdown_gracefully)
 
     _update_summary()

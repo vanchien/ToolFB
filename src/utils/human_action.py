@@ -357,11 +357,13 @@ class HumanAction:
         downward_bias: float = 0.97,
         scroll_from_top: bool = False,
         dwell_scale: float = 1.0,
-    ) -> None:
+        should_stop: Any | None = None,
+    ) -> bool:
         """
         Cuộn bảng tin kiểu đọc: ưu tiên **từ trên xuống dưới**, dừng lâu giữa các lần cuộn.
 
-        ``downward_bias`` gần 1.0 → hầu hết chỉ cuộn xuống; ``scroll_from_top`` → scrollTo(0) trước.
+        Returns:
+            ``False`` nếu người dùng bấm Dừng giữa chừng.
         """
         lo = _env_int("FB_FEED_SCROLL_MIN", 14)
         hi = max(lo, _env_int("FB_FEED_SCROLL_MAX", 24))
@@ -371,27 +373,43 @@ class HumanAction:
         if scroll_from_top:
             self.scroll_to_top()
             time.sleep(random.uniform(1.0, 2.2))
+        dwell_cap = max(2500, _env_int("FB_FEED_DWELL_MS_CAP", 6500))
         logger.info(
-            "[HumanAction] Cuộn {} vòng | top→down bias={:.0%} | dwell×{:.2f}",
+            "[HumanAction] Cuộn {} vòng | top→down bias={:.0%} | dwell×{:.2f} | cap={}ms",
             n,
             bias,
             scale,
+            dwell_cap,
         )
         for i in range(n):
+            if should_stop and should_stop():
+                logger.info("[HumanAction] Dừng cuộn feed — user stop")
+                return False
             if random.random() > bias:
                 dy = -random.randint(50, 140)
             else:
                 dy = random.randint(440, 920)
             self._scroll_by(dy)
             has_media = random.random() < 0.52
-            base_lo = 2800 if has_media else 2200
-            base_hi = 9000 if has_media else 5500
-            dwell_ms = int(random.randint(base_lo, base_hi) * scale)
+            base_lo = 2200 if has_media else 1800
+            base_hi = 7000 if has_media else 4800
+            dwell_ms = min(int(random.randint(base_lo, base_hi) * scale), dwell_cap)
             if random.random() < 0.22:
-                dwell_ms += int(random.randint(1800, 4500) * scale)
+                dwell_ms = min(dwell_ms + int(random.randint(1200, 3200) * scale), dwell_cap + 1200)
             if random.random() < 0.22:
-                time.sleep(random.uniform(0.7, 1.8) * scale)
-            self.page.wait_for_timeout(dwell_ms)
+                time.sleep(random.uniform(0.5, 1.4) * scale)
+            end_dwell = time.monotonic() + dwell_ms / 1000.0
+            while time.monotonic() < end_dwell:
+                if should_stop and should_stop():
+                    return False
+                chunk_ms = min(450, int((end_dwell - time.monotonic()) * 1000))
+                if chunk_ms <= 0:
+                    break
+                try:
+                    self.page.wait_for_timeout(chunk_ms)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[HumanAction] dwell wait: {}", exc)
+                    break
             if on_like and random.random() < max(0.0, min(1.0, like_rate)):
                 try:
                     on_like(self.page)
@@ -404,7 +422,19 @@ class HumanAction:
                     logger.debug("[HumanAction] on_comment: {}", exc)
             if i < n - 1 and random.random() < max(0.04, 0.22 * (1.0 - bias)):
                 self._scroll_by(-random.randint(40, 120))
-                self.page.wait_for_timeout(random.randint(1800, 4500))
+                back_ms = random.randint(1200, 3200)
+                end_back = time.monotonic() + back_ms / 1000.0
+                while time.monotonic() < end_back:
+                    if should_stop and should_stop():
+                        return False
+                    chunk_ms = min(400, int((end_back - time.monotonic()) * 1000))
+                    if chunk_ms <= 0:
+                        break
+                    try:
+                        self.page.wait_for_timeout(chunk_ms)
+                    except Exception:
+                        break
+        return True
 
     def _scroll_by(self, dy: int) -> None:
         """Cuộn từng bước nhỏ (wheel) thay vì nhảy một lần."""
