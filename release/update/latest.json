@@ -1,7 +1,7 @@
 {
-  "version": "1.0.86",
+  "version": "1.0.87",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "ea5f00cafc6184ab2e5b703c96e545e30e27f1738ae40116bb3eef70e3a7b781",
-  "notes": "Python 3.14: marshal UI qua schedule_on_main_thread (fix crash main loop tu worker). Dong bo luong Download -> Video Editor, warm metadata khi mo app.",
-  "generated_at": "2026-06-13T22:46:55"
+  "sha256": "e6a912b11e3d67dbdffdb58d19d3f20348abebb5e25033a095b67da19871592a",
+  "notes": "Proxy tự nhận HTTP/SOCKS5/SOCKS4 end-to-end (đăng lịch, tương tác, đăng nhập). Ghép registry acc_↔UID_, giữ profile Firefox. Pool join timeout + shutdown an toàn. Sửa lỗi worker msg undefined.",
+  "generated_at": "2026-07-02T11:59:15"
 }
