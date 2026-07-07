@@ -1,7 +1,7 @@
 {
-  "version": "1.0.90",
+  "version": "1.0.91",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "36c014fcd480d0fbc66f1cc0ebb5d7456376d7c4bef84879cebd7b16512f1501",
-  "notes": "Switch Page: uu tien mouse click CTA tren Firefox, them recovery Switch Now + F5 + profile switcher khi sidebar khong doi vai tro. Giam fail case page_switch_still_visible trong luong Reel.",
-  "generated_at": "2026-07-07T15:26:57"
+  "sha256": "37c58931ac2bb1a9cc1f3b85b5c169fa4f82c7ca4015a9edce559d4e736d78d1",
+  "notes": "Switch Page + scheduler RAM + cap nhat ngay",
+  "generated_at": "2026-07-07T23:27:39"
 }
