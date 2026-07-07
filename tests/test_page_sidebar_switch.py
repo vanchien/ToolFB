@@ -237,15 +237,13 @@ def test_attempt_page_role_switch_prefers_switch_now() -> None:
     sidebar.assert_not_called()
 
 
-def test_recovery_after_switch_click_uses_switch_now() -> None:
+def test_switch_personal_not_skipped_on_page_slug_with_cta() -> None:
+    """URL slug Page + CTA Switch — không được coi là đã ở account chính."""
     page = MagicMock()
+    page.url = "https://www.facebook.com/KikiroCooking/"
     with (
         patch(
-            "src.automation.facebook_actions._click_switch_now_banner",
-            return_value=True,
-        ),
-        patch(
-            "src.automation.facebook_actions._wait_page_role_switch_complete",
+            "src.automation.facebook_actions._page_switch_ui_visible",
             return_value=True,
         ),
         patch(
@@ -253,17 +251,60 @@ def test_recovery_after_switch_click_uses_switch_now() -> None:
             return_value=True,
         ),
         patch(
-            "src.automation.facebook_actions._page_switch_sidebar_hint_visible",
-            return_value=True,
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            return_value=False,
         ),
     ):
-        from src.automation.facebook_actions import _recovery_after_switch_click_fail
+        from src.automation.facebook_actions import _is_likely_personal_account_surface
 
-        assert _recovery_after_switch_click_fail(
+        assert not _is_likely_personal_account_surface(page)
+
+
+def test_robust_switch_uses_personal_reset_strategy() -> None:
+    page = MagicMock()
+    page.url = "https://www.facebook.com/somepage"
+    personal_calls: list[bool] = []
+
+    def _personal(_page: MagicMock, *, force_home: bool = False) -> bool:
+        personal_calls.append(force_home)
+        return True
+
+    quick_results = iter([False, True])
+
+    with (
+        patch(
+            "src.automation.facebook_actions._view_only_guard_active_on_page",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            side_effect=[False, True],
+        ),
+        patch(
+            "src.automation.facebook_actions._quick_switch_on_page_surface",
+            side_effect=lambda *a, **k: next(quick_results),
+        ),
+        patch(
+            "src.automation.facebook_actions._switch_to_personal_profile",
+            side_effect=_personal,
+        ),
+        patch("src.automation.facebook_actions.navigate_to_url"),
+        patch(
+            "src.automation.facebook_actions._select_page_via_profile_switcher",
+            return_value=False,
+        ),
+        patch("src.automation.facebook_actions._failure_screenshot"),
+        patch.object(page, "wait_for_timeout"),
+    ):
+        from src.automation.facebook_actions import _robust_switch_to_target_page
+
+        ok = _robust_switch_to_target_page(
             page,
-            page_display_name="Ethereal Birds",
-            page_url="https://www.facebook.com/107315425760571",
+            page_display_name="AI kittens",
+            page_url="https://www.facebook.com/123456",
         )
+    assert ok is True
+    assert personal_calls == [True]
 
 
 def test_select_page_via_profile_switcher() -> None:
@@ -293,47 +334,3 @@ def test_select_page_via_profile_switcher() -> None:
             page_display_name="Ethereal Birds",
             page_url="https://www.facebook.com/107315425760571",
         )
-
-
-def test_robust_switch_uses_personal_reset_strategy() -> None:
-    page = MagicMock()
-    page.url = "https://www.facebook.com/somepage"
-    personal_calls = {"n": 0}
-
-    def _personal(_page: MagicMock) -> bool:
-        personal_calls["n"] += 1
-        return True
-
-    direct_results = iter([False, True])
-
-    with (
-        patch(
-            "src.automation.facebook_actions._view_only_guard_active_on_page",
-            return_value=False,
-        ),
-        patch(
-            "src.automation.facebook_actions._page_role_acting_as_page",
-            side_effect=[False, True],
-        ),
-        patch(
-            "src.automation.facebook_actions._try_page_role_switch_direct",
-            side_effect=lambda *a, **k: next(direct_results),
-        ),
-        patch(
-            "src.automation.facebook_actions._switch_to_personal_profile",
-            side_effect=_personal,
-        ),
-        patch("src.automation.facebook_actions.navigate_to_url"),
-        patch("src.automation.facebook_actions._click_switch_now_banner", return_value=False),
-        patch("src.automation.facebook_actions._failure_screenshot"),
-        patch.object(page, "wait_for_timeout"),
-    ):
-        from src.automation.facebook_actions import _robust_switch_to_target_page
-
-        ok = _robust_switch_to_target_page(
-            page,
-            page_display_name="AI kittens",
-            page_url="https://www.facebook.com/123456",
-        )
-    assert ok is True
-    assert personal_calls["n"] >= 1

@@ -44,7 +44,7 @@ def seed_default_runtime_at(dest_root: Path) -> None:
             uc,
             {
                 "manifest_url": (
-                    "https://raw.githubusercontent.com/vanchien/ToolFB/main/release/update/latest.json"
+                    "https://github.com/vanchien/ToolFB/releases/latest/download/latest.json"
                 )
             },
         )

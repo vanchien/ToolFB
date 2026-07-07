@@ -89,10 +89,90 @@ _queue_next_due_hint_utc: datetime | None = None
 _queue_prefetched_until_iso_by_job: dict[str, str] = {}
 _queue_idle_probe_after_utc: datetime | None = None
 _queue_hint_refresh_after_utc: datetime | None = None
+_queue_last_drain_mono: float = 0.0
 _account_run_lock = threading.Lock()
 _account_run_inflight: dict[str, int] = {}
 _page_run_lock = threading.Lock()
 _page_run_inflight: dict[str, int] = {}
+
+
+def _schedule_low_ram_mode() -> bool:
+    """Máy yếu / hàng nghìn job: giảm poll, prefetch, debounce drain queue."""
+    flag = os.environ.get("SCHEDULE_LOW_RAM", os.environ.get("TOOLFB_LOW_RAM", "")).strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+def _drain_debounce_seconds() -> float:
+    raw = os.environ.get("SCHEDULE_DRAIN_DEBOUNCE_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning("SCHEDULE_DRAIN_DEBOUNCE_SEC={!r} không hợp lệ, dùng mặc định.", raw)
+    return 5.0 if _schedule_low_ram_mode() else 2.0
+
+
+def _prune_prefetch_cache(jobs: list[Any]) -> None:
+    """Giảm leak RAM khi file schedule có hàng nghìn job đã xóa/đổi id."""
+    global _queue_prefetched_until_iso_by_job
+    if len(_queue_prefetched_until_iso_by_job) < 256:
+        return
+    active = {str(j.get("id", "")).strip() for j in jobs if str(j.get("id", "")).strip()}
+    for jid in list(_queue_prefetched_until_iso_by_job):
+        if jid not in active:
+            _queue_prefetched_until_iso_by_job.pop(jid, None)
+
+
+def _should_skip_idle_schedule_tick() -> bool:
+    """
+    Bỏ qua tick đầy đủ khi hàng đợi rảnh trong cửa sổ idle probe.
+    Vẫn quét nhẹ theo chu kỳ hint refresh để bắt job mới thêm từ GUI.
+    """
+    global _queue_idle_probe_after_utc, _queue_hint_refresh_after_utc
+    now = datetime.now(timezone.utc)
+    with _dispatch_pending_lock:
+        if sum(_dispatch_pending_by_engine.values()) > 0:
+            return False
+    if _queue_idle_probe_after_utc is None or now >= _queue_idle_probe_after_utc:
+        return False
+    if _queue_hint_refresh_after_utc is not None and now < _queue_hint_refresh_after_utc:
+        return True
+    try:
+        sp = get_default_schedule_posts_manager()
+        if sp.has_active_queue_work(now=now):
+            _queue_idle_probe_after_utc = None
+            return False
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("idle hint refresh: {}", exc)
+    _queue_hint_refresh_after_utc = now + timedelta(seconds=_hint_refresh_seconds())
+    return True
+
+
+def _maybe_drain_queue_after_job_done() -> None:
+    """Drain hàng đợi sau job xong — có debounce để tránh tick storm trên máy yếu."""
+    global _queue_last_drain_mono
+    if os.environ.get("SCHEDULE_DRAIN_QUEUE_ON_DONE", "1").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    debounce = _drain_debounce_seconds()
+    now_mono = time.monotonic()
+    if debounce > 0 and (now_mono - _queue_last_drain_mono) < debounce:
+        return
+    _queue_last_drain_mono = now_mono
+    try:
+        tick_schedule_post_jobs()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Queue dispatcher] Drain queue sau job done lỗi (bỏ qua): {}", exc)
+    try:
+        from src.services.tiktok.schedule_tick import tick_tiktok_upload_jobs
+
+        tick_tiktok_upload_jobs()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Queue dispatcher] Drain TikTok queue sau job done (bỏ qua): {}", exc)
 
 
 def _cpu_count_safe() -> int:
@@ -270,18 +350,7 @@ def _log_dispatch_done(
         )
     if unified_chain_is_active():
         return
-    # Job vừa xong -> thử đẩy ngay hàng đợi due đang chờ slot, không phải đợi poll interval kế tiếp.
-    if os.environ.get("SCHEDULE_DRAIN_QUEUE_ON_DONE", "1").strip().lower() in {"1", "true", "yes", "on"}:
-        try:
-            tick_schedule_post_jobs()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[Queue dispatcher] Drain queue sau job done lỗi (bỏ qua): {}", exc)
-        try:
-            from src.services.tiktok.schedule_tick import tick_tiktok_upload_jobs
-
-            tick_tiktok_upload_jobs()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[Queue dispatcher] Drain TikTok queue sau job done (bỏ qua): {}", exc)
+    _maybe_drain_queue_after_job_done()
 
 
 def _cron_timezone() -> Any:
@@ -827,7 +896,8 @@ def _parse_queue_job_scheduled_at(raw: Any) -> datetime:
 
 def _prefetch_window_seconds() -> int:
     """Số giây prefetch trước lịch đăng (mặc định 60s, giới hạn 10..900)."""
-    raw = os.environ.get("SCHEDULE_POSTS_PREFETCH_SEC", "60").strip()
+    default = "30" if _schedule_low_ram_mode() else "60"
+    raw = os.environ.get("SCHEDULE_POSTS_PREFETCH_SEC", default).strip()
     try:
         n = int(raw)
     except ValueError:
@@ -840,7 +910,8 @@ def _idle_probe_seconds() -> int:
     Khi không có pending job: chờ thêm một khoảng rồi mới quét lại file.
     Mặc định 300s để giảm I/O khi hệ thống đang rảnh.
     """
-    raw = os.environ.get("SCHEDULE_POSTS_IDLE_PROBE_SEC", "300").strip()
+    default = "600" if _schedule_low_ram_mode() else "300"
+    raw = os.environ.get("SCHEDULE_POSTS_IDLE_PROBE_SEC", default).strip()
     try:
         n = int(raw)
     except ValueError:
@@ -853,7 +924,8 @@ def _hint_refresh_seconds() -> int:
     Chu kỳ làm tươi hint lịch gần nhất để bắt kịp job mới được thêm/sửa.
     Mặc định 90s: đủ nhẹ nhưng vẫn phản ứng nhanh.
     """
-    raw = os.environ.get("SCHEDULE_POSTS_HINT_REFRESH_SEC", "90").strip()
+    default = "180" if _schedule_low_ram_mode() else "90"
+    raw = os.environ.get("SCHEDULE_POSTS_HINT_REFRESH_SEC", default).strip()
     try:
         n = int(raw)
     except ValueError:
@@ -1013,7 +1085,7 @@ def tick_schedule_post_jobs() -> None:
         try:
             sp = get_default_schedule_posts_manager()
             ensure_schedule_queue_recovery(sp)
-            jobs = sp.reload_from_disk()
+            jobs = sp.load_all()
         except Exception as exc:  # noqa: BLE001
             logger.debug("schedule_posts tick: không đọc được: {}", exc)
             return
@@ -1040,15 +1112,15 @@ def tick_schedule_post_jobs() -> None:
                     logger.debug("[Queue prefetch] job={} lỗi: {}", jid, exc)
 
         promote_due_pending_to_ready(sp, now=now)
-        jobs = sp.reload_from_disk()
+        jobs = sp.load_all()
 
         ready_jobs = [
-            dict(j)
+            j
             for j in jobs
             if str(j.get("status", "")).strip().lower() == "ready_queue"
         ]
         running_jobs = [
-            dict(j)
+            j
             for j in jobs
             if str(j.get("status", "")).strip().lower() == "running"
         ]
@@ -1105,6 +1177,7 @@ def tick_schedule_post_jobs() -> None:
         else:
             _queue_idle_probe_after_utc = None
         _queue_hint_refresh_after_utc = now + timedelta(seconds=_hint_refresh_seconds())
+        _prune_prefetch_cache(jobs)
 
     if queued_waiting > 0:
         logger.info(
@@ -1228,7 +1301,7 @@ def _tick_merged_serial_facebook_tiktok() -> None:
                 logger.debug("merged tick: không đọc schedule_posts: {}", exc)
                 return
             promote_due_pending_to_ready(sp, now=now)
-            jobs = sp.reload_from_disk()
+            jobs = sp.load_all()
             next_due: datetime | None = None
             per_acc_limit = _per_account_parallel_limit()
             for job in jobs:
@@ -1252,7 +1325,7 @@ def _tick_merged_serial_facebook_tiktok() -> None:
                         logger.debug("[Queue prefetch merged] job={} lỗi: {}", jid, exc)
 
             ready_jobs = [
-                dict(j)
+                j
                 for j in jobs
                 if str(j.get("status", "")).strip().lower() == "ready_queue"
             ]
@@ -1280,7 +1353,7 @@ def _tick_merged_serial_facebook_tiktok() -> None:
                 note_job_dispatched(aid)
 
             running_jobs = [
-                dict(j)
+                j
                 for j in jobs
                 if str(j.get("status", "")).strip().lower() == "running"
             ]
@@ -1340,6 +1413,7 @@ def _tick_merged_serial_facebook_tiktok() -> None:
             else:
                 _queue_idle_probe_after_utc = None
             _queue_hint_refresh_after_utc = now + timedelta(seconds=_hint_refresh_seconds())
+            _prune_prefetch_cache(jobs)
 
             fb_first = (
                 os.environ.get("CROSS_PLATFORM_SCHEDULE_PRIORITY", "facebook_first").strip().lower() != "tiktok_first"
@@ -1482,6 +1556,8 @@ def tick_cross_platform_schedule_jobs() -> None:
     Một tick cho cả ``schedule_posts.json`` và TikTok: nếu **cùng lúc** cả hai nền tảng có job đến hạn,
     chạy tuần tự có thứ tự ưu tiên; không thì giữ hành vi song song như trước.
     """
+    if _should_skip_idle_schedule_tick():
+        return
     if _peek_facebook_due_pending() and _peek_tiktok_due_pending():
         _tick_merged_serial_facebook_tiktok()
     else:
@@ -2190,7 +2266,8 @@ def build_scheduler(
                 replace_existing=True,
             )
             logger.info("Đã đăng ký lịch {}:{} hàng ngày cho account id={} (legacy)", hh, mm, aid)
-    poll_sec = int(os.environ.get("SCHEDULE_POSTS_POLL_SEC", "10"))
+    poll_default = "30" if _schedule_low_ram_mode() else "10"
+    poll_sec = int(os.environ.get("SCHEDULE_POSTS_POLL_SEC", poll_default))
     min_poll = 5
     if poll_sec >= min_poll:
         scheduler.add_job(

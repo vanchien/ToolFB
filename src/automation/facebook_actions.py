@@ -1548,40 +1548,21 @@ def go_to_posting_target_and_open_composer(
     else:
         dest = _fb_normalize_client_url(raw_target)
         logger.info("[FB] Đích đăng: target_type={} | goto={!r}", tt, dest)
+        pname = (page_display_name or "").strip()
         navigate_to_url(page, dest)
         logger.info("[FB] Sau navigate_to_url: url_now={}", page.url)
-        if not _robust_switch_to_target_page(
-            page, page_display_name=(page_display_name or "").strip(), page_url=dest
-        ):
-            logger.warning("[FB] Switch Page lần 1 chưa OK — thử điều hướng lại target_url.")
+        ok = _robust_switch_to_target_page(page, page_display_name=pname, page_url=dest)
         if dest and (
-            not _is_on_target_surface(page, dest)
+            not ok
+            or not _is_on_target_surface(page, dest)
             or not _page_role_acting_as_page(page, timeout_ms=700)
         ):
             logger.warning(
-                "Chưa đứng đúng page đích hoặc chưa vai trò Page sau lần 1 — điều hướng lại."
+                "[FB] Switch/navigate lần 1 chưa OK — thử điều hướng lại target_url một lần."
             )
             navigate_to_url(page, dest)
-            _robust_switch_to_target_page(
-                page, page_display_name=(page_display_name or "").strip(), page_url=dest
-            )
-        if dest and (
-            not _is_on_target_surface(page, dest)
-            or not _page_role_acting_as_page(page, timeout_ms=700)
-        ):
-            pname = (page_display_name or "").strip()
-            if pname and _select_page_in_switch_profiles_popup(
-                page, page_display_name=pname, page_url=dest
-            ):
-                logger.info("[FB] Fallback UI: chọn Page trong Switch profiles {!r}.", pname)
-                _robust_switch_to_target_page(
-                    page, page_display_name=pname, page_url=dest
-                )
-            elif pname and _try_navigate_via_page_name_link(page, pname, dest):
-                logger.info("[FB] Fallback UI: vào Page qua tên hiển thị {!r}.", pname)
-                _robust_switch_to_target_page(
-                    page, page_display_name=pname, page_url=dest
-                )
+            page.wait_for_timeout(1_200)
+            _robust_switch_to_target_page(page, page_display_name=pname, page_url=dest)
         if dest and (
             not _is_on_target_surface(page, dest)
             or not _page_role_acting_as_page(page, timeout_ms=900)
@@ -3341,19 +3322,49 @@ def _click_personal_profile_in_switcher(page: Page) -> bool:
     return False
 
 
-def _switch_to_personal_profile(page: Page) -> bool:
+def _is_likely_personal_account_surface(page: Page) -> bool:
+    """
+    Đang ở feed/profile cá nhân — không phải bề mặt Page đang chờ bấm Switch.
+
+    URL slug Page (vd. ``/KikiroCooking/``) kèm CTA Switch **không** được coi là account chính.
+    """
+    if _page_switch_ui_visible(page, timeout_ms=450):
+        return False
+    if _manage_page_switch_cta_still_visible(page, timeout_ms=400):
+        return False
+    if _page_role_acting_as_page(page, timeout_ms=450):
+        return False
+    try:
+        cur = (page.url or "").lower()
+        if "facebook.com" not in cur:
+            return False
+        if "business.facebook.com" in cur or "/pages/" in cur:
+            return False
+        path = (urlparse(cur).path or "").strip("/")
+        if not path:
+            return True
+        head = path.split("/")[0].lower()
+        if head in ("home.php", "watch", "marketplace", "groups", "gaming", "friends", "notifications"):
+            return True
+        if head == "me" or "profile.php" in cur:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _switch_to_personal_profile(page: Page, *, force_home: bool = False) -> bool:
     """
     Về tài khoản Facebook cá nhân — dùng khi đang ở vai trò Page khác hoặc switch page→page lỗi.
     """
-    if not _page_role_acting_as_page(page, timeout_ms=650):
-        try:
-            cur = (page.url or "").lower()
-            if "facebook.com" in cur and "/pages/" not in cur:
-                return True
-        except Exception:
-            pass
+    if not force_home and _is_likely_personal_account_surface(page):
+        logger.info("[FB] Đã ở bề mặt account chính (không cần reset).")
+        return True
 
-    logger.info("[FB] Reset về profile cá nhân trước khi switch Page đích.")
+    logger.info(
+        "[FB] Reset về profile cá nhân trước khi switch Page đích (force_home={}).",
+        force_home,
+    )
     for attempt in range(1, 4):
         if _open_facebook_profile_switcher_menu(page):
             if _click_personal_profile_in_switcher(page):
@@ -3376,63 +3387,29 @@ def _switch_to_personal_profile(page: Page) -> bool:
     return not _page_role_acting_as_page(page, timeout_ms=800)
 
 
-def _recovery_after_switch_click_fail(
+def _quick_switch_on_page_surface(
     page: Page,
     *,
     page_display_name: str = "",
     page_url: str = "",
 ) -> bool:
     """
-    Sau khi bấm Switch nhưng CTA vẫn còn (không popup / chưa đổi vai trò).
-
-    Thử: Switch Now → F5 + Switch Now/sidebar → profile switcher chọn Page.
+    Một lượt switch nhanh trên bề mặt Page hiện tại: Switch Now → sidebar (không recovery/menu).
     """
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
     _suppress_facebook_click_overlays(page)
-    logger.info("[FB] Recovery switch — CTA vẫn hiện sau click, thử Switch Now / reload / menu.")
-
+    if _page_role_acting_as_page(page, timeout_ms=600):
+        return True
     if _click_switch_now_banner(page, timeout_ms=3_000):
-        if _wait_page_role_switch_complete(page, timeout_ms=10_000):
-            logger.info("[FB] Recovery switch OK — Switch Now.")
+        if _wait_page_role_switch_complete(page, timeout_ms=12_000):
             return True
-
-    still_cta = _manage_page_switch_cta_still_visible(page, timeout_ms=500) or _page_switch_sidebar_hint_visible(
-        page, timeout_ms=500
-    )
-    if still_cta:
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(2_200)
-            _suppress_facebook_click_overlays(page)
-            logger.info("[FB] Recovery switch — đã F5 trang Page.")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[FB] recovery reload: {}", exc)
-        if _click_switch_now_banner(page, timeout_ms=3_200):
-            if _wait_page_role_switch_complete(page, timeout_ms=12_000):
-                logger.info("[FB] Recovery switch OK — Switch Now sau F5.")
-                return True
-        if _click_manage_page_sidebar_switch(page, timeout_ms=2_800):
-            _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
-            )
-            if _wait_page_role_switch_complete(page, timeout_ms=12_000):
-                logger.info("[FB] Recovery switch OK — sidebar sau F5.")
-                return True
-
-    if pname and _open_facebook_profile_switcher_menu(page):
-        if _select_page_in_switch_profiles_popup(
-            page,
-            page_display_name=pname,
-            page_url=dest,
-            max_list_scrolls=12,
-        ):
-            if _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=12_000
-            ) and _page_role_acting_as_page(page, timeout_ms=1_000):
-                logger.info("[FB] Recovery switch OK — profile switcher.")
-                return True
-    return False
+    if _attempt_page_role_switch_clicks(page, timeout_ms=2_200):
+        if _wait_after_page_switch_click(
+            page, page_display_name=pname, page_url=dest, timeout_ms=10_000
+        ) and _wait_page_role_switch_complete(page, timeout_ms=12_000):
+            return True
+    return _page_role_acting_as_page(page, timeout_ms=800)
 
 
 def _select_page_via_profile_switcher(
@@ -3440,6 +3417,7 @@ def _select_page_via_profile_switcher(
     *,
     page_display_name: str,
     page_url: str = "",
+    max_list_scrolls: int = 8,
 ) -> bool:
     """Chọn Page trong menu avatar — ổn định hơn sidebar khi đang xem bề mặt Page."""
     pname = str(page_display_name or "").strip()
@@ -3452,7 +3430,8 @@ def _select_page_via_profile_switcher(
         page,
         page_display_name=pname,
         page_url=dest,
-        max_list_scrolls=12,
+        max_list_scrolls=max_list_scrolls,
+        menu_already_open=True,
     ):
         return False
     return _wait_after_page_switch_click(
@@ -3495,71 +3474,27 @@ def _try_page_role_switch_direct(
     *,
     page_display_name: str = "",
     page_url: str = "",
-    max_switch_attempts: int = 2,
+    max_switch_attempts: int = 1,
 ) -> bool:
     """
-    Switch Page **trực tiếp** trên trang hiện tại (page→page) — không reset account chính.
-
-    Thử: Switch Now / sidebar → popup chọn Page theo tên → ``_ensure_page_role_switched`` (giới hạn lần).
+    Switch Page trực tiếp trên trang hiện tại — một lượt nhanh + profile switcher (không lặp ensure).
     """
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
-    attempts = max(1, min(int(max_switch_attempts), 4))
 
     if _page_role_acting_as_page(page, timeout_ms=700):
         if not dest or _urls_refer_same_facebook_page(dest, str(page.url or ""), page=page):
             return True
 
-    on_target_surface = bool(dest) and _urls_refer_same_facebook_page(
-        dest, str(page.url or ""), page=page
-    )
-
-    if on_target_surface or _page_switch_ui_visible(page, timeout_ms=600):
-        if _click_switch_now_banner(page, timeout_ms=2_800):
-            if _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
-            ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
-                return True
-            if _recovery_after_switch_click_fail(
-                page, page_display_name=pname, page_url=dest
-            ):
-                return True
-        if _page_switch_ui_visible(page, timeout_ms=500):
-            if _attempt_page_role_switch_clicks(page, timeout_ms=2_000):
-                if _wait_after_page_switch_click(
-                    page, page_display_name=pname, page_url=dest, timeout_ms=10_000
-                ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
-                    return True
-                if _recovery_after_switch_click_fail(
-                    page, page_display_name=pname, page_url=dest
-                ):
-                    return True
+    if _quick_switch_on_page_surface(page, page_display_name=pname, page_url=dest):
+        return True
 
     if pname and _select_page_via_profile_switcher(
-        page, page_display_name=pname, page_url=dest
+        page, page_display_name=pname, page_url=dest, max_list_scrolls=6
     ):
         return True
 
-    if pname and _open_facebook_profile_switcher_menu(page):
-        if _select_page_in_switch_profiles_popup(
-            page,
-            page_display_name=pname,
-            page_url=dest,
-            max_list_scrolls=8,
-        ):
-            if _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
-            ) and _page_role_acting_as_page(page, timeout_ms=800):
-                return True
-
-    if _ensure_page_role_switched(
-        page,
-        page_display_name=pname,
-        page_url=dest,
-        max_attempts=attempts,
-        wait_timeout_ms=10_000,
-    ):
-        return _page_role_acting_as_page(page, timeout_ms=800)
+    _ = max_switch_attempts  # giữ API tương thích
     return False
 
 
@@ -3586,69 +3521,32 @@ def _robust_switch_to_target_page(
                 logger.info("[FB] Đã ở vai trò Page đúng đích.")
                 return True
 
-        # ① Page→page trực tiếp (không reset account chính) — 1 lần, fail nhanh
-        if _try_page_role_switch_direct(
-            page, page_display_name=pname, page_url=dest, max_switch_attempts=2
-        ):
-            logger.info("[FB] Switch Page OK — page→page trực tiếp.")
+        # ① Một lượt switch nhanh trên bề mặt Page (không lặp ensure/recovery)
+        if _quick_switch_on_page_surface(page, page_display_name=pname, page_url=dest):
+            logger.info("[FB] Switch Page OK — surface nhanh.")
             return True
 
-        # ② Fallback: account chính → Page đích → Switch Now / sidebar
+        # ② Bắt buộc về account chính → goto Page → profile switcher / surface
         logger.info(
-            "[FB] Page→page trực tiếp thất bại — chuyển về account chính rồi switch Page đích."
+            "[FB] Surface switch thất bại — bắt buộc về account chính rồi switch Page đích."
         )
-        _switch_to_personal_profile(page)
+        _switch_to_personal_profile(page, force_home=True)
         if dest:
             navigate_to_url(page, dest)
-            page.wait_for_timeout(1_400)
+            page.wait_for_timeout(1_600)
 
         if pname and _select_page_via_profile_switcher(
-            page, page_display_name=pname, page_url=dest
+            page, page_display_name=pname, page_url=dest, max_list_scrolls=8
         ):
-            logger.info("[FB] Switch Page OK — profile switcher sau account chính.")
+            logger.info("[FB] Switch Page OK — profile switcher từ account chính.")
             return True
 
-        if _click_switch_now_banner(page, timeout_ms=3_200):
-            if _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
-            ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
-                logger.info("[FB] Switch Page OK — Switch Now sau account chính.")
-                return True
+        if _quick_switch_on_page_surface(page, page_display_name=pname, page_url=dest):
+            logger.info("[FB] Switch Page OK — surface sau account chính.")
+            return True
 
-        for via_personal in range(1, 3):
-            if _try_page_role_switch_direct(
-                page,
-                page_display_name=pname,
-                page_url=dest,
-                max_switch_attempts=2,
-            ):
-                logger.info(
-                    "[FB] Switch Page OK — sau account chính (lần {}).",
-                    via_personal,
-                )
-                return True
-            if via_personal < 2 and dest:
-                navigate_to_url(page, dest)
-                page.wait_for_timeout(1_200)
-
-        # ③ Fallback cuối: popup + Switch Now lần nữa
-        if dest:
-            navigate_to_url(page, dest)
-            page.wait_for_timeout(2_000)
-        if pname and _select_page_in_switch_profiles_popup(
-            page, page_display_name=pname, page_url=dest
-        ):
-            _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=20_000
-            )
-        if _click_switch_now_banner(page):
-            _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=20_000
-            )
-        ok = _ensure_page_role_switched(page, page_display_name=pname, page_url=dest)
-        if not ok:
-            _failure_screenshot(page, "robust_page_switch_failed")
-        return ok and _page_role_acting_as_page(page, timeout_ms=1_000)
+        _failure_screenshot(page, "robust_page_switch_failed")
+        return False
     finally:
         if guard_was_blocking:
             _enable_view_only_guard(page)
@@ -3707,17 +3605,13 @@ def _ensure_page_role_switched(
                 ):
                     logger.info("[FB] Switch Page OK — xác nhận vai trò Page (attempt={}).", attempt)
                     return True
-                elif _recovery_after_switch_click_fail(
-                    page, page_display_name=pname, page_url=dest
-                ):
-                    logger.info("[FB] Switch Page OK — recovery sau click (attempt={}).", attempt)
-                    return True
                 else:
                     logger.warning(
                         "[FB] Đã click Switch nhưng chưa xác nhận vai trò Page (attempt={}) | url={}",
                         attempt,
                         page.url,
                     )
+                    break
             page.wait_for_timeout(500)
 
         ok = _page_role_acting_as_page(page, timeout_ms=800)
@@ -3794,6 +3688,7 @@ def _select_page_in_switch_profiles_popup(
     page_display_name: str,
     page_url: str,
     max_list_scrolls: int = 10,
+    menu_already_open: bool = False,
 ) -> bool:
     """Chọn đúng Page trong popup Switch profiles — có cuộn để tìm mục (giới hạn vòng)."""
     pname = str(page_display_name or "").strip()
@@ -3806,29 +3701,31 @@ def _select_page_in_switch_profiles_popup(
         r"See all profiles|Xem tất cả hồ sơ|Switch profiles|Chuyển hồ sơ|Chuyển sang",
         re.I,
     )
-    if not _switch_profiles_dialog_visible(page, timeout_ms=500):
+    if not menu_already_open and not _switch_profiles_dialog_visible(page, timeout_ms=500):
         if not _open_facebook_profile_switcher_menu(page):
             return False
-        _click_visible_enabled_button(page.get_by_role("menuitem", name=see_all), timeout_ms=900)
-        _click_visible_enabled_button(page.get_by_text(see_all), timeout_ms=700)
+        _click_visible_enabled_button(
+            page.get_by_role("menuitem", name=see_all), timeout_ms=900, human_label=""
+        )
+        _click_visible_enabled_button(page.get_by_text(see_all), timeout_ms=700, human_label="")
         page.wait_for_timeout(700)
 
     pat_name = re.compile(re.escape(pname[:80]), re.I) if len(pname) >= 2 else None
-    scroll_limit = max(3, min(int(max_list_scrolls), 16))
-    fast_click_ms = 520
+    scroll_limit = max(3, min(int(max_list_scrolls), 10))
+    fast_click_ms = 420
 
     for scroll_i in range(scroll_limit):
+        scope = _switch_profiles_dialog_scope(page) if _switch_profiles_dialog_visible(page, timeout_ms=250) else page.locator("[role='menu'], [role='listbox']").last
         if pat_name is not None:
-            dlg = page.locator("[role='dialog']").last
             for factory in (
-                lambda: dlg.get_by_role("button", name=pat_name),
-                lambda: dlg.get_by_role("link", name=pat_name),
-                lambda: dlg.get_by_text(pat_name).last,
-                lambda: page.get_by_role("button", name=pat_name),
-                lambda: page.get_by_role("link", name=pat_name),
+                lambda: scope.get_by_role("button", name=pat_name),
+                lambda: scope.get_by_role("link", name=pat_name),
+                lambda: scope.get_by_text(pat_name).last,
             ):
                 try:
-                    if _click_visible_enabled_button(factory(), timeout_ms=fast_click_ms):
+                    if _click_visible_enabled_button(
+                        factory(), timeout_ms=fast_click_ms, human_label=""
+                    ):
                         logger.info("[FB] Đã chọn Page trong Switch profiles: {!r}", pname)
                         page.wait_for_timeout(900)
                         return True
@@ -3836,8 +3733,8 @@ def _select_page_in_switch_profiles_popup(
                     continue
         if expect_id:
             try:
-                href_loc = page.locator(f"a[href*='{expect_id}']").first
-                if _click_visible_enabled_button(href_loc, timeout_ms=fast_click_ms):
+                href_loc = scope.locator(f"a[href*='{expect_id}']").first
+                if _click_visible_enabled_button(href_loc, timeout_ms=fast_click_ms, human_label=""):
                     logger.info("[FB] Đã chọn Page theo id {} trong Switch profiles.", expect_id)
                     page.wait_for_timeout(900)
                     return True
@@ -3845,8 +3742,8 @@ def _select_page_in_switch_profiles_popup(
                 pass
         if scroll_i + 1 >= scroll_limit:
             break
-        if not _switch_profiles_dialog_visible(page, timeout_ms=280):
-            if scroll_i >= 2:
+        if not _switch_profiles_dialog_visible(page, timeout_ms=250):
+            if scroll_i >= 1:
                 break
         _scroll_switch_profiles_list(page)
     return False
@@ -3869,16 +3766,12 @@ def _ensure_reel_dashboard_page_context(
     if _view_only_guard_active_on_page(page):
         _disable_view_only_guard(page)
     navigate_to_url(page, dest)
-    page.wait_for_timeout(2800)
+    page.wait_for_timeout(2_200)
     if not _robust_switch_to_target_page(page, page_display_name=pname, page_url=dest):
-        navigate_to_url(page, dest)
-        page.wait_for_timeout(2200)
-        if not _robust_switch_to_target_page(page, page_display_name=pname, page_url=dest):
-            _failure_screenshot(page, "reel_page_switch_failed")
-            raise RuntimeError(
-                f"Không switch được sang vai trò Page sau 2 lần thử. "
-                f"dest={dest!r} | url={page.url}"
-            )
+        _failure_screenshot(page, "reel_page_switch_failed")
+        raise RuntimeError(
+            f"Không switch được sang vai trò Page. dest={dest!r} | url={page.url}"
+        )
     _require_page_role_switched(
         page,
         page_display_name=pname,
@@ -6179,7 +6072,12 @@ def _open_reel_composer_direct(page: Page) -> bool:
     return False
 
 
-def _click_visible_enabled_button(candidates: Locator, *, timeout_ms: int = 1200) -> bool:
+def _click_visible_enabled_button(
+    candidates: Locator,
+    *,
+    timeout_ms: int = 1200,
+    human_label: str = "trước click nút (dialog)",
+) -> bool:
     """Click button đầu tiên visible + enabled trong danh sách locator."""
     try:
         n = int(candidates.count())
@@ -6194,12 +6092,14 @@ def _click_visible_enabled_button(candidates: Locator, *, timeout_ms: int = 1200
                 continue
             if b.get_attribute("disabled") is not None:
                 continue
-            human_pause(kind="click", label="trước click nút (dialog)")
+            if human_label:
+                human_pause(kind="click", label=human_label)
             try:
                 b.click(timeout=timeout_ms)
             except Exception:
                 b.click(timeout=timeout_ms, force=True, no_wait_after=True)
-            human_pause(kind="click", label="sau click nút (dialog)")
+            if human_label:
+                human_pause(kind="click", label="sau click nút (dialog)")
             return True
         except Exception:
             continue

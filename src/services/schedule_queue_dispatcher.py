@@ -241,6 +241,14 @@ def promote_due_pending_to_ready(
     """``pending`` + ``scheduled_at <= now`` → ``ready_queue`` (không bỏ job trễ)."""
     now = now or datetime.now(timezone.utc)
     jobs = sp.load_all()
+    any_due = False
+    for job in jobs:
+        st = str(job.get("status", "")).strip().lower()
+        if st == "pending" and parse_job_schedule_time(job.get("scheduled_at")) <= now:
+            any_due = True
+            break
+    if not any_due:
+        return 0
     promoted = 0
     out: list[SchedulePostJob] = []
     dirty = False

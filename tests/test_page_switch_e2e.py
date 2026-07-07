@@ -134,9 +134,9 @@ def test_robust_switch_prefers_direct_before_personal() -> None:
             return_value=False,
         ),
         patch(
-            "src.automation.facebook_actions._try_page_role_switch_direct",
+            "src.automation.facebook_actions._quick_switch_on_page_surface",
             return_value=True,
-        ) as direct,
+        ) as quick,
         patch(
             "src.automation.facebook_actions._switch_to_personal_profile",
         ) as personal,
@@ -150,7 +150,7 @@ def test_robust_switch_prefers_direct_before_personal() -> None:
             page_url="https://www.facebook.com/222",
         )
     assert ok is True
-    direct.assert_called()
+    quick.assert_called()
     personal.assert_not_called()
 
 
@@ -172,9 +172,9 @@ def test_robust_switch_wrong_page_url_tries_direct_first() -> None:
             return_value=False,
         ),
         patch(
-            "src.automation.facebook_actions._try_page_role_switch_direct",
+            "src.automation.facebook_actions._quick_switch_on_page_surface",
             return_value=True,
-        ) as direct,
+        ) as quick,
         patch(
             "src.automation.facebook_actions._switch_to_personal_profile",
         ) as personal,
@@ -188,21 +188,21 @@ def test_robust_switch_wrong_page_url_tries_direct_first() -> None:
             page_url="https://www.facebook.com/222",
         )
     assert ok is True
-    direct.assert_called()
+    quick.assert_called()
     personal.assert_not_called()
 
 
 def test_robust_switch_uses_personal_after_direct_fails() -> None:
-    """Direct thất bại → mới reset account chính."""
+    """Surface switch thất bại → reset account chính (force_home)."""
     page = MagicMock()
     page.url = "https://www.facebook.com/111"
-    personal_calls = {"n": 0}
+    personal_calls: list[bool] = []
 
-    def _personal(_page: MagicMock) -> bool:
-        personal_calls["n"] += 1
+    def _personal(_page: MagicMock, *, force_home: bool = False) -> bool:
+        personal_calls.append(force_home)
         return True
 
-    direct_results = iter([False, True])
+    quick_results = iter([False, True])
 
     with (
         patch(
@@ -214,15 +214,18 @@ def test_robust_switch_uses_personal_after_direct_fails() -> None:
             side_effect=[False, True],
         ),
         patch(
-            "src.automation.facebook_actions._try_page_role_switch_direct",
-            side_effect=lambda *a, **k: next(direct_results),
+            "src.automation.facebook_actions._quick_switch_on_page_surface",
+            side_effect=lambda *a, **k: next(quick_results),
         ),
         patch(
             "src.automation.facebook_actions._switch_to_personal_profile",
             side_effect=_personal,
         ),
         patch("src.automation.facebook_actions.navigate_to_url"),
-        patch("src.automation.facebook_actions._click_switch_now_banner", return_value=False),
+        patch(
+            "src.automation.facebook_actions._select_page_via_profile_switcher",
+            return_value=False,
+        ),
         patch("src.automation.facebook_actions._failure_screenshot"),
         patch.object(page, "wait_for_timeout"),
     ):
@@ -234,4 +237,4 @@ def test_robust_switch_uses_personal_after_direct_fails() -> None:
             page_url="https://www.facebook.com/222",
         )
     assert ok is True
-    assert personal_calls["n"] >= 1
+    assert personal_calls == [True]

@@ -101,6 +101,7 @@ class SchedulePostsManager:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._rows_cache: Optional[list[SchedulePostJob]] = None
         self._rows_mtime: Optional[float] = None
+        self._id_index: dict[str, SchedulePostJob] = {}
         if not self.file_path.is_file():
             self._atomic_write(json.dumps([], ensure_ascii=False, indent=2) + "\n")
             logger.info("Đã tạo schedule_posts.json rỗng: {}", self.file_path)
@@ -128,9 +129,19 @@ class SchedulePostsManager:
     def _invalidate_cache(self) -> None:
         self._rows_cache = None
         self._rows_mtime = None
+        self._id_index = {}
 
-    def reload_from_disk(self) -> list[SchedulePostJob]:
-        self._invalidate_cache()
+    def _rebuild_id_index(self, rows: list[SchedulePostJob]) -> None:
+        self._id_index = {
+            str(x.get("id", "")).strip(): x
+            for x in rows
+            if str(x.get("id", "")).strip()
+        }
+
+    def reload_from_disk(self, *, force: bool = False) -> list[SchedulePostJob]:
+        """Đọc job từ đĩa; mặc định dùng cache nếu mtime không đổi (giảm RAM/IO khi hàng nghìn job)."""
+        if force:
+            self._invalidate_cache()
         return self.load_all()
 
     def _validate_row(self, row: dict[str, Any]) -> None:
@@ -198,6 +209,7 @@ class SchedulePostsManager:
             out.append(item)  # type: ignore[arg-type]
         self._rows_cache = out
         self._rows_mtime = mtime
+        self._rebuild_id_index(out)
         logger.debug("schedule_posts load_all: {} job", len(out))
         return list(out)
 
@@ -209,6 +221,7 @@ class SchedulePostsManager:
             self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
             self._rows_cache = list(lst)
             self._rows_mtime = self.file_path.stat().st_mtime
+            self._rebuild_id_index(self._rows_cache)
             logger.info("Đã ghi {} job schedule_posts vào {}", len(lst), self.file_path)
 
     def upsert(self, row: SchedulePostJob) -> None:
@@ -236,6 +249,7 @@ class SchedulePostsManager:
             self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
             self._rows_cache = new_list
             self._rows_mtime = self.file_path.stat().st_mtime
+            self._rebuild_id_index(new_list)
 
     def upsert_many(self, rows: Iterable[SchedulePostJob]) -> int:
         """Upsert nhiều job trong một lần đọc/ghi file (tránh O(n²) khi nạp hàng loạt)."""
@@ -271,6 +285,7 @@ class SchedulePostsManager:
             self._atomic_write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
             self._rows_cache = out
             self._rows_mtime = self.file_path.stat().st_mtime
+            self._rebuild_id_index(out)
             return len(incoming)
 
     def delete_by_id(self, job_id: str) -> bool:
@@ -299,10 +314,29 @@ class SchedulePostsManager:
 
     def get_by_id(self, job_id: str) -> Optional[SchedulePostJob]:
         jid = str(job_id).strip()
-        for x in self.load_all():
+        if not jid:
+            return None
+        self.load_all()
+        hit = self._id_index.get(jid)
+        if hit is not None:
+            return hit
+        for x in self._rows_cache or []:
             if str(x.get("id")) == jid:
                 return x
         return None
+
+    def has_active_queue_work(self, *, now: datetime | None = None) -> bool:
+        """Có job pending/ready_queue/running hoặc pending đến hạn — dùng skip tick khi idle."""
+        from src.services.schedule_queue_dispatcher import parse_job_schedule_time
+
+        now = now or datetime.now(timezone.utc)
+        for job in self.load_all():
+            st = str(job.get("status", "")).strip().lower()
+            if st in {"ready_queue", "running"}:
+                return True
+            if st == "pending" and parse_job_schedule_time(job.get("scheduled_at")) <= now:
+                return True
+        return False
 
     def list_for_page(self, page_id: str) -> list[SchedulePostJob]:
         pid = str(page_id).strip()
@@ -392,6 +426,7 @@ class SchedulePostsManager:
             self._atomic_write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
             self._rows_cache = out
             self._rows_mtime = self.file_path.stat().st_mtime
+            self._rebuild_id_index(out)
             return updated
 
 

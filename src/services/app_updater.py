@@ -17,7 +17,7 @@ from typing import Any
 
 from loguru import logger
 
-from src.utils.app_restart import DEFERRED_GUI_BAT_NAME
+from src.utils.app_restart import DEFERRED_GUI_BAT_NAME, deferred_gui_bat_path
 
 # Repo công khai chứa ``release/update/latest.json`` (máy không có .git vẫn dùng manifest mặc định).
 TOOLFB_PUBLIC_REPO = "vanchien/ToolFB"
@@ -1000,6 +1000,47 @@ def _zip_extract_resilient(zip_path: Path, dest_dir: Path) -> tuple[int, int]:
 
 
 @dataclass(frozen=True)
+class ApplyUpdateResult:
+    """Kết quả ``apply_update_package`` — backup + có cần relaunch để hoàn tất không."""
+
+    backup_dir: Path
+    deferred: bool
+
+
+def update_pending_deferred_apply(project_root: Path | None = None) -> bool:
+    """True khi bản cập nhật đã stage và chờ relaunch (batch Windows)."""
+    return deferred_gui_bat_path(project_root).is_file()
+
+
+def _windows_deferred_batch_relaunch_lines(project_root: Path) -> list[str]:
+    """Lệnh ``start`` mở lại app sau khi batch apply xong (exe hoặc portable Python)."""
+    pr = project_root.resolve()
+    if getattr(sys, "frozen", False):
+        exe = pr / "ToolFB_GUI.exe"
+        return [f'start "" "{exe}" --gui']
+    venv_pyw = pr / ".venv" / "Scripts" / "pythonw.exe"
+    venv_py = pr / ".venv" / "Scripts" / "python.exe"
+    main_py = pr / "main.py"
+    launcher = venv_pyw if venv_pyw.is_file() else (venv_py if venv_py.is_file() else Path(sys.executable))
+    if main_py.is_file():
+        return [f'start "" "{launcher}" "{main_py}" --gui']
+    return [f'start "" "{launcher}" --gui']
+
+
+def _windows_deferred_pip_line(project_root: Path) -> str:
+    """Một dòng batch ``pip install`` sau apply (portable có ``.venv``)."""
+    pr = project_root.resolve()
+    venv_py = pr / ".venv" / "Scripts" / "python.exe"
+    req = pr / "requirements.txt"
+    if not venv_py.is_file() or not req.is_file():
+        return ""
+    return (
+        f'if exist "{venv_py}" if exist "{req}" '
+        f'"{venv_py}" -m pip install -r "{req}" -q >nul 2>&1'
+    )
+
+
+@dataclass(frozen=True)
 class UpdatePayloadLayout:
     """Bố cục gói giải nén: mã nguồn portable + (tuỳ chọn) thư mục bản EXE đóng gói."""
 
@@ -1059,6 +1100,37 @@ def _merge_exe_gui_bundle(exe_gui: Path, project_root: Path) -> None:
         _copytree_resilient(internal_src, internal_dst)
 
 
+def _deferred_batch_common_tail(
+    *,
+    staged_root: Path,
+    updates_dir: Path,
+    project_root: Path,
+) -> list[str]:
+    """Phần cuối batch: pip (tuỳ chọn), relaunch, dọn staged, xử lý FAIL."""
+    st_s = str(staged_root.resolve())
+    log_file = str((updates_dir / "last_deferred_apply.log").resolve())
+    relaunch_lines = _windows_deferred_batch_relaunch_lines(project_root)
+    pip_line = _windows_deferred_pip_line(project_root)
+    lines = [f'echo [%date% %time%] deferred apply ok >> "{log_file}"']
+    if pip_line:
+        lines.append(pip_line)
+    lines.extend(relaunch_lines)
+    lines.extend(
+        [
+            f'rd /s /q "{st_s}" 2>nul',
+            "goto END",
+            ":FAIL",
+            f'echo [%date% %time%] deferred apply FAILED (max retries) >> "{log_file}"',
+            *relaunch_lines,
+            ":END",
+            'del "%~f0"',
+            "endlocal",
+            "",
+        ]
+    )
+    return lines
+
+
 def _stage_deferred_exe_gui_merge_windows(
     *,
     exe_gui_root: Path,
@@ -1084,23 +1156,28 @@ def _stage_deferred_exe_gui_merge_windows(
     pr_s = str(project_root.resolve())
     st_s = str(staged.resolve())
     exe_dst = str((project_root / "ToolFB_GUI.exe").resolve())
+    log_file = str((updates_dir / "last_deferred_apply.log").resolve())
 
     bat_lines = [
         "@echo off",
         "setlocal",
         f'cd /d "{pr_s}"',
+        f'echo [%date% %time%] deferred gui merge start > "{log_file}"',
         "echo [ToolFB] Dang cap nhat ToolFB_GUI.exe va _internal...",
+        "set tries=0",
         ":L",
+        "set /a tries+=1",
+        "if %tries% gtr 120 goto FAIL",
         "ping -n 2 127.0.0.1 >nul",
         f'copy /Y "{st_s}\\ToolFB_GUI.exe" "{exe_dst}" >nul 2>&1',
         "if errorlevel 1 goto L",
         f'robocopy "{st_s}\\_internal" "{pr_s}\\_internal" /MIR /R:3 /W:2 /NP',
         "if errorlevel 8 goto L",
-        f'start "" "{exe_dst}" --gui',
-        f'rd /s /q "{st_s}" 2>nul',
-        'del "%~f0"',
-        "endlocal",
-        "",
+        *_deferred_batch_common_tail(
+            staged_root=staged,
+            updates_dir=updates_dir,
+            project_root=project_root,
+        ),
     ]
     bat_out.write_text("\r\n".join(bat_lines), encoding="utf-8")
 
@@ -1116,9 +1193,10 @@ def _stage_deferred_full_apply_windows(
     preserve_on_apply_dirs: tuple[str, ...],
 ) -> None:
     """
-    Windows frozen: stage toàn bộ update và apply sau khi process hiện tại thoát.
+    Windows: stage toàn bộ update và apply sau khi process hiện tại thoát.
 
-    Mục tiêu: không còn copy/rmtree trực tiếp khi app đang chạy (tránh WinError 32).
+    Mục tiêu: không còn copy/rmtree trực tiếp khi app đang chạy (tránh WinError 32);
+    người dùng không cần giải nén sang thư mục mới — cập nhật tại chỗ rồi tự mở lại.
     """
     for old in updates_dir.glob("staged_apply_*"):
         shutil.rmtree(old, ignore_errors=True)
@@ -1139,28 +1217,33 @@ def _stage_deferred_full_apply_windows(
     pr_s = str(project_root.resolve())
     st_s = str(staged.resolve())
     exe_dst = str((project_root / "ToolFB_GUI.exe").resolve())
-    excl = " ".join(preserve_on_apply_dirs)
+    robocopy_xd = " ".join(dict.fromkeys((*preserve_on_apply_dirs, "_internal")))
+    log_file = str((updates_dir / "last_deferred_apply.log").resolve())
     bat_lines = [
         "@echo off",
         "setlocal",
         f'cd /d "{pr_s}"',
+        f'echo [%date% %time%] deferred full apply start > "{log_file}"',
         "echo [ToolFB] Dang apply update sau khi thoat app...",
+        "set tries=0",
         ":L",
+        "set /a tries+=1",
+        "if %tries% gtr 120 goto FAIL",
         "ping -n 2 127.0.0.1 >nul",
         (
             f'robocopy "{st_s}\\portable_apply" "{pr_s}" /E /R:3 /W:2 /NP '
-            f"/XD {excl}"
+            f"/XF ToolFB_GUI.exe /XD {robocopy_xd}"
         ),
         "if errorlevel 8 goto L",
         f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" copy /Y "{st_s}\\exe_gui\\ToolFB_GUI.exe" "{exe_dst}" >nul 2>&1',
         f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" if errorlevel 1 goto L',
         f'if exist "{st_s}\\exe_gui\\_internal" robocopy "{st_s}\\exe_gui\\_internal" "{pr_s}\\_internal" /MIR /R:3 /W:2 /NP',
         f'if exist "{st_s}\\exe_gui\\_internal" if errorlevel 8 goto L',
-        f'start "" "{exe_dst}" --gui',
-        f'rd /s /q "{st_s}" 2>nul',
-        'del "%~f0"',
-        "endlocal",
-        "",
+        *_deferred_batch_common_tail(
+            staged_root=staged,
+            updates_dir=updates_dir,
+            project_root=project_root,
+        ),
     ]
     bat_out.write_text("\r\n".join(bat_lines), encoding="utf-8")
 
@@ -1180,12 +1263,14 @@ def apply_update_package(
         "build",
         "config",
     ),
-) -> Path:
+) -> ApplyUpdateResult:
     """
-    Tải và áp dụng gói cập nhật vào ``project_root``.
+    Tải và áp dụng gói cập nhật vào ``project_root`` (tại chỗ — giữ ``data/``, ``config/``).
+
+    Windows: luôn stage + batch apply sau khi thoát app (tránh file lock, không cần đổi thư mục).
 
     Returns:
-        Đường dẫn backup trước update.
+        Backup + cờ ``deferred`` (cần relaunch để hoàn tất trên Windows).
     """
     updates_dir = project_root / "data" / "updates"
     updates_dir.mkdir(parents=True, exist_ok=True)
@@ -1221,14 +1306,17 @@ def apply_update_package(
         payload_root = layout.code_root
         defer_bat = updates_dir / DEFERRED_GUI_BAT_NAME
 
-        # Windows frozen: không patch trực tiếp file đang chạy.
-        if getattr(sys, "frozen", False) and os.name == "nt":
+        # Windows: không ghi đè file đang chạy — stage + batch sau khi thoát (exe hoặc portable).
+        if os.name == "nt":
             backup_dir = updates_dir / f"backup_before_{manifest.version}"
             if backup_dir.exists():
                 shutil.rmtree(backup_dir, ignore_errors=True)
             backup_dir.mkdir(parents=True, exist_ok=True)
             (backup_dir / "_deferred_apply_note.txt").write_text(
-                "Deferred update mode: changes are staged and applied after app exits.\n",
+                (
+                    "Deferred update: gói đã tải và stage; áp dụng tự động khi bạn mở lại app.\n"
+                    "Không cần giải nén sang thư mục mới — data/config giữ nguyên tại chỗ.\n"
+                ),
                 encoding="utf-8",
             )
             _stage_deferred_full_apply_windows(
@@ -1241,8 +1329,8 @@ def apply_update_package(
                 preserve_on_apply_dirs=preserve_on_apply_dirs,
             )
             logger.info("Updater: staged deferred apply; sau relaunch chạy {}", defer_bat.name)
-            logger.info("Updater: áp dụng update {} thành công.", manifest.version)
-            return backup_dir
+            logger.info("Updater: áp dụng update {} thành công (chờ relaunch).", manifest.version)
+            return ApplyUpdateResult(backup_dir=backup_dir, deferred=True)
 
         backup_dir = updates_dir / f"backup_before_{manifest.version}"
         if backup_dir.exists():
@@ -1287,7 +1375,7 @@ def apply_update_package(
             _merge_exe_gui_bundle(layout.exe_gui_root, project_root)
 
         logger.info("Updater: áp dụng update {} thành công.", manifest.version)
-        return backup_dir
+        return ApplyUpdateResult(backup_dir=backup_dir, deferred=False)
     finally:
         shutil.rmtree(extract_root, ignore_errors=True)
 

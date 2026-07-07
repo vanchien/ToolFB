@@ -458,7 +458,7 @@ class _ManagerWindow:
         self._btn_setup_help.pack(side=tk.LEFT, padx=(0, 4))
         self._btn_check_updates = ttk.Button(row1, text="Chỉ kiểm tra", command=self._on_check_updates)
         self._btn_check_updates.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_apply_update = ttk.Button(row1, text="Cập nhật", command=self._on_apply_update)
+        self._btn_apply_update = ttk.Button(row1, text="Cập nhật ngay", command=self._on_apply_update)
         self._apply_update_pack_after = self._btn_check_updates
         self._btn_update_channel = ttk.Button(
             row1,
@@ -9005,14 +9005,17 @@ class _ManagerWindow:
 
         def worker_download() -> None:
             try:
-                backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
+                result = apply_update_package(project_root=project_root(), manifest=mf)
 
                 def done_ok() -> None:
-                    self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
+                    self._lbl_state.configure(text="Update: hoàn tất — đang mở lại app…")
                     self._clear_ui_busy()
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
-                    self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
+                    self._show_update_success_restart_dialog(
+                        version=str(mf.version),
+                        backup_dir=result.backup_dir,
+                    )
 
                 schedule_on_main_thread(self._root, done_ok)
             except Exception as exc:  # noqa: BLE001
@@ -9188,16 +9191,23 @@ class _ManagerWindow:
 
         threading.Thread(target=worker, name="check_updates", daemon=True).start()
 
-    def _show_update_success_restart_dialog(self, *, version: str, backup_dir: Path | None) -> None:
+    def _show_update_success_restart_dialog(
+        self,
+        *,
+        version: str,
+        backup_dir: Path | None,
+        auto_relaunch: bool = True,
+        relaunch_delay_sec: int = 2,
+    ) -> None:
         """
-        Sau cập nhật thành công: nút mở lại chương trình ngay (khuyến nghị) + để sau.
+        Sau cập nhật thành công: tự mở lại app (mặc định) hoặc để người dùng chọn sau.
         """
         self._hide_apply_update_button()
         top = tk.Toplevel(self._root)
         top.title("Cập nhật xong — mở lại chương trình")
         top.transient(self._root)
-        top.geometry("680x300")
-        top.minsize(520, 240)
+        top.geometry("680x320")
+        top.minsize(520, 260)
         try:
             top.grab_set()
         except Exception:
@@ -9205,10 +9215,10 @@ class _ManagerWindow:
         fr = ttk.Frame(top, padding=16)
         fr.pack(fill=tk.BOTH, expand=True)
         extra = ""
-        if getattr(sys, "frozen", False) and (project_root() / "data" / "updates" / DEFERRED_GUI_BAT_NAME).is_file():
+        if (project_root() / "data" / "updates" / DEFERRED_GUI_BAT_NAME).is_file():
             extra = (
-                "\n\n(Windows) Bản .exe và thư mục _internal sẽ được thay sau khi bạn bấm mở lại "
-                "(có thể thấy cửa sổ lệnh tối thiểu vài giây — bình thường)."
+                "\n\n(Windows) App sẽ tự áp dụng bản mới tại thư mục hiện tại khi mở lại "
+                "(data/config giữ nguyên — không cần copy sang thư mục khác)."
             )
         backup_line = (
             str(backup_dir)
@@ -9216,14 +9226,15 @@ class _ManagerWindow:
             else "(Cập nhật qua git — lịch sử trong .git; hoàn tác: git revert / git checkout nếu cần.)"
         )
         msg = (
-            f"Đã cập nhật lên phiên bản {version}.\n\n"
+            f"Đã tải và chuẩn bị phiên bản {version}.\n\n"
             f"Backup / ghi chú:\n{backup_line}\n\n"
-            "Nên bấm «Mở lại chương trình ngay» để dùng bản mới (cửa sổ hiện tại sẽ đóng và app mở lại).\n"
-            "Phím Enter = mở lại ngay. Esc = để sau."
+            "App sẽ tự mở lại để hoàn tất cập nhật."
             f"{extra}"
         )
         lbl_msg = ttk.Label(fr, text=msg, wraplength=620, justify=tk.LEFT)
-        lbl_msg.pack(anchor="w", pady=(0, 14))
+        lbl_msg.pack(anchor="w", pady=(0, 8))
+        lbl_countdown = ttk.Label(fr, text="", wraplength=620, justify=tk.LEFT)
+        lbl_countdown.pack(anchor="w", pady=(0, 14))
         top.bind(
             "<Configure>",
             lambda _e: lbl_msg.configure(wraplength=max(360, int(top.winfo_width()) - 60)),
@@ -9231,8 +9242,11 @@ class _ManagerWindow:
         )
         btn_row = ttk.Frame(fr)
         btn_row.pack(fill=tk.X)
+        cancel_auto = {"v": False}
+        countdown = {"n": max(0, int(relaunch_delay_sec))}
 
         def do_restart() -> None:
+            cancel_auto["v"] = True
             try:
                 top.grab_release()
             except Exception:
@@ -9244,15 +9258,26 @@ class _ManagerWindow:
             relaunch_same_app_and_exit(cwd=project_root(), tk_root=self._root)
 
         def do_later() -> None:
+            cancel_auto["v"] = True
             try:
                 top.grab_release()
             except Exception:
                 pass
             top.destroy()
 
+        def tick() -> None:
+            if cancel_auto["v"] or not top.winfo_exists():
+                return
+            if countdown["n"] <= 0:
+                do_restart()
+                return
+            lbl_countdown.configure(text=f"Tự mở lại sau {countdown['n']} giây… (Esc = để sau)")
+            countdown["n"] -= 1
+            top.after(1000, tick)
+
         btn_restart = ttk.Button(
             btn_row,
-            text="Mở lại chương trình ngay (khuyến nghị)",
+            text="Mở lại ngay",
             command=do_restart,
         )
         btn_restart.pack(side=tk.LEFT, padx=(0, 10))
@@ -9264,6 +9289,8 @@ class _ManagerWindow:
             top.after(80, lambda: btn_restart.focus_set())
         except Exception:
             pass
+        if auto_relaunch:
+            tick()
 
     def _on_apply_update(self) -> None:
         """«Cập nhật»: git pull hoặc tải zip manifest; nút chỉ hiện khi đã phát hiện bản mới (hoặc trong lúc chạy)."""
@@ -9426,14 +9453,17 @@ class _ManagerWindow:
 
                 schedule_on_main_thread(self._root, on_ui_start)
                 ui_evt.wait(timeout=60)
-                backup_dir = apply_update_package(project_root=project_root(), manifest=mf)
+                result = apply_update_package(project_root=project_root(), manifest=mf)
 
                 def on_done() -> None:
-                    self._lbl_state.configure(text="Update: hoàn tất — khởi động lại để dùng bản mới")
+                    self._lbl_state.configure(text="Update: hoàn tất — đang mở lại app…")
                     self._clear_ui_busy()
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
-                    self._show_update_success_restart_dialog(version=str(mf.version), backup_dir=backup_dir)
+                    self._show_update_success_restart_dialog(
+                        version=str(mf.version),
+                        backup_dir=result.backup_dir,
+                    )
 
                 schedule_on_main_thread(self._root, on_done)
             except Exception as exc:  # noqa: BLE001
