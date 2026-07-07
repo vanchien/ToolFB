@@ -237,6 +237,64 @@ def test_attempt_page_role_switch_prefers_switch_now() -> None:
     sidebar.assert_not_called()
 
 
+def test_recovery_after_switch_click_uses_switch_now() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._click_switch_now_banner",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._wait_page_role_switch_complete",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._manage_page_switch_cta_still_visible",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_switch_sidebar_hint_visible",
+            return_value=True,
+        ),
+    ):
+        from src.automation.facebook_actions import _recovery_after_switch_click_fail
+
+        assert _recovery_after_switch_click_fail(
+            page,
+            page_display_name="Ethereal Birds",
+            page_url="https://www.facebook.com/107315425760571",
+        )
+
+
+def test_select_page_via_profile_switcher() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._open_facebook_profile_switcher_menu",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._select_page_in_switch_profiles_popup",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._wait_after_page_switch_click",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            return_value=True,
+        ),
+    ):
+        from src.automation.facebook_actions import _select_page_via_profile_switcher
+
+        assert _select_page_via_profile_switcher(
+            page,
+            page_display_name="Ethereal Birds",
+            page_url="https://www.facebook.com/107315425760571",
+        )
+
+
 def test_robust_switch_uses_personal_reset_strategy() -> None:
     page = MagicMock()
     page.url = "https://www.facebook.com/somepage"

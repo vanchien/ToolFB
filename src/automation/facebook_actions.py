@@ -2370,13 +2370,7 @@ def _click_meta_switch_cta_exact(page: Page, *, timeout_ms: int = 3000) -> bool:
             if loc.count() <= 0 or not loc.is_visible(timeout=1_200):
                 continue
             loc.scroll_into_view_if_needed(timeout=2_500)
-            try:
-                loc.evaluate(_PAGE_SWITCH_META_EXACT_CLICK_JS)
-                logger.info("[FB] Đã bấm Switch CTA (evaluate trên html-div/role=none).")
-                page.wait_for_timeout(2200)
-                return True
-            except Exception:
-                pass
+            # Firefox: ưu tiên mouse (evaluate đôi khi không kích hoạt switch thật)
             try:
                 box = loc.bounding_box()
                 if box:
@@ -2385,20 +2379,27 @@ def _click_meta_switch_cta_exact(page: Page, *, timeout_ms: int = 3000) -> bool:
                         box["y"] + box["height"] / 2,
                     )
                     logger.info("[FB] Đã bấm Switch CTA (mouse tại tâm nút).")
-                    page.wait_for_timeout(2200)
+                    page.wait_for_timeout(2_200)
                     return True
+            except Exception:
+                pass
+            try:
+                loc.evaluate(_PAGE_SWITCH_META_EXACT_CLICK_JS)
+                logger.info("[FB] Đã bấm Switch CTA (evaluate trên html-div/role=none).")
+                page.wait_for_timeout(2_200)
+                return True
             except Exception:
                 pass
             loc.click(timeout=timeout_ms, force=True, no_wait_after=True)
             logger.info("[FB] Đã bấm Switch CTA (force click locator).")
-            page.wait_for_timeout(2200)
+            page.wait_for_timeout(2_200)
             return True
         except Exception:
             continue
     try:
         if page.evaluate(_PAGE_SWITCH_META_EXACT_CLICK_JS):
             logger.info("[FB] Đã bấm Switch CTA (JS Meta exact).")
-            page.wait_for_timeout(2200)
+            page.wait_for_timeout(2_200)
             return True
     except Exception:
         pass
@@ -2935,9 +2936,17 @@ def _wait_after_page_switch_click(
     )
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
-        if not _page_switch_sidebar_hint_visible(page, timeout_ms=400):
+        if _page_role_acting_as_page(page, timeout_ms=450):
+            return True
+        if not _page_switch_sidebar_hint_visible(page, timeout_ms=350) and not _manage_page_switch_cta_still_visible(
+            page, timeout_ms=350
+        ):
             return ok
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(320)
+    if _manage_page_switch_cta_still_visible(page, timeout_ms=400) or _page_switch_sidebar_hint_visible(
+        page, timeout_ms=400
+    ):
+        return False
     return ok
 
 
@@ -3367,6 +3376,90 @@ def _switch_to_personal_profile(page: Page) -> bool:
     return not _page_role_acting_as_page(page, timeout_ms=800)
 
 
+def _recovery_after_switch_click_fail(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    page_url: str = "",
+) -> bool:
+    """
+    Sau khi bấm Switch nhưng CTA vẫn còn (không popup / chưa đổi vai trò).
+
+    Thử: Switch Now → F5 + Switch Now/sidebar → profile switcher chọn Page.
+    """
+    pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
+    _suppress_facebook_click_overlays(page)
+    logger.info("[FB] Recovery switch — CTA vẫn hiện sau click, thử Switch Now / reload / menu.")
+
+    if _click_switch_now_banner(page, timeout_ms=3_000):
+        if _wait_page_role_switch_complete(page, timeout_ms=10_000):
+            logger.info("[FB] Recovery switch OK — Switch Now.")
+            return True
+
+    still_cta = _manage_page_switch_cta_still_visible(page, timeout_ms=500) or _page_switch_sidebar_hint_visible(
+        page, timeout_ms=500
+    )
+    if still_cta:
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(2_200)
+            _suppress_facebook_click_overlays(page)
+            logger.info("[FB] Recovery switch — đã F5 trang Page.")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FB] recovery reload: {}", exc)
+        if _click_switch_now_banner(page, timeout_ms=3_200):
+            if _wait_page_role_switch_complete(page, timeout_ms=12_000):
+                logger.info("[FB] Recovery switch OK — Switch Now sau F5.")
+                return True
+        if _click_manage_page_sidebar_switch(page, timeout_ms=2_800):
+            _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
+            )
+            if _wait_page_role_switch_complete(page, timeout_ms=12_000):
+                logger.info("[FB] Recovery switch OK — sidebar sau F5.")
+                return True
+
+    if pname and _open_facebook_profile_switcher_menu(page):
+        if _select_page_in_switch_profiles_popup(
+            page,
+            page_display_name=pname,
+            page_url=dest,
+            max_list_scrolls=12,
+        ):
+            if _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=12_000
+            ) and _page_role_acting_as_page(page, timeout_ms=1_000):
+                logger.info("[FB] Recovery switch OK — profile switcher.")
+                return True
+    return False
+
+
+def _select_page_via_profile_switcher(
+    page: Page,
+    *,
+    page_display_name: str,
+    page_url: str = "",
+) -> bool:
+    """Chọn Page trong menu avatar — ổn định hơn sidebar khi đang xem bề mặt Page."""
+    pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
+    if len(pname) < 2 and not extract_facebook_numeric_id_from_url(dest):
+        return False
+    if not _open_facebook_profile_switcher_menu(page):
+        return False
+    if not _select_page_in_switch_profiles_popup(
+        page,
+        page_display_name=pname,
+        page_url=dest,
+        max_list_scrolls=12,
+    ):
+        return False
+    return _wait_after_page_switch_click(
+        page, page_display_name=pname, page_url=dest, timeout_ms=12_000
+    ) and _page_role_acting_as_page(page, timeout_ms=1_000)
+
+
 def _attempt_page_role_switch_clicks(page: Page, *, timeout_ms: int = 2_200) -> bool:
     """Thử bấm Switch Page — Switch Now trước, sau đó sidebar Switch."""
     _suppress_facebook_click_overlays(page)
@@ -3427,12 +3520,25 @@ def _try_page_role_switch_direct(
                 page, page_display_name=pname, page_url=dest, timeout_ms=10_000
             ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
                 return True
+            if _recovery_after_switch_click_fail(
+                page, page_display_name=pname, page_url=dest
+            ):
+                return True
         if _page_switch_ui_visible(page, timeout_ms=500):
             if _attempt_page_role_switch_clicks(page, timeout_ms=2_000):
                 if _wait_after_page_switch_click(
                     page, page_display_name=pname, page_url=dest, timeout_ms=10_000
                 ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
                     return True
+                if _recovery_after_switch_click_fail(
+                    page, page_display_name=pname, page_url=dest
+                ):
+                    return True
+
+    if pname and _select_page_via_profile_switcher(
+        page, page_display_name=pname, page_url=dest
+    ):
+        return True
 
     if pname and _open_facebook_profile_switcher_menu(page):
         if _select_page_in_switch_profiles_popup(
@@ -3495,6 +3601,12 @@ def _robust_switch_to_target_page(
         if dest:
             navigate_to_url(page, dest)
             page.wait_for_timeout(1_400)
+
+        if pname and _select_page_via_profile_switcher(
+            page, page_display_name=pname, page_url=dest
+        ):
+            logger.info("[FB] Switch Page OK — profile switcher sau account chính.")
+            return True
 
         if _click_switch_now_banner(page, timeout_ms=3_200):
             if _wait_after_page_switch_click(
@@ -3594,6 +3706,11 @@ def _ensure_page_role_switched(
                     page, timeout_ms=min(14_000, wait_timeout_ms + 2_000)
                 ):
                     logger.info("[FB] Switch Page OK — xác nhận vai trò Page (attempt={}).", attempt)
+                    return True
+                elif _recovery_after_switch_click_fail(
+                    page, page_display_name=pname, page_url=dest
+                ):
+                    logger.info("[FB] Switch Page OK — recovery sau click (attempt={}).", attempt)
                     return True
                 else:
                     logger.warning(
