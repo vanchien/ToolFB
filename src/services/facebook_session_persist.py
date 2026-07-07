@@ -761,25 +761,90 @@ def establish_facebook_session(
         logger.info("[FB session] establish② probe profile account={}: {}", aid, det_probe)
         return _persist_ok(det_probe, "establish_probe")
 
+    failure_reason = "Chưa có phiên profile/cookie — cần mật khẩu để đăng nhập form"
+
     # --- ③ Form login (cuối cùng) ---
     if not allow_form_login:
-        return False, "Chưa có phiên profile/cookie — cần mật khẩu để đăng nhập form"
+        pass
+    elif form_recover_fn is None:
+        failure_reason = "Chưa có phiên — thiếu mật khẩu để đăng nhập form"
+    else:
+        logger.info("[FB session] establish③ form login account={}", aid)
+        if not form_recover_fn():
+            failure_reason = "Đăng nhập form thất bại — kiểm tra pass/2FA/captcha"
+        else:
+            ok_conf, det_conf = confirm_facebook_session_logged_in(page, account, timeout_ms=22_000)
+            if ok_conf:
+                return _persist_ok(det_conf, "establish_form")
+            ok_prof3, det3 = profile_session_ready_for_interaction(page, account)
+            if ok_prof3:
+                return _persist_ok(det3, "establish_form_profile")
+            failure_reason = det_conf or "Form login xong nhưng chưa xác nhận phiên"
 
-    if form_recover_fn is None:
-        return False, "Chưa có phiên — thiếu mật khẩu để đăng nhập form"
+    f5_retries = max(0, int(os.environ.get("FB_ESTABLISH_F5_RETRIES", "2")))
+    for attempt in range(1, f5_retries + 1):
+        recovered = _establish_f5_recovery_pass(
+            page,
+            account,
+            cookie_path=cp,
+            allow_form_login=allow_form_login,
+            form_recover_fn=form_recover_fn,
+            _persist_ok=_persist_ok,
+            aid=aid,
+            attempt=attempt,
+        )
+        if recovered is not None:
+            return recovered
 
-    logger.info("[FB session] establish③ form login account={}", aid)
-    if not form_recover_fn():
-        return False, "Đăng nhập form thất bại — kiểm tra pass/2FA/captcha"
+    return False, failure_reason
 
-    ok_conf, det_conf = confirm_facebook_session_logged_in(page, account, timeout_ms=22_000)
-    if not ok_conf:
-        ok_prof3, det3 = profile_session_ready_for_interaction(page, account)
-        if ok_prof3:
-            return _persist_ok(det3, "establish_form_profile")
-        return False, det_conf or "Form login xong nhưng chưa xác nhận phiên"
 
-    return _persist_ok(det_conf, "establish_form")
+def _establish_f5_recovery_pass(
+    page: Page,
+    account: dict[str, Any],
+    *,
+    cookie_path: str | Path,
+    allow_form_login: bool,
+    form_recover_fn: Callable[[], bool] | None,
+    _persist_ok: Callable[[str, str], tuple[bool, str]],
+    aid: str,
+    attempt: int,
+) -> tuple[bool, str] | None:
+    """Một vòng F5 + thử lại profile/cookie/probe (và form nếu được phép)."""
+    from src.services.facebook_session_recovery import reload_facebook_page_f5
+
+    logger.info("[FB session] establish F5 retry {} account={}", attempt, aid)
+    reload_facebook_page_f5(page, label=f"establish_f5_{attempt}")
+
+    ok_prof, det_prof = wait_profile_session_ready(page, account, timeout_ms=12_000)
+    if ok_prof:
+        return _persist_ok(det_prof, f"establish_f5_profile_{attempt}")
+
+    if cookie_file_has_session(cookie_path):
+        ok_ck, det_ck = try_reuse_saved_cookie_session(
+            page, account, cookie_path=cookie_path, timeout_ms=22_000
+        )
+        if ok_ck:
+            return _persist_ok(det_ck, f"establish_f5_cookie_{attempt}")
+
+    ok_probe, det_probe = probe_existing_facebook_session(
+        page, account, cookie_path=cookie_path, timeout_ms=16_000
+    )
+    if ok_probe:
+        return _persist_ok(det_probe, f"establish_f5_probe_{attempt}")
+
+    if allow_form_login and form_recover_fn is not None:
+        if form_recover_fn():
+            from src.services.facebook_session_recovery import confirm_facebook_session_logged_in
+
+            ok_conf, det_conf = confirm_facebook_session_logged_in(page, account, timeout_ms=18_000)
+            if ok_conf:
+                return _persist_ok(det_conf, f"establish_f5_form_{attempt}")
+            ok_prof3, det3 = profile_session_ready_for_interaction(page, account)
+            if ok_prof3:
+                return _persist_ok(det3, f"establish_f5_form_profile_{attempt}")
+
+    return None
 
 
 def ensure_session_before_interaction(

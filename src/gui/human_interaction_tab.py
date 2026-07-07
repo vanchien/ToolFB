@@ -261,6 +261,7 @@ def build_human_interaction_tab(
         "_save_debounce_id": None,
         "pool_login_only": False,
         "pool_generation": 0,
+        "pool_auto_continue_round": 0,
         "btn_stop_all": [],
         "_pulse_after": None,
         "_pulse_phase": 0,
@@ -1071,6 +1072,43 @@ def build_human_interaction_tab(
         _sync_run_banner()
         _update_summary()
 
+    def _pool_auto_continue_enabled() -> bool:
+        """Mặc định bật — tự chạy lượt tiếp khi pool timeout / TK chưa xong."""
+        return os.environ.get("FB_POOL_AUTO_CONTINUE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    def _pool_auto_continue_max_rounds() -> int:
+        return max(1, int(os.environ.get("FB_POOL_AUTO_CONTINUE_MAX", "10")))
+
+    def _pool_auto_continue_delay_ms() -> int:
+        return max(1200, int(os.environ.get("FB_POOL_AUTO_CONTINUE_DELAY_MS", "2500")))
+
+    def _accounts_for_auto_continue(
+        accounts: list[MappedAccount],
+        *,
+        login_only: bool,
+    ) -> list[MappedAccount]:
+        """TK cần chạy thêm — loại trừ thành công / hủy / lỗi proxy cứng."""
+        terminal_ok = frozenset({"login_ok"} if login_only else {"success"})
+        out: list[MappedAccount] = []
+        for ma in accounts:
+            st = str(ma.status or "").strip()
+            if st in terminal_ok:
+                continue
+            if st == "cancelled":
+                continue
+            if st in ("login_failed", "proxy_error"):
+                continue
+            detail = str(ma.status_detail or "").lower()
+            if st == "error" and "đóng bất ngờ" not in detail and "thử lại" not in detail:
+                continue
+            out.append(ma)
+        return out
+
     def _reconcile_accounts_after_pool(
         accounts: list[MappedAccount],
         *,
@@ -1097,7 +1135,9 @@ def build_human_interaction_tab(
                 continue
             detail = str(ma.status_detail or "")
             if st == "pending" and (
-                "Chưa tới lượt" in detail or "Chưa chạy — pool" in detail
+                "Chưa tới lượt" in detail
+                or "Chưa kịp chạy" in detail
+                or "Chưa chạy — pool" in detail
             ):
                 continue
             if st in ("running", "waiting", "pending", ""):
@@ -1107,11 +1147,24 @@ def build_human_interaction_tab(
                     ma.status_detail = "Đã hủy — người dùng bấm Dừng"
                 elif st == "running":
                     ma.status = "pending"
-                    ma.status_detail = "Dừng giữa module — bấm «Chạy» lại (cookie/profile giữ nguyên)"
+                    ma.status_detail = (
+                        "Dừng giữa module — tự động chạy tiếp"
+                        if _pool_auto_continue_enabled()
+                        else "Dừng giữa module — bấm «Chạy» lại (cookie/profile giữ nguyên)"
+                    )
+                elif st == "waiting" and "Module:" in detail:
+                    ma.status = "pending"
+                    ma.status_detail = (
+                        "Dừng giữa module — tự động chạy tiếp"
+                        if _pool_auto_continue_enabled()
+                        else "Dừng giữa module — bấm «Chạy» lại (cookie/profile giữ nguyên)"
+                    )
                 elif not join_ok or workers_alive:
                     ma.status = "pending"
                     ma.status_detail = (
-                        "Chưa chạy xong — pool hết thời gian chờ, bấm «Chạy» để tiếp tục"
+                        "Chưa chạy xong — tự động chạy tiếp"
+                        if _pool_auto_continue_enabled()
+                        else "Chưa chạy xong — pool hết thời gian chờ, bấm «Chạy» để tiếp tục"
                     )
                 else:
                     ma.status = "error"
@@ -1400,6 +1453,13 @@ def build_human_interaction_tab(
 
     def _on_status(ma: MappedAccount, status: str, detail: str) -> None:
         def _ui() -> None:
+            # Pool đã dọn — bỏ callback trễ (tránh «Đang chạy» treo sau reconcile).
+            if state.get("pool") is None:
+                terminal = frozenset(
+                    {"success", "login_ok", "login_failed", "proxy_error", "error", "cancelled"}
+                )
+                if str(status or "").strip() not in terminal:
+                    return
             ma.status = status
             ma.status_detail = detail
             if status in ("login_ok", "success") and ma.cookie_path:
@@ -1565,10 +1625,34 @@ def build_human_interaction_tab(
         *,
         login_only: bool = False,
         on_pool_finished: Callable[[bool, list[MappedAccount]], None] | None = None,
+        is_auto_continue: bool = False,
     ) -> None:
-        if not accounts:
-            messagebox.showwarning("Chưa chọn", "Chọn ít nhất một dòng trong bảng.", parent=parent)
+        if state.get("pool") or state.get("pool_stopping"):
+            if is_auto_continue:
+                logger.warning("[Human GUI] Auto-continue trễ — pool vẫn đang chạy/dừng")
+                root.after(
+                    _pool_auto_continue_delay_ms(),
+                    lambda: _start_pool(
+                        accounts,
+                        login_only=login_only,
+                        on_pool_finished=on_pool_finished,
+                        is_auto_continue=True,
+                    ),
+                )
+            else:
+                messagebox.showwarning(
+                    "Đang chạy",
+                    "Tiến trình đang chạy hoặc đang dừng — chờ xong rồi mới chạy lượt mới.",
+                    parent=parent,
+                )
             return
+        if not accounts:
+            if not is_auto_continue:
+                messagebox.showwarning("Chưa chọn", "Chọn ít nhất một dòng trong bảng.", parent=parent)
+            return
+
+        if not is_auto_continue:
+            state["pool_auto_continue_round"] = 0
 
         if not login_only:
             from src.utils.account_proxy_mapper import prepare_mapped_account_for_browser_run
@@ -1578,6 +1662,8 @@ def build_human_interaction_tab(
                     prepare_mapped_account_for_browser_run(ma)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[Human GUI] Chuẩn bị TK {}: {}", ma.account_id, exc)
+
+        if not login_only and not is_auto_continue:
             ready, blocked, blocked_reasons = _filter_accounts_for_interaction(accounts)
             if ready:
                 _refresh_trees()
@@ -1690,6 +1776,12 @@ def build_human_interaction_tab(
         state["pool_login_only"] = login_only
         state["pool_stopping"] = False
         _sync_run_banner()
+        if is_auto_continue:
+            logger.info(
+                "[Human GUI] Auto-continue lượt {} — {} TK",
+                state.get("pool_auto_continue_round"),
+                len(accounts),
+            )
         pool.start()
         ids_preview = ", ".join(m.display_uid() for m in accounts[:6])
         if len(accounts) > 6:
@@ -1704,6 +1796,8 @@ def build_human_interaction_tab(
 
         def _after_pool_join(*, join_ok: bool) -> None:
             """Chạy trên main thread — dừng banner, cập nhật UI, thông báo."""
+            # Ngắt callback trạng thái trước reconcile — worker có thể vẫn sống vài giây.
+            state["pool"] = None
             workers_alive = bool(getattr(pool, "_join_workers_alive", False))
             user_cancelled = bool(getattr(pool, "is_stopped", lambda: False)())
             _reconcile_accounts_after_pool(
@@ -1730,6 +1824,42 @@ def build_human_interaction_tab(
                 workers_alive,
                 pool_generation,
             )
+
+            pending_continue = _accounts_for_auto_continue(accounts, login_only=login_only)
+            if not pending_continue:
+                state["pool_auto_continue_round"] = 0
+            elif not user_cancelled and _pool_auto_continue_enabled() and chain_cb is None:
+                rnd = int(state.get("pool_auto_continue_round") or 0) + 1
+                max_r = _pool_auto_continue_max_rounds()
+                if rnd <= max_r:
+                    state["pool_auto_continue_round"] = rnd
+                    for ma in pending_continue:
+                        ma.status = "waiting"
+                        ma.status_detail = (
+                            f"Tự động chạy tiếp — lượt {rnd}/{max_r} "
+                            f"({len(pending_continue)} TK còn lại)"
+                        )
+                    _refresh_trees()
+                    _save_settings()
+                    logger.info(
+                        "[Human GUI] Auto-continue lượt {}/{} | {} TK | join_ok={}",
+                        rnd,
+                        max_r,
+                        len(pending_continue),
+                        join_ok,
+                    )
+                    root.after(
+                        _pool_auto_continue_delay_ms(),
+                        lambda pending=list(pending_continue): _start_pool(
+                            pending,
+                            login_only=login_only,
+                            is_auto_continue=True,
+                        ),
+                    )
+                    return
+                state["pool_auto_continue_round"] = 0
+                logger.warning("[Human GUI] Đã hết {} lượt auto-continue", max_r)
+
             if chain_cb is not None:
                 return
             if login_only:
@@ -1750,10 +1880,15 @@ def build_human_interaction_tab(
                     )
                 messagebox.showinfo("Hoàn tất đăng nhập", "\n".join(lines), parent=parent)
             else:
-                ok_n = sum(1 for m in accounts if m.status in ("success", "login_ok"))
-                msg = f"Đã xử lý xong {len(accounts)} tài khoản (thành công ~{ok_n})."
-                if not join_ok:
-                    msg += "\n\nMột số luồng chưa thoát hết — kiểm tra Firefox còn mở."
+                ok_n = sum(1 for m in accounts if m.status == "success")
+                pending_n = len(_accounts_for_auto_continue(accounts, login_only=False))
+                msg = f"Đã xử lý xong {len(accounts)} tài khoản (thành công {ok_n})."
+                if pending_n and not _pool_auto_continue_enabled():
+                    msg += (
+                        f"\n\nCòn {pending_n} tài khoản chưa xong — bấm «Chạy» lại."
+                    )
+                elif pending_n:
+                    msg += f"\n\nCòn {pending_n} tài khoản — đã hết lượt tự động, bấm «Chạy» nếu cần."
                 messagebox.showinfo("Hoàn tất", msg, parent=parent)
 
         def _watch() -> None:
@@ -2663,6 +2798,8 @@ def build_human_interaction_tab(
                     "Tiến trình đang được dừng — vui lòng chờ vài giây.",
                     parent=parent,
                 )
+            return
+        if state.get("pool_stopping"):
             return
         if not messagebox.askyesno(
             "Dừng tiến trình",

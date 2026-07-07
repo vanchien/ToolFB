@@ -357,6 +357,7 @@ class HumanAction:
         downward_bias: float = 0.97,
         scroll_from_top: bool = False,
         dwell_scale: float = 1.0,
+        dwell_cap_ms: int | None = None,
         should_stop: Any | None = None,
     ) -> bool:
         """
@@ -373,7 +374,7 @@ class HumanAction:
         if scroll_from_top:
             self.scroll_to_top()
             time.sleep(random.uniform(1.0, 2.2))
-        dwell_cap = max(2500, _env_int("FB_FEED_DWELL_MS_CAP", 6500))
+        dwell_cap = max(2000, int(dwell_cap_ms or _env_int("FB_FEED_DWELL_MS_CAP", 6500)))
         logger.info(
             "[HumanAction] Cuộn {} vòng | top→down bias={:.0%} | dwell×{:.2f} | cap={}ms",
             n,

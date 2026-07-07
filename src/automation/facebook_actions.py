@@ -1550,27 +1550,46 @@ def go_to_posting_target_and_open_composer(
         logger.info("[FB] Đích đăng: target_type={} | goto={!r}", tt, dest)
         navigate_to_url(page, dest)
         logger.info("[FB] Sau navigate_to_url: url_now={}", page.url)
-        _ensure_switched_into_page_if_needed(
+        if not _robust_switch_to_target_page(
             page, page_display_name=(page_display_name or "").strip(), page_url=dest
-        )
-        # Có trường hợp bấm Switch Now xong bị về trang trung gian; ép quay lại URL đích.
-        if dest and not _is_on_target_surface(page, dest):
-            logger.warning("Chưa đứng đúng page đích sau lần 1, điều hướng lại target_url.")
+        ):
+            logger.warning("[FB] Switch Page lần 1 chưa OK — thử điều hướng lại target_url.")
+        if dest and (
+            not _is_on_target_surface(page, dest)
+            or not _page_role_acting_as_page(page, timeout_ms=700)
+        ):
+            logger.warning(
+                "Chưa đứng đúng page đích hoặc chưa vai trò Page sau lần 1 — điều hướng lại."
+            )
             navigate_to_url(page, dest)
-            _ensure_switched_into_page_if_needed(
+            _robust_switch_to_target_page(
                 page, page_display_name=(page_display_name or "").strip(), page_url=dest
             )
-        if dest and not _is_on_target_surface(page, dest):
+        if dest and (
+            not _is_on_target_surface(page, dest)
+            or not _page_role_acting_as_page(page, timeout_ms=700)
+        ):
             pname = (page_display_name or "").strip()
             if pname and _select_page_in_switch_profiles_popup(
                 page, page_display_name=pname, page_url=dest
             ):
                 logger.info("[FB] Fallback UI: chọn Page trong Switch profiles {!r}.", pname)
+                _robust_switch_to_target_page(
+                    page, page_display_name=pname, page_url=dest
+                )
             elif pname and _try_navigate_via_page_name_link(page, pname, dest):
                 logger.info("[FB] Fallback UI: vào Page qua tên hiển thị {!r}.", pname)
-        if dest and not _is_on_target_surface(page, dest):
+                _robust_switch_to_target_page(
+                    page, page_display_name=pname, page_url=dest
+                )
+        if dest and (
+            not _is_on_target_surface(page, dest)
+            or not _page_role_acting_as_page(page, timeout_ms=900)
+        ):
             _failure_screenshot(page, f"go_to_posting_target: chưa vào đúng page đích {dest}")
-            raise PlaywrightTimeoutError(f"Chưa vào đúng page đích: {dest}")
+            raise PlaywrightTimeoutError(
+                f"Chưa vào đúng page đích hoặc chưa switch vai trò Page: {dest}"
+            )
     raw_tgt = str((entity or {}).get("target_url", "")).strip()
     norm_tgt = _fb_normalize_client_url(raw_tgt) if raw_tgt else ""
     if norm_tgt and _is_meta_business_composer_url(norm_tgt):
@@ -1592,7 +1611,11 @@ def go_to_posting_target_and_open_composer(
                 fbk_norm,
             )
             navigate_to_url(page, fbk_norm)
-            _ensure_switched_into_page_if_needed(page, page_url=fbk_norm)
+            _robust_switch_to_target_page(
+                page,
+                page_display_name=(page_display_name or "").strip(),
+                page_url=fbk_norm,
+            )
             open_post_box(page)
             return
         logger.warning(
@@ -2186,6 +2209,11 @@ def _is_on_target_surface(page: Page, target_url: str) -> bool:
 
 
 _SWITCH_EXACT_LABEL_RE = re.compile(r"^\s*Switch\s*$", re.I)
+_SWITCH_NOW_RE = re.compile(r"Switch Now|Chuyển ngay", re.I)
+_SWITCH_MANAGING_BANNER_RE = re.compile(
+    r"Switch\s+into.+to\s+start\s+managing|Switch\s+into.+để\s+bắt đầu\s+quản\s+lý",
+    re.I | re.S,
+)
 
 # Sidebar Manage Page — HTML Meta: div[role=none] > div.html-div > span «Switch» (+ overlay ignore chặn click)
 _PAGE_SWITCH_STRICT_XPATHS: tuple[str, ...] = (
@@ -2219,10 +2247,14 @@ _PAGE_SIDEBAR_SCROLL_JS = """
   for (const el of document.querySelectorAll('div, section, aside')) {
     const raw = (el.innerText || '').replace(/\\s+/g, ' ').trim();
     const low = raw.toLowerCase();
-    if (!low.includes('switch into') || !low.includes('take more actions')) continue;
-    if (raw.length > 200) continue;
+    const isSwitchCard = low.includes('switch into') && (
+      low.includes('take more actions') || low.includes('start managing') ||
+      low.includes('bắt đầu quản lý') || low.includes('thực hiện thêm')
+    );
+    if (!isSwitchCard) continue;
+    if (raw.length > 260) continue;
     const r = el.getBoundingClientRect();
-    if (r.left > window.innerWidth * 0.42) continue;
+    if (r.left > window.innerWidth * 0.55) continue;
     if (!card || r.bottom > card.getBoundingClientRect().bottom) card = el;
   }
   if (!card) return false;
@@ -2243,14 +2275,22 @@ _PAGE_SIDEBAR_SCROLL_JS = """
 _PAGE_SWITCH_META_EXACT_CLICK_JS = """
 () => {
   const isIgnore = (el) => el && el.getAttribute('data-visualcompletion') === 'ignore';
+  for (const ov of document.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
+    ov.style.display = 'none';
+  }
   let card = null;
   for (const el of document.querySelectorAll('div')) {
     const raw = (el.innerText || '').replace(/\\s+/g, ' ').trim();
     const low = raw.toLowerCase();
-    if (!low.includes('switch into') || !low.includes('take more actions')) continue;
-    if (raw.length > 240) continue;
+    const isSwitchCard = low.includes('switch into') && (
+      low.includes('take more actions') || low.includes('start managing') ||
+      low.includes('bắt đầu quản lý') || low.includes('thực hiện thêm')
+    );
+    if (!isSwitchCard) continue;
+    if (raw.length > 280) continue;
     const r = el.getBoundingClientRect();
-    if (r.left > window.innerWidth * 0.42) continue;
+    if (r.left > window.innerWidth * 0.55) continue;
     if (!card || r.bottom > card.getBoundingClientRect().bottom) card = el;
   }
   if (!card) return false;
@@ -2259,10 +2299,6 @@ _PAGE_SWITCH_META_EXACT_CLICK_JS = """
     if (/^switch$/i.test((sp.textContent || '').trim())) { switchSpan = sp; break; }
   }
   if (!switchSpan) return false;
-  for (const ov of card.querySelectorAll('[data-visualcompletion="ignore"]')) {
-    ov.style.pointerEvents = 'none';
-    ov.style.display = 'none';
-  }
   const htmlDiv = switchSpan.closest('div.html-div') || switchSpan.closest("[class*='html-div']");
   const innerRole = switchSpan.closest("div[role='none']");
   const outerRole = htmlDiv && htmlDiv.parentElement && htmlDiv.parentElement.getAttribute('role') === 'none'
@@ -2314,17 +2350,8 @@ def _click_meta_switch_cta_exact(page: Page, *, timeout_ms: int = 3000) -> bool:
 
     Facebook thêm ``div[data-visualcompletion='ignore']`` phủ ``inset:0`` — tắt overlay rồi dispatch click.
     """
+    _suppress_facebook_click_overlays(page)
     _scroll_manage_page_sidebar_switch_cta(page)
-    try:
-        page.evaluate(
-            """() => {
-              for (const ov of document.querySelectorAll('[data-visualcompletion="ignore"]')) {
-                ov.style.pointerEvents = 'none';
-              }
-            }"""
-        )
-    except Exception:
-        pass
     locators = (
         page.locator(
             "xpath=(//div[@role='none'][.//div[contains(@class,'html-div')]"
@@ -2915,9 +2942,13 @@ def _confirm_switch_profiles_popup(page: Page, *, page_display_name: str = "", p
 def _page_switch_ui_visible(page: Page, *, timeout_ms: int = 900) -> bool:
     if _page_switch_sidebar_hint_visible(page, timeout_ms=timeout_ms):
         return True
-    sw_now = re.compile(r"Switch Now|Chuyển ngay", re.I)
     try:
-        if page.get_by_role("button", name=sw_now).first.is_visible(timeout=timeout_ms):
+        if page.get_by_role("button", name=_SWITCH_NOW_RE).first.is_visible(timeout=timeout_ms):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.get_by_text(_SWITCH_MANAGING_BANNER_RE).first.is_visible(timeout=timeout_ms):
             return True
     except Exception:
         pass
@@ -3016,6 +3047,464 @@ def _require_page_role_switched(
     )
 
 
+def _suppress_facebook_click_overlays(page: Page) -> None:
+    """Tắt overlay ``data-visualcompletion=ignore`` che nút Switch / Switch Now."""
+    try:
+        page.evaluate(
+            """() => {
+              for (const ov of document.querySelectorAll('[data-visualcompletion="ignore"]')) {
+                ov.style.pointerEvents = 'none';
+                ov.style.opacity = '0.01';
+              }
+            }"""
+        )
+    except Exception:
+        pass
+
+
+_CLICK_SWITCH_NOW_ANY_JS = """
+() => {
+  for (const ov of document.querySelectorAll('[data-visualcompletion="ignore"]')) {
+    ov.style.pointerEvents = 'none';
+  }
+  const nowRe = /^switch\\s+now$/i;
+  const chuyenRe = /^chuyển\\s+ngay$/i;
+  const hits = [];
+  for (const el of document.querySelectorAll('[role="button"], a, span, div[role="none"]')) {
+    const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!nowRe.test(t) && !chuyenRe.test(t)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 36 || r.height < 12 || r.bottom < 0 || r.right < 0) continue;
+    if (r.top > window.innerHeight || r.left > window.innerWidth) continue;
+    let score = r.width * r.height;
+    let p = el;
+    for (let i = 0; i < 10 && p; i++) {
+      const raw = (p.innerText || '').toLowerCase();
+      if (raw.includes('switch into')) score += 80_000;
+      if (raw.includes('start managing') || raw.includes('take more actions')) score += 50_000;
+      if (raw.includes('bắt đầu quản lý') || raw.includes('thực hiện thêm')) score += 50_000;
+      p = p.parentElement;
+    }
+    hits.push({ el, score, bottom: r.bottom });
+  }
+  if (!hits.length) return false;
+  hits.sort((a, b) => b.score - a.score || b.bottom - a.bottom);
+  const fire = (node) => {
+    if (!node) return false;
+    try {
+      const r = node.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        node.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window, clientX: x, clientY: y
+        }));
+      }
+      if (typeof node.click === 'function') node.click();
+      return true;
+    } catch (_) { return false; }
+  };
+  for (const h of hits) {
+    let node = h.el;
+    for (let i = 0; i < 8 && node; i++) {
+      const role = (node.getAttribute && node.getAttribute('role')) || '';
+      if (role === 'button' || role === 'none' || node.tagName === 'A') {
+        if (fire(node)) return true;
+      }
+      node = node.parentElement;
+    }
+    if (fire(h.el)) return true;
+  }
+  return false;
+}
+"""
+
+
+def _mouse_click_locator_center(page: Page, loc: Locator, *, label: str = "switch") -> bool:
+    """Click tâm locator bằng mouse — tránh overlay chặn Playwright click."""
+    try:
+        if not loc.is_visible(timeout=1_200):
+            return False
+        loc.scroll_into_view_if_needed(timeout=2_500)
+        box = loc.bounding_box()
+        if box:
+            human_pause(kind="click", label=label)
+            page.mouse.click(
+                float(box["x"]) + float(box["width"]) / 2.0,
+                float(box["y"]) + float(box["height"]) / 2.0,
+            )
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _click_switch_now_banner(page: Page, *, timeout_ms: int = 2800) -> bool:
+    """
+    Bấm «Switch Now» / «Chuyển ngay» — banner, sidebar, hoặc bất kỳ nút hiển thị trên Page.
+    """
+    _suppress_facebook_click_overlays(page)
+    try:
+        buttons = page.get_by_role("button", name=_SWITCH_NOW_RE)
+        n = min(buttons.count(), 8)
+    except Exception:
+        n = 0
+    for i in range(n):
+        btn = buttons.nth(i)
+        if _mouse_click_locator_center(page, btn, label="Switch Now"):
+            logger.info("[FB] Đã bấm Switch Now (mouse, index={}).", i)
+            page.wait_for_timeout(random.randint(2200, 3800))
+            return True
+    if _click_visible_enabled_button(
+        page.get_by_role("button", name=_SWITCH_NOW_RE),
+        timeout_ms=timeout_ms,
+    ):
+        logger.info("[FB] Đã bấm Switch Now (role=button).")
+        page.wait_for_timeout(random.randint(2200, 3800))
+        return True
+    for factory in (
+        lambda: page.locator("[role='button']").filter(has_text=_SWITCH_NOW_RE),
+        lambda: page.locator("a").filter(has_text=_SWITCH_NOW_RE),
+        lambda: page.locator("div[role='none']").filter(has_text=_SWITCH_NOW_RE),
+        lambda: page.get_by_text(_SWITCH_NOW_RE),
+    ):
+        try:
+            loc = factory()
+            if _mouse_click_locator_center(page, loc, label="Switch Now fallback"):
+                logger.info("[FB] Đã bấm Switch Now (mouse fallback).")
+                page.wait_for_timeout(random.randint(2200, 3800))
+                return True
+            if _click_visible_enabled_button(loc, timeout_ms=min(1600, timeout_ms)):
+                logger.info("[FB] Đã bấm Switch Now (locator fallback).")
+                page.wait_for_timeout(random.randint(2200, 3800))
+                return True
+        except Exception:
+            continue
+    try:
+        if page.evaluate(_CLICK_SWITCH_NOW_ANY_JS):
+            logger.info("[FB] Đã bấm Switch Now (JS any visible).")
+            page.wait_for_timeout(random.randint(2200, 3800))
+            return True
+    except Exception:
+        pass
+    try:
+        clicked = page.evaluate(
+            """() => {
+              const nowRe = /^switch now$/i;
+              for (const btn of document.querySelectorAll('[role="button"], a, span')) {
+                const t = (btn.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!nowRe.test(t)) continue;
+                let p = btn;
+                for (let i = 0; i < 10 && p; i++) {
+                  const raw = (p.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  if (raw.includes('switch into') && (
+                    raw.includes('start managing') || raw.includes('take more actions') ||
+                    raw.includes('bắt đầu quản lý') || raw.includes('thực hiện thêm')
+                  )) {
+                    try {
+                      const r = btn.getBoundingClientRect();
+                      const x = r.left + r.width / 2;
+                      const y = r.top + r.height / 2;
+                      for (const type of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+                        btn.dispatchEvent(new MouseEvent(type, {
+                          bubbles: true, cancelable: true, view: window, clientX: x, clientY: y
+                        }));
+                      }
+                      if (typeof btn.click === 'function') btn.click();
+                      return true;
+                    } catch (_) {}
+                  }
+                  p = p.parentElement;
+                }
+              }
+              return false;
+            }"""
+        )
+        if clicked:
+            logger.info("[FB] Đã bấm Switch Now (JS banner start managing).")
+            page.wait_for_timeout(random.randint(2200, 3800))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _open_facebook_profile_switcher_menu(page: Page) -> bool:
+    """Mở menu avatar / chuyển profile góc phải Facebook."""
+    for sel in (
+        '[aria-label="Your profile"]',
+        '[aria-label*="Your profile" i]',
+        '[aria-label*="Account" i]',
+        '[aria-label*="Tài khoản" i]',
+        '[aria-label*="Profile" i]',
+        'div[role="button"][aria-label*="profile" i]',
+        'div[role="button"][aria-label*="account" i]',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=1_200):
+                human_pause(kind="click", label="mở menu profile")
+                loc.click(timeout=4_000)
+                page.wait_for_timeout(900)
+                return True
+        except Exception:
+            continue
+    try:
+        banner = page.locator('[role="banner"]').first
+        btn = banner.locator('[role="button"][aria-label]').last
+        if btn.is_visible(timeout=1_000):
+            btn.click(timeout=3_500)
+            page.wait_for_timeout(900)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _click_personal_profile_in_switcher(page: Page) -> bool:
+    """Chọn profile cá nhân trong menu / popup Switch profiles."""
+    see_all = re.compile(
+        r"See all profiles|Xem tất cả hồ sơ|Switch profiles|Chuyển hồ sơ|Chuyển sang",
+        re.I,
+    )
+    if _click_visible_enabled_button(page.get_by_role("menuitem", name=see_all), timeout_ms=1_400):
+        page.wait_for_timeout(1_100)
+    elif _click_visible_enabled_button(page.get_by_text(see_all), timeout_ms=1_000):
+        page.wait_for_timeout(1_100)
+
+    for pat in (
+        r"^Your profile$",
+        r"Hồ sơ của bạn",
+        r"Tài khoản của bạn",
+        r"^Profile$",
+    ):
+        try:
+            if _click_visible_enabled_button(
+                page.get_by_role("menuitem", name=re.compile(pat, re.I)),
+                timeout_ms=1_200,
+            ):
+                page.wait_for_timeout(2_000)
+                return True
+        except Exception:
+            continue
+
+    try:
+        me = page.locator("a[href*='/me/'], a[href*='profile.php?id=']").first
+        if _click_visible_enabled_button(me, timeout_ms=1_400):
+            page.wait_for_timeout(2_000)
+            return True
+    except Exception:
+        pass
+
+    if _switch_profiles_dialog_visible(page, timeout_ms=800):
+        try:
+            dlg = _switch_profiles_dialog_scope(page)
+            rows = dlg.locator("[role='button'], [role='menuitem'], a")
+            n = min(rows.count(), 16)
+            for i in range(n):
+                row = rows.nth(i)
+                try:
+                    if not row.is_visible(timeout=400):
+                        continue
+                    txt = str(row.inner_text(timeout=500) or "").lower()
+                    if "page" in txt and "switch" in txt:
+                        continue
+                    if "log out" in txt or "đăng xuất" in txt:
+                        continue
+                    if _click_visible_enabled_button(row, timeout_ms=900):
+                        page.wait_for_timeout(2_000)
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return False
+
+
+def _switch_to_personal_profile(page: Page) -> bool:
+    """
+    Về tài khoản Facebook cá nhân — dùng khi đang ở vai trò Page khác hoặc switch page→page lỗi.
+    """
+    if not _page_role_acting_as_page(page, timeout_ms=650):
+        try:
+            cur = (page.url or "").lower()
+            if "facebook.com" in cur and "/pages/" not in cur:
+                return True
+        except Exception:
+            pass
+
+    logger.info("[FB] Reset về profile cá nhân trước khi switch Page đích.")
+    for attempt in range(1, 4):
+        if _open_facebook_profile_switcher_menu(page):
+            if _click_personal_profile_in_switcher(page):
+                page.wait_for_timeout(1_800)
+                if not _page_role_acting_as_page(page, timeout_ms=800):
+                    logger.info("[FB] Đã về profile cá nhân (menu, attempt={}).", attempt)
+                    return True
+        try:
+            home = _fb_normalize_client_url("https://www.facebook.com/")
+            assert_safe_facebook_navigation_url(home, label="switch_personal_home")
+            page.goto(home, wait_until="domcontentloaded", timeout=50_000)
+            _force_www_facebook_if_mobile_redirect(page)
+            page.wait_for_timeout(2_200)
+            if not _page_role_acting_as_page(page, timeout_ms=900):
+                logger.info("[FB] Đã về profile cá nhân (goto home, attempt={}).", attempt)
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FB] goto home reset personal: {}", exc)
+        page.wait_for_timeout(900)
+    return not _page_role_acting_as_page(page, timeout_ms=800)
+
+
+def _attempt_page_role_switch_clicks(page: Page, *, timeout_ms: int = 2_200) -> bool:
+    """Thử bấm Switch Page — Switch Now trước, sau đó sidebar Switch."""
+    _suppress_facebook_click_overlays(page)
+    if _click_switch_now_banner(page, timeout_ms=timeout_ms):
+        return True
+    if _page_switch_sidebar_hint_visible(page, timeout_ms=500):
+        _scroll_manage_page_sidebar_switch_cta(page)
+        if _click_manage_page_sidebar_switch(page, timeout_ms=timeout_ms):
+            return True
+    if _click_switch_now_banner(page, timeout_ms=min(1800, timeout_ms)):
+        return True
+    if _click_manage_page_sidebar_switch(page, timeout_ms=timeout_ms):
+        return True
+    try:
+        sw_block = page.locator(
+            "xpath=(//*[contains(translate(normalize-space(.), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
+            "//*[@role='none' or self::span][.//span[normalize-space()='Switch'] "
+            "or normalize-space()='Switch'])[last()]"
+        )
+        if _mouse_click_locator_center(page, sw_block, label="Switch block"):
+            page.wait_for_timeout(random.randint(1800, 3200))
+            return True
+        if _click_visible_enabled_button(sw_block, timeout_ms=min(1600, timeout_ms)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _try_page_role_switch_direct(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    page_url: str = "",
+) -> bool:
+    """
+    Switch Page **trực tiếp** trên trang hiện tại (page→page) — không reset account chính.
+
+    Thử: Switch Now / sidebar → popup chọn Page theo tên → ``_ensure_page_role_switched``.
+    """
+    pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
+
+    if _page_role_acting_as_page(page, timeout_ms=900):
+        if not dest or _urls_refer_same_facebook_page(dest, str(page.url or ""), page=page):
+            return True
+
+    if _page_switch_ui_visible(page, timeout_ms=700):
+        if _attempt_page_role_switch_clicks(page, timeout_ms=2_400):
+            _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=22_000
+            )
+            if _wait_page_role_switch_complete(page, timeout_ms=18_000):
+                return True
+
+    if pname and _open_facebook_profile_switcher_menu(page):
+        if _select_page_in_switch_profiles_popup(
+            page, page_display_name=pname, page_url=dest
+        ):
+            _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=20_000
+            )
+            if _page_role_acting_as_page(page, timeout_ms=1_000):
+                return True
+
+    if _ensure_page_role_switched(page, page_display_name=pname, page_url=dest):
+        return _page_role_acting_as_page(page, timeout_ms=1_000)
+    return False
+
+
+def _robust_switch_to_target_page(
+    page: Page,
+    *,
+    page_display_name: str = "",
+    page_url: str = "",
+) -> bool:
+    """
+    Luồng switch Page cho đăng lịch.
+
+    ① Page→page trực tiếp (ưu tiên — giữ flow cũ khi chuyển Page bình thường).
+    ② Chỉ khi ① thất bại: về account chính → goto Page đích → switch lại.
+    """
+    pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
+    guard_was_blocking = _view_only_guard_active_on_page(page)
+    if guard_was_blocking:
+        _disable_view_only_guard(page)
+    try:
+        if _page_role_acting_as_page(page, timeout_ms=900):
+            if not dest or _urls_refer_same_facebook_page(dest, str(page.url or ""), page=page):
+                logger.info("[FB] Đã ở vai trò Page đúng đích.")
+                return True
+
+        # ① Page→page trực tiếp (không reset account chính)
+        for direct_try in range(1, 3):
+            if _try_page_role_switch_direct(
+                page, page_display_name=pname, page_url=dest
+            ):
+                logger.info("[FB] Switch Page OK — page→page trực tiếp (lần {}).", direct_try)
+                return True
+            if direct_try < 2:
+                page.wait_for_timeout(900)
+
+        # ② Fallback: account chính → Page đích
+        logger.info(
+            "[FB] Page→page trực tiếp thất bại — chuyển về account chính rồi switch Page đích."
+        )
+        _switch_to_personal_profile(page)
+        if dest:
+            navigate_to_url(page, dest)
+            page.wait_for_timeout(2_200)
+
+        for via_personal in range(1, 3):
+            if _try_page_role_switch_direct(
+                page, page_display_name=pname, page_url=dest
+            ):
+                logger.info(
+                    "[FB] Switch Page OK — sau account chính (lần {}).",
+                    via_personal,
+                )
+                return True
+            if via_personal < 2 and dest:
+                navigate_to_url(page, dest)
+                page.wait_for_timeout(1_800)
+
+        # ③ Fallback cuối: popup + Switch Now lần nữa
+        if dest:
+            navigate_to_url(page, dest)
+            page.wait_for_timeout(2_000)
+        if pname and _select_page_in_switch_profiles_popup(
+            page, page_display_name=pname, page_url=dest
+        ):
+            _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=20_000
+            )
+        if _click_switch_now_banner(page):
+            _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=20_000
+            )
+        ok = _ensure_page_role_switched(page, page_display_name=pname, page_url=dest)
+        if not ok:
+            _failure_screenshot(page, "robust_page_switch_failed")
+        return ok and _page_role_acting_as_page(page, timeout_ms=1_000)
+    finally:
+        if guard_was_blocking:
+            _enable_view_only_guard(page)
+
+
 def _ensure_page_role_switched(
     page: Page,
     *,
@@ -3038,31 +3527,8 @@ def _ensure_page_role_switched(
             logger.info("[FB] Đã ở vai trò Page (không cần bấm Switch).")
             return True
 
-        sw_now = re.compile(r"Switch Now|Chuyển ngay", re.I)
-        sidebar_hint = _page_switch_sidebar_hint_visible(page, timeout_ms=800)
-
         for attempt in range(1, 5):
-            clicked = False
-            _scroll_manage_page_sidebar_switch_cta(page)
-            if sidebar_hint and _click_manage_page_sidebar_switch(page):
-                clicked = True
-            elif _click_visible_enabled_button(page.get_by_role("button", name=sw_now), timeout_ms=1_800):
-                clicked = True
-                page.wait_for_timeout(random.randint(2600, 4800))
-            elif _click_manage_page_sidebar_switch(page):
-                clicked = True
-            else:
-                try:
-                    sw_block = page.locator(
-                        "xpath=(//*[contains(translate(normalize-space(.), "
-                        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'switch into')]"
-                        "//*[@role='none' or self::span][.//span[normalize-space()='Switch'] "
-                        "or normalize-space()='Switch'])[last()]"
-                    )
-                    if _click_visible_enabled_button(sw_block, timeout_ms=1_500):
-                        clicked = True
-                except Exception:
-                    pass
+            clicked = _attempt_page_role_switch_clicks(page, timeout_ms=2_400)
 
             if clicked:
                 popup_ok = _wait_after_page_switch_click(
@@ -3081,7 +3547,6 @@ def _ensure_page_role_switched(
                     attempt,
                     page.url,
                 )
-            sidebar_hint = _page_switch_sidebar_hint_visible(page, timeout_ms=600)
             page.wait_for_timeout(900)
 
         ok = _page_role_acting_as_page(page, timeout_ms=1_000)
@@ -3103,11 +3568,16 @@ def _ensure_switched_into_page_if_needed(
 ) -> None:
     """
     Nếu Facebook hiển thị banner hoặc sidebar yêu cầu switch sang Page thì bấm Switch.
+
+    Luồng đầy đủ: Switch Now → sidebar → reset cá nhân → goto Page đích.
     """
     try:
-        need_switch = _page_switch_ui_visible(page, timeout_ms=1_200)
-        if need_switch:
-            _ensure_page_role_switched(
+        need_switch = (
+            _page_switch_ui_visible(page, timeout_ms=1_200)
+            or not _page_role_acting_as_page(page, timeout_ms=500)
+        )
+        if need_switch or str(page_url or "").strip():
+            _robust_switch_to_target_page(
                 page,
                 page_display_name=page_display_name,
                 page_url=page_url,
@@ -3202,10 +3672,10 @@ def _ensure_reel_dashboard_page_context(
         _disable_view_only_guard(page)
     navigate_to_url(page, dest)
     page.wait_for_timeout(2800)
-    if not _ensure_page_role_switched(page, page_display_name=pname, page_url=dest):
+    if not _robust_switch_to_target_page(page, page_display_name=pname, page_url=dest):
         navigate_to_url(page, dest)
         page.wait_for_timeout(2200)
-        if not _ensure_page_role_switched(page, page_display_name=pname, page_url=dest):
+        if not _robust_switch_to_target_page(page, page_display_name=pname, page_url=dest):
             _failure_screenshot(page, "reel_page_switch_failed")
             raise RuntimeError(
                 f"Không switch được sang vai trò Page sau 2 lần thử. "

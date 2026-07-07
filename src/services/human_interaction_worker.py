@@ -159,24 +159,26 @@ def run_human_interaction_worker(
 
     login_only: bool = False,
     should_stop: Callable[[], bool] | None = None,
+    is_user_cancelled: Callable[[], bool] | None = None,
     on_work_finished: Callable[[str], None] | None = None,
     skip_launch_stagger: bool = False,
 
 ) -> str:
-
     cfg = profile or resolve_profile("normal")
 
     """
-
     Chạy pipeline cho một MappedAccount.
 
     ``login_only=True``: chỉ kiểm tra proxy, mở profile và đăng nhập Facebook (lưu cookie).
 
     Returns:
-
         Trạng thái cuối: ``success`` | ``login_ok`` | ``proxy_error`` | ``login_failed`` | ``error``.
-
     """
+
+    worker_max = float(
+        os.environ.get("FB_HUMAN_WORKER_MAX_SEC", str(getattr(cfg, "max_worker_sec", 300.0) or 300.0))
+    )
+    worker_deadline = time.monotonic() + max(120.0, worker_max)
 
 
 
@@ -190,8 +192,38 @@ def run_human_interaction_worker(
 
             on_status(st, detail)
 
+    def _user_stopped() -> bool:
+        return bool(is_user_cancelled and is_user_cancelled())
+
+    def _pool_abort() -> bool:
+        return bool(should_stop and should_stop()) and not _user_stopped()
+
+    def _deadline_reached() -> bool:
+        return time.monotonic() >= worker_deadline
+
     def _stopped() -> bool:
-        return bool(should_stop and should_stop())
+        return _user_stopped() or _pool_abort() or _deadline_reached()
+
+    def _abort_detail() -> tuple[str, str]:
+        """Trả (status, detail) khi cần dừng; rỗng nếu không dừng."""
+        if _user_stopped():
+            return "cancelled", "Đã hủy — người dùng bấm Dừng"
+        if _pool_abort():
+            return "pending", "Dừng giữa module — tự động chạy tiếp lượt sau"
+        if _deadline_reached():
+            return "pending", "Hết thời gian lượt — tự động chạy tiếp lượt sau"
+        return "", ""
+
+    def _finish_if_aborted(*, notify_now: bool = True, allow_deadline_continue: bool = False) -> str | None:
+        st, detail = _abort_detail()
+        if not st:
+            return None
+        if allow_deadline_continue and st == "pending" and _deadline_reached() and not _pool_abort():
+            return None
+        _status(st, detail)
+        result = "cancelled" if st == "cancelled" else "interrupted"
+        _finish(result, notify_now=notify_now)
+        return result
 
     _pending_pool_result: list[str | None] = [None]
 
@@ -211,9 +243,8 @@ def run_human_interaction_worker(
             _pending_pool_result[0] = result
         return result
 
-    if _stopped():
-        _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-        return _finish("cancelled", notify_now=True)
+    if _finish_if_aborted(notify_now=True):
+        return "cancelled" if _user_stopped() else "interrupted"
 
     apply_mapped_secrets_to_vault(mapped)
 
@@ -221,9 +252,8 @@ def run_human_interaction_worker(
 
     _status("running", "Kiểm tra proxy")
 
-    if _stopped():
-        _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-        return _finish("cancelled", notify_now=True)
+    if _finish_if_aborted(notify_now=True):
+        return "cancelled" if _user_stopped() else "interrupted"
 
     ok_px, px_msg = ensure_mapped_proxy_live(mapped)
 
@@ -242,20 +272,18 @@ def run_human_interaction_worker(
     if grid_slot is not None:
         grid_vp = (grid_slot.width, grid_slot.height)
         win_pos = (grid_slot.x, grid_slot.y)
-        stagger_ms = max(0, int(float(os.environ.get("FB_GRID_LAUNCH_STAGGER_MS", "1200"))))
+        stagger_ms = max(0, int(float(os.environ.get("FB_GRID_LAUNCH_STAGGER_MS", "800"))))
         if not skip_launch_stagger and grid_slot.index > 0 and stagger_ms > 0:
             delay_s = (grid_slot.index * stagger_ms) / 1000.0
             _status("waiting", f"Chờ mở cửa sổ ô {grid_slot.index + 1} ({delay_s:.1f}s)")
             end = time.monotonic() + delay_s
             while time.monotonic() < end:
-                if _stopped():
-                    _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-                    return _finish("cancelled", notify_now=True)
+                if _finish_if_aborted(notify_now=True):
+                    return "cancelled" if _user_stopped() else "interrupted"
                 time.sleep(min(0.4, max(0.05, end - time.monotonic())))
 
-    if _stopped():
-        _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-        return _finish("cancelled", notify_now=True)
+    if _finish_if_aborted(notify_now=True):
+        return "cancelled" if _user_stopped() else "interrupted"
 
     _status("running", "Khởi tạo trình duyệt")
 
@@ -384,7 +412,7 @@ def run_human_interaction_worker(
 
         if mapped.use_proxy:
             _status("running", "Kiểm tra proxy qua trình duyệt (Facebook)")
-            ok_bf, px_bf = verify_browser_facebook_via_proxy(page)
+            ok_bf, px_bf = verify_browser_facebook_via_proxy(page, timeout_ms=30_000)
             if not ok_bf:
                 logger.warning(
                     "[Human] Proxy qua browser FAIL account={}: {}",
@@ -463,7 +491,7 @@ def run_human_interaction_worker(
                         page,
                         acc,
                         cookie_path=cookie_path,
-                        should_stop=should_stop,
+                        should_stop=_stopped,
                         force_fresh_login=False,
                         allow_form_login=True,
                     ):
@@ -474,7 +502,7 @@ def run_human_interaction_worker(
                         or facebook_auth_flow_was_active(acc)
                     ):
                         if continue_facebook_auth_flow(
-                            page, acc, cookie_path=cookie_path, should_stop=should_stop
+                            page, acc, cookie_path=cookie_path, should_stop=_stopped
                         ):
                             return True
                     _try_email_otp_checkpoint(page, mapped)
@@ -483,7 +511,7 @@ def run_human_interaction_worker(
                             page,
                             acc,
                             cookie_path=cookie_path,
-                            should_stop=should_stop,
+                            should_stop=_stopped,
                             force_fresh_login=False,
                             allow_form_login=True,
                         )
@@ -500,18 +528,33 @@ def run_human_interaction_worker(
                 prep_mode,
             )
         else:
-            ok_sess, sess_detail = establish_facebook_session(
-                page,
-                acc,
-                cookie_path=cookie_path,
-                allow_form_login=allow_form_login,
-                form_recover_fn=_form_login_recover if allow_form_login else None,
-            )
+            from src.services.facebook_session_recovery import reload_facebook_page_f5
+
+            establish_retries = max(1, int(os.environ.get("FB_SESSION_ESTABLISH_F5_RETRIES", "2")))
+            ok_sess = False
+            sess_detail = ""
+            for est_i in range(establish_retries):
+                if est_i > 0:
+                    _status(
+                        "running",
+                        f"F5 — thử lại xác nhận phiên ({est_i + 1}/{establish_retries})",
+                    )
+                    reload_facebook_page_f5(page, label=f"human_establish_{est_i}")
+                    if aborted := _finish_if_aborted(notify_now=False):
+                        return aborted
+                ok_sess, sess_detail = establish_facebook_session(
+                    page,
+                    acc,
+                    cookie_path=cookie_path,
+                    allow_form_login=allow_form_login,
+                    form_recover_fn=_form_login_recover if allow_form_login else None,
+                )
+                if ok_sess:
+                    break
 
         if not ok_sess:
-            if _stopped():
-                _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-                return _finish("cancelled")
+            if aborted := _finish_if_aborted(notify_now=False):
+                return aborted
             hint = (
                 " — thử «Lưu cookie» hoặc bổ sung pass để đăng nhập form"
                 if has_cookie_file and not has_password
@@ -575,16 +618,23 @@ def run_human_interaction_worker(
             page,
             profile=cfg,
             on_status=on_status,
-            should_stop=should_stop,
+            should_stop=_stopped,
         )
 
-        if _stopped():
-            _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-            return _finish("cancelled")
+        if _deadline_reached() and not _user_stopped():
+            logger.info(
+                "[Human] Đạt giới hạn thời gian lượt (~{:.0f}s) account={} — lưu phiên và kết thúc",
+                worker_max,
+                mapped.account_id,
+            )
+
+        aborted = _finish_if_aborted(notify_now=False, allow_deadline_continue=True)
+        if aborted:
+            return aborted
 
         _status("running", "Lưu cookie phiên sau tương tác")
 
-        time.sleep(max(0.8, min(4.0, float(cfg.sync_wait_sec))))
+        time.sleep(max(0.5, min(1.5, float(cfg.sync_wait_sec))))
 
         saved_done, ck_done = auto_save_session_for_account(
             page,
@@ -614,9 +664,9 @@ def run_human_interaction_worker(
 
     except Exception as exc:  # noqa: BLE001
         if _stopped():
-            logger.info("[Human] Worker hủy theo «Dừng» account={}", mapped.account_id)
-            _status("cancelled", "Đã hủy — người dùng bấm Dừng")
-            return _finish("cancelled")
+            if aborted := _finish_if_aborted(notify_now=False):
+                logger.info("[Human] Worker dừng account={} ({})", mapped.account_id, aborted)
+                return aborted
         if is_playwright_target_closed_error(exc):
             logger.warning(
                 "[Human] Trình duyệt đóng bất ngờ account={}: {}",

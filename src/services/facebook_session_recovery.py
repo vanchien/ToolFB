@@ -507,6 +507,50 @@ def _read_facebook_c_user(page: Page) -> str:
     return ""
 
 
+def reload_facebook_page_f5(
+    page: Page,
+    *,
+    label: str = "recovery",
+    timeout_ms: int = 45_000,
+    prefer_keyboard: bool = True,
+) -> bool:
+    """
+    F5 / reload trang Facebook — dùng khi lỗi UI hoặc chưa xác nhận được phiên.
+
+    Returns:
+        True nếu reload/goto thành công.
+    """
+    from src.automation.facebook_actions import (
+        _fb_normalize_client_url,
+        _force_www_facebook_if_mobile_redirect,
+        assert_safe_facebook_navigation_url,
+        navigate_away_from_login_if_session_active,
+    )
+
+    try:
+        u = (page.url or "").lower()
+        if "facebook.com" not in u:
+            home = _fb_normalize_client_url("https://www.facebook.com/")
+            assert_safe_facebook_navigation_url(home, label=label)
+            page.goto(home, wait_until="domcontentloaded", timeout=timeout_ms)
+        elif prefer_keyboard:
+            try:
+                page.keyboard.press("F5")
+                page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            except Exception:
+                page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+        else:
+            page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+        _force_www_facebook_if_mobile_redirect(page)
+        navigate_away_from_login_if_session_active(page)
+        page.wait_for_timeout(700)
+        logger.info("[FB recovery] F5/reload OK ({})", label)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[FB recovery] F5/reload thất bại ({}): {}", label, exc)
+        return False
+
+
 def _normalize_facebook_uid(value: str | None) -> str:
     """Chuẩn hóa UID Facebook (``UID_100…`` → ``100…``) để so khớp cookie ``c_user``."""
     s = str(value or "").strip()
@@ -581,6 +625,9 @@ def confirm_facebook_session_logged_in(
     stable_hits = 0
     last_detail = "Chưa thấy bảng tin / menu tài khoản"
     navigated_home = False
+    last_reload_at = 0.0
+    reload_count = 0
+    max_reload = max(0, int(os.environ.get("FB_CONFIRM_F5_RELOADS", "4")))
 
     while time.time() < deadline:
         u = _url_lower(page)
@@ -616,6 +663,13 @@ def confirm_facebook_session_logged_in(
         if not _session_logged_in(page):
             last_detail = "Chưa có phiên hợp lệ (cookie/UI đăng nhập)"
             stable_hits = 0
+            now = time.time()
+            if reload_count < max_reload and (now - last_reload_at) >= 3.5:
+                if reload_facebook_page_f5(page, label=f"confirm_retry_{reload_count + 1}"):
+                    reload_count += 1
+                    last_reload_at = now
+                    navigated_home = True
+                    continue
             page.wait_for_timeout(500)
             continue
 
@@ -650,6 +704,17 @@ def confirm_facebook_session_logged_in(
         if c_user:
             return True, f"Đã vào tài khoản Facebook (UID {c_user})"
         return True, "Đã vào tài khoản Facebook"
+
+    if reload_count < max_reload:
+        if reload_facebook_page_f5(page, label="confirm_final_f5"):
+            page.wait_for_timeout(900)
+            if _session_logged_in(page):
+                c_user = _read_facebook_c_user(page)
+                if expected_uid and c_user and not _facebook_uids_match(c_user, expected_uid):
+                    return False, f"UID cookie ({c_user}) khác UID cấu hình ({expected_uid})"
+                if c_user:
+                    return True, f"Đã vào tài khoản Facebook (UID {c_user}) sau F5"
+                return True, "Đã vào tài khoản Facebook sau F5"
 
     _log_facebook_session_diagnostic(page, stage="confirm_login_failed")
     return False, last_detail

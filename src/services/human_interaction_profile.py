@@ -30,8 +30,12 @@ class HumanInteractionProfile:
     dwell_scale: float = 1.15
     module_pause_min_sec: float = 2.0
     module_pause_max_sec: float = 4.0
-    # Giới hạn số module thực sự chạy mỗi lượt (tránh 1 TK kéo dài 20+ phút)
+    # Giới hạn số module thực sự chạy mỗi lượt (tránh 1 TK kéo dài quá lâu)
     max_modules_per_run: int = 3
+    # Giới hạn thời gian (giây) — 9 TK / 4 luồng ≈ 15–20 phút cả pool
+    max_worker_sec: float = 300.0
+    max_module_phase_sec: float = 150.0
+    feed_dwell_cap_ms: int = 4500
     reels_clip_min_ms: int = 5000
     reels_clip_max_ms: int = 9500
     page_load_pause_min_sec: float = 1.0
@@ -53,10 +57,13 @@ PROFILES: dict[str, HumanInteractionProfile] = {
         scroll_rounds_short_min=7,
         scroll_rounds_short_max=11,
         dwell_scale=1.0,
-        module_pause_min_sec=1.4,
-        module_pause_max_sec=2.6,
-        max_modules_per_run=3,
-        reels_clip_min_ms=6500,
+        module_pause_min_sec=1.2,
+        module_pause_max_sec=2.2,
+        max_modules_per_run=2,
+        max_worker_sec=360.0,
+        max_module_phase_sec=180.0,
+        feed_dwell_cap_ms=5200,
+        reels_clip_min_ms=5500,
         reels_clip_max_ms=12_000,
         page_load_pause_min_sec=1.4,
         page_load_pause_max_sec=2.8,
@@ -67,21 +74,24 @@ PROFILES: dict[str, HumanInteractionProfile] = {
         reels_prob=0.60,
         search_prob=0.40,
         post_prob=0.20,
-        deep_delay_min_sec=7.0,
-        deep_delay_max_sec=14.0,
-        sync_wait_sec=2.0,
-        scroll_rounds_min=8,
-        scroll_rounds_max=13,
-        scroll_rounds_short_min=5,
-        scroll_rounds_short_max=8,
-        dwell_scale=0.82,
-        module_pause_min_sec=0.7,
-        module_pause_max_sec=1.5,
-        max_modules_per_run=3,
-        reels_clip_min_ms=4500,
-        reels_clip_max_ms=9000,
-        page_load_pause_min_sec=1.0,
-        page_load_pause_max_sec=2.0,
+        deep_delay_min_sec=3.0,
+        deep_delay_max_sec=6.0,
+        sync_wait_sec=1.2,
+        scroll_rounds_min=5,
+        scroll_rounds_max=8,
+        scroll_rounds_short_min=4,
+        scroll_rounds_short_max=6,
+        dwell_scale=0.68,
+        module_pause_min_sec=0.45,
+        module_pause_max_sec=1.0,
+        max_modules_per_run=2,
+        max_worker_sec=300.0,
+        max_module_phase_sec=140.0,
+        feed_dwell_cap_ms=4000,
+        reels_clip_min_ms=3200,
+        reels_clip_max_ms=6000,
+        page_load_pause_min_sec=0.6,
+        page_load_pause_max_sec=1.2,
     ),
     "fast": HumanInteractionProfile(
         name="fast",
@@ -89,21 +99,24 @@ PROFILES: dict[str, HumanInteractionProfile] = {
         reels_prob=0.50,
         search_prob=0.30,
         post_prob=0.10,
-        deep_delay_min_sec=4.0,
-        deep_delay_max_sec=9.0,
-        sync_wait_sec=1.5,
-        scroll_rounds_min=6,
-        scroll_rounds_max=10,
-        scroll_rounds_short_min=4,
-        scroll_rounds_short_max=7,
-        dwell_scale=0.72,
-        module_pause_min_sec=0.5,
-        module_pause_max_sec=1.1,
+        deep_delay_min_sec=2.0,
+        deep_delay_max_sec=4.5,
+        sync_wait_sec=0.9,
+        scroll_rounds_min=4,
+        scroll_rounds_max=7,
+        scroll_rounds_short_min=3,
+        scroll_rounds_short_max=5,
+        dwell_scale=0.62,
+        module_pause_min_sec=0.35,
+        module_pause_max_sec=0.8,
         max_modules_per_run=2,
-        reels_clip_min_ms=3500,
-        reels_clip_max_ms=6500,
-        page_load_pause_min_sec=0.7,
-        page_load_pause_max_sec=1.4,
+        max_worker_sec=240.0,
+        max_module_phase_sec=110.0,
+        feed_dwell_cap_ms=3500,
+        reels_clip_min_ms=2800,
+        reels_clip_max_ms=5000,
+        page_load_pause_min_sec=0.5,
+        page_load_pause_max_sec=1.0,
     ),
 }
 
@@ -148,12 +161,20 @@ def resolve_profile(name: str | None, *, settings: dict[str, Any] | None = None)
         "max_modules_per_run",
         "reels_clip_min_ms",
         "reels_clip_max_ms",
+        "feed_dwell_cap_ms",
+        "max_worker_sec",
+        "max_module_phase_sec",
         "page_load_pause_min_sec",
         "page_load_pause_max_sec",
     ):
         if key in settings:
             try:
-                if key in ("max_modules_per_run", "reels_clip_min_ms", "reels_clip_max_ms"):
+                if key in (
+                    "max_modules_per_run",
+                    "reels_clip_min_ms",
+                    "reels_clip_max_ms",
+                    "feed_dwell_cap_ms",
+                ):
                     overrides[key] = int(settings[key])
                 elif "scale" in key or "sec" in key:
                     overrides[key] = float(settings[key])

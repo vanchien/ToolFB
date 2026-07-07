@@ -34,25 +34,39 @@ def compute_pool_join_timeout_sec(
     login_only: bool = False,
 ) -> float:
     """
-    Thời gian chờ pool hoàn tất — tính theo số đợt (account / luồng), tránh join sớm khi còn TK trong hàng đợi.
+    Thời gian chờ pool hoàn tất — tính theo số đợt × thời gian worker × (1 + retry).
 
-    Mỗi TK có thể mất vài phút (proxy chậm, captcha, module FB) — không dùng ``n * 120s`` cố định.
+    Mặc định đủ cho 9 TK / 4 luồng kể cả establish + F5 + retry (~25–40 phút nếu cần).
+
+    Cấu hình: ``FB_POOL_TARGET_MINUTES``, ``FB_HUMAN_WORKER_MAX_SEC``,
+    ``FB_HUMAN_INTERACTION_MAX_RETRIES``, ``FB_POOL_JOIN_BUFFER_SEC``,
+    ``FB_POOL_JOIN_MIN_SEC``, ``FB_POOL_JOIN_MAX_SEC``.
     """
     n = max(0, int(account_count))
     mc = max(1, int(max_concurrent))
     if n <= 0:
         return 120.0
-    waves = (n + mc - 1) // mc
-    per_account = float(
+    target_min = float(
         os.environ.get(
-            "FB_POOL_JOIN_SEC_PER_ACCOUNT",
-            "300" if login_only else "240",
+            "FB_POOL_TARGET_MINUTES",
+            "10" if login_only else "18",
         )
     )
-    buffer = float(os.environ.get("FB_POOL_JOIN_BUFFER_SEC", "180"))
-    cap = float(os.environ.get("FB_POOL_JOIN_MAX_SEC", "14400"))
-    est = waves * per_account * mc * 0.55 + n * 45.0 + buffer
-    return max(300.0, min(cap, est))
+    buffer = float(os.environ.get("FB_POOL_JOIN_BUFFER_SEC", "120"))
+    establish_pad = float(os.environ.get("FB_POOL_ESTABLISH_PAD_SEC", "150"))
+    floor = float(os.environ.get("FB_POOL_JOIN_MIN_SEC", "900"))  # 15 phút
+    cap = float(os.environ.get("FB_POOL_JOIN_MAX_SEC", "3600"))  # 60 phút
+    worker_sec = float(os.environ.get("FB_HUMAN_WORKER_MAX_SEC", "300"))
+    retries = max(0, int(os.environ.get("FB_HUMAN_INTERACTION_MAX_RETRIES", "2")))
+    attempts = max(1, 1 + retries)
+    waves = max(1, (n + mc - 1) // mc)
+    # Wall-clock: mỗi đợt có thể chạy đủ worker_sec × số lần thử lại / TK.
+    worker_est = waves * worker_sec * attempts + establish_pad + buffer
+    target_est = target_min * 60.0 + buffer + establish_pad
+    if waves > 3:
+        target_est += min(240.0, (waves - 3) * 75.0)
+    est = max(worker_est, target_est)
+    return max(floor, min(cap, est))
 
 
 def format_human_pool_error(exc: BaseException) -> str:
@@ -117,6 +131,7 @@ class HumanInteractionPool:
         self._completed_accounts = 0
         self._join_workers_alive = False
         self._retry_counts: dict[str, int] = {}
+        self._graceful_shutdown = False
         # Đăng nhập: luôn chạy đủ N luồng, không tự hạ concurrency.
         if self._login_only:
             self._recent_results.clear()
@@ -147,6 +162,18 @@ class HumanInteractionPool:
     def is_stopped(self) -> bool:
         """True sau khi người dùng bấm Dừng (không gồm pool join/shutdown nội bộ)."""
         return self._user_cancel.is_set()
+
+    def should_abort_worker(self) -> bool:
+        """
+        Worker/module dừng sớm khi user bấm Dừng hoặc pool join timeout.
+
+        Không dùng khi ``shutdown_gracefully`` — để worker kịp ghi profile/cookie.
+        """
+        if self._user_cancel.is_set():
+            return True
+        if self._stop.is_set() and not self._graceful_shutdown:
+            return True
+        return False
 
     def stop(self) -> None:
         """
@@ -181,6 +208,7 @@ class HumanInteractionPool:
         """
         if not self._threads:
             return True
+        self._graceful_shutdown = True
         self._shutting_down = True
         logger.info(
             "[Human pool] Graceful shutdown — chờ {} worker ghi profile (timeout={}s)",
@@ -285,14 +313,14 @@ class HumanInteractionPool:
                 stranded.append(item)
             self._work_q.task_done()
         for ma in stranded:
-            if not self._user_cancel.is_set():
+            if self._user_cancel.is_set():
+                self._emit_status(ma, "cancelled", "Đã hủy — người dùng bấm Dừng")
+            else:
                 self._emit_status(
                     ma,
                     "pending",
-                    "Chưa tới lượt — pool hết thời gian chờ, bấm «Chạy» để tiếp tục",
+                    "Chưa kịp chạy trong lượt này — sẽ tự động chạy tiếp",
                 )
-            else:
-                self._emit_status(ma, "cancelled", "Đã hủy — người dùng bấm Dừng")
 
     def _terminate_pool_browser_processes(self, *, force: bool = False) -> None:
         """
@@ -344,31 +372,58 @@ class HumanInteractionPool:
             True nếu tất cả worker đã kết thúc trong ``timeout``; False nếu hết giờ (đã cố ép dừng).
         """
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        join_started = time.monotonic()
+        abs_cap = float(os.environ.get("FB_POOL_JOIN_ABSOLUTE_MAX_SEC", "4200"))
 
         def _remaining() -> float | None:
             if deadline is None:
                 return None
             return max(0.0, deadline - time.monotonic())
 
-        self._shutting_down = True
+        def _absolute_exceeded() -> bool:
+            return (time.monotonic() - join_started) >= abs_cap
+
+        self._shutting_down = False
         completed = True
         workers_alive = False
         try:
-            # Chờ hết task trong hàng đợi — kể cả sau khi user bấm Dừng (không thoát sớm vì _stop).
-            while self._work_q.unfinished_tasks > 0:
+            # Chờ hết hàng đợi + mọi TK đã ``task_done`` — không gửi _stop trong lúc chờ.
+            while True:
+                all_accounts_done = self._completed_accounts >= self._total_accounts
+                queue_drained = self._work_q.unfinished_tasks <= 0
+                if all_accounts_done and queue_drained:
+                    break
                 rem = _remaining()
                 if rem is not None and rem <= 0:
+                    if self.has_live_workers() and not _absolute_exceeded():
+                        # Gia hạn mềm — worker vẫn chạy, chưa vượt trần tuyệt đối.
+                        if rem <= 0 and deadline is not None:
+                            extra_soft = float(os.environ.get("FB_POOL_JOIN_SOFT_EXTEND_SEC", "180"))
+                            deadline = time.monotonic() + max(60.0, extra_soft)
+                            logger.info(
+                                "[Human pool] Gia hạn mềm join {:.0f}s — {}/{} TK, worker còn chạy",
+                                extra_soft,
+                                self._completed_accounts,
+                                self._total_accounts,
+                            )
+                        time.sleep(0.35)
+                        continue
                     completed = False
                     logger.warning(
-                        "[Human pool] join timeout — còn {} task chưa task_done.",
+                        "[Human pool] join timeout — done {}/{} TK, còn {} task chưa task_done.",
+                        self._completed_accounts,
+                        self._total_accounts,
                         self._work_q.unfinished_tasks,
                     )
                     break
-                time.sleep(min(0.25, rem or 0.25))
+                time.sleep(min(0.35, rem or 0.35))
 
             if (
                 not completed
-                and self._work_q.unfinished_tasks > 0
+                and (
+                    self._completed_accounts < self._total_accounts
+                    or self._work_q.unfinished_tasks > 0
+                )
                 and self.has_live_workers()
             ):
                 extra = float(os.environ.get("FB_POOL_JOIN_EXTRA_SEC", "300"))
@@ -378,16 +433,24 @@ class HumanInteractionPool:
                     self._work_q.unfinished_tasks,
                 )
                 extra_deadline = time.monotonic() + max(60.0, extra)
-                while self._work_q.unfinished_tasks > 0 and time.monotonic() < extra_deadline:
-                    if not self.has_live_workers():
+                while (
+                    time.monotonic() < extra_deadline
+                    and self._completed_accounts < self._total_accounts
+                    and self.has_live_workers()
+                ):
+                    if self._work_q.unfinished_tasks <= 0 and self._completed_accounts >= self._total_accounts:
                         break
                     time.sleep(0.35)
-                if self._work_q.unfinished_tasks > 0:
+                if self._completed_accounts >= self._total_accounts and self._work_q.unfinished_tasks <= 0:
+                    completed = True
+                    logger.info("[Human pool] Gia hạn join — đã xử lý hết tài khoản.")
+                elif self._work_q.unfinished_tasks > 0 or self._completed_accounts < self._total_accounts:
                     completed = False
                 else:
                     completed = True
                     logger.info("[Human pool] Gia hạn join — đã xử lý hết task trong hàng đợi.")
 
+            self._shutting_down = True
             self._stop.set()
             with self._state_cv:
                 self._state_cv.notify_all()
@@ -578,7 +641,7 @@ class HumanInteractionPool:
 
     @staticmethod
     def _retryable_result(result: str) -> bool:
-        return str(result or "") in {"browser_closed", "error"}
+        return str(result or "") in {"browser_closed", "error", "interrupted"}
 
     def _worker_loop(self, worker_index: int) -> None:
         """Mỗi worker giữ một ô lưới cố định — cửa sổ không nhảy vị trí giữa các tài khoản."""
@@ -668,7 +731,8 @@ class HumanInteractionPool:
                     profile=self._profile,
                     on_status=_cb,
                     login_only=self._login_only,
-                    should_stop=self.is_stopped,
+                    should_stop=self.should_abort_worker,
+                    is_user_cancelled=self.is_stopped,
                     skip_launch_stagger=not first_account_in_worker,
                 )
                 first_account_in_worker = False
@@ -703,7 +767,8 @@ class HumanInteractionPool:
                         profile=self._profile,
                         on_status=_cb,
                         login_only=self._login_only,
-                        should_stop=self.is_stopped,
+                        should_stop=self.should_abort_worker,
+                        is_user_cancelled=self.is_stopped,
                         skip_launch_stagger=True,
                     )
                 if not counted_done:

@@ -75,7 +75,7 @@ def test_click_sidebar_switch_role_none() -> None:
         assert _click_manage_page_sidebar_switch(page)
 
 
-def test_ensure_page_role_switched_prefers_sidebar() -> None:
+def test_ensure_page_role_switched_prefers_switch_now() -> None:
     page = MagicMock()
     with (
         patch(
@@ -87,20 +87,12 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
             side_effect=[False, True],
         ),
         patch(
-            "src.automation.facebook_actions._page_switch_ui_visible",
+            "src.automation.facebook_actions._click_switch_now_banner",
             return_value=True,
-        ),
-        patch(
-            "src.automation.facebook_actions._page_switch_sidebar_hint_visible",
-            return_value=True,
-        ),
-        patch(
-            "src.automation.facebook_actions._click_visible_enabled_button",
-            return_value=False,
-        ),
+        ) as sw_now,
         patch(
             "src.automation.facebook_actions._click_manage_page_sidebar_switch",
-            return_value=True,
+            return_value=False,
         ) as sidebar,
         patch(
             "src.automation.facebook_actions._wait_after_page_switch_click",
@@ -114,7 +106,8 @@ def test_ensure_page_role_switched_prefers_sidebar() -> None:
         assert _ensure_page_role_switched(
             page, page_display_name="Best News US", page_url="https://www.facebook.com/123"
         )
-        sidebar.assert_called()
+        sw_now.assert_called()
+        sidebar.assert_not_called()
         wait_sw.assert_called()
 
 
@@ -131,22 +124,11 @@ def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
             return_value=False,
         ),
         patch(
-            "src.automation.facebook_actions._page_switch_ui_visible",
-            return_value=False,
-        ),
-        patch(
-            "src.automation.facebook_actions._manage_page_switch_cta_still_visible",
-            return_value=True,
-        ),
-        patch(
-            "src.automation.facebook_actions._click_manage_page_sidebar_switch",
-            return_value=False,
-        ),
-        patch(
-            "src.automation.facebook_actions._click_visible_enabled_button",
+            "src.automation.facebook_actions._attempt_page_role_switch_clicks",
             return_value=False,
         ),
         patch("src.automation.facebook_actions._failure_screenshot"),
+        patch.object(page, "wait_for_timeout"),
     ):
         assert not _ensure_page_role_switched(page, page_url="https://www.facebook.com/103833422779877")
 
@@ -192,15 +174,9 @@ def test_handle_switch_profiles_popup_confirm() -> None:
 
 def test_ensure_switched_passes_page_name() -> None:
     page = MagicMock()
-    with (
-        patch(
-            "src.automation.facebook_actions._page_switch_ui_visible",
-            return_value=True,
-        ),
-        patch(
-            "src.automation.facebook_actions._ensure_page_role_switched",
-        ) as role_sw,
-    ):
+    with patch(
+        "src.automation.facebook_actions._robust_switch_to_target_page",
+    ) as robust:
         from src.automation.facebook_actions import _ensure_switched_into_page_if_needed
 
         _ensure_switched_into_page_if_needed(
@@ -208,8 +184,70 @@ def test_ensure_switched_passes_page_name() -> None:
             page_display_name="My Page",
             page_url="https://www.facebook.com/999",
         )
-        role_sw.assert_called_once_with(
+        robust.assert_called_once_with(
             page,
             page_display_name="My Page",
             page_url="https://www.facebook.com/999",
         )
+
+
+def test_attempt_page_role_switch_prefers_switch_now() -> None:
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._click_switch_now_banner",
+            return_value=True,
+        ) as sw_now,
+        patch(
+            "src.automation.facebook_actions._click_manage_page_sidebar_switch",
+            return_value=False,
+        ) as sidebar,
+    ):
+        from src.automation.facebook_actions import _attempt_page_role_switch_clicks
+
+        assert _attempt_page_role_switch_clicks(page)
+    sw_now.assert_called()
+    sidebar.assert_not_called()
+
+
+def test_robust_switch_uses_personal_reset_strategy() -> None:
+    page = MagicMock()
+    page.url = "https://www.facebook.com/somepage"
+    personal_calls = {"n": 0}
+
+    def _personal(_page: MagicMock) -> bool:
+        personal_calls["n"] += 1
+        return True
+
+    direct_results = iter([False, False, True])
+
+    with (
+        patch(
+            "src.automation.facebook_actions._view_only_guard_active_on_page",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            side_effect=[False, True],
+        ),
+        patch(
+            "src.automation.facebook_actions._try_page_role_switch_direct",
+            side_effect=lambda *a, **k: next(direct_results),
+        ),
+        patch(
+            "src.automation.facebook_actions._switch_to_personal_profile",
+            side_effect=_personal,
+        ),
+        patch("src.automation.facebook_actions.navigate_to_url"),
+        patch("src.automation.facebook_actions._failure_screenshot"),
+        patch.object(page, "wait_for_timeout"),
+    ):
+        from src.automation.facebook_actions import _robust_switch_to_target_page
+
+        ok = _robust_switch_to_target_page(
+            page,
+            page_display_name="AI kittens",
+            page_url="https://www.facebook.com/123456",
+        )
+    assert ok is True
+    assert personal_calls["n"] >= 1

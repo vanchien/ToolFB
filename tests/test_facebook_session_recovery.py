@@ -222,3 +222,48 @@ def test_finalize_successful_recovery_confirm_path_saves_cookie(tmp_path, monkey
     assert ok is True
     save_mock.assert_called_once_with(page, str(ck))
     assert account.get("session_status") == "ready"
+
+
+def test_reload_facebook_page_f5_on_facebook_uses_keyboard() -> None:
+    from unittest.mock import MagicMock, patch
+
+    from src.services.facebook_session_recovery import reload_facebook_page_f5
+
+    page = MagicMock()
+    page.url = "https://www.facebook.com/"
+    with patch(
+        "src.automation.facebook_actions._force_www_facebook_if_mobile_redirect",
+    ) as force_www:
+        with patch(
+            "src.automation.facebook_actions.navigate_away_from_login_if_session_active",
+        ):
+            ok = reload_facebook_page_f5(page, label="unit_test")
+    assert ok is True
+    page.keyboard.press.assert_called_once_with("F5")
+    force_www.assert_called_once()
+
+
+def test_reload_facebook_page_f5_goto_when_not_on_facebook() -> None:
+    from unittest.mock import MagicMock, patch
+
+    from src.services.facebook_session_recovery import reload_facebook_page_f5
+
+    page = MagicMock()
+    page.url = "about:blank"
+    with patch(
+        "src.automation.facebook_actions._fb_normalize_client_url",
+        return_value="https://www.facebook.com/",
+    ):
+        with patch(
+            "src.automation.facebook_actions.assert_safe_facebook_navigation_url",
+        ):
+            with patch(
+                "src.automation.facebook_actions._force_www_facebook_if_mobile_redirect",
+            ):
+                with patch(
+                    "src.automation.facebook_actions.navigate_away_from_login_if_session_active",
+                ):
+                    ok = reload_facebook_page_f5(page, label="unit_goto")
+    assert ok is True
+    page.goto.assert_called_once()
+    page.keyboard.press.assert_not_called()

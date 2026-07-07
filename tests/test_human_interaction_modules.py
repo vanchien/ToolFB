@@ -10,10 +10,12 @@ from src.services.human_interaction_profile import PROFILES, resolve_profile
 
 def test_normal_profile_shorter_than_before() -> None:
     normal = PROFILES["normal"]
-    assert normal.scroll_rounds_max <= 13
-    assert normal.deep_delay_max_sec <= 14.0
-    assert normal.max_modules_per_run == 3
-    assert normal.reels_clip_max_ms <= 9000
+    assert normal.scroll_rounds_max <= 8
+    assert normal.deep_delay_max_sec <= 6.0
+    assert normal.max_modules_per_run == 2
+    assert normal.reels_clip_max_ms <= 6000
+    assert normal.max_worker_sec <= 300.0
+    assert normal.max_module_phase_sec <= 150.0
 
 
 def test_locate_like_uses_tagged_button() -> None:

@@ -42,6 +42,21 @@ def _re_raise_browser_closed(exc: BaseException) -> None:
         raise exc
 
 
+def _recover_facebook_page_after_glitch(page: Page, *, label: str = "module_recovery") -> bool:
+    """F5/reload Facebook sau lỗi module — tiếp tục lượt tương tác."""
+    if not _page_usable(page):
+        return False
+    try:
+        from src.services.facebook_session_recovery import reload_facebook_page_f5
+
+        return reload_facebook_page_f5(page, label=label)
+    except Exception as exc:  # noqa: BLE001
+        if is_playwright_target_closed_error(exc):
+            raise
+        logger.debug("[Human] F5 sau lỗi module ({}): {}", label, exc)
+        return False
+
+
 def _interruptible_sleep(
     seconds: float,
     *,
@@ -181,6 +196,7 @@ def _scroll_feed_top_to_bottom(
         downward_bias=0.97,
         scroll_from_top=True,
         dwell_scale=cfg.dwell_scale,
+        dwell_cap_ms=int(getattr(cfg, "feed_dwell_cap_ms", 0) or 0) or None,
         should_stop=should_stop,
     )
     if not ok or (should_stop and should_stop()):
@@ -727,6 +743,8 @@ def run_shuffled_interaction_modules(
 ) -> None:
     """Xáo trộn module và chạy với Deep Delay giữa các module đã chạy."""
     cfg = profile or resolve_profile("normal")
+    phase_limit = max(60.0, float(getattr(cfg, "max_module_phase_sec", 150.0) or 150.0))
+    phase_deadline = time.monotonic() + phase_limit
     modules = [
         ("newsfeed", lambda: module_newsfeed_like(page, probability=cfg.newsfeed_prob, cfg=cfg, should_stop=should_stop)),
         ("search_reels", lambda: module_search_reels(page, probability=cfg.reels_prob, cfg=cfg, should_stop=should_stop)),
@@ -741,6 +759,13 @@ def run_shuffled_interaction_modules(
     for name, fn in modules:
         if should_stop and should_stop():
             logger.info("[Human] Dừng tương tác — người dùng bấm Dừng (trước module {})", name)
+            break
+        if time.monotonic() >= phase_deadline:
+            logger.info(
+                "[Human] Hết thời gian phase module ({:.0f}s) — kết thúc sớm (đã chạy {})",
+                phase_limit,
+                success_count,
+            )
             break
         if success_count >= max_mod:
             logger.info("[Human] Đã đủ {} module/lượt — bỏ qua phần còn lại", max_mod)
@@ -762,10 +787,13 @@ def run_shuffled_interaction_modules(
             elif should_stop and should_stop():
                 logger.info("[Human] Dừng tương tác — người dùng bấm Dừng (sau module {})", name)
                 break
+            else:
+                _recover_facebook_page_after_glitch(page, label=f"after_{name}_skip")
         except Exception as exc:  # noqa: BLE001
             if is_playwright_target_closed_error(exc) or not _page_usable(page):
                 raise
             logger.warning("[Human] Module {} lỗi (bỏ qua): {}", name, exc)
+            _recover_facebook_page_after_glitch(page, label=f"after_{name}_err")
     if not ran_any:
         logger.info("[Human] Không module nào chạy (xác suất) — scroll nhẹ")
         try:
