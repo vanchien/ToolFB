@@ -8,11 +8,17 @@ from src.automation.facebook_actions import (
     _click_manage_page_sidebar_switch,
     _click_switch_in_sidebar_cta_card,
     _ensure_page_role_switched,
+    _facebook_slug_from_url,
     _normalize_compact_page_name,
     _page_switch_name_aliases,
     _page_switch_sidebar_hint_visible,
     _switch_profiles_dialog_mentions_page,
 )
+
+
+def test_facebook_slug_from_numeric_page_url() -> None:
+    assert _facebook_slug_from_url("https://www.facebook.com/102949712869335") == ""
+    assert _facebook_slug_from_url("https://www.facebook.com/AnimalsBeingDerpss/") == "animalsbeingderpss"
 
 
 def test_sidebar_hint_detects_take_more_actions() -> None:
@@ -75,7 +81,7 @@ def test_click_sidebar_switch_role_none() -> None:
         assert _click_manage_page_sidebar_switch(page)
 
 
-def test_ensure_page_role_switched_prefers_switch_now() -> None:
+def test_ensure_page_role_switched_delegates_to_robust() -> None:
     page = MagicMock()
     with (
         patch(
@@ -83,32 +89,22 @@ def test_ensure_page_role_switched_prefers_switch_now() -> None:
             return_value=False,
         ),
         patch(
-            "src.automation.facebook_actions._page_role_acting_as_page",
+            "src.automation.facebook_actions._target_page_role_satisfied",
             side_effect=[False, True],
         ),
         patch(
-            "src.automation.facebook_actions._click_switch_now_banner",
+            "src.automation.facebook_actions._robust_switch_to_target_page",
             return_value=True,
-        ) as sw_now,
-        patch(
-            "src.automation.facebook_actions._click_manage_page_sidebar_switch",
-            return_value=False,
-        ) as sidebar,
-        patch(
-            "src.automation.facebook_actions._wait_after_page_switch_click",
-            return_value=True,
-        ) as wait_sw,
-        patch(
-            "src.automation.facebook_actions._wait_page_role_switch_complete",
-            return_value=True,
-        ),
+        ) as robust,
     ):
         assert _ensure_page_role_switched(
             page, page_display_name="Best News US", page_url="https://www.facebook.com/123"
         )
-        sw_now.assert_called()
-        sidebar.assert_not_called()
-        wait_sw.assert_called()
+        robust.assert_called_once_with(
+            page,
+            page_display_name="Best News US",
+            page_url="https://www.facebook.com/123",
+        )
 
 
 def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
@@ -120,21 +116,20 @@ def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
             return_value=False,
         ),
         patch(
-            "src.automation.facebook_actions._page_role_acting_as_page",
+            "src.automation.facebook_actions._target_page_role_satisfied",
             return_value=False,
         ),
         patch(
-            "src.automation.facebook_actions._attempt_page_role_switch_clicks",
+            "src.automation.facebook_actions._robust_switch_to_target_page",
             return_value=False,
         ),
         patch("src.automation.facebook_actions._failure_screenshot"),
-        patch.object(page, "wait_for_timeout"),
     ):
         assert not _ensure_page_role_switched(page, page_url="https://www.facebook.com/103833422779877")
 
 
-def test_ensure_page_role_stops_early_on_popup_fail_streak() -> None:
-    """Popup confirm lỗi liên tiếp — dừng sớm, không lặp 4 lần."""
+def test_ensure_page_role_skips_robust_when_already_satisfied() -> None:
+    """Đã ở vai trò Page đúng đích — không gọi robust."""
     page = MagicMock()
     with (
         patch(
@@ -142,22 +137,15 @@ def test_ensure_page_role_stops_early_on_popup_fail_streak() -> None:
             return_value=False,
         ),
         patch(
-            "src.automation.facebook_actions._page_role_acting_as_page",
-            return_value=False,
-        ),
-        patch(
-            "src.automation.facebook_actions._attempt_page_role_switch_clicks",
+            "src.automation.facebook_actions._target_page_role_satisfied",
             return_value=True,
-        ) as clicks,
-        patch(
-            "src.automation.facebook_actions._wait_after_page_switch_click",
-            return_value=False,
         ),
-        patch("src.automation.facebook_actions._failure_screenshot"),
-        patch.object(page, "wait_for_timeout"),
+        patch(
+            "src.automation.facebook_actions._robust_switch_to_target_page",
+        ) as robust,
     ):
-        assert not _ensure_page_role_switched(page, max_attempts=4)
-    assert clicks.call_count == 2
+        assert _ensure_page_role_switched(page, page_url="https://www.facebook.com/103833422779877")
+    robust.assert_not_called()
 
 
 def test_slug_alias_matches_display_name_in_popup() -> None:
@@ -288,6 +276,14 @@ def test_robust_switch_uses_personal_reset_strategy() -> None:
             "src.automation.facebook_actions._switch_to_personal_profile",
             side_effect=_personal,
         ),
+        patch(
+            "src.automation.facebook_actions._personal_reset_confirmed",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._target_page_role_satisfied",
+            side_effect=[False, True],
+        ),
         patch("src.automation.facebook_actions.navigate_to_url"),
         patch(
             "src.automation.facebook_actions._select_page_via_profile_switcher",
@@ -317,13 +313,13 @@ def test_select_page_via_profile_switcher() -> None:
         patch(
             "src.automation.facebook_actions._select_page_in_switch_profiles_popup",
             return_value=True,
-        ),
+        ) as popup,
         patch(
             "src.automation.facebook_actions._wait_after_page_switch_click",
             return_value=True,
         ),
         patch(
-            "src.automation.facebook_actions._page_role_acting_as_page",
+            "src.automation.facebook_actions._target_page_role_satisfied",
             return_value=True,
         ),
     ):
@@ -334,3 +330,4 @@ def test_select_page_via_profile_switcher() -> None:
             page_display_name="Ethereal Birds",
             page_url="https://www.facebook.com/107315425760571",
         )
+    assert popup.call_args.kwargs.get("menu_already_open") is True

@@ -138,6 +138,10 @@ def test_robust_switch_prefers_direct_before_personal() -> None:
             return_value=True,
         ) as quick,
         patch(
+            "src.automation.facebook_actions._target_page_role_satisfied",
+            side_effect=[False, True],
+        ),
+        patch(
             "src.automation.facebook_actions._switch_to_personal_profile",
         ) as personal,
         patch.object(page, "wait_for_timeout"),
@@ -176,6 +180,10 @@ def test_robust_switch_wrong_page_url_tries_direct_first() -> None:
             return_value=True,
         ) as quick,
         patch(
+            "src.automation.facebook_actions._target_page_role_satisfied",
+            side_effect=[False, True],
+        ),
+        patch(
             "src.automation.facebook_actions._switch_to_personal_profile",
         ) as personal,
         patch.object(page, "wait_for_timeout"),
@@ -190,6 +198,42 @@ def test_robust_switch_wrong_page_url_tries_direct_first() -> None:
     assert ok is True
     quick.assert_called()
     personal.assert_not_called()
+
+
+def test_robust_switch_selects_page_from_home_before_navigate() -> None:
+    """Sau reset cá nhân: chọn Page trong menu trước khi goto URL đích."""
+    page = MagicMock()
+    call_order: list[str] = []
+
+    def _select(*_a, **_k) -> bool:
+        call_order.append("select")
+        return True
+
+    def _nav(*_a, **_k) -> None:
+        call_order.append("navigate")
+
+    with (
+        patch("src.automation.facebook_actions._view_only_guard_active_on_page", return_value=False),
+        patch(
+            "src.automation.facebook_actions._target_page_role_satisfied",
+            side_effect=[False, True],
+        ),
+        patch("src.automation.facebook_actions._quick_switch_on_page_surface", return_value=False),
+        patch("src.automation.facebook_actions._switch_to_personal_profile", return_value=True),
+        patch("src.automation.facebook_actions._select_page_via_profile_switcher", side_effect=_select),
+        patch("src.automation.facebook_actions.navigate_to_url", side_effect=_nav),
+        patch("src.automation.facebook_actions._failure_screenshot"),
+        patch.object(page, "wait_for_timeout"),
+    ):
+        from src.automation.facebook_actions import _robust_switch_to_target_page
+
+        ok = _robust_switch_to_target_page(
+            page,
+            page_display_name="Animals Being Derps",
+            page_url="https://www.facebook.com/102949712869335",
+        )
+    assert ok is True
+    assert call_order == ["select", "navigate"]
 
 
 def test_robust_switch_uses_personal_after_direct_fails() -> None:
@@ -220,6 +264,14 @@ def test_robust_switch_uses_personal_after_direct_fails() -> None:
         patch(
             "src.automation.facebook_actions._switch_to_personal_profile",
             side_effect=_personal,
+        ),
+        patch(
+            "src.automation.facebook_actions._personal_reset_confirmed",
+            return_value=True,
+        ),
+        patch(
+            "src.automation.facebook_actions._target_page_role_satisfied",
+            side_effect=[False, True],
         ),
         patch("src.automation.facebook_actions.navigate_to_url"),
         patch(
