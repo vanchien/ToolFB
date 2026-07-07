@@ -2781,7 +2781,7 @@ def _click_switch_profiles_popup_confirm(
         return not _switch_profiles_dialog_visible(page, timeout_ms=450)
 
     def _after_click_pause() -> bool:
-        page.wait_for_timeout(2_400)
+        page.wait_for_timeout(1_200)
         return _popup_closed()
 
     try:
@@ -2799,6 +2799,8 @@ def _click_switch_profiles_popup_confirm(
 
     locators = (
         dlg.get_by_role("button", name=_SWITCH_EXACT_LABEL_RE).last,
+        dlg.locator("[aria-label='Switch']").last,
+        dlg.locator("[aria-label*='Switch' i]").last,
         dlg.locator(
             "xpath=.//*[@role='button'][.//span[normalize-space()='Switch'] or normalize-space()='Switch'][last()]"
         ),
@@ -2854,8 +2856,8 @@ def _handle_switch_profiles_popup_if_present(
     *,
     page_display_name: str = "",
     page_url: str = "",
-    appear_wait_ms: int = 4_500,
-    settle_ms: int = 22_000,
+    appear_wait_ms: int = 3_200,
+    settle_ms: int = 10_000,
 ) -> bool:
     """
     Sau khi bấm Switch sidebar: nếu có popup thì bấm Switch xanh, chờ đóng + xác nhận vai trò Page.
@@ -2863,48 +2865,57 @@ def _handle_switch_profiles_popup_if_present(
     _ = page_url  # giữ API; chọn Page trong popup chỉ khi cần danh sách
     pname = str(page_display_name or "").strip()
     popup_seen = False
-    appear_deadline = time.time() + max(1.5, appear_wait_ms / 1000.0)
+    appear_deadline = time.time() + max(1.2, appear_wait_ms / 1000.0)
     while time.time() < appear_deadline:
-        if _switch_profiles_dialog_visible(page, timeout_ms=450):
+        if _switch_profiles_dialog_visible(page, timeout_ms=350):
             popup_seen = True
             break
-        page.wait_for_timeout(280)
+        page.wait_for_timeout(220)
     if not popup_seen:
         logger.info("[FB] Không có popup Switch profiles (switch trực tiếp hoặc đã đóng).")
         return True
 
     logger.info("[FB] Popup Switch profiles — bấm nút Switch xác nhận.")
     dest = str(page_url or "").strip()
-    for popup_click_try in range(1, 4):
+    confirm_failures = 0
+    for popup_click_try in range(1, 3):
         if _click_switch_profiles_popup_confirm(
             page,
             page_display_name=pname,
             page_url=dest,
         ):
-            if not _switch_profiles_dialog_visible(page, timeout_ms=600):
+            if not _switch_profiles_dialog_visible(page, timeout_ms=450):
                 break
-        elif not _switch_profiles_dialog_visible(page, timeout_ms=400):
+        elif not _switch_profiles_dialog_visible(page, timeout_ms=350):
             break
-        page.wait_for_timeout(600)
-    if _switch_profiles_dialog_visible(page, timeout_ms=500):
+        confirm_failures += 1
+        if confirm_failures >= 2:
+            logger.warning(
+                "[FB] Popup Switch profiles — xác nhận thất bại {} lần, dừng sớm.",
+                confirm_failures,
+            )
+            break
+        page.wait_for_timeout(400)
+    if _switch_profiles_dialog_visible(page, timeout_ms=450):
         _failure_screenshot(page, "switch_profiles_popup_confirm_fail")
         return False
 
-    settle_deadline = time.time() + max(5.0, settle_ms / 1000.0)
+    settle_deadline = time.time() + max(3.5, settle_ms / 1000.0)
     while time.time() < settle_deadline:
-        if _switch_profiles_dialog_visible(page, timeout_ms=350):
-            _click_switch_profiles_popup_confirm(
+        if _switch_profiles_dialog_visible(page, timeout_ms=300):
+            if not _click_switch_profiles_popup_confirm(
                 page, page_display_name=pname, page_url=dest
-            )
-            page.wait_for_timeout(500)
+            ):
+                return False
+            page.wait_for_timeout(350)
             continue
-        if _page_role_acting_as_page(page, timeout_ms=600):
+        if _page_role_acting_as_page(page, timeout_ms=500):
             logger.info("[FB] Popup đã đóng — xác nhận vai trò Page sau Switch profiles.")
             return True
-        page.wait_for_timeout(450)
-    if _switch_profiles_dialog_visible(page, timeout_ms=500):
+        page.wait_for_timeout(320)
+    if _switch_profiles_dialog_visible(page, timeout_ms=450):
         return False
-    return _page_role_acting_as_page(page, timeout_ms=900)
+    return _page_role_acting_as_page(page, timeout_ms=700)
 
 
 def _wait_after_page_switch_click(
@@ -3391,39 +3402,58 @@ def _try_page_role_switch_direct(
     *,
     page_display_name: str = "",
     page_url: str = "",
+    max_switch_attempts: int = 2,
 ) -> bool:
     """
     Switch Page **trực tiếp** trên trang hiện tại (page→page) — không reset account chính.
 
-    Thử: Switch Now / sidebar → popup chọn Page theo tên → ``_ensure_page_role_switched``.
+    Thử: Switch Now / sidebar → popup chọn Page theo tên → ``_ensure_page_role_switched`` (giới hạn lần).
     """
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
+    attempts = max(1, min(int(max_switch_attempts), 4))
 
-    if _page_role_acting_as_page(page, timeout_ms=900):
+    if _page_role_acting_as_page(page, timeout_ms=700):
         if not dest or _urls_refer_same_facebook_page(dest, str(page.url or ""), page=page):
             return True
 
-    if _page_switch_ui_visible(page, timeout_ms=700):
-        if _attempt_page_role_switch_clicks(page, timeout_ms=2_400):
-            _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=22_000
-            )
-            if _wait_page_role_switch_complete(page, timeout_ms=18_000):
+    on_target_surface = bool(dest) and _urls_refer_same_facebook_page(
+        dest, str(page.url or ""), page=page
+    )
+
+    if on_target_surface or _page_switch_ui_visible(page, timeout_ms=600):
+        if _click_switch_now_banner(page, timeout_ms=2_800):
+            if _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
+            ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
                 return True
+        if _page_switch_ui_visible(page, timeout_ms=500):
+            if _attempt_page_role_switch_clicks(page, timeout_ms=2_000):
+                if _wait_after_page_switch_click(
+                    page, page_display_name=pname, page_url=dest, timeout_ms=10_000
+                ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
+                    return True
 
     if pname and _open_facebook_profile_switcher_menu(page):
         if _select_page_in_switch_profiles_popup(
-            page, page_display_name=pname, page_url=dest
+            page,
+            page_display_name=pname,
+            page_url=dest,
+            max_list_scrolls=8,
         ):
-            _wait_after_page_switch_click(
-                page, page_display_name=pname, page_url=dest, timeout_ms=20_000
-            )
-            if _page_role_acting_as_page(page, timeout_ms=1_000):
+            if _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
+            ) and _page_role_acting_as_page(page, timeout_ms=800):
                 return True
 
-    if _ensure_page_role_switched(page, page_display_name=pname, page_url=dest):
-        return _page_role_acting_as_page(page, timeout_ms=1_000)
+    if _ensure_page_role_switched(
+        page,
+        page_display_name=pname,
+        page_url=dest,
+        max_attempts=attempts,
+        wait_timeout_ms=10_000,
+    ):
+        return _page_role_acting_as_page(page, timeout_ms=800)
     return False
 
 
@@ -3450,28 +3480,35 @@ def _robust_switch_to_target_page(
                 logger.info("[FB] Đã ở vai trò Page đúng đích.")
                 return True
 
-        # ① Page→page trực tiếp (không reset account chính)
-        for direct_try in range(1, 3):
-            if _try_page_role_switch_direct(
-                page, page_display_name=pname, page_url=dest
-            ):
-                logger.info("[FB] Switch Page OK — page→page trực tiếp (lần {}).", direct_try)
-                return True
-            if direct_try < 2:
-                page.wait_for_timeout(900)
+        # ① Page→page trực tiếp (không reset account chính) — 1 lần, fail nhanh
+        if _try_page_role_switch_direct(
+            page, page_display_name=pname, page_url=dest, max_switch_attempts=2
+        ):
+            logger.info("[FB] Switch Page OK — page→page trực tiếp.")
+            return True
 
-        # ② Fallback: account chính → Page đích
+        # ② Fallback: account chính → Page đích → Switch Now / sidebar
         logger.info(
             "[FB] Page→page trực tiếp thất bại — chuyển về account chính rồi switch Page đích."
         )
         _switch_to_personal_profile(page)
         if dest:
             navigate_to_url(page, dest)
-            page.wait_for_timeout(2_200)
+            page.wait_for_timeout(1_400)
+
+        if _click_switch_now_banner(page, timeout_ms=3_200):
+            if _wait_after_page_switch_click(
+                page, page_display_name=pname, page_url=dest, timeout_ms=10_000
+            ) and _wait_page_role_switch_complete(page, timeout_ms=10_000):
+                logger.info("[FB] Switch Page OK — Switch Now sau account chính.")
+                return True
 
         for via_personal in range(1, 3):
             if _try_page_role_switch_direct(
-                page, page_display_name=pname, page_url=dest
+                page,
+                page_display_name=pname,
+                page_url=dest,
+                max_switch_attempts=2,
             ):
                 logger.info(
                     "[FB] Switch Page OK — sau account chính (lần {}).",
@@ -3480,7 +3517,7 @@ def _robust_switch_to_target_page(
                 return True
             if via_personal < 2 and dest:
                 navigate_to_url(page, dest)
-                page.wait_for_timeout(1_800)
+                page.wait_for_timeout(1_200)
 
         # ③ Fallback cuối: popup + Switch Now lần nữa
         if dest:
@@ -3510,6 +3547,8 @@ def _ensure_page_role_switched(
     *,
     page_display_name: str = "",
     page_url: str = "",
+    max_attempts: int = 2,
+    wait_timeout_ms: int = 12_000,
 ) -> bool:
     """
     Chuyển sang vai trò Page: sidebar Switch (html-div), Switch Now, popup profiles.
@@ -3523,35 +3562,53 @@ def _ensure_page_role_switched(
     if guard_was_blocking:
         _disable_view_only_guard(page)
     try:
-        if _page_role_acting_as_page(page, timeout_ms=900):
+        if _page_role_acting_as_page(page, timeout_ms=700):
             logger.info("[FB] Đã ở vai trò Page (không cần bấm Switch).")
             return True
 
-        for attempt in range(1, 5):
-            clicked = _attempt_page_role_switch_clicks(page, timeout_ms=2_400)
+        attempts = max(1, min(int(max_attempts), 5))
+        popup_fail_streak = 0
+        for attempt in range(1, attempts + 1):
+            clicked = _attempt_page_role_switch_clicks(page, timeout_ms=2_000)
 
             if clicked:
                 popup_ok = _wait_after_page_switch_click(
-                    page, page_display_name=pname, page_url=dest, timeout_ms=24_000
+                    page,
+                    page_display_name=pname,
+                    page_url=dest,
+                    timeout_ms=wait_timeout_ms,
                 )
                 if not popup_ok:
+                    popup_fail_streak += 1
                     logger.warning(
                         "[FB] Popup Switch profiles chưa xử lý (attempt={}) — thử lại vòng sau.",
                         attempt,
                     )
-                elif _wait_page_role_switch_complete(page, timeout_ms=22_000):
+                    if popup_fail_streak >= 2:
+                        logger.warning(
+                            "[FB] Popup Switch profiles lỗi liên tiếp — dừng sớm (attempt={}).",
+                            attempt,
+                        )
+                        break
+                elif _wait_page_role_switch_complete(
+                    page, timeout_ms=min(14_000, wait_timeout_ms + 2_000)
+                ):
                     logger.info("[FB] Switch Page OK — xác nhận vai trò Page (attempt={}).", attempt)
                     return True
-                logger.warning(
-                    "[FB] Đã click Switch nhưng chưa xác nhận vai trò Page (attempt={}) | url={}",
-                    attempt,
-                    page.url,
-                )
-            page.wait_for_timeout(900)
+                else:
+                    logger.warning(
+                        "[FB] Đã click Switch nhưng chưa xác nhận vai trò Page (attempt={}) | url={}",
+                        attempt,
+                        page.url,
+                    )
+            page.wait_for_timeout(500)
 
-        ok = _page_role_acting_as_page(page, timeout_ms=1_000)
+        ok = _page_role_acting_as_page(page, timeout_ms=800)
         if not ok:
-            logger.warning("[FB] Vẫn chưa switch vào vai trò Page sau 4 lần thử.")
+            logger.warning(
+                "[FB] Vẫn chưa switch vào vai trò Page sau {} lần thử.",
+                attempts,
+            )
             _failure_screenshot(page, "page_switch_still_visible")
         return ok
     finally:
@@ -3619,37 +3676,61 @@ def _select_page_in_switch_profiles_popup(
     *,
     page_display_name: str,
     page_url: str,
+    max_list_scrolls: int = 10,
 ) -> bool:
-    """Chọn đúng Page trong popup Switch profiles — có cuộn để tìm mục."""
+    """Chọn đúng Page trong popup Switch profiles — có cuộn để tìm mục (giới hạn vòng)."""
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
     expect_id = extract_facebook_numeric_id_from_url(dest)
     if len(pname) < 2 and not expect_id:
         return False
+
+    see_all = re.compile(
+        r"See all profiles|Xem tất cả hồ sơ|Switch profiles|Chuyển hồ sơ|Chuyển sang",
+        re.I,
+    )
+    if not _switch_profiles_dialog_visible(page, timeout_ms=500):
+        if not _open_facebook_profile_switcher_menu(page):
+            return False
+        _click_visible_enabled_button(page.get_by_role("menuitem", name=see_all), timeout_ms=900)
+        _click_visible_enabled_button(page.get_by_text(see_all), timeout_ms=700)
+        page.wait_for_timeout(700)
+
     pat_name = re.compile(re.escape(pname[:80]), re.I) if len(pname) >= 2 else None
-    for _ in range(34):
+    scroll_limit = max(3, min(int(max_list_scrolls), 16))
+    fast_click_ms = 520
+
+    for scroll_i in range(scroll_limit):
         if pat_name is not None:
+            dlg = page.locator("[role='dialog']").last
             for factory in (
+                lambda: dlg.get_by_role("button", name=pat_name),
+                lambda: dlg.get_by_role("link", name=pat_name),
+                lambda: dlg.get_by_text(pat_name).last,
                 lambda: page.get_by_role("button", name=pat_name),
                 lambda: page.get_by_role("link", name=pat_name),
-                lambda: page.locator("[role='dialog']").get_by_text(pat_name).last,
             ):
                 try:
-                    if _click_visible_enabled_button(factory(), timeout_ms=950):
+                    if _click_visible_enabled_button(factory(), timeout_ms=fast_click_ms):
                         logger.info("[FB] Đã chọn Page trong Switch profiles: {!r}", pname)
-                        page.wait_for_timeout(1200)
+                        page.wait_for_timeout(900)
                         return True
                 except Exception:
                     continue
         if expect_id:
             try:
                 href_loc = page.locator(f"a[href*='{expect_id}']").first
-                if _click_visible_enabled_button(href_loc, timeout_ms=850):
+                if _click_visible_enabled_button(href_loc, timeout_ms=fast_click_ms):
                     logger.info("[FB] Đã chọn Page theo id {} trong Switch profiles.", expect_id)
-                    page.wait_for_timeout(1200)
+                    page.wait_for_timeout(900)
                     return True
             except Exception:
                 pass
+        if scroll_i + 1 >= scroll_limit:
+            break
+        if not _switch_profiles_dialog_visible(page, timeout_ms=280):
+            if scroll_i >= 2:
+                break
         _scroll_switch_profiles_list(page)
     return False
 

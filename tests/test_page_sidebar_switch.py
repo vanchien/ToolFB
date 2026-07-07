@@ -133,6 +133,33 @@ def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
         assert not _ensure_page_role_switched(page, page_url="https://www.facebook.com/103833422779877")
 
 
+def test_ensure_page_role_stops_early_on_popup_fail_streak() -> None:
+    """Popup confirm lỗi liên tiếp — dừng sớm, không lặp 4 lần."""
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._view_only_guard_active_on_page",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._page_role_acting_as_page",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._attempt_page_role_switch_clicks",
+            return_value=True,
+        ) as clicks,
+        patch(
+            "src.automation.facebook_actions._wait_after_page_switch_click",
+            return_value=False,
+        ),
+        patch("src.automation.facebook_actions._failure_screenshot"),
+        patch.object(page, "wait_for_timeout"),
+    ):
+        assert not _ensure_page_role_switched(page, max_attempts=4)
+    assert clicks.call_count == 2
+
+
 def test_slug_alias_matches_display_name_in_popup() -> None:
     """Slug job khớp «Xabre Owners Bandung» trong popup (so sánh compact)."""
     aliases = _page_switch_name_aliases(
@@ -219,7 +246,7 @@ def test_robust_switch_uses_personal_reset_strategy() -> None:
         personal_calls["n"] += 1
         return True
 
-    direct_results = iter([False, False, True])
+    direct_results = iter([False, True])
 
     with (
         patch(
@@ -239,6 +266,7 @@ def test_robust_switch_uses_personal_reset_strategy() -> None:
             side_effect=_personal,
         ),
         patch("src.automation.facebook_actions.navigate_to_url"),
+        patch("src.automation.facebook_actions._click_switch_now_banner", return_value=False),
         patch("src.automation.facebook_actions._failure_screenshot"),
         patch.object(page, "wait_for_timeout"),
     ):

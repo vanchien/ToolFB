@@ -202,7 +202,7 @@ def test_robust_switch_uses_personal_after_direct_fails() -> None:
         personal_calls["n"] += 1
         return True
 
-    direct_results = iter([False, False, True])
+    direct_results = iter([False, True])
 
     with (
         patch(
@@ -222,6 +222,7 @@ def test_robust_switch_uses_personal_after_direct_fails() -> None:
             side_effect=_personal,
         ),
         patch("src.automation.facebook_actions.navigate_to_url"),
+        patch("src.automation.facebook_actions._click_switch_now_banner", return_value=False),
         patch("src.automation.facebook_actions._failure_screenshot"),
         patch.object(page, "wait_for_timeout"),
     ):
