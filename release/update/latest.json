@@ -1,7 +1,7 @@
 {
-  "version": "1.0.91",
+  "version": "1.0.92",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "37c58931ac2bb1a9cc1f3b85b5c169fa4f82c7ca4015a9edce559d4e736d78d1",
-  "notes": "Switch Page + scheduler RAM + cap nhat ngay",
-  "generated_at": "2026-07-07T23:27:39"
+  "sha256": "572b280cf796542191787dab201f7f28337dd5ec834f7250d1fa803289db8d6e",
+  "notes": "Switch Page: sua toggle menu 2 lan, luong account→Page on dinh, xac nhan vai tro+URL, retry switcher, 34 test E2E pass. Cap nhat qua «Cap nhat ngay» trong app.",
+  "generated_at": "2026-07-08T00:21:17"
 }

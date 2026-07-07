@@ -1,9 +1,9 @@
 {
-  "app_version": "1.0.91",
+  "app_version": "1.0.92",
   "playwright_python": "1.58.0",
   "browsers": {
-    "chromium": "chromium-1228",
-    "chromium_headless_shell": "chromium_headless_shell-1228",
+    "chromium": "chromium-1208",
+    "chromium_headless_shell": "chromium_headless_shell-1208",
     "ffmpeg": "ffmpeg-1011",
     "firefox": "firefox-1509",
     "webkit": "webkit-2248",
