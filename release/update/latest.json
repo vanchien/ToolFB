@@ -1,7 +1,7 @@
 {
-  "version": "1.0.87",
+  "version": "1.0.88",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "e6a912b11e3d67dbdffdb58d19d3f20348abebb5e25033a095b67da19871592a",
-  "notes": "Proxy tự nhận HTTP/SOCKS5/SOCKS4 end-to-end (đăng lịch, tương tác, đăng nhập). Ghép registry acc_↔UID_, giữ profile Firefox. Pool join timeout + shutdown an toàn. Sửa lỗi worker msg undefined.",
-  "generated_at": "2026-07-02T11:59:15"
+  "sha256": "72ff22bb7ce4e6c34d5700665fd9bce450df855d786c2eda7820594ad9b07f4d",
+  "notes": "Pool tuong tac: auto-continue sau pool, timeout/retry, fix huy gia. Session: F5 tu dong khi loi hoac chua xac nhan phien. Dang lich: uu tien switch page-to-page, fallback account chinh, Switch Now toi uu.",
+  "generated_at": "2026-07-07T13:03:06"
 }
