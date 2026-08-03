@@ -1,7 +1,7 @@
 {
-  "version": "1.0.92",
+  "version": "1.0.93",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "572b280cf796542191787dab201f7f28337dd5ec834f7250d1fa803289db8d6e",
-  "notes": "Switch Page: sua toggle menu 2 lan, luong account→Page on dinh, xac nhan vai tro+URL, retry switcher, 34 test E2E pass. Cap nhat qua «Cap nhat ngay» trong app.",
-  "generated_at": "2026-07-08T00:21:17"
+  "sha256": "e40805bfcdc6403a2970b1a829e2a8e593d17867a7e253dfca108e2d9506071d",
+  "notes": "May moi: giai nen zip → Start_ToolFB.bat chay ngay. Co version.json canh EXE, kiem tra ms-playwright, ffmpeg chi bin/, portable bat buoc setup. Khong can Python/playwright install.",
+  "generated_at": "2026-08-03T22:31:08"
 }
