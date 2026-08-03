@@ -48,3 +48,17 @@ def seed_default_runtime_at(dest_root: Path) -> None:
                 )
             },
         )
+
+    # Sao version.json từ repo nếu thiếu (EXE build cũng gọi seed trước khi copy riêng).
+    vf = dest_root / "version.json"
+    if not vf.is_file():
+        for cand in (
+            Path(__file__).resolve().parents[1] / "version.json",
+            dest_root.parent / "version.json",
+        ):
+            if cand.is_file():
+                try:
+                    vf.write_text(cand.read_text(encoding="utf-8"), encoding="utf-8")
+                except OSError:
+                    pass
+                break

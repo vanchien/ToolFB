@@ -73,14 +73,30 @@ def _bundle_playwright_browsers(*, project_root: Path, dist_dir: Path) -> None:
 
 
 def _copy_portable_ffmpeg_if_present(*, project_root: Path, dist_dir: Path) -> None:
+    """Chỉ copy ``bin/`` (ffmpeg/ffprobe/ffplay) — bỏ downloads/extracted để zip nhẹ và tránh path dài."""
     ffmpeg_root = project_root / "tools" / "ffmpeg"
     bin_dir = ffmpeg_root / "bin"
     if not (bin_dir / "ffmpeg.exe").is_file() and not (bin_dir / "ffmpeg").is_file():
         return
-    target = dist_dir / "tools" / "ffmpeg"
-    if target.exists():
-        shutil.rmtree(target, ignore_errors=True)
-    shutil.copytree(ffmpeg_root, target)
+    target_bin = dist_dir / "tools" / "ffmpeg" / "bin"
+    if target_bin.parent.exists():
+        shutil.rmtree(target_bin.parent, ignore_errors=True)
+    target_bin.mkdir(parents=True, exist_ok=True)
+    for name in ("ffmpeg.exe", "ffmpeg", "ffprobe.exe", "ffprobe", "ffplay.exe", "ffplay"):
+        src = bin_dir / name
+        if src.is_file():
+            shutil.copy2(src, target_bin / name)
+
+
+def _copy_version_json(*, project_root: Path, dist_dir: Path) -> None:
+    """Bắt buộc có ``version.json`` cạnh EXE — tránh máy mới hiện ``0.0.0-dev`` / báo cập nhật giả."""
+    src = project_root / "version.json"
+    if not src.is_file():
+        print("WARN: thiếu version.json ở root — EXE sẽ fallback 0.0.0-dev", file=sys.stderr)
+        return
+    dest = dist_dir / "version.json"
+    shutil.copy2(src, dest)
+    print(f"VERSION_JSON_COPIED={dest}", file=sys.stderr)
 
 
 def _copy_config_template_files(*, project_root: Path, dist_dir: Path) -> None:
@@ -152,12 +168,31 @@ def build_exe() -> Path:
 
     seed_default_runtime_at(dist)
     _copy_config_template_files(project_root=root, dist_dir=dist)
+    _copy_version_json(project_root=root, dist_dir=dist)
     _copy_portable_ffmpeg_if_present(project_root=root, dist_dir=dist)
     _bundle_playwright_browsers(project_root=root, dist_dir=dist)
 
-    # Launcher click-1 cho bản portable EXE.
+    # Launcher click-1 cho bản portable EXE (+ kiểm tra _internal trước khi mở).
     launcher = dist / "Start_ToolFB_GUI.bat"
-    launcher.write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "ToolFB_GUI.exe" --gui\r\n', encoding="utf-8")
+    launcher.write_text(
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "if not exist \"ToolFB_GUI.exe\" (\r\n"
+        "  echo [LOI] Thieu ToolFB_GUI.exe trong thu muc nay.\r\n"
+        "  pause\r\n"
+        "  exit /b 1\r\n"
+        ")\r\n"
+        "if not exist \"_internal\\ms-playwright\\\" (\r\n"
+        "  echo [LOI] Thieu _internal\\ms-playwright — ban cai khong day du.\r\n"
+        "  echo Hay giai nen TOAN BO thu muc exe_gui tu ToolFB_release_bundle.zip\r\n"
+        "  echo (khong chi copy file .exe le).\r\n"
+        "  pause\r\n"
+        "  exit /b 1\r\n"
+        ")\r\n"
+        "start \"\" \"ToolFB_GUI.exe\" --gui\r\n",
+        encoding="utf-8",
+    )
     return exe_path
 
 

@@ -84,6 +84,15 @@ def _verify_release_browser_bundle(exe_dir: Path) -> None:
                 exe = bp / folder / "chrome-win" / "chrome.exe"
         if not exe.is_file():
             raise RuntimeError(f"Thiếu {key} trong bundle: {exe}")
+    vf = exe_dir / "version.json"
+    if not vf.is_file():
+        raise RuntimeError(
+            f"Thiếu {vf} — máy mới sẽ hiện 0.0.0-dev và báo cập nhật giả. "
+            "build_exe_gui phải copy version.json cạnh ToolFB_GUI.exe."
+        )
+    ffmpeg = exe_dir / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
+    if not ffmpeg.is_file():
+        print(f"WARN: thiếu {ffmpeg} — Video Editor / schedule có thể lỗi ffmpeg.", file=sys.stderr)
 
 
 def _read_local_version(root: Path) -> str:
@@ -170,26 +179,61 @@ def build_release_bundle() -> tuple[Path, Path, Path]:
     if n1 or n2:
         print(f"PRUNED_VEO3_NODE_CACHE_DIRS portable={n1} exe_gui={n2}", file=sys.stderr)
 
-    readme = bundle_dir / "README_RELEASE.txt"
-    readme.write_text(
-        "ToolFB Release Bundle\n"
-        "====================\n\n"
-        "1) portable_clean/\n"
-        "- Chua source + launcher Start_ToolFB_GUI.bat\n"
-        "- Khong kem du lieu van hanh (accounts/pages/jobs/cookies/profiles/logs da reset)\n\n"
-        "2) exe_gui/\n"
-        "- Chay truc tiep ToolFB_GUI.exe khong can go lenh\n"
-        "- Co Start_ToolFB_GUI.bat de mo nhanh\n"
-        "- BAT BUOC: copy ca thu muc exe_gui (gom ToolFB_GUI.exe + _internal/...), khong chi copy file .exe le\n"
-        "- Ban build day du da dong goi Chromium + Firefox + WebKit (Playwright) trong _internal/ms-playwright — may dich khong can `playwright install`\n"
-        "- yt-dlp: file tools/yt-dlp/yt-dlp.exe (Windows) duoc tai khi build va chép canh ToolFB_GUI.exe — may dich khong can pip cai yt-dlp\n"
-        "- Kich thuoc zip lon (hang tram MB) do trinh duyet; build nhanh: dat TOOLFB_SKIP_BROWSER_BUNDLE=1 khi goi tools/build_exe_gui.py\n"
-        "- Veo3Studio: cache trong node_modules/.cache (Prisma/npm) duoc xoa truoc khi zip de giam dung luong + tranh path qua dai khi cap nhat; Prisma tai lai khi can.\n\n"
-        "Goi y:\n"
-        "- Neu may dich co Python/venv: dung portable_clean\n"
-        "- Neu muon click-chay ngay tren may sach: dung exe_gui (build day du)\n",
+    # Launcher gốc — máy mới chỉ cần giải nén rồi double-click file này.
+    root_launcher = bundle_dir / "Start_ToolFB.bat"
+    root_launcher.write_text(
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "if not exist \"exe_gui\\ToolFB_GUI.exe\" (\r\n"
+        "  echo [LOI] Thieu exe_gui\\ToolFB_GUI.exe\r\n"
+        "  echo Hay giai nen dung ToolFB_release_bundle.zip ^(giu nguyen cau truc thu muc^).\r\n"
+        "  pause\r\n"
+        "  exit /b 1\r\n"
+        ")\r\n"
+        "if not exist \"exe_gui\\_internal\\ms-playwright\\\" (\r\n"
+        "  echo [LOI] Thieu exe_gui\\_internal\\ms-playwright\r\n"
+        "  echo Ban zip khong day du hoac chi copy file .exe le.\r\n"
+        "  echo Tai lai ToolFB_release_bundle.zip tu GitHub Releases ^(khoang 900MB+^).\r\n"
+        "  pause\r\n"
+        "  exit /b 1\r\n"
+        ")\r\n"
+        "cd /d \"%~dp0exe_gui\"\r\n"
+        "start \"\" \"ToolFB_GUI.exe\" --gui\r\n",
         encoding="utf-8",
     )
+
+    ver = _read_local_version(root)
+    readme = bundle_dir / "README_RELEASE.txt"
+    readme.write_text(
+        f"ToolFB {ver} — Huong dan may moi\n"
+        "================================\n\n"
+        "CAI DAT NHANH (khuyen nghi):\n"
+        "1) Giai nen TOAN BO file ToolFB_release_bundle.zip ra mot thu muc\n"
+        "   (vi du: D:\\ToolFB) — KHONG chi copy ToolFB_GUI.exe le.\n"
+        "2) Double-click Start_ToolFB.bat (o goc thu muc vua giai nen).\n"
+        "3) App mo GUI — them tai khoan / Page trong bang dieu khien.\n\n"
+        "Hoac mo: exe_gui\\Start_ToolFB_GUI.bat\n\n"
+        "QUAN TRONG:\n"
+        "- Can ca thu muc exe_gui (ToolFB_GUI.exe + _internal + config + tools).\n"
+        "- Ban day du da kem Chromium/Firefox/WebKit trong _internal\\ms-playwright\n"
+        "  → may dich KHONG can cai Python, KHONG can chay «playwright install».\n"
+        "- Zip thieu ms-playwright (~nhe) se bao loi trinh duyet khi dang bai.\n"
+        "- Nen giai nen ra o dia cuc bo (tranh OneDrive/path qua dai).\n\n"
+        "Cac thu muc trong zip:\n"
+        "1) Start_ToolFB.bat  ← bam de chay (may sach)\n"
+        "2) exe_gui/          ← ban click-chay (co trinh duyet + ffmpeg + yt-dlp)\n"
+        "3) portable_clean/   ← source Python (can scripts\\setup_windows.bat)\n"
+        "   May moi KHONG dung portable_clean neu chua cai Python/.venv.\n\n"
+        "Cap nhat sau nay: trong app bam «Cap nhat ngay» (giu config/data).\n",
+        encoding="utf-8",
+    )
+
+    # Đảm bảo version.json có trong exe_gui (phòng build cũ thiếu bước copy).
+    vf_src = root / "version.json"
+    vf_dst = bundle_dir / "exe_gui" / "version.json"
+    if vf_src.is_file():
+        shutil.copy2(vf_src, vf_dst)
 
     zip_base = dist / "ToolFB_release_bundle"
     zip_path = Path(shutil.make_archive(str(zip_base), "zip", root_dir=bundle_dir.parent, base_dir=bundle_dir.name))

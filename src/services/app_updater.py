@@ -584,17 +584,50 @@ def maybe_auto_git_pull_on_startup(
 
 
 def read_local_version(project_root: Path) -> str:
-    """Đọc phiên bản local từ ``version.json`` (fallback ``0.0.0-dev``)."""
+    """Đọc phiên bản local từ ``version.json`` (fallback manifest / ``0.0.0-dev``)."""
     vf = project_root / "version.json"
-    if not vf.is_file():
-        return "0.0.0-dev"
-    try:
-        raw = json.loads(vf.read_text(encoding="utf-8"))
-    except Exception:
-        return "0.0.0-dev"
-    if not isinstance(raw, dict):
-        return "0.0.0-dev"
-    return str(raw.get("version", "")).strip() or "0.0.0-dev"
+    if vf.is_file():
+        try:
+            raw = json.loads(vf.read_text(encoding="utf-8"))
+        except Exception:
+            raw = None
+        if isinstance(raw, dict):
+            v = str(raw.get("version", "")).strip()
+            if v:
+                return v
+    # Máy mới / zip thiếu version.json cạnh EXE → lấy từ browser_bundle_manifest.
+    for mf in (
+        project_root / "_internal" / "browser_bundle_manifest.json",
+        project_root / "browser_bundle_manifest.json",
+        project_root / "release" / "browser_bundle_manifest.json",
+    ):
+        if not mf.is_file():
+            continue
+        try:
+            raw_mf = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(raw_mf, dict):
+            v = str(raw_mf.get("app_version", "")).strip()
+            if v and v.lower() not in {"0.0.0", "0.0.0-dev", "unknown"}:
+                try:
+                    vf.write_text(
+                        json.dumps(
+                            {
+                                "version": v,
+                                "channel": "stable",
+                                "healed_from": "browser_bundle_manifest",
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                return v
+    return "0.0.0-dev"
 
 
 def parse_github_owner_repo_from_url(url: str) -> str:

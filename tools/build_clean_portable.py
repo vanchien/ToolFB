@@ -33,9 +33,20 @@ def build_clean_portable() -> tuple[Path, Path]:
     def _ignore(cur_dir: str, names: list[str]) -> set[str]:
         cur = Path(cur_dir).resolve()
         out: set[str] = set()
-        # Luôn bỏ rác dev.
+        # Luôn bỏ rác dev / IDE / CI.
         for n in names:
-            if n in {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cursor"}:
+            if n in {
+                ".git",
+                ".venv",
+                "__pycache__",
+                ".pytest_cache",
+                ".mypy_cache",
+                ".ruff_cache",
+                ".cursor",
+                ".vscode",
+                ".github",
+                ".idea",
+            }:
                 out.add(n)
             if n.endswith(".pyc") or n.endswith(".pyo"):
                 out.add(n)
@@ -44,23 +55,32 @@ def build_clean_portable() -> tuple[Path, Path]:
             for n in ("dist", "build", "logs", "data"):
                 if n in names:
                     out.add(n)
+        # Bỏ cache tải ffmpeg (không cần trên máy khách).
+        if cur == (root / "tools" / "ffmpeg").resolve():
+            for n in ("downloads", "extracted_ffplay", "extracted"):
+                if n in names:
+                    out.add(n)
         return out
 
     shutil.copytree(root, out_dir, dirs_exist_ok=True, ignore=_ignore)
 
     seed_default_runtime_at(out_dir)
 
-    # Thêm launcher click-1 để người dùng chạy GUI không cần gõ lệnh.
+    # Portable cần Python + setup — không fallback python hệ thống (dễ ImportError trên máy sạch).
     launcher = out_dir / "Start_ToolFB_GUI.bat"
     launcher.write_text(
         "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
         "setlocal\r\n"
         "cd /d \"%~dp0\"\r\n"
-        "if exist \".venv\\Scripts\\python.exe\" (\r\n"
-        "  \".venv\\Scripts\\python.exe\" \"main.py\" --gui\r\n"
-        ") else (\r\n"
-        "  python \"main.py\" --gui\r\n"
+        "if not exist \".venv\\Scripts\\python.exe\" (\r\n"
+        "  echo [portable_clean] Chua co .venv — may moi hay dung thu muc exe_gui\r\n"
+        "  echo   ^(click Start_ToolFB.bat o goc zip hoac exe_gui\\Start_ToolFB_GUI.bat^).\r\n"
+        "  echo Neu muon chay bang source: chay scripts\\setup_windows.bat truoc.\r\n"
+        "  pause\r\n"
+        "  exit /b 1\r\n"
         ")\r\n"
+        "\".venv\\Scripts\\python.exe\" \"main.py\" --gui\r\n"
         "endlocal\r\n",
         encoding="utf-8",
     )

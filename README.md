@@ -9,6 +9,15 @@ Công cụ tự động Facebook: lịch đăng bài, quản lý Page/Group, AI 
 - **RAM** 8GB+ (16GB nếu vừa tải video + chỉnh video + đăng bài song song)
 - **FFmpeg** — tùy chọn; app có thể dùng `tools/ffmpeg/bin` hoặc FFmpeg trên PATH
 
+## Cài đặt từ zip (máy mới — khuyến nghị)
+
+1. Tải **`ToolFB_release_bundle.zip`** từ [GitHub Releases](https://github.com/vanchien/ToolFB/releases/latest) (khoảng 900MB+, có trình duyệt).
+2. Giải nén **toàn bộ** ra ổ cục bộ (ví dụ `D:\ToolFB`) — không chỉ copy `ToolFB_GUI.exe`.
+3. Double-click **`Start_ToolFB.bat`** (ở gốc thư mục vừa giải nén), hoặc `exe_gui\Start_ToolFB_GUI.bat`.
+4. Thêm tài khoản / Page trong GUI. Không cần cài Python, không chạy `playwright install`.
+
+Máy mới **không** dùng thư mục `portable_clean/` trừ khi đã cài Python và chạy `scripts\setup_windows.bat`.
+
 ## Cài đặt từ GitHub (máy mới)
 
 ```bat

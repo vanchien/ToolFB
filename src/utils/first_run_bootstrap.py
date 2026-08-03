@@ -80,6 +80,15 @@ def bootstrap_all(*, root: Path | None = None) -> dict[str, Any]:
     base = root or project_root()
     ensure_runtime_directories(root=base)
     created = bootstrap_config_files(root=base)
+    # Heal version.json nếu zip thiếu (máy mới / bản EXE cũ).
+    try:
+        from src.services.app_updater import read_local_version
+
+        ver = read_local_version(base)
+        if ver and ver != "0.0.0-dev":
+            logger.debug("Phiên bản local: {}", ver)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Bỏ qua heal version.json: {}", exc)
     return {"created_config": created, "root": str(base)}
 
 
