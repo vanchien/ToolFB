@@ -1,7 +1,7 @@
 {
-  "version": "1.0.94",
+  "version": "1.0.95",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "0074b4bcdec9acf18b98797cd89b37e9596494a9626fe2c60ee4f03afb5b4e83",
-  "notes": "Dong bo may kem profile va cai dat. Chia se xem-binh luan, check live, luot nhan thiet bi. Giao dien co theo cua so.",
-  "generated_at": "2026-10-09T14:03:03"
+  "sha256": "c7b4812adb018d117ce27f59bd4c7e83b5965cc5872bd6ae110984bbaf9ff537",
+  "notes": "Luot Reel truoc khi xem video. Moi page xem so giay ngau nhien. Tich page roi chia se link. Cot ket qua hien thanh cong hoac loi.",
+  "generated_at": "2026-10-10T00:30:43"
 }
