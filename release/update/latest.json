@@ -1,7 +1,7 @@
 {
-  "version": "1.0.93",
+  "version": "1.0.94",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "e40805bfcdc6403a2970b1a829e2a8e593d17867a7e253dfca108e2d9506071d",
-  "notes": "May moi: giai nen zip → Start_ToolFB.bat chay ngay. Co version.json canh EXE, kiem tra ms-playwright, ffmpeg chi bin/, portable bat buoc setup. Khong can Python/playwright install.",
-  "generated_at": "2026-08-03T22:31:08"
+  "sha256": "0074b4bcdec9acf18b98797cd89b37e9596494a9626fe2c60ee4f03afb5b4e83",
+  "notes": "Dong bo may kem profile va cai dat. Chia se xem-binh luan, check live, luot nhan thiet bi. Giao dien co theo cua so.",
+  "generated_at": "2026-10-09T14:03:03"
 }
