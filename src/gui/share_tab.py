@@ -9,23 +9,38 @@ from typing import Any
 
 from src.gui.ui_responsiveness import schedule_on_main_thread
 from src.services.facebook_groups.engine import GroupEngine, parse_group_uids
-from src.services.facebook_groups.video_engage import clamp_watch_max_minutes, clamp_watch_seconds
+from src.services.facebook_groups.video_engage import clamp_reel_seconds, optional_watch_bounds
 from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
 from src.services.facebook_groups.fingerprint import normalize_share_images
 from src.services.facebook_groups.store import GroupStore
 
-_STATUS = {
-    "PENDING": "Đang chờ",
-    "SUBMIT": "Đang gửi",
-    "CHECKING_PERMISSION": "Đang kiểm tra",
-    "VERIFYING": "Đang kiểm tra",
-    "COMPLETED": "Xong",
-    "FAILED": "Lỗi",
-    "SKIPPED": "Bỏ qua",
-    "DUPLICATE": "Trùng",
-    "PAUSED": "Tạm dừng",
-    "DELAYING": "Nghỉ",
-}
+def describe_page_jobs(jobs: list[dict[str, Any]], paused_note: str = "") -> tuple[str, str, str]:
+    """Kết quả một page: nhãn, câu chi tiết, và màu (ok, fail, part, run, wait)."""
+    if not jobs:
+        if paused_note:
+            return "Lỗi", paused_note, "fail"
+        return "", "", ""
+    done = [row for row in jobs if str(row.get("status") or "") == "COMPLETED"]
+    failed = [row for row in jobs if str(row.get("status") or "") in {"FAILED", "SKIPPED"}]
+    active = [row for row in jobs if str(row.get("status") or "") in {"SUBMIT", "CHECKING_PERMISSION", "VERIFYING", "DELAYING"}]
+    paused = [row for row in jobs if str(row.get("status") or "") == "PAUSED"]
+    pending = [row for row in jobs if str(row.get("status") or "") == "PENDING"]
+    errors = [str(row.get("error_message") or "").strip() for row in failed + paused if str(row.get("error_message") or "").strip()]
+    if done and not failed and not active and not paused and not pending:
+        return "Thành công", f"Đã chia sẻ {len(done)} bài", "ok"
+    if failed and not done and not active and not pending:
+        return "Lỗi", errors[0] if errors else "Chưa chia sẻ được", "fail"
+    if paused and not done and not active:
+        return "Lỗi", paused_note or (errors[0] if errors else "Đã tạm dừng"), "fail"
+    if done and (failed or paused):
+        return "Một phần", errors[0] if errors else f"Thành công {len(done)}, lỗi {len(failed)}", "part"
+    if active:
+        return "Đang gửi", "Đang chia sẻ link", "run"
+    if pending and paused_note:
+        return "Lỗi", paused_note, "fail"
+    if pending:
+        return "Đang chờ", "Chưa tới lượt", "wait"
+    return "Đang chờ", "", "wait"
 
 
 class ShareTab:
@@ -38,6 +53,8 @@ class ShareTab:
         self.engine = GroupEngine(self.store, FacebookGroupProvider())
         self.engine.on_progress = self._on_progress
         self.pages: list[dict[str, str]] = []
+        self._checked: set[str] = set()
+        self._outcomes: dict[tuple[str, str], tuple[str, str, str]] = {}
         self.image_paths: list[str] = []
         self.batch_ids: list[str] = []
         self._running = False
@@ -52,7 +69,7 @@ class ShareTab:
 
         form = ttk.LabelFrame(
             parent,
-            text="Xem video, bình luận, rồi chia sẻ link lên Page. Không tải video",
+            text="Lướt Reel, xem video, bình luận, rồi chia sẻ link. Không tải video",
             padding=8,
         )
         form.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
@@ -86,12 +103,15 @@ class ShareTab:
         ttk.Label(form, textvariable=self.group_uid_count).grid(row=6, column=1, columnspan=3, sticky="w")
         timing = ttk.Frame(form)
         timing.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        ttk.Label(timing, text="Xem video (giây)").pack(side=tk.LEFT)
+        ttk.Label(timing, text="Lướt Reel (giây)").pack(side=tk.LEFT)
+        self.reel_seconds = tk.StringVar(value="20")
+        ttk.Entry(timing, textvariable=self.reel_seconds, width=5).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(timing, text="Xem từ (giây)").pack(side=tk.LEFT)
         self.watch_seconds = tk.StringVar(value="20")
         ttk.Entry(timing, textvariable=self.watch_seconds, width=6).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(timing, text="Tối đa (phút)").pack(side=tk.LEFT)
-        self.watch_max_minutes = tk.StringVar(value="5")
-        ttk.Entry(timing, textvariable=self.watch_max_minutes, width=4).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(timing, text="đến (giây)").pack(side=tk.LEFT)
+        self.watch_until = tk.StringVar(value="60")
+        ttk.Entry(timing, textvariable=self.watch_until, width=6).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(timing, text="Nghỉ mỗi bài (giây)").pack(side=tk.LEFT)
         self.cooldown = tk.StringVar(value="30")
         ttk.Entry(timing, textvariable=self.cooldown, width=6).pack(side=tk.LEFT, padx=4)
@@ -101,7 +121,7 @@ class ShareTab:
         ttk.Button(actions, text="Dừng", command=self.stop).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Tiếp tục", command=self.resume).pack(side=tk.LEFT)
         self.status = tk.StringVar(
-            value="Mỗi dòng một bình luận. Mỗi tài khoản lấy ngẫu nhiên một câu, không trùng đến khi hết danh sách."
+            value="Tích page cần đăng. Ô để trống thì bỏ qua. Xem xong video rồi mới chia sẻ link lên page đã tích."
         )
         status_lbl = ttk.Label(form, textvariable=self.status, wraplength=360, justify=tk.LEFT)
         status_lbl.grid(row=9, column=0, columnspan=4, sticky="ew")
@@ -129,41 +149,52 @@ class ShareTab:
         self.estimate = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.estimate).pack(side=tk.LEFT, padx=8)
 
-        cols = ("account", "page", "groups", "url")
-        self.tree = ttk.Treeview(listing, columns=cols, show="headings", selectmode="extended")
-        for key, title, width in (
-            ("account", "Tài khoản", 180),
-            ("page", "Page", 220),
-            ("groups", "Nhóm đã vào", 110),
-            ("url", "Link Page", 280),
+        cols = ("pick", "account", "page", "result", "url")
+        self.tree = ttk.Treeview(listing, columns=cols, show="headings", selectmode="browse")
+        for key, title, width, stretch in (
+            ("pick", "Đăng", 52, False),
+            ("account", "Tài khoản", 140, False),
+            ("page", "Page", 200, True),
+            ("result", "Kết quả", 280, True),
+            ("url", "Link Page", 220, True),
         ):
             self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, stretch=True)
+            self.tree.column(key, width=width, stretch=stretch, anchor=tk.W)
+        self._paint_result_tags(self.tree)
         self.tree.grid(row=1, column=0, sticky="nsew")
-        self.tree.bind("<<TreeviewSelect>>", lambda _event: self._estimate())
+        self.tree.bind("<Button-1>", self._on_page_click)
         scroll = ttk.Scrollbar(listing, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.grid(row=1, column=1, sticky="ns")
 
-        result = ttk.LabelFrame(parent, text="Tiến độ", padding=4)
+        result = ttk.LabelFrame(parent, text="Kết quả từng page", padding=4)
         result.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
         result.columnconfigure(0, weight=1)
-        result.rowconfigure(0, weight=1)
-        result_cols = ("account", "page", "where", "status", "detail")
-        self.results = ttk.Treeview(result, columns=result_cols, show="headings", height=8)
+        result.rowconfigure(1, weight=1)
+        self.outcome = tk.StringVar(value="Chưa chia sẻ. Cột Kết quả sẽ hiện Thành công hoặc Lỗi theo từng page.")
+        outcome_lbl = ttk.Label(result, textvariable=self.outcome, wraplength=480, justify=tk.LEFT)
+        outcome_lbl.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+
+        def _fit_outcome(_event: object = None) -> None:
+            width = int(result.winfo_width() or 0)
+            if width > 80:
+                outcome_lbl.configure(wraplength=max(200, width - 16))
+
+        result.bind("<Configure>", _fit_outcome, add="+")
+        result_cols = ("page", "status", "detail")
+        self.results = ttk.Treeview(result, columns=result_cols, show="headings", height=6)
         for key, title, width in (
-            ("account", "Tài khoản", 140),
-            ("page", "Page", 180),
-            ("where", "Đích", 140),
-            ("status", "Kết quả", 100),
-            ("detail", "Chi tiết", 280),
+            ("page", "Page", 220),
+            ("status", "Kết quả", 110),
+            ("detail", "Chi tiết", 420),
         ):
             self.results.heading(key, text=title)
             self.results.column(key, width=width, stretch=True)
-        self.results.grid(row=0, column=0, sticky="nsew")
+        self._paint_result_tags(self.results)
+        self.results.grid(row=1, column=0, sticky="nsew")
         result_scroll = ttk.Scrollbar(result, orient=tk.VERTICAL, command=self.results.yview)
         self.results.configure(yscrollcommand=result_scroll.set)
-        result_scroll.grid(row=0, column=1, sticky="ns")
+        result_scroll.grid(row=1, column=1, sticky="ns")
 
     def reload_pages(self) -> None:
         """Đọc Page đã lưu và số nhóm đã tham gia của từng Page."""
@@ -192,6 +223,8 @@ class ShareTab:
                 )
         except Exception as exc:  # noqa: BLE001
             self.status.set(f"Không đọc được danh sách Page: {exc}")
+        alive = {row["iid"] for row in rows}
+        self._checked &= alive
         self.pages = rows
         self._fill_pages()
 
@@ -219,6 +252,7 @@ class ShareTab:
         return counts
 
     def _fill_pages(self) -> None:
+        self._refresh_outcomes()
         needle = self.filter_text.get().strip().casefold()
         self.tree.delete(*self.tree.get_children())
         for row in self.pages:
@@ -229,21 +263,94 @@ class ShareTab:
                 "",
                 tk.END,
                 iid=row["iid"],
-                values=(row["account_name"], row["page_name"], row["joined"], row["target_url"]),
+                values=self._page_values(row),
+                tags=self._page_tags(row),
             )
         self._estimate()
 
+    def _paint_result_tags(self, tree: ttk.Treeview) -> None:
+        """Màu chữ: xanh là thành công, đỏ là lỗi."""
+        tree.tag_configure("ok", foreground="#0b7a32")
+        tree.tag_configure("fail", foreground="#b00020")
+        tree.tag_configure("part", foreground="#8a5a00")
+        tree.tag_configure("run", foreground="#0b5394")
+        tree.tag_configure("wait", foreground="#555555")
+
+    def _refresh_outcomes(self) -> None:
+        """Gom job theo page. Lỗi xem video hiện lên mọi page của tài khoản đó chưa đăng được."""
+        notes: dict[str, str] = {}
+        wanted = set(self.batch_ids)
+        if wanted:
+            for batch in self.store.share_batches():
+                if str(batch.get("id") or "") not in wanted:
+                    continue
+                note = str(batch.get("watch_note") or "").strip()
+                if note:
+                    notes[str(batch.get("account_id") or "")] = note
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for job in self._jobs():
+            key = (str(job.get("account_id") or ""), str(job.get("page_id") or ""))
+            grouped.setdefault(key, []).append(job)
+        found: dict[tuple[str, str], tuple[str, str, str]] = {}
+        for row in self.pages:
+            key = (row["account_id"], row["page_id"])
+            found[key] = describe_page_jobs(grouped.get(key, []), notes.get(row["account_id"], ""))
+        self._outcomes = found
+
+    def _page_values(self, row: dict[str, str]) -> tuple[str, str, str, str, str]:
+        label, detail, _tag = self._outcomes.get((row["account_id"], row["page_id"]), ("", "", ""))
+        shown = ""
+        if label and detail:
+            shown = f"{label} — {detail}"
+        elif label:
+            shown = label
+        return (
+            "☑" if row["iid"] in self._checked else "☐",
+            row["account_name"],
+            row["page_name"],
+            shown,
+            row["target_url"],
+        )
+
+    def _page_tags(self, row: dict[str, str]) -> tuple[str, ...]:
+        tag = self._outcomes.get((row["account_id"], row["page_id"]), ("", "", ""))[2]
+        return (tag,) if tag else ()
+
+    def _on_page_click(self, event: tk.Event) -> str | None:
+        """Bấm một dòng để tích hoặc bỏ page đó. Có thể tích nhiều page."""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        if row in self._checked:
+            self._checked.discard(row)
+        else:
+            self._checked.add(row)
+        values = list(self.tree.item(row, "values"))
+        if values:
+            values[0] = "☑" if row in self._checked else "☐"
+            self.tree.item(row, values=values)
+        self._estimate()
+        return "break"
+
     def _selected_pages(self) -> list[dict[str, str]]:
-        chosen = set(self.tree.selection())
-        return [row for row in self.pages if row["iid"] in chosen]
+        """Các page đang được tích. Một page hoặc nhiều page cùng lúc."""
+        return [row for row in self.pages if row["iid"] in self._checked]
 
     def _select_all(self) -> None:
-        self.tree.selection_set(self.tree.get_children())
-        self._estimate()
+        self._checked.update(row["iid"] for row in self.pages if self._row_visible(row))
+        self._fill_pages()
 
     def _clear_selection(self) -> None:
-        self.tree.selection_remove(self.tree.selection())
-        self._estimate()
+        visible = {row["iid"] for row in self.pages if self._row_visible(row)}
+        self._checked.difference_update(visible)
+        self._fill_pages()
+
+    def _row_visible(self, row: dict[str, str]) -> bool:
+        needle = self.filter_text.get().strip().casefold()
+        if not needle:
+            return True
+        blob = " ".join((row["account_name"], row["page_name"], row["page_id"])).casefold()
+        return needle in blob
 
     def _group_uid_raw(self) -> str:
         """Nội dung ô list UID nhóm. Một ô, nhiều dòng."""
@@ -285,7 +392,10 @@ class ShareTab:
         self.image_label.set(f"{len(self.image_paths)} ảnh" if self.image_paths else "Chưa chọn ảnh")
 
     def _cooldown_seconds(self) -> int:
-        raw = self.cooldown.get().strip() or "30"
+        """Ô nghỉ để trống thì không nghỉ giữa các bài."""
+        raw = self.cooldown.get().strip()
+        if not raw:
+            return 0
         try:
             seconds = int(raw)
         except ValueError:
@@ -304,13 +414,13 @@ class ShareTab:
             return
         selected = self._selected_pages()
         if not selected:
-            messagebox.showwarning("Chưa chọn Page", "Chọn một hoặc nhiều Page.", parent=self.root)
+            messagebox.showwarning("Chưa tích Page", "Tích một hoặc nhiều page cần đăng.", parent=self.root)
             return
         try:
-            images = normalize_share_images(self.image_paths)
+            images = normalize_share_images(self.image_paths) if self.image_paths else []
             cooldown = self._cooldown_seconds()
-            max_minutes = clamp_watch_max_minutes(self.watch_max_minutes.get())
-            watch_seconds = clamp_watch_seconds(self.watch_seconds.get(), max_minutes)
+            reel_seconds = clamp_reel_seconds(self.reel_seconds.get())
+            watch_low, watch_high = optional_watch_bounds(self.watch_seconds.get(), self.watch_until.get())
         except ValueError as exc:
             messagebox.showwarning("Chia sẻ", str(exc), parent=self.root)
             return
@@ -343,7 +453,9 @@ class ShareTab:
                     destination=place,
                     group_ids=group_ids,
                     cooldown_fixed=cooldown,
-                    watch_seconds=watch_seconds,
+                    watch_seconds=watch_low,
+                    watch_max_seconds=watch_high,
+                    reel_seconds=reel_seconds,
                     comment=self._comment_raw(),
                 )
                 self.batch_ids = list(result.get("batch_ids") or [])
@@ -393,10 +505,7 @@ class ShareTab:
     def _finish_status(self) -> None:
         if self._running:
             return
-        rows = self._jobs()
-        done = sum(1 for row in rows if str(row.get("status")) == "COMPLETED")
-        failed = sum(1 for row in rows if str(row.get("status")) == "FAILED")
-        self.status.set(f"Xong {done} bài. Lỗi {failed}. Mỗi tài khoản đã dùng một lần mở trình duyệt.")
+        self.status.set(self.outcome.get())
 
     def _on_progress(self, text: str) -> None:
         schedule_on_main_thread(self.root, lambda: self.status.set(text))
@@ -409,20 +518,36 @@ class ShareTab:
         return [row for row in self.store.share_jobs() if str(row.get("batch_id") or "") in wanted]
 
     def _fill_results(self) -> None:
-        names = {(row["account_id"], row["page_id"]): row for row in self.pages}
+        """Một dòng một page: Thành công hoặc Lỗi, kèm câu lỗi."""
+        self._fill_pages()
         self.results.delete(*self.results.get_children())
-        for job in self._jobs():
-            page_id = str(job.get("page_id") or "")
-            account_id = str(job.get("account_id") or "")
-            known = names.get((account_id, page_id), {})
-            where = "Page" if str(job.get("destination") or "") == "page" else str(job.get("group_id") or "nhóm")
-            status = _STATUS.get(str(job.get("status") or ""), str(job.get("status") or ""))
-            detail = str(job.get("error_message") or job.get("post_url") or "")
+        ok_names: list[str] = []
+        bad_lines: list[str] = []
+        for row in self.pages:
+            label, detail, tag = self._outcomes.get((row["account_id"], row["page_id"]), ("", "", ""))
+            if not label:
+                continue
             self.results.insert(
                 "",
                 tk.END,
-                values=(known.get("account_name", account_id), known.get("page_name", page_id), where, status, detail),
+                values=(row["page_name"], label, detail),
+                tags=(tag,) if tag else (),
             )
+            if tag == "ok":
+                ok_names.append(row["page_name"])
+            elif tag in {"fail", "part"}:
+                bad_lines.append(f"{row['page_name']}: {detail}")
+        parts: list[str] = []
+        if ok_names:
+            parts.append(f"Thành công ({len(ok_names)}): {', '.join(ok_names)}")
+        if bad_lines:
+            parts.append(f"Lỗi ({len(bad_lines)}): {' · '.join(bad_lines)}")
+        if parts:
+            self.outcome.set(". ".join(parts))
+        elif self.batch_ids:
+            self.outcome.set("Đang chờ kết quả. Cột Kết quả cập nhật theo từng page.")
+        else:
+            self.outcome.set("Chưa chia sẻ. Cột Kết quả sẽ hiện Thành công hoặc Lỗi theo từng page.")
 
 
 def build_share_tab(parent: ttk.Frame, root: tk.Misc) -> ShareTab:

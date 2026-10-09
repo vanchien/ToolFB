@@ -11,7 +11,7 @@ from typing import Any, Callable
 from src.services.page_creation.engine import calculate_delay_seconds
 
 from .fingerprint import assert_link_only, classify_source_url, normalize_share_images, share_fingerprint
-from .video_engage import parse_comment_lines, pick_share_comment
+from .video_engage import parse_comment_lines, pick_page_watch_seconds, pick_share_comment
 from .match import passes_discovery_filters, qualify_group, topic_match_score
 from .states import (
     BATCH_CANCELLED,
@@ -585,14 +585,19 @@ class GroupEngine:
         group_ids: list[str] | None = None,
         cooldown_fixed: int = 30,
         watch_seconds: int = 0,
+        watch_max_seconds: int = 0,
+        reel_seconds: int = 0,
         comment: str = "",
     ) -> dict[str, Any]:
-        """Cùng một link cho nhiều page. UID nhóm được nhập sẽ nhận bài từ từng page."""
+        """Cùng một link cho nhiều page. Mỗi page xem một số giây ngẫu nhiên trong khoảng đã đặt."""
         assert_link_only({"source_url": source_url, "text": text})
         images = normalize_share_images(image_paths)
         place = destination if destination in {"page", "joined", "both"} else "page"
         source_type = classify_source_url(source_url)
+        watch_low = max(0, int(watch_seconds or 0))
+        watch_high = max(watch_low, int(watch_max_seconds or 0))
         by_account: dict[str, list[dict[str, Any]]] = {}
+        page_watch: dict[tuple[str, str], int] = {}
         duplicates: list[str] = []
         skipped: list[str] = []
         for page in pages:
@@ -612,6 +617,9 @@ class GroupEngine:
             if not specs:
                 skipped.append(page_id)
                 continue
+            watch_key = (account_id, page_id)
+            if watch_key not in page_watch:
+                page_watch[watch_key] = pick_page_watch_seconds(watch_low, watch_high, self._rng)
             bucket = by_account.setdefault(account_id, [])
             for spec in specs:
                 group_id = spec["group_id"]
@@ -637,6 +645,7 @@ class GroupEngine:
                         "error_code": "",
                         "error_message": "",
                         "fingerprint": share_fingerprint(page_id, group_id, source_url, text, images),
+                        "watch_seconds": page_watch[watch_key],
                         "started_at": "",
                         "finished_at": "",
                     }
@@ -662,7 +671,10 @@ class GroupEngine:
                     "cooldown_fixed": int(cooldown_fixed or 0),
                     "cooldown_min": int(cooldown_fixed or 0),
                     "cooldown_max": int(cooldown_fixed or 0),
-                    "watch_seconds": int(watch_seconds or 0),
+                    "watch_seconds": watch_low,
+                    "watch_min_seconds": watch_low,
+                    "watch_max_seconds": watch_high,
+                    "reel_seconds": max(0, int(reel_seconds or 0)),
                     "comment": chosen_comment,
                 },
                 jobs,
@@ -804,7 +816,7 @@ class GroupEngine:
         self.store.save_share_batch(batch)
         batch["status"] = BATCH_RUNNING
         self.store.save_share_batch(batch)
-        if self._prepare_source_video(batch_id):
+        if self._browse_reels(batch_id):
             return self._batch(batch_id)
         while True:
             batch = self._batch(batch_id)
@@ -813,6 +825,8 @@ class GroupEngine:
             job = self._next_share_job(batch_id)
             if job is None:
                 break
+            if self._watch_page_before_share(batch_id, str(job.get("page_id") or "")):
+                return self._batch(batch_id)
             self._run_one_share(batch, job)
             batch = self.store.refresh_batch_counts(batch_id) or batch
             if job_hold := self._batch(batch_id).get("status") in {BATCH_PAUSED}:
@@ -831,60 +845,102 @@ class GroupEngine:
                 self.store.save_share_batch(batch)
         return batch
 
-    def _prepare_source_video(self, batch_id: str) -> bool:
-        """Xem video, bình luận xong, rồi mới chia sẻ link lên tường page hoặc nhóm."""
+    def _browse_reels(self, batch_id: str) -> bool:
+        """Lướt Reel trước. True khi phải dừng cả lượt chia sẻ."""
         batch = self._batch(batch_id)
-        if batch.get("source_prepared"):
+        if batch.get("reels_browsed"):
             return False
+        seconds = int(batch.get("reel_seconds") or 0)
+        if seconds <= 0 or not hasattr(self.provider, "browse_reels"):
+            return False
+        self._note(f"Đang lướt Reel {seconds} giây trước khi xem video")
+        result = self._call(
+            "browse_reels",
+            account_id=str(batch.get("account_id") or ""),
+            reel_seconds=seconds,
+            should_stop=lambda: batch_id in self._cancel,
+        )
+        if self._pause_prepare(batch_id, result):
+            return True
+        batch = self._batch(batch_id)
+        batch["reels_browsed"] = True
+        self.store.save_share_batch(batch)
+        self._note("Đã lướt Reel. Đang mở video để xem.")
+        return False
+
+    def _watch_page_before_share(self, batch_id: str, page_id: str) -> bool:
+        """Xem video theo số giây của page này, rồi mới chia sẻ. True khi phải dừng."""
+        batch = self._batch(batch_id)
+        watched = [str(item) for item in (batch.get("watched_page_ids") or [])]
+        already = page_id in watched
         comment = str(batch.get("comment") or "").strip()
-        already_watched = bool(batch.get("source_watched"))
-        seconds = 0 if already_watched else int(batch.get("watch_seconds") or 0)
-        if seconds <= 0 and not comment:
+        need_comment = bool(comment) and not batch.get("source_commented")
+        if already and not need_comment:
             return False
-        if already_watched and (not comment or batch.get("source_commented")):
+        seconds = 0 if already else self._page_watch_seconds(batch_id, page_id)
+        if seconds <= 0 and not need_comment:
             return False
         if not hasattr(self.provider, "prepare_source_video"):
             return False
-        if already_watched:
+        if already:
             self._note("Đang bình luận dưới video trước khi chia sẻ")
         else:
             self._note(
-                f"Đang xem video {seconds} giây"
-                + (", rồi bình luận dưới video" if comment else "")
+                f"Page {page_id}: đang xem video {seconds} giây"
+                + (" rồi bình luận" if need_comment else "")
             )
         result = self._call(
             "prepare_source_video",
             account_id=str(batch.get("account_id") or ""),
             source_url=str(batch.get("source_url") or ""),
             watch_seconds=seconds,
-            comment=comment,
+            comment=comment if need_comment else "",
             should_stop=lambda: batch_id in self._cancel,
         )
-        code = str(result.get("error_code") or "")
-        if code in PAUSE_CODES or code == "CANCELLED":
-            batch["status"] = BATCH_PAUSED
-            self.store.save_share_batch(batch)
-            self._cancel.add(batch_id)
+        if self._pause_prepare(batch_id, result):
             return True
-        batch["source_watched"] = True
+        batch = self._batch(batch_id)
+        if not already:
+            batch["watched_page_ids"] = [*watched, page_id]
+            batch["source_watched"] = True
         note = str(result.get("error_message") or "")
-        if comment and not result.get("commented"):
+        if need_comment and not result.get("commented"):
             batch["source_commented"] = False
+            batch["source_prepared"] = False
             batch["watch_note"] = note or "Chưa bình luận được dưới video — chưa chia sẻ"
             batch["status"] = BATCH_PAUSED
             self.store.save_share_batch(batch)
             self._cancel.add(batch_id)
             self._note(str(batch["watch_note"]))
             return True
-        batch["source_commented"] = True
+        if need_comment:
+            batch["source_commented"] = True
+            self._note("Đã bình luận dưới video. Đang chia sẻ link.")
+        else:
+            batch["source_commented"] = True
+            self._note(f"Đã xem {seconds} giây. Đang chia sẻ link.")
         batch["source_prepared"] = True
         batch["watch_note"] = ""
         self.store.save_share_batch(batch)
-        if comment:
-            self._note("Đã bình luận dưới video. Đang chia sẻ lên tường Page hoặc nhóm.")
-        else:
-            self._note(f"Đã xem {seconds} giây. Đang chia sẻ lên tường Page hoặc nhóm.")
         return False
+
+    def _page_watch_seconds(self, batch_id: str, page_id: str) -> int:
+        """Số giây đã bốc cho page. Mọi đích của page đó dùng cùng một lần xem."""
+        for job in self._batch_jobs(batch_id):
+            if str(job.get("page_id") or "") == page_id:
+                return int(job.get("watch_seconds") or 0)
+        return int(self._batch(batch_id).get("watch_seconds") or 0)
+
+    def _pause_prepare(self, batch_id: str, result: dict[str, Any]) -> bool:
+        """Dừng khi Facebook chặn hoặc người dùng bấm Dừng."""
+        code = str(result.get("error_code") or "")
+        if code not in PAUSE_CODES and code != "CANCELLED":
+            return False
+        batch = self._batch(batch_id)
+        batch["status"] = BATCH_PAUSED
+        self.store.save_share_batch(batch)
+        self._cancel.add(batch_id)
+        return True
 
     def pause(self, batch_id: str) -> None:
         batch = self._batch(batch_id)

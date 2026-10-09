@@ -7,10 +7,15 @@ import random
 import pytest
 
 from src.services.facebook_groups.video_engage import (
+    browse_reels_feed,
+    clamp_reel_seconds,
+    clamp_watch_bounds,
     clamp_watch_max_minutes,
     clamp_watch_seconds,
     engage_source_video,
+    optional_watch_bounds,
     parse_comment_lines,
+    pick_page_watch_seconds,
     pick_share_comment,
 )
 
@@ -57,10 +62,19 @@ class _Roles:
         return self._items[index]
 
 
+class _Keyboard:
+    def __init__(self) -> None:
+        self.keys: list[str] = []
+
+    def press(self, key: str) -> None:
+        self.keys.append(key)
+
+
 class _Page:
     def __init__(self, url: str) -> None:
         self.url = url
         self.waits: list[int] = []
+        self.keyboard = _Keyboard()
         self.like = _Control("Like")
         self.play = _Control("Play")
         self.comment = _Control("Write a comment")
@@ -162,3 +176,50 @@ def test_clamp_watch_seconds() -> None:
         clamp_watch_max_minutes("31")
     with pytest.raises(ValueError):
         clamp_watch_seconds("abc")
+
+
+def test_blank_watch_fields_are_skipped() -> None:
+    assert optional_watch_bounds("", "") == (0, 0)
+    assert optional_watch_bounds("  ", "") == (0, 0)
+    assert optional_watch_bounds("15", "") == (15, 15)
+    assert optional_watch_bounds("", "40") == (40, 40)
+
+
+def test_watch_bounds_are_random_per_page() -> None:
+    assert clamp_watch_bounds("20", "60") == (20, 60)
+    assert clamp_reel_seconds("0") == 0
+    assert clamp_reel_seconds("20") == 20
+    with pytest.raises(ValueError):
+        clamp_watch_bounds("40", "20")
+    with pytest.raises(ValueError):
+        clamp_reel_seconds("181")
+    drawn = {pick_page_watch_seconds(10, 25, random.Random(seed)) for seed in range(6)}
+    assert drawn <= set(range(10, 26))
+    assert len(drawn) > 1
+
+
+def test_browse_reels_moves_down_without_clicking() -> None:
+    page = _Page("https://www.facebook.com/")
+    opened: list[str] = []
+
+    def goto(url: str, wait_until: str = "", timeout: int = 0) -> None:
+        del wait_until, timeout
+        opened.append(url)
+        page.url = url
+
+    page.goto = goto
+    result = browse_reels_feed(page, seconds=4)
+    assert result["error_code"] == ""
+    assert result["browsed_seconds"] == 4
+    assert opened == ["https://www.facebook.com/reels/"]
+    assert page.keyboard.keys == ["ArrowDown"]
+    assert page.like.clicked is False
+    assert page.play.clicked is False
+
+
+def test_browse_reels_stops_on_checkpoint() -> None:
+    page = _Page("https://www.facebook.com/checkpoint/1")
+    result = browse_reels_feed(page, seconds=10)
+    assert result["error_code"] == "CHECKPOINT"
+    assert page.waits == []
+    assert page.keyboard.keys == []

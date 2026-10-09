@@ -1,4 +1,4 @@
-"""Xem video nguồn theo số giây người dùng đặt, rồi bình luận. Không tải video."""
+"""Lướt Reel, xem video nguồn theo khoảng giây người dùng đặt, rồi bình luận. Không tải video."""
 
 from __future__ import annotations
 
@@ -57,6 +57,112 @@ def clamp_watch_seconds(raw: object, max_minutes: int = 1) -> int:
     return seconds
 
 
+def clamp_reel_seconds(raw: object) -> int:
+    """Số giây lướt Reel trước khi mở video. 0 là bỏ qua, tối đa 3 phút."""
+    try:
+        seconds = int(str(raw if raw is not None else "").strip() or "0")
+    except ValueError as exc:
+        raise ValueError("Thời gian lướt Reel phải là số giây từ 0 đến 180") from exc
+    if seconds < 0 or seconds > 180:
+        raise ValueError("Thời gian lướt Reel phải từ 0 đến 180 giây")
+    return seconds
+
+
+def optional_watch_bounds(low_raw: object, high_raw: object) -> tuple[int, int]:
+    """Để trống cả hai ô thì không xem video. Chỉ điền một ô thì dùng đúng số đó."""
+    low_text = str(low_raw if low_raw is not None else "").strip()
+    high_text = str(high_raw if high_raw is not None else "").strip()
+    if not low_text and not high_text:
+        return 0, 0
+    if not low_text:
+        low_text = high_text
+    if not high_text:
+        high_text = low_text
+    return clamp_watch_bounds(low_text, high_text)
+
+
+def clamp_watch_bounds(low_raw: object, high_raw: object) -> tuple[int, int]:
+    """Khoảng giây xem video. Mỗi page nhận một số ngẫu nhiên trong khoảng này, tối đa 30 phút."""
+    try:
+        low = int(str(low_raw if low_raw is not None else "").strip())
+        high = int(str(high_raw if high_raw is not None else "").strip())
+    except ValueError as exc:
+        raise ValueError("Thời gian xem video phải là số giây từ 5 đến 1800") from exc
+    if low < 5 or high < 5 or low > 1800 or high > 1800:
+        raise ValueError("Thời gian xem video phải từ 5 giây đến 30 phút")
+    if high < low:
+        raise ValueError("Số giây xem đến phải lớn hơn hoặc bằng số giây bắt đầu")
+    return low, high
+
+
+def pick_page_watch_seconds(low: int, high: int, rng: random.Random | None = None) -> int:
+    """Một page một thời lượng. Cùng khoảng người dùng đặt, page khác thì số giây khác."""
+    start = max(0, int(low))
+    end = max(start, int(high))
+    if end <= 0:
+        return 0
+    return (rng or random.Random()).randint(start, end)
+
+
+def browse_reels_feed(
+    page: Any,
+    *,
+    seconds: int,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Lướt Reel bằng phím xuống. Không bấm thích, bình luận hay chia sẻ."""
+    blocked = _session_block(page)
+    if blocked:
+        return {"error_code": blocked, "browsed_seconds": 0}
+    _open_reels(page)
+    blocked = _session_block(page)
+    if blocked:
+        return {"error_code": blocked, "browsed_seconds": 0}
+    watched_ms = 0
+    target_ms = max(0, int(seconds)) * 1000
+    while watched_ms < target_ms:
+        if should_stop is not None and should_stop():
+            return {"error_code": "CANCELLED", "browsed_seconds": watched_ms // 1000}
+        chunk = min(1000, target_ms - watched_ms)
+        page.wait_for_timeout(chunk)
+        watched_ms += chunk
+        if watched_ms < target_ms and watched_ms % 3000 == 0:
+            _next_reel(page)
+    return {"error_code": "", "browsed_seconds": int(seconds)}
+
+
+def _session_block(page: Any) -> str:
+    """Checkpoint hoặc trang đăng nhập thì dừng, không bấm xác nhận."""
+    url = str(getattr(page, "url", "") or "").casefold()
+    if "checkpoint" in url:
+        return "CHECKPOINT"
+    if "/login" in url or "login.php" in url:
+        return "SESSION_EXPIRED"
+    return ""
+
+
+def _open_reels(page: Any) -> None:
+    """Mở bảng Reel nếu trình duyệt chưa ở đó."""
+    url = str(getattr(page, "url", "") or "").casefold()
+    if "/reel" in url:
+        return
+    goto = getattr(page, "goto", None)
+    if goto is None:
+        return
+    goto("https://www.facebook.com/reels/", wait_until="domcontentloaded", timeout=60_000)
+
+
+def _next_reel(page: Any) -> None:
+    """Chuyển Reel kế tiếp. Không click nút trên video."""
+    keyboard = getattr(page, "keyboard", None)
+    if keyboard is None:
+        return
+    try:
+        keyboard.press("ArrowDown")
+    except Exception:  # noqa: BLE001
+        return
+
+
 def engage_source_video(
     page: Any,
     *,
@@ -68,11 +174,9 @@ def engage_source_video(
 
     Không bấm like, không tải file video. Chưa bình luận xong thì chưa coi là xong.
     """
-    url = str(getattr(page, "url", "") or "").casefold()
-    if "checkpoint" in url:
-        return {"error_code": "CHECKPOINT", "watched_seconds": 0, "commented": False}
-    if "/login" in url or "login.php" in url:
-        return {"error_code": "SESSION_EXPIRED", "watched_seconds": 0, "commented": False}
+    blocked = _session_block(page)
+    if blocked:
+        return {"error_code": blocked, "watched_seconds": 0, "commented": False}
     _press_play(page)
     watched_ms = 0
     target_ms = max(0, int(watch_seconds)) * 1000

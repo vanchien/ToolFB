@@ -119,6 +119,29 @@ class FacebookGroupProvider:
     def verify_membership(self, *, account_id: str, page_id: str, group_id: str) -> dict[str, Any]:
         return self.check_membership(account_id=account_id, page_id=page_id, group_id=group_id)
 
+    def browse_reels(
+        self,
+        *,
+        account_id: str,
+        reel_seconds: int = 0,
+        should_stop: Any = None,
+    ) -> dict[str, Any]:
+        """Mở bảng Reel và lướt đủ số giây. Không bấm thích, bình luận hay chia sẻ."""
+        from src.services.facebook_groups.video_engage import browse_reels_feed
+
+        seconds = int(reel_seconds or 0)
+        if seconds <= 0:
+            return {"error_code": "", "browsed_seconds": 0}
+        if self._fetch_html is not None:
+            return {"error_code": "", "browsed_seconds": seconds}
+        self._load_html(account_id, "https://www.facebook.com/reels/")
+        if self._page is None:
+            return {"error_code": "TIMEOUT", "browsed_seconds": 0}
+        code = self._pause_code(str(getattr(self._page, "url", "") or ""), self._visible_text(self._page))
+        if code:
+            return {"error_code": code, "browsed_seconds": 0}
+        return browse_reels_feed(self._page, seconds=seconds, should_stop=should_stop)
+
     def prepare_source_video(
         self,
         *,

@@ -654,11 +654,10 @@ def test_share_wave_watches_once_then_shares_with_page_text(tmp_path) -> None:
     order: list[str] = []
 
     def prepare_source_video(**kwargs):
-        order.append(f"watch:{kwargs['account_id']}")
-        assert kwargs["watch_seconds"] == 12
-        assert kwargs["comment"] == "Hay quá"
+        order.append(f"watch:{kwargs['watch_seconds']}")
+        assert kwargs["comment"] == "Hay quá" if order.count("watch:12") == 1 else kwargs["comment"] == ""
         assert kwargs["source_url"].endswith("/videos/9")
-        return {"error_code": "", "watched_seconds": 12, "commented": True}
+        return {"error_code": "", "watched_seconds": kwargs["watch_seconds"], "commented": bool(kwargs["comment"])}
 
     def publish_link(**kwargs):
         order.append(f"share:{kwargs['page_id']}")
@@ -681,9 +680,71 @@ def test_share_wave_watches_once_then_shares_with_page_text(tmp_path) -> None:
         cooldown_fixed=0,
     )
     engine.run_share_wave(wave["batch_ids"])
-    assert order == ["watch:acc-a", "share:page-1", "share:page-2"]
+    assert order == ["watch:12", "share:page-1", "watch:12", "share:page-2"]
     assert fake.publish_calls[0]["text"] == "Đăng lên page của mình"
     assert engine.store.share_batches()[0]["source_prepared"] is True
+
+
+def test_share_wave_browses_reels_then_watches_each_page(tmp_path) -> None:
+    store = GroupStore(tmp_path / "facebook_groups.json")
+    fake = FakeGroups()
+    engine = GroupEngine(store, fake, rng=random.Random(4))
+    order: list[str] = []
+
+    def browse_reels(**kwargs):
+        order.append(f"reel:{kwargs['reel_seconds']}")
+        return {"error_code": "", "browsed_seconds": kwargs["reel_seconds"]}
+
+    def prepare_source_video(**kwargs):
+        order.append(f"watch:{kwargs['watch_seconds']}")
+        return {"error_code": "", "watched_seconds": kwargs["watch_seconds"], "commented": False}
+
+    def publish_link(**kwargs):
+        order.append(f"share:{kwargs['page_id']}:{kwargs['group_id']}")
+        fake.publish_calls.append(dict(kwargs))
+        return {"post_id": "post-1", "post_url": kwargs["source_url"]}
+
+    fake.browse_reels = browse_reels
+    fake.prepare_source_video = prepare_source_video
+    fake.publish_link = publish_link
+    store.upsert_membership(
+        {
+            "account_id": "acc-a",
+            "page_id": "page-1",
+            "group_id": "g-ok",
+            "membership_status": "JOINED",
+            "posting_permission": "UNKNOWN",
+        }
+    )
+    wave = engine.create_share_wave(
+        pages=[
+            {"account_id": "acc-a", "page_id": "page-1", "target_url": "https://www.facebook.com/page-1"},
+            {"account_id": "acc-a", "page_id": "page-2", "target_url": "https://www.facebook.com/page-2"},
+        ],
+        source_url="https://www.facebook.com/other/videos/9",
+        text="Lên tường",
+        destination="both",
+        watch_seconds=10,
+        watch_max_seconds=40,
+        reel_seconds=15,
+        cooldown_fixed=0,
+    )
+    jobs = [job for job in store.share_jobs() if job.get("batch_id") == wave["batch_ids"][0]]
+    by_page: dict[str, set[int]] = {}
+    for job in jobs:
+        by_page.setdefault(str(job["page_id"]), set()).add(int(job["watch_seconds"]))
+    assert set(by_page) == {"page-1", "page-2"}
+    for seconds in by_page.values():
+        assert len(seconds) == 1
+        assert 10 <= next(iter(seconds)) <= 40
+    engine.run_share_wave(wave["batch_ids"])
+    assert order[0] == "reel:15"
+    assert order[1].startswith("watch:")
+    assert "share:page-1:" in order
+    assert "share:page-1:g-ok" in order
+    assert order.index("share:page-1:") > order.index(order[1])
+    assert sum(item.startswith("watch:") for item in order) == 2
+    assert engine.store.share_batches()[0]["reels_browsed"] is True
 
 
 def test_share_wave_comments_then_shares_to_page_and_group(tmp_path) -> None:
