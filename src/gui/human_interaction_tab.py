@@ -5,6 +5,7 @@ Tab GUI: Tương tác giống người dùng — hai trang «Đăng nhập» và
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -27,13 +28,25 @@ from src.utils.account_proxy_mapper import (
     apply_mapped_secrets_to_vault,
     count_unique_proxy_servers,
     assert_proxy_exclusive_among_accounts,
-    duplicate_proxy_assignments,
     ensure_mapped_proxy_live,
     export_mapped_accounts_to_registry,
     load_registry_proxy_index,
+    classify_account_live,
+    live_result_rank,
     filter_lines_by_live_proxy,
+    account_line_format_label,
+    apply_imported_cookies_to_accounts,
     map_accounts_with_proxies,
+    map_pasted_accounts_for_live_check,
+    parse_proxy_line_to_network,
+    proxy_identity_key_for_account,
+    proxy_identity_key_for_network,
+    _proxy_blocked_for_candidate,
+    normalize_account_line_format,
+    ACCOUNT_LINE_FORMAT_LABELS,
+    attach_imported_cookie,
     mapped_account_to_account_dict,
+    proxy_dict_to_network,
     persist_mapped_proxy_to_accounts_json,
     read_lines_file,
     reassign_proxies_from_pool,
@@ -67,16 +80,18 @@ _STATUS_VI = {
 _FONT_UI = ("Segoe UI", 9)
 _FONT_MONO = ("Consolas", 9)
 _FONT_HINT = ("Segoe UI", 8)
-_FONT_STATUS = ("Segoe UI", 10, "bold")
+_FONT_STATUS = ("Segoe UI", 10)
 
-# Palette tab Tương tác người dùng
+# Thanh trạng thái — một màu ổn định, không nhấp nền.
 _C_IDLE_BG = "#f8fafc"
-_C_IDLE_FG = "#475569"
-_C_RUN_BG_A = "#bbf7d0"
-_C_RUN_BG_B = "#4ade80"
-_C_RUN_FG = "#14532d"
-_C_STOPPING_BG = "#fde68a"
+_C_IDLE_FG = "#334155"
+_C_IDLE_LED = "#94a3b8"
+_C_RUN_BG = "#ecfdf5"
+_C_RUN_FG = "#065f46"
+_C_RUN_LED = "#059669"
+_C_STOPPING_BG = "#fffbeb"
 _C_STOPPING_FG = "#92400e"
+_C_STOPPING_LED = "#d97706"
 _C_LOGIN_HINT_BG = "#ecfdf5"
 _C_LOGIN_HINT_FG = "#047857"
 _C_INTER_HINT_BG = "#eff6ff"
@@ -117,24 +132,60 @@ def _flat_btn(
     active_bg: str,
     fg: str = "white",
     state: str = tk.NORMAL,
-    padx: int = 10,
 ) -> tk.Button:
-    """Nút phẳng màu — đồng bộ giao diện tab Human."""
+    """Nút phẳng cùng cỡ — chiều cao và chữ giống nhau trên mọi hàng."""
     return tk.Button(
         master,
         text=text,
         command=command,
-        font=("Segoe UI", 9, "bold"),
+        font=("Segoe UI", 9),
         bg=bg,
         fg=fg,
         activebackground=active_bg,
         activeforeground=fg,
         relief=tk.FLAT,
-        padx=padx,
-        pady=4,
+        padx=10,
+        pady=3,
         cursor="hand2",
         state=state,
+        highlightthickness=0,
+        bd=0,
     )
+
+
+class _FlowBar(ttk.Frame):
+    """Hàng nút cùng khoảng cách, tự xuống dòng khi khung hẹp."""
+
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master)
+        self._items: list[tk.Widget] = []
+        self._width = 0
+        self.bind("<Configure>", self._on_configure)
+
+    def add(self, widget: tk.Widget) -> tk.Widget:
+        """Thêm nút vào hàng và giữ khoảng cách đều."""
+        self._items.append(widget)
+        widget.grid(row=0, column=len(self._items) - 1, padx=(0, 6), pady=2, sticky="w")
+        return widget
+
+    def _on_configure(self, event: tk.Event) -> None:
+        if event.widget is not self or event.width < 80:
+            return
+        if abs(event.width - self._width) < 12:
+            return
+        self._width = int(event.width)
+        x = 0
+        row = 0
+        col = 0
+        for widget in self._items:
+            need = int(widget.winfo_reqwidth()) + 6
+            if col and x + need > event.width:
+                row += 1
+                col = 0
+                x = 0
+            widget.grid_configure(row=row, column=col)
+            col += 1
+            x += need
 
 
 def _apply_human_ttk_styles(root: tk.Tk) -> ttk.Style:
@@ -200,7 +251,6 @@ def _human_vertical_scroll(host: ttk.Frame) -> ttk.Frame:
     win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
     def _sync_region(_event: tk.Event | None = None) -> None:
-        canvas.update_idletasks()
         bbox = canvas.bbox("all")
         if bbox:
             canvas.configure(scrollregion=bbox)
@@ -245,7 +295,8 @@ def build_human_interaction_tab(
     """Gắn tab «Tương tác người dùng» — nhập liệu, ghép, chạy từng dòng hoặc cả danh sách."""
     persisted = load_human_interaction_settings()
     parent.columnconfigure(0, weight=1)
-    parent.rowconfigure(0, weight=1)
+    parent.rowconfigure(0, weight=0)
+    parent.rowconfigure(1, weight=1)
 
     state: dict[str, Any] = {
         "mapped_login": [],
@@ -301,14 +352,14 @@ def build_human_interaction_tab(
     var_summary = tk.StringVar(value="Chọn tab bên dưới: Đăng nhập hoặc Tương tác")
     var_run_status = tk.StringVar(value="● Sẵn sàng — chưa có tiến trình")
 
-    run_banner = tk.Frame(parent, bg=_C_IDLE_BG, padx=10, pady=8, highlightthickness=1, highlightbackground="#cbd5e1")
+    run_banner = tk.Frame(parent, bg=_C_IDLE_BG, padx=8, pady=4, highlightthickness=1, highlightbackground="#e2e8f0")
     run_banner.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
     lbl_run_led = tk.Label(
         run_banner,
         text="●",
-        font=("Segoe UI", 16, "bold"),
+        font=("Segoe UI", 12),
         bg=_C_IDLE_BG,
-        fg="#94a3b8",
+        fg=_C_IDLE_LED,
         width=2,
     )
     lbl_run_led.pack(side=tk.LEFT, padx=(0, 6))
@@ -323,19 +374,17 @@ def build_human_interaction_tab(
     lbl_run_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
     btn_stop_global = _flat_btn(
         run_banner,
-        text="■ DỪNG",
+        text="Dừng",
         command=lambda: None,
         bg=_C_BTN_DANGER,
         active_bg=_C_BTN_DANGER_H,
         state=tk.DISABLED,
-        padx=14,
     )
     btn_stop_global.pack(side=tk.RIGHT, padx=(8, 0))
 
     # --- Hai TRANG chính (không gộp chung một màn hình) ---
     nb_main = ttk.Notebook(parent, padding=2, style="Human.TNotebook")
     nb_main.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
-    parent.rowconfigure(1, weight=1)
 
     page_login = ttk.Frame(nb_main, padding=6)
     page_interaction = ttk.Frame(nb_main, padding=6)
@@ -366,31 +415,33 @@ def build_human_interaction_tab(
 
     hint_login = tk.Frame(login_inner, bg=_C_LOGIN_HINT_BG, highlightthickness=0)
     hint_login.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-    tk.Label(
+    lbl_hint_login = tk.Label(
         hint_login,
-        text="🔐  Bước 1 — Dán TK + Proxy → Ghép → Đăng nhập. Tài khoản OK tự chuyển sang tab «Tương tác».",
+        text="🔐  Bước 1 — Dán TK + Proxy → Ghép → Đăng nhập. Tài khoản OK ở lại tab này cho đến khi bạn mở tab «Tương tác».",
         font=("Segoe UI", 9),
         bg=_C_LOGIN_HINT_BG,
         fg=_C_LOGIN_HINT_FG,
-        wraplength=900,
+        wraplength=640,
         justify=tk.LEFT,
         padx=10,
         pady=8,
-    ).pack(anchor="w")
+    )
+    lbl_hint_login.pack(anchor="w", fill=tk.X)
 
     hint_interaction = tk.Frame(interaction_inner, bg=_C_INTER_HINT_BG, highlightthickness=0)
     hint_interaction.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-    tk.Label(
+    lbl_hint_interaction = tk.Label(
         hint_interaction,
-        text="👤  Bước 2 — Chỉ tài khoản đã login. Chạy tương tác giống người dùng (không ghép TK ở đây).",
+        text="👤  Bước 2 — Mở tab này để nhận tài khoản Đăng nhập OK. Chạy tương tác tại đây.",
         font=("Segoe UI", 9),
         bg=_C_INTER_HINT_BG,
         fg=_C_INTER_HINT_FG,
-        wraplength=900,
+        wraplength=640,
         justify=tk.LEFT,
         padx=10,
         pady=8,
-    ).pack(anchor="w")
+    )
+    lbl_hint_interaction.pack(anchor="w", fill=tk.X)
 
     # --- Trang Đăng nhập: nguồn dữ liệu (gọn) ---
     step1 = ttk.LabelFrame(
@@ -400,8 +451,28 @@ def build_human_interaction_tab(
     step1.columnconfigure(0, weight=1)
     step1.rowconfigure(0, weight=0)
 
+    fmt_row = ttk.Frame(step1)
+    fmt_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+    ttk.Label(fmt_row, text="Định dạng nick", font=_FONT_UI).pack(side=tk.LEFT, padx=(0, 6))
+    _fmt_labels = [label for _fid, label in ACCOUNT_LINE_FORMAT_LABELS]
+    _fmt_by_label = {label: fid for fid, label in ACCOUNT_LINE_FORMAT_LABELS}
+    _saved_fmt = normalize_account_line_format(str(persisted.get("account_line_format") or "mail"))
+    var_account_format = tk.StringVar(value=account_line_format_label(_saved_fmt))
+    cmb_fmt = ttk.Combobox(
+        fmt_row,
+        textvariable=var_account_format,
+        values=_fmt_labels,
+        state="readonly",
+        width=36,
+    )
+    cmb_fmt.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _current_account_format() -> str:
+        """Id định dạng đang chọn — dùng khi ghép dòng và đăng nhập."""
+        return _fmt_by_label.get(var_account_format.get().strip(), "mail")
+
     nb_in = ttk.Notebook(step1)
-    nb_in.grid(row=0, column=0, sticky="nsew")
+    nb_in.grid(row=1, column=0, sticky="nsew")
 
     tab_paste = ttk.Frame(nb_in, padding=4)
     tab_file = ttk.Frame(nb_in, padding=4)
@@ -409,48 +480,60 @@ def build_human_interaction_tab(
     nb_in.add(tab_file, text="  Chọn file  ")
 
     tab_paste.columnconfigure(0, weight=1)
-    tab_paste.columnconfigure(1, weight=1)
-    tab_paste.rowconfigure(1, weight=1)
+    tab_paste.rowconfigure(2, weight=1, minsize=150)
 
-    ttk.Label(
+    lbl_paste_help = ttk.Label(
         tab_paste,
-        text=(
-            "Tài khoản — 6 trường theo thứ tự (phân tách | hoặc Tab từ Excel): "
-            "uid | pass | 2fa | mail | pass_mail | mail_khoi_phuc  —  "
-            "Proxy: host:port:user:pass | socks5://ip:port:user:pass | http://user:pass@host:port"
-        ),
+        text="",
         font=_FONT_HINT,
-        wraplength=720,
-    ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        wraplength=640,
+    )
+    lbl_paste_help.grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
-    tab_paste.columnconfigure(0, weight=1)
-    tab_paste.rowconfigure(2, weight=0)
+    def _apply_format_hint(*_args: object) -> None:
+        """Đổi dòng hướng dẫn theo định dạng nick đang chọn."""
+        fid = _current_account_format()
+        if fid == "cookie":
+            order = "UID | mật khẩu | 2FA | cookie | mail khôi phục | mật khẩu mail"
+            extra = " Cookie (c_user/xs hoặc JSON) được nạp trước khi đăng nhập."
+        elif fid == "auto":
+            order = "Tự nhận: trường 4 là email → định dạng mail; còn lại → cookie"
+            extra = ""
+        else:
+            order = "uid | pass | 2FA | mail | pass mail | mail khôi phục"
+            extra = ""
+        lbl_paste_help.configure(
+            text=(
+                f"Tài khoản — {order}. Phân tách | hoặc Tab từ Excel.{extra} "
+                "Proxy: host:port:user:pass | socks5://ip:port:user:pass | http://user:pass@host:port"
+            )
+        )
 
-    hdr = ttk.Frame(tab_paste)
-    hdr.grid(row=1, column=0, sticky="ew")
-    ttk.Label(hdr, text="Tài khoản", font=_FONT_UI).pack(side=tk.LEFT)
+    var_account_format.trace_add("write", _apply_format_hint)
+    _apply_format_hint()
 
-    inner_paned = ttk.Panedwindow(tab_paste, orient=tk.HORIZONTAL)
-    inner_paned.grid(row=2, column=0, sticky="nsew", pady=(2, 0))
+    editors = ttk.Frame(tab_paste)
+    editors.grid(row=2, column=0, sticky="nsew", pady=(2, 0))
+    editors.columnconfigure(0, weight=3, minsize=220)
+    editors.columnconfigure(1, weight=2, minsize=220)
+    editors.rowconfigure(0, weight=1)
 
-    acc_wrap = ttk.LabelFrame(inner_paned, text="Tài khoản (kéo thanh giữa để chỉnh rộng)", padding=2)
-    px_wrap = ttk.LabelFrame(inner_paned, text="Proxy", padding=2)
-    inner_paned.add(acc_wrap, weight=3)
-    inner_paned.add(px_wrap, weight=2)
+    acc_wrap = ttk.LabelFrame(editors, text="Tài khoản", padding=4)
+    px_wrap = ttk.LabelFrame(editors, text="Proxy", padding=4)
+    acc_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+    px_wrap.grid(row=0, column=1, sticky="nsew")
 
     acc_box = ttk.Frame(acc_wrap)
-    px_toolbar = ttk.Frame(px_wrap)
     px_box = ttk.Frame(px_wrap)
     acc_box.pack(fill=tk.BOTH, expand=True)
-    px_toolbar.pack(fill=tk.X, pady=(0, 4))
     px_box.pack(fill=tk.BOTH, expand=True)
     acc_box.columnconfigure(0, weight=1)
     acc_box.rowconfigure(0, weight=1)
     px_box.columnconfigure(0, weight=1)
     px_box.rowconfigure(0, weight=1)
 
-    txt_acc = tk.Text(acc_box, height=3, wrap="none", font=_FONT_MONO)
-    txt_px = tk.Text(px_box, height=3, wrap="none", font=_FONT_MONO)
+    txt_acc = tk.Text(acc_box, height=6, wrap="none", font=_FONT_MONO)
+    txt_px = tk.Text(px_box, height=6, wrap="none", font=_FONT_MONO)
     sy_acc = ttk.Scrollbar(acc_box, orient=tk.VERTICAL, command=txt_acc.yview)
     sy_px = ttk.Scrollbar(px_box, orient=tk.VERTICAL, command=txt_px.yview)
     txt_acc.configure(yscrollcommand=sy_acc.set)
@@ -460,20 +543,35 @@ def build_human_interaction_tab(
     txt_px.grid(row=0, column=0, sticky="nsew")
     sy_px.grid(row=0, column=1, sticky="ns")
 
-    paste_btns = ttk.Frame(tab_paste)
-    paste_btns.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+    var_input_counts = tk.StringVar(value="Tài khoản: 0  |  Proxy: 0  |  Proxy LIVE: chưa kiểm tra")
+    lbl_input_counts = ttk.Label(
+        tab_paste,
+        textvariable=var_input_counts,
+        font=("Segoe UI", 9, "bold"),
+        foreground="#0f172a",
+    )
+    lbl_input_counts.grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+    paste_btns = _FlowBar(tab_paste)
+    paste_btns.grid(row=4, column=0, sticky="ew", pady=(4, 0))
 
     tab_file.columnconfigure(1, weight=1)
     ttk.Label(tab_file, text="File tài khoản (.txt)").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(tab_file, textvariable=var_acc).grid(row=0, column=1, sticky="ew", padx=6)
     ttk.Label(tab_file, text="File proxy (.txt)").grid(row=1, column=0, sticky="w", pady=4)
     ttk.Entry(tab_file, textvariable=var_px).grid(row=1, column=1, sticky="ew", padx=6)
+    var_file_counts = tk.StringVar(value="File: chưa đếm")
+    ttk.Label(
+        tab_file,
+        textvariable=var_file_counts,
+        font=("Segoe UI", 9, "bold"),
+    ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
     ttk.Label(
         tab_file,
         text="Dùng tab này khi đã có sẵn file trên máy. Tab «Dán trực tiếp» được ưu tiên nếu cả hai đều có nội dung.",
         font=_FONT_HINT,
         wraplength=640,
-    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
     if persisted.get("accounts_text"):
         txt_acc.insert("1.0", str(persisted.get("accounts_text")))
@@ -494,12 +592,12 @@ def build_human_interaction_tab(
 
     login_toolbar = ttk.LabelFrame(login_inner, text="Thao tác đăng nhập", padding=6, style="Human.TLabelframe")
     login_toolbar.grid(row=3, column=0, sticky="ew", pady=(0, 4))
-    data_btns = ttk.Frame(login_toolbar)
+    data_btns = _FlowBar(login_toolbar)
     data_btns.pack(fill=tk.X)
-    login_btns = ttk.Frame(login_toolbar)
-    login_btns.pack(fill=tk.X, pady=(6, 0))
-    login_row_btns = ttk.Frame(login_toolbar)
-    login_row_btns.pack(fill=tk.X, pady=(6, 0))
+    login_btns = _FlowBar(login_toolbar)
+    login_btns.pack(fill=tk.X, pady=(4, 0))
+    login_row_btns = _FlowBar(login_toolbar)
+    login_row_btns.pack(fill=tk.X, pady=(4, 0))
     lbl_login_summary = ttk.Label(login_toolbar, textvariable=var_summary, font=_FONT_HINT)
     lbl_login_summary.pack(anchor="e", pady=(4, 0))
 
@@ -557,10 +655,12 @@ def build_human_interaction_tab(
         interaction_inner, text="Thao tác tương tác", padding=6, style="Human.TLabelframe"
     )
     interaction_toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 4))
-    run_btns = ttk.Frame(interaction_toolbar)
+    run_btns = _FlowBar(interaction_toolbar)
     run_btns.pack(fill=tk.X)
-    interaction_row_btns = ttk.Frame(interaction_toolbar)
-    interaction_row_btns.pack(fill=tk.X, pady=(6, 0))
+    profile_btns = _FlowBar(interaction_toolbar)
+    profile_btns.pack(fill=tk.X, pady=(4, 0))
+    interaction_row_btns = _FlowBar(interaction_toolbar)
+    interaction_row_btns.pack(fill=tk.X, pady=(4, 0))
     lbl_interaction_summary = ttk.Label(interaction_toolbar, textvariable=var_summary, font=_FONT_HINT)
     lbl_interaction_summary.pack(anchor="e", pady=(4, 0))
 
@@ -584,7 +684,8 @@ def build_human_interaction_tab(
     )
     lbl_health.pack(side=tk.RIGHT, fill=tk.X, expand=True)
 
-    cols = ("uid", "email", "twofa", "proxy", "status", "detail")
+    cols = ("stt", "uid", "username", "password", "email", "twofa", "proxy", "status", "detail")
+    table_toolbars: list[ttk.Frame] = []
 
     def _build_mapped_tree(parent_fr: ttk.Frame) -> ttk.Treeview:
         tr = ttk.Treeview(
@@ -595,23 +696,38 @@ def build_human_interaction_tab(
             selectmode="extended",
             style="Human.Treeview",
         )
+        tr.heading("stt", text="STT")
         tr.heading("uid", text="UID")
+        tr.heading("username", text="Tên người dùng")
+        tr.heading("password", text="Pass")
         tr.heading("email", text="Mail")
         tr.heading("twofa", text="2FA")
         tr.heading("proxy", text="Proxy")
         tr.heading("status", text="Trạng thái")
         tr.heading("detail", text="Chi tiết")
-        tr.column("uid", width=115, minwidth=80)
-        tr.column("email", width=150, minwidth=80)
-        tr.column("twofa", width=44, minwidth=40)
-        tr.column("proxy", width=150, minwidth=90)
-        tr.column("status", width=95, minwidth=70)
-        tr.column("detail", width=200, minwidth=100)
+        tr.column("stt", width=52, minwidth=44, stretch=False, anchor="center")
+        tr.column("uid", width=120, minwidth=90, stretch=False)
+        tr.column("username", width=140, minwidth=90, stretch=False)
+        tr.column("password", width=120, minwidth=80, stretch=False)
+        tr.column("email", width=180, minwidth=100, stretch=False)
+        tr.column("twofa", width=52, minwidth=44, stretch=False)
+        tr.column("proxy", width=220, minwidth=120, stretch=False)
+        tr.column("status", width=110, minwidth=80, stretch=False)
+        tr.column("detail", width=280, minwidth=140, stretch=True)
+        tools = ttk.Frame(parent_fr)
+        tools.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        table_toolbars.append(tools)
         sy = ttk.Scrollbar(parent_fr, orient=tk.VERTICAL, command=tr.yview)
-        tr.configure(yscrollcommand=sy.set)
-        tr.grid(row=0, column=0, sticky="nsew")
-        sy.grid(row=0, column=1, sticky="ns")
+        sx = ttk.Scrollbar(parent_fr, orient=tk.HORIZONTAL, command=tr.xview)
+        tr.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        tr.grid(row=1, column=0, sticky="nsew")
+        sy.grid(row=1, column=1, sticky="ns")
+        sx.grid(row=2, column=0, sticky="ew")
+        parent_fr.rowconfigure(0, weight=0)
+        parent_fr.rowconfigure(1, weight=1)
+        parent_fr.columnconfigure(0, weight=1)
         _configure_tree_status_tags(tr)
+        tr.heading("status", command=lambda tree=tr: _sort_tree_by_status(tree))
         return tr
 
     tree_login = _build_mapped_tree(login_table_fr)
@@ -621,14 +737,6 @@ def build_human_interaction_tab(
     state["page_interaction"] = page_interaction
     state["tree_login"] = tree_login
     state["tree_interaction"] = tree_interaction
-
-    for _tr in (tree_login, tree_interaction):
-        install_treeview_shortcuts(
-            _tr,
-            owner=root,
-            enable_drag_select=True,
-            info_callback=lambda msg: logger.info(msg),
-        )
 
     # --- Logic ---
     def _clipboard_text() -> str:
@@ -653,6 +761,8 @@ def build_human_interaction_tab(
             return
         txt_acc.delete("1.0", tk.END)
         txt_px.delete("1.0", tk.END)
+        state["proxy_live"] = None
+        _refresh_input_counts()
 
     def _set_text_lines(widget: tk.Text, lines: list[str]) -> None:
         widget.delete("1.0", tk.END)
@@ -684,9 +794,15 @@ def build_human_interaction_tab(
             payload: tuple[list[str], list[str], list[dict[str, Any]], int, int, dict[str, int]],
         ) -> None:
             live_acc, live_px, dead, n_before, n_live, scheme_counts = payload
-            _set_text_lines(txt_px, live_px)
-            if live_acc or _non_empty_lines(txt_acc.get("1.0", tk.END)):
-                _set_text_lines(txt_acc, live_acc)
+            state["_suppress_live_invalidate"] = True
+            try:
+                _set_text_lines(txt_px, live_px)
+                if live_acc or _non_empty_lines(txt_acc.get("1.0", tk.END)):
+                    _set_text_lines(txt_acc, live_acc)
+            finally:
+                state["_suppress_live_invalidate"] = False
+            state["proxy_live"] = {"live": n_live, "checked": n_before}
+            _refresh_input_counts()
             _save_settings()
             removed = n_before - n_live
             lines = [
@@ -736,36 +852,41 @@ def build_human_interaction_tab(
             else:
                 state["proxies_path"] = path
             nb_in.select(tab_file)
+            _refresh_file_counts()
 
     def _mapped_snapshot_for_save() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        if not state.get("pool"):
-            refresh_mapped_accounts_storage(
-                list(state.get("mapped_login") or []) + list(state.get("mapped_interaction") or [])
-            )
+        """Chụp bảng đang có — không đọc đĩa trên luồng giao diện."""
         login = [ma.to_dict() for ma in (state.get("mapped_login") or [])]
         interaction = [ma.to_dict() for ma in (state.get("mapped_interaction") or [])]
         return login, interaction
 
     def _save_settings() -> None:
         login_snap, interaction_snap = _mapped_snapshot_for_save()
-        save_human_interaction_settings(
-            {
-                "accounts_path": var_acc.get().strip(),
-                "proxies_path": var_px.get().strip(),
-                "accounts_text": txt_acc.get("1.0", tk.END).strip(),
-                "proxies_text": txt_px.get("1.0", tk.END).strip(),
-                "threads": max(1, int(var_threads.get())),
-                "grid_cols": max(1, min(8, int(var_grid_cols.get()))),
-                "headless": bool(var_headless.get()),
-                "profile": var_profile.get().strip().lower() or "normal",
-                "like_rate_pct": max(0, min(100, int(var_like_pct.get()))),
-                "comment_rate_pct": max(0, min(100, int(var_comment_pct.get()))),
-                "virtual_cursor": bool(var_virtual_cursor.get()),
-                "ai_comments": bool(var_ai_comments.get()),
-                "mapped_accounts_login": login_snap,
-                "mapped_accounts_interaction": interaction_snap,
-            }
-        )
+        payload = {
+            "accounts_path": var_acc.get().strip(),
+            "proxies_path": var_px.get().strip(),
+            "accounts_text": txt_acc.get("1.0", tk.END).strip(),
+            "proxies_text": txt_px.get("1.0", tk.END).strip(),
+            "threads": max(1, int(var_threads.get())),
+            "grid_cols": max(1, min(8, int(var_grid_cols.get()))),
+            "headless": bool(var_headless.get()),
+            "profile": var_profile.get().strip().lower() or "normal",
+            "like_rate_pct": max(0, min(100, int(var_like_pct.get()))),
+            "comment_rate_pct": max(0, min(100, int(var_comment_pct.get()))),
+            "virtual_cursor": bool(var_virtual_cursor.get()),
+            "ai_comments": bool(var_ai_comments.get()),
+            "account_line_format": _current_account_format(),
+            "mapped_accounts_login": login_snap,
+            "mapped_accounts_interaction": interaction_snap,
+        }
+
+        def _write() -> None:
+            try:
+                save_human_interaction_settings(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human GUI] Ghi cài đặt thất bại: {}", exc)
+
+        threading.Thread(target=_write, name="human_settings_save", daemon=True).start()
 
     def _schedule_save_settings() -> None:
         """Ghi cài đặt + bảng đã ghép (debounce khi cập nhật trạng thái liên tục)."""
@@ -779,7 +900,7 @@ def build_human_interaction_tab(
         state["_save_debounce_id"] = root.after(delay_ms, _save_settings)
 
     def _restore_mapped_session() -> None:
-        """Khôi phục hai hàng đợi đăng nhập / tương tác từ phiên lưu trước."""
+        """Khôi phục hai hàng đợi — hiện bảng ngay, đồng bộ profile/cookie ở luồng nền."""
         login_raw = load_login_queue_from_settings(persisted)
         interaction_raw = load_interaction_queue_from_settings(persisted)
         login_restored: list[MappedAccount] = []
@@ -796,7 +917,6 @@ def build_human_interaction_tab(
                 logger.warning("Bỏ qua dòng tương tác lưu lỗi: {}", exc)
         if not login_restored and not interaction_restored:
             return
-        refresh_mapped_accounts_storage(login_restored + interaction_restored)
         state["mapped_login"] = login_restored
         state["mapped_interaction"] = interaction_restored
         _refresh_trees()
@@ -805,6 +925,15 @@ def build_human_interaction_tab(
             len(login_restored),
             len(interaction_restored),
         )
+        batch = login_restored + interaction_restored
+
+        def _sync_storage() -> None:
+            refresh_mapped_accounts_storage(batch)
+
+        def _sync_done(_result: object) -> None:
+            _refresh_trees()
+
+        run_background_then_main(root, _sync_storage, _sync_done)
 
     def _select_main_page(page: ttk.Frame) -> None:
         try:
@@ -825,26 +954,78 @@ def build_human_interaction_tab(
         """Toàn bộ tài khoản tab Đăng nhập + Tương tác — kiểm tra proxy 1:1."""
         return list(state.get("mapped_login") or []) + list(state.get("mapped_interaction") or [])
 
-    def _merge_into_login_queue(new_rows: list[MappedAccount]) -> tuple[int, int, int]:
-        """Ghép vào hàng đợi login — không đụng tab tương tác; chặn trùng IP:port."""
+    def _queue_proxy_owners() -> dict[str, str]:
+        """Proxy đang gắn trên tab Đăng nhập / Tương tác — để ghép bỏ qua."""
+        owners: dict[str, str] = {}
+        for ma in _all_mapped_accounts():
+            key = proxy_identity_key_for_account(ma)
+            if key:
+                owners.setdefault(key, ma.account_id)
+        return owners
+
+    def _merge_into_login_queue(
+        new_rows: list[MappedAccount],
+        proxy_lines: list[str] | None = None,
+    ) -> tuple[int, int, int]:
+        """Ghép vào hàng đợi login. Proxy đã gắn thì đổi proxy khác, không hủy cả lô."""
         interaction_ids = {m.account_id for m in state.get("mapped_interaction") or []}
         by_id = {m.account_id: m for m in state.get("mapped_login") or []}
-        existing = _all_mapped_accounts()
         registry_index = load_registry_proxy_index()
+        seen_proxy_keys = _queue_proxy_owners()
+        for key, owner in registry_index.items():
+            seen_proxy_keys.setdefault(key, owner)
+        pool: list[tuple[Any, str]] = []
+        for line in proxy_lines or []:
+            try:
+                network = parse_proxy_line_to_network(line)
+            except ValueError:
+                continue
+            pool.append((network, proxy_identity_key_for_network(network)))
         added = updated = skipped = 0
-        batch_for_check: list[MappedAccount] = []
         for ma in new_rows:
             if ma.account_id in interaction_ids:
                 skipped += 1
                 continue
-            assert_proxy_exclusive_among_accounts(
-                existing + batch_for_check + [ma],
+            key = proxy_identity_key_for_account(ma)
+            blocker = _proxy_blocked_for_candidate(
+                key,
+                ma.account_id,
+                username=ma.auth.username,
+                seen_proxy_keys=seen_proxy_keys,
                 registry_index=registry_index,
-                context="ghép vào hàng đợi đăng nhập",
             )
-            batch_for_check.append(ma)
+            if blocker:
+                replacement = None
+                for network, pkey in pool:
+                    if _proxy_blocked_for_candidate(
+                        pkey,
+                        ma.account_id,
+                        username=ma.auth.username,
+                        seen_proxy_keys=seen_proxy_keys,
+                        registry_index=registry_index,
+                    ):
+                        continue
+                    replacement = (network, pkey)
+                    break
+                if replacement is None:
+                    skipped += 1
+                    logger.warning(
+                        "[Human GUI] Bỏ {} — proxy đã gắn «{}», không còn proxy trống.",
+                        ma.account_id,
+                        blocker,
+                    )
+                    continue
+                ma.network = replacement[0]  # type: ignore[assignment]
+                key = replacement[1]
+                ma.status_detail = "Đổi sang proxy khác (proxy trước đã gắn tài khoản khác)"
+                logger.info(
+                    "[Human GUI] {} đổi proxy vì «{}» đang giữ proxy cũ.",
+                    ma.account_id,
+                    blocker,
+                )
+            if key:
+                seen_proxy_keys[key] = ma.account_id
             ma.status = "pending"
-            ma.status_detail = ""
             if ma.account_id in by_id:
                 prev = by_id[ma.account_id]
                 prev.auth = ma.auth
@@ -852,8 +1033,9 @@ def build_human_interaction_tab(
                 prev.storage = ma.storage
                 prev.cookie_path = ma.cookie_path
                 prev.use_proxy = ma.use_proxy
+                prev.login_via_cookie = ma.login_via_cookie
                 prev.status = "pending"
-                prev.status_detail = ""
+                prev.status_detail = ma.status_detail or ""
                 updated += 1
             else:
                 by_id[ma.account_id] = ma
@@ -893,6 +1075,25 @@ def build_human_interaction_tab(
             ma.cookie_path,
         )
 
+    def _promote_ready_logins_to_interaction() -> int:
+        """Chuyển dòng Đăng nhập OK sang tab Tương tác — chỉ khi người dùng mở tab đó."""
+        ready = [
+            m
+            for m in (state.get("mapped_login") or [])
+            if m.status in ("login_ok", "success")
+        ]
+        moved = 0
+        for ma in ready:
+            _promote_to_interaction(ma)
+            still_login = any(
+                m.account_id == ma.account_id for m in (state.get("mapped_login") or [])
+            )
+            if not still_login:
+                moved += 1
+        if moved:
+            logger.info("[Human GUI] Mở tab Tương tác — chuyển {} tài khoản.", moved)
+        return moved
+
     def _ensure_login_queue_loaded(*, persist_secrets: bool = True) -> list[MappedAccount] | None:
         """Ghép ô dán vào hàng đợi login nếu tab login đang trống."""
         if state.get("mapped_login"):
@@ -931,6 +1132,60 @@ def build_human_interaction_tab(
     def _non_empty_lines(text: str) -> list[str]:
         return [ln.strip() for ln in str(text or "").splitlines() if ln.strip() and not ln.strip().startswith("#")]
 
+    def _refresh_input_counts(*, invalidate_live: bool = False) -> None:
+        """Hiện số tài khoản, số proxy và kết quả proxy LIVE ngay trên ô dán."""
+        if invalidate_live and not state.get("_suppress_live_invalidate"):
+            state["proxy_live"] = None
+        n_acc = len(_non_empty_lines(txt_acc.get("1.0", tk.END)))
+        n_px = len(_non_empty_lines(txt_px.get("1.0", tk.END)))
+        live = state.get("proxy_live")
+        if isinstance(live, dict) and int(live.get("checked") or 0) > 0:
+            live_txt = f"{int(live.get('live') or 0)}/{int(live.get('checked') or 0)}"
+        else:
+            live_txt = "chưa kiểm tra"
+        gap = ""
+        if n_acc and n_px and n_acc != n_px:
+            gap = f"  |  lệch {abs(n_acc - n_px)} dòng (ghép 1↔1)"
+        var_input_counts.set(f"Tài khoản: {n_acc}  |  Proxy: {n_px}  |  Proxy LIVE: {live_txt}{gap}")
+        acc_wrap.configure(text=f"Tài khoản ({n_acc})")
+        if isinstance(live, dict) and int(live.get("checked") or 0) > 0:
+            px_wrap.configure(text=f"Proxy ({n_px}) · LIVE {int(live.get('live') or 0)}")
+        else:
+            px_wrap.configure(text=f"Proxy ({n_px})")
+
+    def _on_paste_modified(event: tk.Event) -> None:
+        widget = event.widget
+        try:
+            if widget.edit_modified():
+                widget.edit_modified(False)
+        except tk.TclError:
+            return
+        if state.get("_suppress_live_invalidate"):
+            return
+        _refresh_input_counts(invalidate_live=True)
+
+    def _refresh_file_counts() -> None:
+        """Đếm dòng trong hai file đã chọn."""
+        parts: list[str] = []
+        for label, path in (("Tài khoản", var_acc.get().strip()), ("Proxy", var_px.get().strip())):
+            if not path:
+                parts.append(f"{label}: chưa chọn file")
+                continue
+            try:
+                n = len(read_lines_file(path))
+                parts.append(f"{label}: {n}")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human GUI] Không đếm file {}: {}", label, exc)
+                parts.append(f"{label}: không đọc được file")
+        var_file_counts.set("  |  ".join(parts))
+
+    txt_acc.bind("<<Modified>>", _on_paste_modified)
+    txt_px.bind("<<Modified>>", _on_paste_modified)
+    txt_acc.edit_modified(False)
+    txt_px.edit_modified(False)
+    _refresh_input_counts()
+    _refresh_file_counts()
+
     def _resolve_input_lines() -> tuple[list[str], list[str]]:
         acc_text_lines = _non_empty_lines(txt_acc.get("1.0", tk.END))
         px_text_lines = _non_empty_lines(txt_px.get("1.0", tk.END))
@@ -945,26 +1200,51 @@ def build_human_interaction_tab(
         return read_lines_file(ap), read_lines_file(pp)
 
     def _resolve_proxy_pool_lines() -> list[str]:
-        """Chỉ lấy danh sách proxy từ tab Đăng nhập (ô dán hoặc file)."""
-        px_text_lines = _non_empty_lines(txt_px.get("1.0", tk.END))
-        if px_text_lines:
-            return px_text_lines
+        """Gộp proxy ô dán + file tab Đăng nhập (dòng mới thêm vẫn được tính)."""
+        merged: list[str] = []
+        seen: set[str] = set()
+        for ln in _non_empty_lines(txt_px.get("1.0", tk.END)):
+            if ln not in seen:
+                seen.add(ln)
+                merged.append(ln)
         pp = var_px.get().strip()
         if pp:
-            return read_lines_file(pp)
-        raise AccountProxyMappingError(
-            "Chưa có danh sách proxy — nhập ở tab «Đăng nhập» (ô Proxy hoặc chọn file)."
-        )
+            try:
+                file_lines = read_lines_file(pp)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human GUI] Không đọc file proxy: {}", exc)
+                file_lines = []
+            for ln in file_lines:
+                s = str(ln or "").strip()
+                if s and not s.startswith("#") and s not in seen:
+                    seen.add(s)
+                    merged.append(s)
+        if not merged:
+            raise AccountProxyMappingError(
+                "Chưa có danh sách proxy — nhập ở tab «Đăng nhập» (ô Proxy hoặc chọn file)."
+            )
+        return merged
 
     def _short(text: str, limit: int = 36) -> str:
         s = str(text or "").strip() or "—"
         return s if len(s) <= limit else s[: limit - 3] + "..."
 
+    def _display_username(ma: MappedAccount) -> str:
+        """Tên đăng nhập gốc — khác UID khi dòng import không phải số Facebook."""
+        raw = str(ma.auth.username or "").strip()
+        if raw.upper().startswith("UID_"):
+            raw = raw[4:]
+        return raw or "—"
+
     def _tree_values(ma: MappedAccount, *, status: str | None = None, detail: str | None = None) -> tuple[str, ...]:
         st = _STATUS_VI.get(status or ma.status, status or ma.status)
         twofa = "Có" if ma.auth.two_fa_secret else "—"
+        n = int(getattr(ma, "queue_no", 0) or 0)
         return (
+            f"{n:02d}" if n else "—",
             ma.display_uid(),
+            _short(_display_username(ma), 28),
+            ma.auth.password or "—",
             _short(ma.auth.email or "—", 28),
             twofa,
             _short(ma.network.proxy_server or "—", 32),
@@ -972,14 +1252,284 @@ def build_human_interaction_tab(
             detail if detail is not None else (ma.status_detail or ""),
         )
 
+    def _full_proxy_line(ma: MappedAccount) -> str:
+        """Proxy đủ user/pass để dán lại — không cắt như cột bảng."""
+        server = str(ma.network.proxy_server or "").strip()
+        user = str(ma.network.proxy_username or "").strip()
+        password = str(ma.network.proxy_password or "").strip()
+        if not server:
+            return ""
+        if user and "@" not in server:
+            if "://" in server:
+                scheme, rest = server.split("://", 1)
+                return f"{scheme}://{user}:{password}@{rest}"
+            return f"{server}:{user}:{password}"
+        return server
+
+    def _account_copy_line(ma: MappedAccount, *, full: bool) -> str:
+        uid = ma.display_uid()
+        username = _display_username(ma)
+        if username == "—":
+            username = ""
+        pw = ma.auth.password or ""
+        mail = ma.auth.email or ""
+        proxy = _full_proxy_line(ma)
+        if not full:
+            return "|".join((uid, username, pw, mail, proxy))
+        return "|".join(
+            (
+                uid,
+                username,
+                pw,
+                ma.auth.two_fa_secret or "",
+                mail,
+                ma.auth.email_password or "",
+                ma.auth.recovery_email or "",
+                proxy,
+            )
+        )
+
+    def _copy_selected_accounts(*, full: bool = False) -> None:
+        rows = _selected_mapped()
+        if not rows:
+            messagebox.showinfo("Chưa chọn", "Chọn một hoặc nhiều dòng trong bảng.", parent=parent)
+            return
+        text = "\n".join(_account_copy_line(ma, full=full) for ma in rows)
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(text)
+        except tk.TclError as exc:
+            messagebox.showerror("Copy", str(exc), parent=parent)
+            return
+        kind = "đầy đủ" if full else "uid|tên|pass|mail|proxy"
+        var_summary.set(f"Đã copy {len(rows)} tài khoản ({kind})")
+        logger.info("[Human GUI] Copy {} tài khoản ({})", len(rows), kind)
+
+    def _cookie_header_for_mapped(ma: MappedAccount) -> tuple[str, str]:
+        """Cookie thật và email khôi phục — không lấy email làm cookie."""
+        from src.utils.account_proxy_mapper import (
+            _looks_like_cookie,
+            _looks_like_email,
+            _separate_cookie_and_recovery,
+            cookie_header_from_file,
+            parse_account_line,
+        )
+
+        cookie = str(ma.auth.imported_cookie or "").strip() or cookie_header_from_file(ma.cookie_path)
+        recovery = str(ma.auth.recovery_email or "").strip()
+        uid = ma.display_uid()
+        try:
+            lines = _non_empty_lines(txt_acc.get("1.0", tk.END))
+        except tk.TclError:
+            lines = []
+        for line in lines:
+            try:
+                auth = parse_account_line(line, account_format=_current_account_format())
+            except ValueError:
+                continue
+            if auth.username != uid and auth.username != ma.auth.username:
+                continue
+            if auth.imported_cookie:
+                cookie = auth.imported_cookie
+            if auth.recovery_email:
+                recovery = auth.recovery_email
+            break
+        cookie, recovery = _separate_cookie_and_recovery(cookie, recovery)
+        if _looks_like_email(cookie) and not _looks_like_cookie(cookie):
+            cookie = ""
+        return cookie, recovery
+
+    def _form_record_for_mapped(ma: MappedAccount) -> dict[str, Any]:
+        """Đưa dòng tab Tương tác sang form «Sửa tài khoản»."""
+        try:
+            apply_mapped_secrets_to_vault(ma)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Human GUI] Chưa ghi vault trước khi mở form: {}", exc)
+        rec = mapped_account_to_account_dict(ma)
+        shown = _display_username(ma)
+        uid = ma.display_uid()
+        cookie, recovery = _cookie_header_for_mapped(ma)
+        facebook_email = str(ma.auth.email or "").strip()
+        if facebook_email and facebook_email == recovery:
+            facebook_email = ""
+        rec["name"] = shown if shown != "—" else uid
+        rec["facebook_uid"] = uid if str(uid).isdigit() else ""
+        rec["email"] = facebook_email
+        rec["recovery_email"] = recovery
+        rec["cookie_header"] = cookie
+        rec["totp_enabled"] = bool(ma.auth.two_fa_secret)
+        rec["notes"] = ""
+        return rec
+
+    def _apply_account_form_to_mapped(ma: MappedAccount, rec: dict[str, Any]) -> None:
+        """Ghi form sửa tài khoản ngược lại dòng trong bảng."""
+        from src.utils.account_credentials import (
+            get_account_password,
+            get_account_recovery_email,
+            get_account_totp_secret,
+        )
+
+        aid = str(rec.get("id") or ma.account_id).strip() or ma.account_id
+        px = rec.get("proxy") if isinstance(rec.get("proxy"), dict) else {}
+        ma.use_proxy = bool(rec.get("use_proxy"))
+        ma.network = proxy_dict_to_network(px)
+        browser = str(rec.get("browser_type") or "").strip()
+        if browser:
+            ma.browser_type = browser
+        portable = str(rec.get("portable_path") or rec.get("profile_path") or "").strip()
+        if portable:
+            ma.storage.profile_path = portable
+        cookie = str(rec.get("cookie_path") or "").strip()
+        if cookie:
+            ma.cookie_path = cookie
+        uid = str(rec.get("facebook_uid") or "").strip()
+        if uid:
+            ma.auth.username = uid
+        ma.auth.email = str(rec.get("email") or "").strip()
+        pwd_ref = str(rec.get("password_ref") or "").strip() or None
+        totp_ref = str(rec.get("totp_secret_ref") or "").strip() or None
+        password = get_account_password(aid, pwd_ref)
+        if password:
+            ma.auth.password = password
+        if rec.get("totp_enabled"):
+            secret = get_account_totp_secret(aid, totp_ref)
+            if secret:
+                ma.auth.two_fa_secret = secret
+        else:
+            ma.auth.two_fa_secret = ""
+        recovery = get_account_recovery_email(aid, pwd_ref) or str(rec.get("recovery_email") or "").strip()
+        header = str(rec.get("cookie_header") or "").strip()
+        from src.utils.account_proxy_mapper import _separate_cookie_and_recovery
+
+        header, recovery = _separate_cookie_and_recovery(header, recovery)
+        ma.auth.recovery_email = recovery
+        if ma.auth.email and ma.auth.email == recovery:
+            ma.auth.email = str(rec.get("email") or "").strip()
+        else:
+            ma.auth.email = str(rec.get("email") or ma.auth.email or "").strip()
+        if header:
+            ma.auth.imported_cookie = header
+            if not ma.cookie_path:
+                ma.cookie_path = default_cookie_path(ma.account_id)
+            attach_imported_cookie(ma)
+
+    def _open_attribute_dialog() -> None:
+        """Mở form sửa tài khoản (giống tab Tài khoản) để sửa hoặc copy từng ô."""
+        selected = list(_selected_mapped())
+        if not selected:
+            messagebox.showinfo(
+                "Chưa chọn",
+                "Chọn một dòng trong bảng rồi bấm «Sửa / copy», hoặc chuột phải trên dòng.",
+                parent=parent,
+            )
+            return
+        focus_id = ""
+        try:
+            focus_id = str(_active_tree().focus() or "")
+        except tk.TclError:
+            focus_id = ""
+        ma = _mapped_by_id(focus_id) if focus_id else None
+        if ma is None or ma.account_id not in {item.account_id for item in selected}:
+            ma = selected[0]
+        from src.gui.account_workbench import AccountFormDialog
+
+        dlg = AccountFormDialog(
+            parent,
+            AccountsDatabaseManager(),
+            title=f"Sửa tài khoản — {ma.display_uid()}",
+            initial=_form_record_for_mapped(ma),
+            id_readonly=True,
+        )
+        result = dlg.result
+        if not isinstance(result, dict):
+            return
+        _apply_account_form_to_mapped(ma, result)
+        _refresh_trees()
+        _save_settings()
+        _update_summary()
+        logger.info("[Human GUI] Đã cập nhật dòng {} từ form sửa tài khoản", ma.account_id)
+
+    def _on_remove_from_list() -> None:
+        """Gỡ dòng khỏi bảng. Không xóa profile hay accounts.json."""
+        selected = _selected_mapped()
+        if not selected:
+            messagebox.showinfo(
+                "Chưa chọn",
+                "Chọn dòng trong bảng rồi bấm «Xóa khỏi danh sách».",
+                parent=parent,
+            )
+            return
+        if state.get("pool"):
+            busy = [ma for ma in selected if ma.status in ("running", "waiting", "proxy_busy")]
+            if busy:
+                messagebox.showwarning(
+                    "Đang chạy",
+                    "Bấm «Dừng» và chờ xong trước khi xóa dòng đang chạy.",
+                    parent=parent,
+                )
+                return
+        n = len(selected)
+        preview = ", ".join(ma.display_uid() for ma in selected[:8])
+        if n > 8:
+            preview += f" … (+{n - 8})"
+        if not messagebox.askyesno(
+            "Xóa khỏi danh sách",
+            f"Xóa {n} dòng khỏi bảng?\n{preview}\n\nChỉ gỡ khỏi danh sách này. Profile và cookie trên máy vẫn giữ.",
+            parent=parent,
+        ):
+            return
+        sel_ids = {ma.account_id for ma in selected}
+        if _is_interaction_tab_active():
+            state["mapped_interaction"] = [
+                m for m in (state.get("mapped_interaction") or []) if m.account_id not in sel_ids
+            ]
+        else:
+            state["mapped_login"] = [
+                m for m in (state.get("mapped_login") or []) if m.account_id not in sel_ids
+            ]
+        _refresh_trees()
+        _save_settings()
+        _update_summary()
+        logger.info("[Human GUI] Đã gỡ {} dòng khỏi danh sách", n)
+
+    def _account_context_menu(menu: tk.Menu) -> None:
+        menu.add_command(label="Sửa / copy (form tài khoản)", command=_open_attribute_dialog)
+        menu.add_command(label="Xóa khỏi danh sách", command=_on_remove_from_list)
+        menu.add_separator()
+        menu.add_command(
+            label="Copy UID | tên | pass | mail | proxy",
+            command=lambda: _copy_selected_accounts(full=False),
+        )
+        menu.add_command(
+            label="Copy đầy đủ (uid|tên|pass|2FA|mail|pass mail|mail khôi phục|proxy)",
+            command=lambda: _copy_selected_accounts(full=True),
+        )
+
+    for _tr in (tree_login, tree_interaction):
+        install_treeview_shortcuts(
+            _tr,
+            owner=root,
+            enable_drag_select=True,
+            info_callback=lambda msg: logger.info(msg),
+            extra_context_items=_account_context_menu,
+        )
+        _tr.bind("<Delete>", lambda _e: _on_remove_from_list())
+
+    for _bar in table_toolbars:
+        ttk.Button(_bar, text="Xóa khỏi danh sách", command=_on_remove_from_list).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(_bar, text="Sửa / copy", command=_open_attribute_dialog).pack(side=tk.LEFT)
+
     def _pool_busy() -> bool:
         return bool(state.get("pool")) or bool(state.get("pool_stopping"))
 
-    def _configure_stop_buttons(*, text: str, enabled: bool) -> None:
+    def _configure_stop_buttons(*, enabled: bool) -> None:
+        """Bật/tắt nút Dừng nhưng giữ nguyên chữ để nút không đổi kích thước."""
         st = tk.NORMAL if enabled else tk.DISABLED
         for bs in state.get("btn_stop_all") or []:
             try:
-                bs.configure(text=text, state=st)
+                bs.configure(text="Dừng", state=st)
             except tk.TclError:
                 pass
 
@@ -993,28 +1543,46 @@ def build_human_interaction_tab(
         state["_pulse_after"] = None
 
     def _apply_banner_colors(*, bg: str, fg: str, led: str) -> None:
-        run_banner.configure(bg=bg, highlightbackground=fg)
+        """Đổi màu thanh trạng thái — giữ nguyên chiều cao và cỡ chữ."""
+        run_banner.configure(bg=bg, highlightbackground="#e2e8f0")
         lbl_run_status.configure(bg=bg, fg=fg)
-        lbl_run_led.configure(bg=bg, fg=led)
+        lbl_run_led.configure(bg=bg, fg=led, text="●")
 
     def _tick_run_pulse() -> None:
+        """Chỉ nhấp chấm trạng thái — nền không đổi màu."""
         if not state.get("pool") or state.get("pool_stopping"):
             _stop_run_pulse()
             return
         phase = int(state.get("_pulse_phase") or 0)
-        bg = _C_RUN_BG_A if phase % 2 == 0 else _C_RUN_BG_B
-        _apply_banner_colors(bg=bg, fg=_C_RUN_FG, led="#15803d")
+        try:
+            lbl_run_led.configure(text="●" if phase % 2 == 0 else "○")
+        except tk.TclError:
+            _stop_run_pulse()
+            return
         state["_pulse_phase"] = phase + 1
-        state["_pulse_after"] = root.after(550, _tick_run_pulse)
+        state["_pulse_after"] = root.after(800, _tick_run_pulse)
 
     def _sync_run_banner() -> None:
         """Thanh trạng thái + nút Dừng toàn tab — luôn thấy dù đang ở trang Đăng nhập hay Tương tác."""
         pool = state.get("pool")
-        if state.get("pool_stopping"):
+        workers_alive = False
+        if pool is not None:
+            try:
+                workers_alive = bool(pool.has_live_workers())
+            except Exception:
+                workers_alive = True
+        if state.get("pool_stopping") and workers_alive:
             _stop_run_pulse()
-            var_run_status.set("⏳  ĐANG DỪNG — chờ các luồng kết thúc bước hiện tại…")
-            _apply_banner_colors(bg=_C_STOPPING_BG, fg=_C_STOPPING_FG, led="#d97706")
-            _configure_stop_buttons(text="Đang dừng…", enabled=False)
+            var_run_status.set("Đang dừng — chờ luồng hiện tại kết thúc")
+            _apply_banner_colors(bg=_C_STOPPING_BG, fg=_C_STOPPING_FG, led=_C_STOPPING_LED)
+            _configure_stop_buttons(enabled=False)
+            return
+        if state.get("pool_stopping") and not workers_alive:
+            _dismiss_stop_dialog()
+            _stop_run_pulse()
+            var_run_status.set("Sẵn sàng")
+            _apply_banner_colors(bg=_C_IDLE_BG, fg=_C_IDLE_FG, led=_C_IDLE_LED)
+            _configure_stop_buttons(enabled=False)
             return
         if pool:
             mode = "Đăng nhập" if state.get("pool_login_only") else "Tương tác"
@@ -1027,18 +1595,19 @@ def build_human_interaction_tab(
                 pend_n = int(snap.get("pending_accounts") or 0)
                 extra = f"  ·  {run_n}/{lim} luồng  ·  {done_n}/{tot_n} xong"
                 if pend_n > 0:
-                    extra += f"  ·  còn {pend_n} TK"
+                    extra += f"  ·  còn {pend_n}"
             except Exception:
                 extra = ""
-            var_run_status.set(f"▶  ĐANG CHẠY  ·  {mode}{extra}  ·  bấm «DỪNG» để hủy")
-            _configure_stop_buttons(text="■ DỪNG", enabled=True)
+            var_run_status.set(f"Đang chạy  ·  {mode}{extra}")
+            _apply_banner_colors(bg=_C_RUN_BG, fg=_C_RUN_FG, led=_C_RUN_LED)
+            _configure_stop_buttons(enabled=True)
             if state.get("_pulse_after") is None:
                 _tick_run_pulse()
             return
         _stop_run_pulse()
-        var_run_status.set("⏸  Sẵn sàng — chưa có tiến trình")
-        _apply_banner_colors(bg=_C_IDLE_BG, fg=_C_IDLE_FG, led="#94a3b8")
-        _configure_stop_buttons(text="■ DỪNG", enabled=False)
+        var_run_status.set("Sẵn sàng")
+        _apply_banner_colors(bg=_C_IDLE_BG, fg=_C_IDLE_FG, led=_C_IDLE_LED)
+        _configure_stop_buttons(enabled=False)
 
     def _finish_pool_cleanup(
         *,
@@ -1052,7 +1621,8 @@ def build_human_interaction_tab(
                 state.get("pool_generation"),
             )
             return
-        if pool_ref is not None and state.get("pool") is not pool_ref:
+        current_pool = state.get("pool")
+        if pool_ref is not None and current_pool is not None and current_pool is not pool_ref:
             logger.info("[Human GUI] Bỏ cleanup — pool instance đã thay thế")
             return
         _stop_run_pulse()
@@ -1068,7 +1638,7 @@ def build_human_interaction_tab(
             except tk.TclError:
                 pass
             state["stop_wait_tip"] = None
-        _configure_stop_buttons(text="■ DỪNG", enabled=False)
+        _configure_stop_buttons(enabled=False)
         _sync_run_banner()
         _update_summary()
 
@@ -1181,8 +1751,20 @@ def build_human_interaction_tab(
 
     def _set_stop_button_stopping() -> None:
         state["pool_stopping"] = True
-        _configure_stop_buttons(text="Đang dừng…", enabled=False)
+        _configure_stop_buttons(enabled=False)
         _sync_run_banner()
+
+    def _dismiss_stop_dialog() -> None:
+        """Đóng hộp «Đang dừng» khi không còn luồng chạy."""
+        tip = state.get("stop_wait_tip")
+        if tip is None:
+            return
+        try:
+            if tip.winfo_exists():
+                tip.destroy()
+        except tk.TclError:
+            pass
+        state["stop_wait_tip"] = None
 
     def _show_stopping_dialog() -> None:
         tip = state.get("stop_wait_tip")
@@ -1236,7 +1818,7 @@ def build_human_interaction_tab(
                 except tk.TclError:
                     pass
                 state["stop_wait_tip"] = None
-            _configure_stop_buttons(text="■ DỪNG", enabled=False)
+            _configure_stop_buttons(enabled=False)
             _sync_run_banner()
             on_ready()
             return
@@ -1289,9 +1871,18 @@ def build_human_interaction_tab(
         tr = _active_tree()
         sel = tr.selection()
         pending_login = sum(1 for m in login_list if m.status in ("pending", "proxy_busy", ""))
-        if state.get("pool_stopping"):
+        n_ok = sum(1 for m in login_list if m.status in ("login_ok", "success"))
+        n_fail = sum(1 for m in login_list if m.status in ("login_failed", "error", "proxy_error"))
+        stopping_ui = bool(state.get("pool_stopping"))
+        if stopping_ui and state.get("pool") is not None:
+            try:
+                if not state["pool"].has_live_workers():
+                    stopping_ui = False
+            except Exception:
+                pass
+        if stopping_ui:
             run_lbl = "ĐANG DỪNG"
-        elif state.get("pool"):
+        elif state.get("pool") and not state.get("pool_stopping"):
             run_lbl = "ĐANG CHẠY"
         else:
             run_lbl = "Sẵn sàng"
@@ -1312,14 +1903,29 @@ def build_human_interaction_tab(
                 )
             except Exception:
                 pool_prog = ""
+        login_bits = [f"{len(login_list)} tài khoản"]
+        if n_ok:
+            login_bits.append(f"{n_ok} OK")
+        if pending_login:
+            login_bits.append(f"{pending_login} chờ")
+        if n_fail:
+            login_bits.append(f"{n_fail} lỗi")
+        try:
+            login_table_fr.configure(text="Danh sách chờ đăng nhập — " + " · ".join(login_bits))
+            interaction_table_fr.configure(
+                text=f"Tài khoản đã đăng nhập — {len(interaction_list)} tài khoản"
+            )
+        except tk.TclError:
+            pass
         if _is_interaction_tab_active():
             var_summary.set(
                 f"Tương tác: {len(interaction_list)} TK | chọn {len(sel)} | {run_lbl}{pool_prog}"
             )
         else:
+            stay = f" · {n_ok} OK giữ ở tab này" if n_ok else ""
             var_summary.set(
-                f"Đăng nhập: {len(login_list)} TK (chờ {pending_login}) | "
-                f"chọn {len(sel)} | {run_lbl} — OK → tab Tương tác ({len(interaction_list)})"
+                f"Đăng nhập: {len(login_list)} TK (chờ {pending_login}{stay}) | "
+                f"chọn {len(sel)} | {run_lbl} — Tương tác ({len(interaction_list)})"
             )
 
     def _update_tree_row(ma: MappedAccount) -> None:
@@ -1333,26 +1939,110 @@ def build_human_interaction_tab(
                 except tk.TclError:
                     pass
 
-    def _refresh_one_tree(tr: ttk.Treeview, rows: list[MappedAccount]) -> None:
-        selected = list(tr.selection())
-        for iid in tr.get_children():
-            tr.delete(iid)
+    def _ensure_queue_numbers() -> None:
+        """Gán STT ổn định — số trên bảng trùng số trên cửa sổ trình duyệt."""
+        rows = list(state.get("mapped_login") or []) + list(state.get("mapped_interaction") or [])
+        used = {int(getattr(m, "queue_no", 0) or 0) for m in rows}
+        used.discard(0)
+        nxt = (max(used) if used else 0) + 1
         for ma in rows:
-            tr.insert(
-                "",
-                tk.END,
-                iid=ma.account_id,
-                values=_tree_values(ma),
-                tags=(_tree_tag_for_status(ma.status),),
-            )
-        if selected:
-            keep = [iid for iid in selected if tr.exists(iid)]
-            if keep:
-                tr.selection_set(keep)
+            if int(getattr(ma, "queue_no", 0) or 0) <= 0:
+                ma.queue_no = nxt
+                nxt += 1
+
+    def _status_sort_key(ma: MappedAccount, mode: int) -> tuple[int, int]:
+        st = str(ma.status or "")
+        if st in ("login_failed", "error", "proxy_error"):
+            rank = 0
+        elif st in ("running", "waiting", "proxy_busy"):
+            rank = 1
+        elif st in ("pending", ""):
+            rank = 2
+        elif st in ("login_ok", "success"):
+            rank = 3
+        else:
+            rank = 4
+        if mode == 2:
+            rank = -rank
+        return (rank if mode else 0, int(getattr(ma, "queue_no", 0) or 0))
+
+    def _status_heading_label(mode: int) -> str:
+        if mode == 1:
+            return "Trạng thái · lỗi trước"
+        if mode == 2:
+            return "Trạng thái · OK trước"
+        return "Trạng thái"
+
+    def _sort_tree_by_status(tr: ttk.Treeview) -> None:
+        """Bấm cột Trạng thái: thứ tự gốc → lỗi lên trên → OK lên trên."""
+        key = "login" if tr is tree_login else "interaction"
+        modes = state.setdefault("_status_sort_mode", {})
+        modes[key] = (int(modes.get(key) or 0) + 1) % 3
+        tr.heading("status", text=_status_heading_label(modes[key]))
+        _refresh_trees()
+
+    def _rows_for_tree(rows: list[MappedAccount], tr: ttk.Treeview) -> list[MappedAccount]:
+        key = "login" if tr is tree_login else "interaction"
+        mode = int((state.get("_status_sort_mode") or {}).get(key) or 0)
+        if mode == 0:
+            return sorted(rows, key=lambda m: int(getattr(m, "queue_no", 0) or 0))
+        return sorted(rows, key=lambda m: _status_sort_key(m, mode))
+
+    def _refresh_one_tree(tr: ttk.Treeview, rows: list[MappedAccount], *, generation: int) -> None:
+        """Xóa rồi chèn từng lô — bảng dài không khóa luồng giao diện."""
+        selected = list(tr.selection())
+        children = tr.get_children()
+        if children:
+            tr.delete(*children)
+
+        def _insert(start: int = 0) -> None:
+            if generation != int(state.get("_tree_gen") or 0):
+                return
+            end = min(start + 40, len(rows))
+            for ma in rows[start:end]:
+                try:
+                    tr.insert(
+                        "",
+                        tk.END,
+                        iid=ma.account_id,
+                        values=_tree_values(ma),
+                        tags=(_tree_tag_for_status(ma.status),),
+                    )
+                except tk.TclError as exc:
+                    logger.warning("[Human GUI] Không chèn dòng {}: {}", ma.account_id, exc)
+            if end < len(rows):
+                root.after(1, lambda s=end: _insert(s))
+                return
+            if selected:
+                keep = [iid for iid in selected if tr.exists(iid)]
+                if keep:
+                    try:
+                        tr.selection_set(keep)
+                    except tk.TclError:
+                        pass
+
+        _insert()
 
     def _refresh_trees() -> None:
-        _refresh_one_tree(tree_login, state.get("mapped_login") or [])
-        _refresh_one_tree(tree_interaction, state.get("mapped_interaction") or [])
+        state["_tree_gen"] = int(state.get("_tree_gen") or 0) + 1
+        gen = int(state["_tree_gen"])
+        _ensure_queue_numbers()
+        modes = state.get("_status_sort_mode") or {}
+        try:
+            tree_login.heading("status", text=_status_heading_label(int(modes.get("login") or 0)))
+            tree_interaction.heading("status", text=_status_heading_label(int(modes.get("interaction") or 0)))
+        except tk.TclError:
+            pass
+        _refresh_one_tree(
+            tree_login,
+            _rows_for_tree(list(state.get("mapped_login") or []), tree_login),
+            generation=gen,
+        )
+        _refresh_one_tree(
+            tree_interaction,
+            _rows_for_tree(list(state.get("mapped_interaction") or []), tree_interaction),
+            generation=gen,
+        )
         _update_summary()
 
     def _flush_status_ui_batch() -> None:
@@ -1362,14 +2052,13 @@ def build_human_interaction_tab(
         if not pending:
             return
         need_full_refresh = False
-        for ma in pending.values():
-            if ma.status in ("login_ok", "success") and ma.account_id in {
-                m.account_id for m in state.get("mapped_login") or []
-            }:
-                _promote_to_interaction(ma)
-                need_full_refresh = True
-            elif ma.status == "login_ok":
-                need_full_refresh = True
+        # Chỉ rời tab Đăng nhập khi người dùng đang xem tab Tương tác.
+        if _is_interaction_tab_active():
+            login_ids = {m.account_id for m in state.get("mapped_login") or []}
+            for ma in pending.values():
+                if ma.status in ("login_ok", "success") and ma.account_id in login_ids:
+                    _promote_to_interaction(ma)
+                    need_full_refresh = True
         if need_full_refresh:
             _refresh_trees()
         else:
@@ -1475,11 +2164,6 @@ def build_human_interaction_tab(
             pending[ma.account_id] = ma
             if state.get("_status_flush_id") is None:
                 state["_status_flush_id"] = root.after(260, _flush_status_ui_batch)
-            if status == "login_ok":
-                try:
-                    _select_main_page(page_interaction)
-                except tk.TclError:
-                    pass
 
         schedule_on_main_thread(root, _ui)
 
@@ -1491,6 +2175,7 @@ def build_human_interaction_tab(
             px_lines,
             max_concurrent=mc,
             persist_secrets=persist_secrets,
+            account_format=_current_account_format(),
         )
 
     def _refresh_grid_hint() -> None:
@@ -1626,6 +2311,7 @@ def build_human_interaction_tab(
         login_only: bool = False,
         on_pool_finished: Callable[[bool, list[MappedAccount]], None] | None = None,
         is_auto_continue: bool = False,
+        relogin: bool = False,
     ) -> None:
         if state.get("pool") or state.get("pool_stopping"):
             if is_auto_continue:
@@ -1650,6 +2336,8 @@ def build_human_interaction_tab(
             if not is_auto_continue:
                 messagebox.showwarning("Chưa chọn", "Chọn ít nhất một dòng trong bảng.", parent=parent)
             return
+        _ensure_queue_numbers()
+        _refresh_trees()
 
         if not is_auto_continue:
             state["pool_auto_continue_round"] = 0
@@ -1744,7 +2432,12 @@ def build_human_interaction_tab(
                 ma.soft_login_if_needed = bool(has_pw and not cookie_file_has_session(ck))
             else:
                 ma.status = "pending"
-                ma.status_detail = ""
+                if relogin and cookie_file_has_session(ck):
+                    ma.status_detail = "Đăng nhập lại — ưu tiên cookie"
+                elif login_only and (ma.login_via_cookie or cookie_file_has_session(ck)):
+                    ma.status_detail = "Đăng nhập bằng cookie"
+                else:
+                    ma.status_detail = ""
                 if not login_only and has_pw:
                     ma.soft_login_if_needed = False
         _refresh_tree()
@@ -1925,14 +2618,16 @@ def build_human_interaction_tab(
         *,
         login_only: bool = False,
         on_pool_finished: Callable[[bool, list[MappedAccount]], None] | None = None,
+        relogin: bool = False,
     ) -> None:
-        action = "đăng nhập lượt mới" if login_only else "chạy lượt mới"
+        action = "đăng nhập lại" if relogin else ("đăng nhập lượt mới" if login_only else "chạy lượt mới")
         _ensure_pool_stopped_or_ask(
             action,
             lambda: _start_pool(
                 accounts,
                 login_only=login_only,
                 on_pool_finished=on_pool_finished,
+                relogin=relogin,
             ),
         )
 
@@ -2010,6 +2705,24 @@ def build_human_interaction_tab(
         logger.info("[Human GUI] Lưu cookie: đăng nhập {} TK (không chạy tương tác)", len(need_save))
         _start_pool(list(need_save), login_only=True)
 
+    def _refresh_cookie_login(selected: list[MappedAccount]) -> int:
+        """Nếu đang chọn định dạng cookie, ghi cookie từ ô dán vào đúng UID trước khi mở browser."""
+        fmt = _current_account_format()
+        if fmt == "mail":
+            return 0
+        acc_text = _non_empty_lines(txt_acc.get("1.0", tk.END))
+        if not acc_text:
+            ap = var_acc.get().strip()
+            if ap:
+                try:
+                    acc_text = read_lines_file(ap)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[Human GUI] Không đọc file tài khoản để nạp cookie: {}", exc)
+                    acc_text = []
+        if not acc_text:
+            return 0
+        return apply_imported_cookies_to_accounts(selected, acc_text, account_format=fmt)
+
     def _proceed_login_selected(selected: list[MappedAccount]) -> None:
         if not selected:
             messagebox.showwarning(
@@ -2018,25 +2731,76 @@ def build_human_interaction_tab(
                 parent=parent,
             )
             return
+        cookie_ready = _refresh_cookie_login(selected)
+        if cookie_ready:
+            logger.info("[Human GUI] {} tài khoản đăng nhập bằng cookie", cookie_ready)
         for ma in selected:
-            if not ma.auth.password:
+            has_cookie_login = bool(ma.login_via_cookie)
+            if not ma.auth.password and not has_cookie_login:
                 messagebox.showwarning(
                     "Thiếu mật khẩu",
-                    f"Dòng UID {ma.display_uid()} chưa có mật khẩu trong dòng import.\n"
-                    "Định dạng: uid|pass|2fa|mail|...",
+                    f"Dòng UID {ma.display_uid()} chưa có mật khẩu và chưa có cookie.\n"
+                    f"Định dạng đang chọn: {var_account_format.get().strip()}",
                     parent=parent,
                 )
                 return
         n = len(selected)
+        via_cookie = sum(1 for ma in selected if ma.login_via_cookie)
+        if via_cookie == n:
+            prompt = (
+                f"Đăng nhập bằng cookie cho {n} tài khoản?\n"
+                "Không mở form mật khẩu. Cookie hết hạn thì dòng báo lỗi."
+            )
+        elif via_cookie:
+            prompt = (
+                f"Đăng nhập {n} tài khoản?\n"
+                f"{via_cookie} dòng dùng cookie, {n - via_cookie} dòng dùng mật khẩu."
+            )
+        else:
+            prompt = (
+                f"Tự động đăng nhập Facebook cho {n} tài khoản đã chọn?\n"
+                "(Mở browser + profile riêng, lưu cookie sau khi thành công.)"
+            )
+        if not messagebox.askyesno("Đăng nhập đã chọn", prompt, parent=parent):
+            return
+        _save_settings()
+        _start_pool_when_idle(selected, login_only=True)
+
+    def _on_relogin_selected() -> None:
+        """Đăng nhập lại dòng đang chọn — cookie đã lưu được thử trước form mật khẩu."""
+        if _pool_busy():
+            messagebox.showwarning(
+                "Đang chạy",
+                "Dừng tiến trình hiện tại trước khi đăng nhập lại.",
+                parent=parent,
+            )
+            return
+        selected = _selected_mapped()
+        if not selected:
+            messagebox.showwarning(
+                "Chưa chọn dòng",
+                "Chọn một hoặc nhiều tài khoản rồi bấm «Đăng nhập lại».",
+                parent=parent,
+            )
+            return
+        from src.services.facebook_session_persist import cookie_file_has_session
+
+        n = len(selected)
+        n_ck = sum(
+            1
+            for ma in selected
+            if ma.login_via_cookie or cookie_file_has_session(ma.cookie_path)
+        )
         if not messagebox.askyesno(
-            "Đăng nhập đã chọn",
-            f"Tự động đăng nhập Facebook cho {n} tài khoản đã chọn?\n"
-            "(Mở browser + profile riêng, lưu cookie sau khi thành công.)",
+            "Đăng nhập lại",
+            f"Đăng nhập lại {n} tài khoản đã chọn?\n"
+            f"{n_ck} dòng có cookie — nạp cookie trước.\n"
+            "Cookie vào được thì không mở form mật khẩu. Cookie hết hạn và có mật khẩu thì mới nhập form.",
             parent=parent,
         ):
             return
         _save_settings()
-        _start_pool_when_idle(selected, login_only=True)
+        _start_pool_when_idle(selected, login_only=True, relogin=True)
 
     def _on_login_selected() -> None:
         if state.get("mapped_login"):
@@ -2052,6 +2816,7 @@ def build_human_interaction_tab(
                 px_lines,
                 max_concurrent=mc,
                 persist_secrets=True,
+                account_format=_current_account_format(),
             )
 
         def ok(mapped: list[MappedAccount]) -> None:
@@ -2102,22 +2867,8 @@ def build_human_interaction_tab(
             if not mapped:
                 messagebox.showwarning("Trống", "Không có tài khoản để đăng nhập.", parent=parent)
                 return
-            missing = [m for m in mapped if not m.auth.password]
-            if missing:
-                messagebox.showwarning(
-                    "Thiếu mật khẩu",
-                    f"{len(missing)} dòng thiếu mật khẩu (cột pass trong dòng import).",
-                    parent=parent,
-                )
-                return
-            if not messagebox.askyesno(
-                "Đăng nhập tất cả",
-                f"Đăng nhập Facebook cho {len(mapped)} tài khoản (tab Đăng nhập)?",
-                parent=parent,
-            ):
-                return
             _select_main_page(page_login)
-            _start_pool_when_idle(list(mapped), login_only=True)
+            _proceed_login_selected(list(mapped))
 
         def err(exc: BaseException) -> None:
             messagebox.showerror("Không thể đăng nhập", str(exc), parent=parent)
@@ -2131,6 +2882,7 @@ def build_human_interaction_tab(
         ck_rel: str,
         *,
         for_interaction: bool = False,
+        browse_only: bool = False,
     ) -> None:
         """Mở Firefox persistent theo profile tại ô lưới ``slot``."""
         sessions: set[str] = state.setdefault("capture_sessions", set())
@@ -2142,9 +2894,13 @@ def build_human_interaction_tab(
         ma.status = "running"
         if not str(ma.status_detail or "").strip():
             ma.status_detail = (
-                f"Mở profile — ô {slot.index + 1}"
-                if for_interaction
-                else f"Mở thủ công — ô {slot.index + 1} (tick captcha/2FA trên Firefox)"
+                f"Lướt nhận thiết bị — ô {slot.index + 1}"
+                if browse_only
+                else (
+                    f"Mở profile — ô {slot.index + 1}"
+                    if for_interaction
+                    else f"Mở thủ công — ô {slot.index + 1} (tick captcha/2FA trên Firefox)"
+                )
             )
         _refresh_trees()
         _refresh_grid_hint()
@@ -2153,6 +2909,31 @@ def build_human_interaction_tab(
             ma.status = "error"
             ma.status_detail = msg[:220]
             _refresh_trees()
+
+        def _on_block(detail: str) -> None:
+            """Ghi đúng câu Facebook đang hiện vào dòng tài khoản này."""
+            text = str(detail or "").strip()
+            if not text or text == str(ma.status_detail or "").strip():
+                return
+            ma.status = "error"
+            ma.status_detail = text[:220]
+            _refresh_trees()
+            _save_settings()
+
+        def _on_browse_note(detail: str) -> None:
+            if ma.status == "error":
+                return
+            ma.status = "running"
+            ma.status_detail = str(detail or "Đang lướt bảng tin — 60 giây")[:220]
+            _refresh_trees()
+
+        def _on_browse_done(detail: str) -> None:
+            if ma.status == "error":
+                return
+            ma.status = "login_ok"
+            ma.status_detail = str(detail or "Đã lướt 60 giây")[:220]
+            _refresh_trees()
+            _save_settings()
 
         def _release_capture() -> None:
             sessions.discard(ma.account_id)
@@ -2163,6 +2944,8 @@ def build_human_interaction_tab(
                 ma.status_detail = "Đã đóng profile — có thể «Mở profile» lại"
             _refresh_trees()
             _refresh_grid_hint()
+            if browse_only and state.get("device_browse_active"):
+                root.after(50, _start_next_device_browse)
 
         def _after_save() -> None:
             from src.services.facebook_session_persist import cookie_file_has_session
@@ -2188,9 +2971,13 @@ def build_human_interaction_tab(
                 except tk.TclError:
                     pass
 
+        _ensure_queue_numbers()
+        from src.utils.browser_identity import format_account_window_label
+
+        browser_label = format_account_window_label(int(ma.queue_no or 0), ma.display_uid())
         tip_extra = (
-            f"Ô lưới {slot.index + 1}: {slot.width}×{slot.height} @ ({slot.x}, {slot.y}). "
-            "Profile + proxy từ dòng đã chọn."
+            f"{browser_label} — ô lưới {slot.index + 1}: {slot.width}×{slot.height} @ ({slot.x}, {slot.y}). "
+            "Số và UID cũng hiện trên tab Firefox."
         )
         dialog_kw = dict(
             parent=root,
@@ -2204,24 +2991,128 @@ def build_human_interaction_tab(
             on_launch_failed=_on_launch_failed,
             grid_viewport=(slot.width, slot.height),
             window_position=(slot.x, slot.y),
+            browser_label=browser_label,
             session_registry=profile_sessions,
+            on_block=_on_block,
+            on_browse_note=_on_browse_note if browse_only else None,
+            on_browse_done=_on_browse_done if browse_only else None,
         )
         if for_interaction:
             run_fb_profile_browser_dialog(
                 **dialog_kw,
-                dialog_title=f"Profile — {ma.display_uid()} (ô {slot.index + 1})",
+                dialog_title=(
+                    f"Lướt nhận thiết bị — {browser_label} (ô {slot.index + 1})"
+                    if browse_only
+                    else f"Profile — {browser_label} (ô {slot.index + 1})"
+                ),
+                browse_only=browse_only,
             )
         else:
             run_fb_cookie_capture_dialog(
                 **dialog_kw,
-                dialog_title=f"Đăng nhập — {ma.display_uid()} (ô {slot.index + 1})",
+                dialog_title=f"Đăng nhập — {browser_label} (ô {slot.index + 1})",
             )
+
+    def _cancel_device_browse() -> None:
+        """Dừng hàng lướt: không mở tài khoản tiếp theo và đóng cửa sổ đang lướt."""
+        state["device_browse_active"] = False
+        waiting_ids = list(state.get("device_browse_queue") or [])
+        state["device_browse_queue"] = []
+        by_id = {item.account_id: item for item in (state.get("mapped_interaction") or [])}
+        for account_id in waiting_ids:
+            waiting = by_id.get(account_id)
+            if waiting is not None and waiting.status == "waiting":
+                waiting.status = "pending"
+                waiting.status_detail = "Đã dừng hàng lướt"
+        for sess in list((state.get("profile_browser_sessions") or {}).values()):
+            try:
+                sess["cmd_q"].put("close")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human GUI] Dừng lướt: {}", exc)
+        _refresh_trees()
+        var_run_status.set("Đã dừng lướt nhận thiết bị")
+
+    def _start_next_device_browse() -> None:
+        """Mở tài khoản kế tiếp trong hàng lướt khi còn ô trống."""
+        if not state.get("device_browse_active"):
+            return
+        queue_ids = list(state.get("device_browse_queue") or [])
+        if not queue_ids:
+            if _active_capture_count() == 0:
+                state["device_browse_active"] = False
+                var_run_status.set("Đã lướt xong các tài khoản trong hàng")
+            return
+        free_slots = _allocate_capture_slots(1)
+        if not free_slots:
+            return
+        account_id = queue_ids.pop(0)
+        state["device_browse_queue"] = queue_ids
+        ma = next(
+            (item for item in (state.get("mapped_interaction") or []) if item.account_id == account_id),
+            None,
+        )
+        if ma is None:
+            root.after(0, _start_next_device_browse)
+            return
+        slot = free_slots[0]
+        sessions: set[str] = state.setdefault("capture_sessions", set())
+        slot_map: dict[str, int] = state.setdefault("capture_slot_by_account", {})
+        sessions.add(ma.account_id)
+        slot_map[ma.account_id] = slot.index
+        left = len(queue_ids)
+        ma.status = "running"
+        ma.status_detail = f"Đang tới lượt lướt — còn {left} tài khoản"
+        _refresh_trees()
+        _refresh_grid_hint()
+        var_run_status.set(f"Đang lướt nhận thiết bị — còn {left} tài khoản")
+
+        def work() -> tuple[MappedAccount, GridWindowSlot, dict[str, Any], str]:
+            from src.utils.account_proxy_mapper import prepare_mapped_account_for_browser_run
+
+            apply_mapped_secrets_to_vault(ma)
+            ok_px, px_msg = ensure_mapped_proxy_live(ma)
+            if not ok_px:
+                raise ValueError(f"proxy chưa LIVE — {px_msg}")
+            acc = prepare_mapped_account_for_browser_run(ma)
+            ck_rel = str(acc.get("cookie_path") or ma.cookie_path or "").strip()
+            return ma, slot, acc, ck_rel
+
+        def ok(row: tuple[MappedAccount, GridWindowSlot, dict[str, Any], str]) -> None:
+            if not state.get("device_browse_active"):
+                sessions.discard(ma.account_id)
+                slot_map.pop(ma.account_id, None)
+                if ma.status == "running":
+                    ma.status = "pending"
+                    ma.status_detail = "Đã dừng hàng lướt"
+                _refresh_trees()
+                _refresh_grid_hint()
+                return
+            got_ma, got_slot, acc, ck_rel = row
+            _launch_profile_browser(
+                got_ma,
+                got_slot,
+                acc,
+                ck_rel,
+                for_interaction=True,
+                browse_only=True,
+            )
+
+        def err(exc: BaseException) -> None:
+            sessions.discard(ma.account_id)
+            slot_map.pop(ma.account_id, None)
+            ma.status = "proxy_error"
+            ma.status_detail = str(exc)[:220]
+            _refresh_trees()
+            _refresh_grid_hint()
+            _start_next_device_browse()
+
+        run_background_then_main(root, work, ok, on_error=err)
 
     def _launch_manual_browser_capture(ma: MappedAccount, slot: GridWindowSlot, acc: dict[str, Any], ck_rel: str) -> None:
         """Alias tab Đăng nhập."""
         _launch_profile_browser(ma, slot, acc, ck_rel, for_interaction=False)
 
-    def _open_profile_browsers_impl(*, for_interaction: bool = False) -> None:
+    def _open_profile_browsers_impl(*, for_interaction: bool = False, browse_only: bool = False) -> None:
         if for_interaction:
             if not state.get("mapped_interaction"):
                 messagebox.showwarning(
@@ -2272,6 +3163,20 @@ def build_human_interaction_tab(
             )
             return
 
+        if browse_only:
+            state["device_browse_active"] = True
+            state["device_browse_queue"] = [ma.account_id for ma in pending]
+            total = len(pending)
+            for index, ma in enumerate(pending, start=1):
+                ma.status = "waiting"
+                ma.status_detail = f"Đang chờ lượt lướt ({index}/{total})"
+            _refresh_trees()
+            var_run_status.set(f"Lướt lần lượt {total} tài khoản — mỗi tài khoản 60 giây")
+            starters = min(total, len(free_slots), _max_capture_windows())
+            for _ in range(starters):
+                _start_next_device_browse()
+            return
+
         can_open = min(len(pending), len(free_slots))
         if len(pending) > can_open:
             if not messagebox.askyesno(
@@ -2310,9 +3215,12 @@ def build_human_interaction_tab(
             _save_settings()
             for ma, slot, acc, ck_rel in rows:
                 ma.status = "running"
-                ma.status_detail = "Proxy LIVE — đang mở Firefox…"
+                ma.status_detail = (
+                    "Đang lướt — 60 giây"
+                    if browse_only
+                    else "Proxy LIVE — đang mở Firefox…"
+                )
             _refresh_trees()
-            root.update_idletasks()
             for ma, slot, acc, ck_rel in rows:
                 logger.info(
                     "[Human GUI] Mở profile account={} ô={} profile={}",
@@ -2320,7 +3228,14 @@ def build_human_interaction_tab(
                     slot.index + 1,
                     acc.get("portable_path") or "",
                 )
-                _launch_profile_browser(ma, slot, acc, ck_rel, for_interaction=for_interaction)
+                _launch_profile_browser(
+                    ma,
+                    slot,
+                    acc,
+                    ck_rel,
+                    for_interaction=for_interaction,
+                    browse_only=browse_only,
+                )
 
         def err(exc: BaseException) -> None:
             messagebox.showerror("Không mở được trình duyệt", str(exc), parent=parent)
@@ -2340,6 +3255,13 @@ def build_human_interaction_tab(
             _ensure_pool_stopped_or_ask("mở profile trình duyệt", _on_open_profile_browser)
             return
         _open_profile_browsers_impl(for_interaction=True)
+
+    def _on_browse_for_device() -> None:
+        """Mở tài khoản đã đăng nhập và chỉ lướt bảng tin."""
+        if _pool_busy():
+            _ensure_pool_stopped_or_ask("lướt nhận thiết bị", _on_browse_for_device)
+            return
+        _open_profile_browsers_impl(for_interaction=True, browse_only=True)
 
     def _on_close_profile_browser() -> None:
         """Đóng cửa sổ Firefox profile đang mở (dòng đã chọn)."""
@@ -2374,67 +3296,91 @@ def build_human_interaction_tab(
         var_run_status.set(f"Đang đóng {closed} cửa sổ profile…")
 
     def _on_merge() -> None:
-        def work() -> tuple[list[MappedAccount], int, int]:
+        try:
             acc_lines, px_lines = _resolve_input_lines()
-            mc = max(1, int(var_threads.get()))
+        except AccountProxyMappingError as exc:
+            messagebox.showerror("Lỗi ghép", str(exc), parent=parent)
+            return
+        blocked = _queue_proxy_owners()
+        account_format = _current_account_format()
+        mc = max(1, int(var_threads.get()))
+
+        def work() -> tuple[list[MappedAccount], int, int]:
             mapped = map_accounts_with_proxies(
                 acc_lines,
                 px_lines,
                 max_concurrent=mc,
                 persist_secrets=False,
+                account_format=account_format,
+                extra_blocked=blocked,
             )
             return mapped, len(acc_lines), len(px_lines)
 
         def ok(payload: tuple[list[MappedAccount], int, int]) -> None:
-            mapped, n_acc, n_px = payload
-            added, updated, skipped = _merge_into_login_queue(mapped)
-            _refresh_trees()
-            _save_settings()
-            _select_main_page(page_login)
-            login_rows = state.get("mapped_login") or []
-            if login_rows:
-                tree_login.selection_set(login_rows[0].account_id)
-            n_login = len(login_rows)
-            n_int = len(state.get("mapped_interaction") or [])
-            msg = (
-                f"Đã ghép {len(mapped)} dòng → hàng đợi Đăng nhập: +{added} mới, cập nhật {updated}.\n"
-                f"Tab Tương tác giữ nguyên {n_int} tài khoản đã login"
-            )
-            if skipped:
-                msg += f" ({skipped} dòng đã có ở tab Tương tác — bỏ qua)."
-            msg += "\nĐịnh dạng TK: uid|pass|2fa|mail|pass_mail|mail_khoi_phuc"
-            if n_acc > n_px:
-                msg += f"\n\nCảnh báo: {n_acc} dòng TK nhưng {n_px} proxy — bỏ qua {n_acc - n_px} TK cuối."
-            mc = max(1, int(var_threads.get()))
-            if n_px < mc:
-                msg += f"\n\nLưu ý: {n_px} proxy < {mc} luồng — khi chạy tối đa {min(n_px, len(mapped))} song song."
-            dups = duplicate_proxy_assignments(mapped)
-            if dups:
-                msg += f"\n\n⚠ {len(dups)} proxy trùng — sửa trước khi chạy {mc} luồng:"
-                for px_key, aids in list(dups.items())[:4]:
-                    msg += f"\n  • {px_key[:40]}… → {', '.join(aids)}"
-            uniq = count_unique_proxy_servers(mapped)
-            if mapped and uniq == len(mapped):
-                msg += f"\n\n✓ {uniq} proxy riêng — đủ cho chạy song song."
-            msg += f"\n\nHiện có: {n_login} chờ login | {n_int} sẵn tương tác."
-            if not mapped:
-                msg = (
-                    "Không ghép được cặp nào.\n"
-                    "Kiểm tra: mỗi dòng TK đủ trường (| hoặc Tab), mỗi dòng proxy host:port:user:pass."
-                )
-            messagebox.showinfo("Ghép & hiển thị", msg, parent=parent)
+            try:
+                _finish_merge(payload, px_lines)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[Human GUI] Ghép xong nhưng không đổ được bảng")
+                messagebox.showerror("Lỗi ghép", str(exc), parent=parent)
 
         def err(exc: BaseException) -> None:
             messagebox.showerror("Lỗi ghép", str(exc), parent=parent)
 
         run_background_then_main(root, work, ok, on_error=err)
 
+    def _finish_merge(payload: tuple[list[MappedAccount], int, int], px_lines: list[str]) -> None:
+        mapped, n_acc, n_px = payload
+        added, updated, skipped = _merge_into_login_queue(mapped, px_lines)
+        _refresh_trees()
+        _save_settings()
+        _select_main_page(page_login)
+        try:
+            _init_login_paned_sash()
+        except Exception:  # noqa: BLE001
+            pass
+        login_rows = state.get("mapped_login") or []
+        if login_rows:
+            try:
+                tree_login.selection_set(login_rows[-1].account_id)
+                tree_login.see(login_rows[-1].account_id)
+            except tk.TclError:
+                pass
+        n_login = len(login_rows)
+        n_int = len(state.get("mapped_interaction") or [])
+        msg = (
+            f"Đã ghép {len(mapped)} dòng → hàng đợi Đăng nhập: +{added} mới, cập nhật {updated}.\n"
+            f"Tab Tương tác giữ nguyên {n_int} tài khoản đã login"
+        )
+        if skipped:
+            msg += (
+                f"\nBỏ qua {skipped} dòng (đã ở tab Tương tác, hoặc hết proxy trống)."
+            )
+        msg += f"\nĐịnh dạng nick: {var_account_format.get().strip()}"
+        if len(mapped) < n_acc:
+            msg += (
+                f"\n\n{n_acc - len(mapped)} tài khoản chưa ghép: hết proxy trống. "
+                "Proxy đã gắn tài khoản khác được bỏ qua và thay bằng proxy khác trong list khi còn."
+            )
+        mc = max(1, int(var_threads.get()))
+        if n_px < mc:
+            msg += f"\n\nLưu ý: {n_px} proxy < {mc} luồng — khi chạy tối đa {min(n_px, len(mapped))} song song."
+        uniq = count_unique_proxy_servers(login_rows)
+        if login_rows and uniq == len(login_rows):
+            msg += f"\n\n✓ {uniq} proxy riêng — đủ cho chạy song song."
+        msg += f"\n\nHiện có: {n_login} chờ login | {n_int} sẵn tương tác."
+        if not login_rows:
+            msg = (
+                "Không đưa được dòng nào vào danh sách chờ đăng nhập.\n"
+                "Tài khoản đã nằm ở tab Tương tác, hoặc mọi proxy trong list đã gắn nick khác."
+            )
+        messagebox.showinfo("Ghép & hiển thị", msg, parent=parent)
+
     def _on_run_all() -> None:
         interaction_rows = state.get("mapped_interaction") or []
         if not interaction_rows:
             messagebox.showwarning(
                 "Chưa có tài khoản tương tác",
-                "Đăng nhập thành công trước — tài khoản «Đăng nhập OK» tự chuyển sang tab «Tương tác».",
+                "Mở tab «Tương tác» sau khi đăng nhập OK — tài khoản OK sẽ chuyển sang lúc đó.",
                 parent=parent,
             )
             return
@@ -2464,7 +3410,7 @@ def build_human_interaction_tab(
         if not state.get("mapped_interaction"):
             messagebox.showwarning(
                 "Chưa có tài khoản tương tác",
-                "Chọn tab «Tương tác (đã login OK)» — hoặc đăng nhập xong để tự chuyển sang tab này.",
+                "Mở tab «Tương tác» — tài khoản Đăng nhập OK sẽ chuyển sang khi bạn mở tab này.",
                 parent=parent,
             )
             return
@@ -2520,27 +3466,32 @@ def build_human_interaction_tab(
                 parent=parent,
             )
             return
+        skip_status = {"running", "success", "login_ok"}
         selected = _selected_mapped()
         if selected:
-            targets = [ma for ma in selected if ma.status == "proxy_error"]
+            targets = [ma for ma in selected if ma.status not in skip_status]
             if not targets:
                 messagebox.showinfo(
-                    "Không có lỗi proxy",
-                    "Các dòng đã chọn không ở trạng thái «Lỗi Proxy».",
+                    "Không đổi proxy",
+                    "Dòng đã chọn đang chạy hoặc đã login OK — không đổi proxy.",
                     parent=parent,
                 )
                 return
         elif _is_interaction_tab_active():
-            targets = [
-                ma for ma in (state.get("mapped_interaction") or []) if ma.status == "proxy_error"
-            ]
+            pool_rows = state.get("mapped_interaction") or []
+            targets = [ma for ma in pool_rows if ma.status == "proxy_error"]
+            if not targets:
+                targets = [ma for ma in pool_rows if ma.status not in skip_status]
         else:
-            targets = [ma for ma in (state.get("mapped_login") or []) if ma.status == "proxy_error"]
+            pool_rows = state.get("mapped_login") or []
+            targets = [ma for ma in pool_rows if ma.status == "proxy_error"]
+            if not targets:
+                targets = [ma for ma in pool_rows if ma.status not in skip_status]
         if not targets:
             messagebox.showinfo(
-                "Không có lỗi proxy",
-                "Không có tài khoản «Lỗi Proxy» trong tab hiện tại.\n"
-                "Chọn dòng cụ thể hoặc chạy pool để phát hiện lỗi proxy trước.",
+                "Không có tài khoản",
+                "Không có dòng cần đổi proxy.\n"
+                "Chọn dòng (kể cả «Đã hủy» / «Lỗi Proxy») hoặc dán proxy mới ở tab Đăng nhập.",
                 parent=parent,
             )
             return
@@ -2554,8 +3505,9 @@ def build_human_interaction_tab(
             preview += f" … (+{len(targets) - 5})"
         if not messagebox.askyesno(
             "Cập nhật proxy",
-            f"Gán proxy mới (không trùng IP:port) cho {len(targets)} tài khoản:\n{preview}\n\n"
-            f"Dùng {len(px_lines)} dòng proxy từ tab Đăng nhập?",
+            f"Gán proxy mới cho {len(targets)} tài khoản:\n{preview}\n\n"
+            f"Đọc {len(px_lines)} dòng từ ô Proxy + file ở tab Đăng nhập "
+            "(dòng mới, kể cả cùng gateway khác user, được ưu tiên).",
             parent=parent,
         ):
             return
@@ -2573,6 +3525,7 @@ def build_human_interaction_tab(
             ma = _mapped_by_id(aid)
             if ma and persist_mapped_proxy_to_accounts_json(ma):
                 persisted += 1
+        _save_settings()
         _refresh_tree()
         lines = [f"Đã đổi proxy: {len(res['updated'])} tài khoản."]
         if persisted:
@@ -2612,7 +3565,7 @@ def build_human_interaction_tab(
             messagebox.showinfo(
                 "Chưa có tài khoản",
                 "Tab «Tương tác» chưa có tài khoản nào.\n"
-                "Đăng nhập xong — TK «Đăng nhập OK» sẽ tự chuyển sang đây.",
+                "Đăng nhập xong, mở tab «Tương tác» để chuyển các TK Đăng nhập OK sang đây.",
                 parent=parent,
             )
             return
@@ -2791,6 +3744,10 @@ def build_human_interaction_tab(
         _refresh_trees()
 
     def _on_stop() -> None:
+        if state.get("device_browse_active"):
+            _cancel_device_browse()
+            if not state.get("pool"):
+                return
         if not state.get("pool"):
             if state.get("pool_stopping"):
                 messagebox.showinfo(
@@ -2830,6 +3787,18 @@ def build_human_interaction_tab(
             _sync_run_banner()
             _update_summary()
             return
+        if state.get("pool_stopping"):
+            try:
+                alive = bool(pool.has_live_workers())
+            except Exception:
+                alive = True
+            if not alive:
+                health_fr.configure(bg=_C_HEALTH_BG)
+                lbl_health.configure(text="💤 Idle — các luồng đã dừng", bg=_C_HEALTH_BG, fg=_C_HEALTH_FG)
+                _sync_run_banner()
+                _update_summary()
+                root.after(1200, _schedule_health_refresh)
+                return
         snap = pool.health_snapshot()
         health_fr.configure(bg="#d1fae5")
         lbl_health.configure(
@@ -2862,34 +3831,7 @@ def build_human_interaction_tab(
         ma = _mapped_by_id(str(iid))
         if not ma:
             return
-        if _is_interaction_tab_active() or tr is tree_interaction:
-
-            def _run_one() -> None:
-                if messagebox.askyesno(
-                    "Chạy một tài khoản",
-                    f"Chạy tương tác UID {ma.display_uid()}?",
-                    parent=parent,
-                ):
-                    _start_pool_when_idle([ma])
-
-            if _pool_busy():
-                _ensure_pool_stopped_or_ask("chạy dòng này", _run_one)
-            else:
-                _run_one()
-            return
-
-        def _login_one() -> None:
-            if messagebox.askyesno(
-                "Đăng nhập một tài khoản",
-                f"Đăng nhập UID {ma.display_uid()}?",
-                parent=parent,
-            ):
-                _start_pool_when_idle([ma], login_only=True)
-
-        if _pool_busy():
-            _ensure_pool_stopped_or_ask("đăng nhập dòng này", _login_one)
-        else:
-            _login_one()
+        _open_attribute_dialog()
 
     def _bind_tree_events(tr: ttk.Treeview) -> None:
         tr.bind("<<TreeviewSelect>>", _on_tree_select)
@@ -2897,244 +3839,577 @@ def build_human_interaction_tab(
 
     _bind_tree_events(tree_login)
     _bind_tree_events(tree_interaction)
-    nb_main.bind("<<NotebookTabChanged>>", lambda _e: _update_summary())
+    def _on_main_tab_changed(_event: object = None) -> None:
+        """Mở tab Tương tác thì mới chuyển các tài khoản đã đăng nhập OK."""
+        if _is_interaction_tab_active() and _promote_ready_logins_to_interaction():
+            _refresh_trees()
+            _save_settings()
+            return
+        _update_summary()
 
-    # Nút — nhóm Dữ liệu (màu phân loại)
-    _flat_btn(
-        data_btns,
-        text="⚡ Ghép → Đăng nhập",
-        command=_on_merge,
-        bg=_C_BTN_MERGE,
-        active_bg=_C_BTN_MERGE_H,
-        padx=12,
-    ).pack(side=tk.LEFT, padx=3)
-    _flat_btn(
-        data_btns,
-        text="💾 Lưu nội dung",
-        command=_on_save_inputs,
-        bg=_C_BTN_SAVE,
-        active_bg=_C_BTN_SAVE_H,
-        padx=10,
-    ).pack(side=tk.LEFT, padx=2)
+    nb_main.bind("<<NotebookTabChanged>>", _on_main_tab_changed)
 
-    ttk.Button(
+    def _open_check_live_dialog() -> None:
+        """Check live tài khoản từ list dán riêng — không ghi vào hàng đợi Đăng nhập."""
+        if _pool_busy():
+            messagebox.showwarning(
+                "Đang chạy",
+                "Dừng đăng nhập / tương tác trước khi check live.",
+                parent=parent,
+            )
+            return
+        win = tk.Toplevel(parent)
+        win.title("Check Live tài khoản")
+        win.geometry("760x560")
+        win.transient(parent)
+        ttk.Label(
+            win,
+            text=(
+                "Chọn một tài khoản đã đăng nhập. Bấm Hiện trình duyệt để xem trang đang check, "
+                "hoặc Ẩn trình duyệt khi không cần nhìn. "
+                "Chỉ kết luận khi trang khóa (Die) hoặc hồ sơ đã hiện (Live). "
+                "UID lấy từ số hoặc cookie c_user=1000…. Live xếp trên, Die xếp dưới."
+            ),
+            wraplength=720,
+        ).pack(anchor="w", padx=10, pady=(8, 4))
+        viewer_row = ttk.Frame(win)
+        viewer_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        ttk.Label(viewer_row, text="Tài khoản đã đăng nhập").pack(side=tk.LEFT)
+        var_viewer = tk.StringVar()
+        viewer_box = ttk.Combobox(viewer_row, textvariable=var_viewer, state="readonly", width=48)
+        viewer_box.pack(side=tk.LEFT, padx=6)
+        viewer_choices: dict[str, tuple[str, str]] = {}
+
+        def _reload_viewers() -> None:
+            viewer_choices.clear()
+            labels: list[str] = []
+            seen: set[str] = set()
+            for bucket in ("mapped_interaction", "mapped_login"):
+                for ma in state.get(bucket) or []:
+                    if bucket == "mapped_login" and ma.status not in ("login_ok", "success"):
+                        continue
+                    if ma.account_id in seen:
+                        continue
+                    seen.add(ma.account_id)
+                    label = f"{ma.display_uid()} · đã đăng nhập"
+                    viewer_choices[label] = ("mapped", ma.account_id)
+                    labels.append(label)
+            try:
+                from src.utils.db_manager import AccountsDatabaseManager
+
+                for row in AccountsDatabaseManager().load_all():
+                    aid = str(row.get("id") or "")
+                    if not aid or aid in seen:
+                        continue
+                    seen.add(aid)
+                    label = f"{row.get('name') or aid} · profile đã lưu"
+                    viewer_choices[label] = ("registry", aid)
+                    labels.append(label)
+            except Exception:  # noqa: BLE001
+                pass
+            viewer_box["values"] = labels
+            if var_viewer.get() not in viewer_choices and labels:
+                var_viewer.set(labels[0])
+
+        ttk.Button(viewer_row, text="Tải lại", command=_reload_viewers).pack(side=tk.LEFT)
+        _reload_viewers()
+        body = ttk.Panedwindow(win, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=1)
+        ttk.Label(left, text="Tài khoản").pack(anchor="w")
+        txt_live_acc = tk.Text(left, height=8, wrap="none", font=("Consolas", 9))
+        txt_live_acc.pack(fill=tk.BOTH, expand=True)
+        uid_bar = ttk.Frame(right)
+        uid_bar.pack(fill=tk.X)
+        ttk.Label(uid_bar, text="UID đã lọc").pack(side=tk.LEFT)
+        txt_live_uids = tk.Text(right, height=8, wrap="none", font=("Consolas", 9))
+
+        def _filter_uids() -> None:
+            from src.utils.account_proxy_mapper import extract_uid_lines
+
+            uids = extract_uid_lines(txt_live_acc.get("1.0", tk.END))
+            txt_live_uids.delete("1.0", tk.END)
+            if uids:
+                txt_live_uids.insert("1.0", "\n".join(uids))
+            var_live_status.set(f"Đã lọc {len(uids)} UID. Bấm Copy UID để chép.")
+
+        def _copy_uids() -> None:
+            raw = txt_live_uids.get("1.0", tk.END).strip()
+            if not raw:
+                _filter_uids()
+                raw = txt_live_uids.get("1.0", tk.END).strip()
+            if not raw:
+                messagebox.showwarning("Chưa có UID", "Không thấy dãy số UID trong danh sách.", parent=win)
+                return
+            win.clipboard_clear()
+            win.clipboard_append(raw)
+            var_live_status.set(f"Đã copy {len(raw.splitlines())} UID.")
+
+        ttk.Button(uid_bar, text="Lọc UID", command=_filter_uids).pack(side=tk.LEFT, padx=6)
+        ttk.Button(uid_bar, text="Copy UID", command=_copy_uids).pack(side=tk.LEFT)
+        txt_live_uids.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        opts = ttk.Frame(win)
+        opts.pack(fill=tk.X, padx=10, pady=4)
+        ttk.Label(opts, text="Lần lượt từng UID").pack(side=tk.LEFT)
+        ttk.Label(opts, text="Lọc").pack(side=tk.LEFT, padx=(8, 2))
+        var_live_filter = tk.StringVar(value="Tất cả")
+        cb_live_filter = ttk.Combobox(
+            opts,
+            textvariable=var_live_filter,
+            state="readonly",
+            width=18,
+            values=("Tất cả", "Còn hoạt động", "Không hoạt động", "Lỗi"),
+        )
+        cb_live_filter.pack(side=tk.LEFT)
+        var_live_status = tk.StringVar(value="Sẵn sàng")
+        ttk.Label(opts, textvariable=var_live_status).pack(side=tk.LEFT, padx=8)
+        cols = ("uid", "result", "detail")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=8)
+        tree.heading("uid", text="UID")
+        tree.heading("result", text="Kết quả")
+        tree.heading("detail", text="Chi tiết")
+        tree.column("uid", width=140)
+        tree.column("result", width=100)
+        tree.column("detail", width=480)
+        tree.tag_configure("live", foreground="#047857")
+        tree.tag_configure("die", foreground="#b91c1c")
+        tree.tag_configure("bad", foreground="#b45309")
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        stop_ev = threading.Event()
+        running = {"on": False}
+        checked: dict[str, MappedAccount] = {}
+        show_browser = {"on": True}
+        browser_profile = {"path": ""}
+
+        def _reveal_browser() -> None:
+            show_browser["on"] = True
+            path = browser_profile["path"]
+            if not path:
+                var_live_status.set("Sẽ hiện trình duyệt khi bắt đầu check.")
+                return
+            from src.services.facebook_live_check import set_account_window_visible
+
+            set_account_window_visible({"portable_path": path}, True)
+            var_live_status.set("Đã hiện trình duyệt.")
+
+        def _conceal_browser() -> None:
+            show_browser["on"] = False
+            path = browser_profile["path"]
+            if not path:
+                var_live_status.set("Sẽ ẩn trình duyệt khi bắt đầu check.")
+                return
+            from src.services.facebook_live_check import set_account_window_visible
+
+            set_account_window_visible({"portable_path": path}, False)
+            var_live_status.set("Đã ẩn trình duyệt.")
+
+        def _live_bucket(label: str) -> str:
+            if label == "Live":
+                return "Còn hoạt động"
+            if label in {"Die", "Checkpoint"}:
+                return "Không hoạt động"
+            if label in {"Lỗi", "Lỗi proxy"}:
+                return "Lỗi"
+            return ""
+
+        def _row_visible(label: str) -> bool:
+            pick = str(var_live_filter.get() or "Tất cả")
+            if pick == "Tất cả":
+                return True
+            return _live_bucket(label) == pick
+
+        def _row_tag(label: str) -> str:
+            bucket = _live_bucket(label)
+            if bucket == "Còn hoạt động":
+                return "live"
+            if bucket == "Không hoạt động":
+                return "die"
+            if bucket == "Lỗi":
+                return "bad"
+            return ""
+
+        def _live_summary() -> str:
+            live = dead = bad = 0
+            for ma in checked.values():
+                bucket = _live_bucket(classify_account_live(ma.status, ma.status_detail))
+                if bucket == "Còn hoạt động":
+                    live += 1
+                elif bucket == "Không hoạt động":
+                    dead += 1
+                elif bucket == "Lỗi":
+                    bad += 1
+            return f"Còn hoạt động: {live} · Không hoạt động: {dead} · Lỗi: {bad}"
+
+        def _sorted_index(label: str, slot: int, skip_iid: str) -> int:
+            rank = live_result_rank(label)
+            index = 0
+            for child in tree.get_children():
+                if child == skip_iid:
+                    continue
+                other_rank = live_result_rank(tree.set(child, "result"))
+                other = checked.get(child)
+                other_slot = int(other.grid_slot_index) if other else 0
+                if (other_rank, other_slot) > (rank, slot):
+                    break
+                index += 1
+            return index
+
+        def _fill_row(ma: MappedAccount) -> None:
+            checked[ma.account_id] = ma
+            label = classify_account_live(ma.status, ma.status_detail)
+            iid = ma.account_id
+            vals = (ma.display_uid(), label, (ma.status_detail or "")[:180])
+            tag = _row_tag(label)
+            if not _row_visible(label):
+                if tree.exists(iid):
+                    tree.delete(iid)
+                return
+            index = _sorted_index(label, int(ma.grid_slot_index or 0), iid)
+            if tree.exists(iid):
+                tree.item(iid, values=vals, tags=(tag,) if tag else ())
+                tree.move(iid, "", index)
+            else:
+                tree.insert("", index, iid=iid, values=vals, tags=(tag,) if tag else ())
+
+        def _apply_live_filter(_event: object = None) -> None:
+            for item in tree.get_children():
+                tree.delete(item)
+            for ma in checked.values():
+                _fill_row(ma)
+            if checked and not running["on"]:
+                var_live_status.set(f"Xong {len(checked)} — {_live_summary()}")
+
+        cb_live_filter.bind("<<ComboboxSelected>>", _apply_live_filter)
+
+        def _viewer_account_dict(kind: str, viewer_id: str) -> dict[str, Any]:
+            """Profile persistent của tài khoản đã chọn. Proxy lấy từ chính tài khoản đó."""
+            if kind == "mapped":
+                from src.utils.account_proxy_mapper import prepare_mapped_account_for_browser_run
+
+                for bucket in ("mapped_interaction", "mapped_login"):
+                    for ma in state.get(bucket) or []:
+                        if ma.account_id != viewer_id:
+                            continue
+                        account = prepare_mapped_account_for_browser_run(ma)
+                        account.setdefault("id", viewer_id)
+                        return account
+                raise ValueError("Không tìm thấy tài khoản đã đăng nhập")
+            from src.utils.account_proxy_mapper import prepare_account_dict_for_browser_run
+            from src.utils.db_manager import AccountsDatabaseManager
+
+            row = AccountsDatabaseManager().get_by_id(viewer_id)
+            if row is None:
+                raise ValueError("Không tìm thấy profile đã lưu")
+            return prepare_account_dict_for_browser_run(dict(row), require_proxy_live=True)
+
+        def _start() -> None:
+            if running["on"]:
+                return
+            acc_lines = _non_empty_lines(txt_live_acc.get("1.0", tk.END))
+            if not acc_lines:
+                messagebox.showwarning("Thiếu list", "Dán ít nhất một dòng tài khoản.", parent=win)
+                return
+            try:
+                mapped = map_pasted_accounts_for_live_check(
+                    acc_lines,
+                    None,
+                    browser_type="firefox",
+                    account_format=_current_account_format(),
+                )
+            except AccountProxyMappingError as exc:
+                messagebox.showerror("List không hợp lệ", str(exc), parent=win)
+                return
+            for item in tree.get_children():
+                tree.delete(item)
+            checked.clear()
+            for ma in mapped:
+                ma.status = "pending"
+                ma.status_detail = "Đang chờ"
+                _fill_row(ma)
+            chosen = viewer_choices.get(var_viewer.get())
+            if chosen is None:
+                messagebox.showwarning(
+                    "Chưa chọn tài khoản",
+                    "Chọn tài khoản đã đăng nhập để mở trình duyệt check.",
+                    parent=win,
+                )
+                return
+            from src.utils.account_proxy_mapper import facebook_uid_for_live_check
+
+            by_uid: dict[str, list[MappedAccount]] = {}
+            ordered_uids: list[str] = []
+            for ma in mapped:
+                uid = facebook_uid_for_live_check(ma)
+                if not uid:
+                    ma.status = "error"
+                    ma.status_detail = "Thiếu UID số"
+                    _fill_row(ma)
+                    continue
+                by_uid.setdefault(uid, []).append(ma)
+                if uid not in ordered_uids:
+                    ordered_uids.append(uid)
+            if not ordered_uids:
+                messagebox.showwarning("Thiếu UID", "Không lấy được UID số từ danh sách.", parent=win)
+                return
+            stop_ev.clear()
+            running["on"] = True
+            var_live_status.set("Đang mở trình duyệt tài khoản đã đăng nhập…")
+            done_n = {"n": sum(1 for item in mapped if item.status == "error")}
+            total = len(mapped)
+
+            def _paint(ma: MappedAccount, *, finished: bool = False) -> None:
+                def _ui() -> None:
+                    if not win.winfo_exists():
+                        return
+                    _fill_row(ma)
+                    if finished:
+                        var_live_status.set(
+                            f"{done_n['n']}/{total} — {classify_account_live(ma.status, ma.status_detail)}"
+                        )
+                        if done_n["n"] >= total:
+                            running["on"] = False
+                            var_live_status.set(f"Xong {total} — {_live_summary()}")
+                    else:
+                        var_live_status.set(f"Đang check {done_n['n']}/{total} — {ma.display_uid()}")
+
+                schedule_on_main_thread(win, _ui)
+
+            def _mark(rows: list[MappedAccount], status: str, detail: str, *, finished: bool) -> None:
+                for item in rows:
+                    if item.status in {"login_ok", "login_failed", "error", "cancelled"}:
+                        continue
+                    item.status = status
+                    item.status_detail = detail
+                    if finished:
+                        done_n["n"] += 1
+                    _paint(item, finished=finished)
+
+            def _browser() -> None:
+                from src.services.facebook_live_check import run_live_check_in_account_browser
+
+                kind, viewer_id = chosen
+                try:
+                    account = _viewer_account_dict(kind, viewer_id)
+                    browser_profile["path"] = str(
+                        account.get("portable_path") or account.get("profile_path") or ""
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _mark(mapped, "proxy_error" if "proxy" in str(exc).lower() else "error", str(exc)[:180], finished=True)
+                    return
+
+                def _on_begin(uid: str) -> None:
+                    for item in by_uid.get(uid) or []:
+                        item.status = "running"
+                        item.status_detail = f"Đang xem UID {uid}…"
+                        _paint(item)
+
+                def _on_result(uid: str, status: str, detail: str) -> None:
+                    rows = by_uid.get(uid) or []
+                    for item in rows:
+                        item.status = status
+                        item.status_detail = detail
+                        done_n["n"] += 1
+                        _paint(item, finished=True)
+
+                try:
+                    code = run_live_check_in_account_browser(
+                        account,
+                        ordered_uids,
+                        on_result=_on_result,
+                        on_begin=_on_begin,
+                        should_stop=stop_ev.is_set,
+                        show_window=lambda: show_browser["on"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    code = "error"
+                    _mark(
+                        [item for rows in by_uid.values() for item in rows],
+                        "error",
+                        str(exc)[:180],
+                        finished=True,
+                    )
+                    return
+                if code == "cancelled":
+                    _mark(
+                        [item for rows in by_uid.values() for item in rows],
+                        "cancelled",
+                        "Đã hủy",
+                        finished=True,
+                    )
+                elif code == "session":
+                    _mark(
+                        [item for rows in by_uid.values() for item in rows],
+                        "error",
+                        "Tài khoản đã chọn chưa đăng nhập hoặc bị đăng xuất",
+                        finished=True,
+                    )
+                elif code == "checkpoint":
+                    _mark(
+                        [item for rows in by_uid.values() for item in rows],
+                        "error",
+                        "Tài khoản dùng để check đang bị checkpoint",
+                        finished=True,
+                    )
+                else:
+                    pending = [
+                        item
+                        for rows in by_uid.values()
+                        for item in rows
+                        if item.status not in {"login_ok", "login_failed", "error", "cancelled"}
+                    ]
+                    if pending:
+                        _mark(pending, "error", "Chưa đọc được trang hồ sơ", finished=True)
+                    else:
+                        schedule_on_main_thread(
+                            win,
+                            lambda: var_live_status.set(f"Xong {total} — {_live_summary()}")
+                            if win.winfo_exists()
+                            else None,
+                        )
+                        running["on"] = False
+
+            threading.Thread(target=_browser, name="live-check-browser", daemon=True).start()
+
+        def _stop() -> None:
+            stop_ev.set()
+            var_live_status.set("Đang dừng…")
+
+        bar = ttk.Frame(win)
+        bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(bar, text="Bắt đầu check", command=_start).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Dừng", command=_stop).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Hiện trình duyệt", command=_reveal_browser).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="Ẩn trình duyệt", command=_conceal_browser).pack(side=tk.LEFT, padx=2)
+
+    def _btn(bar: _FlowBar, **kwargs: Any) -> tk.Button:
+        """Gắn nút vào hàng chảy — cùng cỡ, cùng khoảng cách."""
+        return bar.add(_flat_btn(bar, **kwargs))
+
+    # Dán / file — cùng kiểu với nút thao tác, không trộn nút hệ thống.
+    _btn(
         paste_btns,
         text="Dán TK",
-        width=8,
         command=lambda: _paste_clipboard_into(txt_acc, label="tài khoản"),
-    ).pack(side=tk.LEFT, padx=2)
-    ttk.Button(
+        bg=_C_BTN_SAVE,
+        active_bg=_C_BTN_SAVE_H,
+    )
+    _btn(
         paste_btns,
         text="Dán Proxy",
-        width=9,
         command=lambda: _paste_clipboard_into(txt_px, label="proxy"),
-    ).pack(side=tk.LEFT, padx=2)
-    ttk.Button(paste_btns, text="Xóa 2 ô", width=8, command=_clear_both_text_areas).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
+        bg=_C_BTN_SAVE,
+        active_bg=_C_BTN_SAVE_H,
+    )
+    _btn(
         paste_btns,
-        text="✓ Check Proxy LIVE",
+        text="Xóa 2 ô",
+        command=_clear_both_text_areas,
+        bg="#cbd5e1",
+        active_bg="#94a3b8",
+        fg="#1e293b",
+    )
+    _btn(
+        paste_btns,
+        text="Check Proxy LIVE",
         command=_on_check_proxy_live,
         bg=_C_BTN_PROXY,
         active_bg=_C_BTN_PROXY_H,
-        padx=12,
-    ).pack(side=tk.LEFT, padx=(12, 2))
-    _flat_btn(
-        px_toolbar,
-        text="✓ Check Proxy LIVE",
-        command=_on_check_proxy_live,
-        bg=_C_BTN_PROXY,
-        active_bg=_C_BTN_PROXY_H,
-        padx=10,
-    ).pack(side=tk.LEFT)
+    )
 
-    ttk.Button(tab_file, text="Chọn file TK…", command=lambda: _pick_file(var_acc, "accounts")).grid(
-        row=0, column=2, padx=4
+    file_btns = _FlowBar(tab_file)
+    file_btns.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+    _btn(
+        file_btns,
+        text="Chọn file TK",
+        command=lambda: _pick_file(var_acc, "accounts"),
+        bg=_C_BTN_SAVE,
+        active_bg=_C_BTN_SAVE_H,
     )
-    ttk.Button(tab_file, text="Chọn file Proxy…", command=lambda: _pick_file(var_px, "proxies")).grid(
-        row=1, column=2, padx=4
+    _btn(
+        file_btns,
+        text="Chọn file Proxy",
+        command=lambda: _pick_file(var_px, "proxies"),
+        bg=_C_BTN_SAVE,
+        active_bg=_C_BTN_SAVE_H,
     )
-    ttk.Button(
-        tab_file,
+    _btn(
+        file_btns,
         text="Check Proxy LIVE",
         command=lambda: _on_check_proxy_live(from_file_tab=True),
-    ).grid(row=1, column=3, padx=4, sticky="w")
-
-    _flat_btn(
-        run_btns,
-        text="▶ Chạy tất cả",
-        command=_on_run_all,
-        bg="#2563eb",
-        active_bg="#1d4ed8",
-    ).pack(side=tk.LEFT, padx=3)
-    _flat_btn(
-        run_btns,
-        text="▶ Chạy đã chọn",
-        command=_on_run_selected,
-        bg=_C_BTN_SECONDARY,
-        active_bg=_C_BTN_SECONDARY_H,
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    btn_stop_interaction = _flat_btn(
-        run_btns,
-        text="■ DỪNG",
-        command=_on_stop,
-        bg=_C_BTN_DANGER,
-        active_bg=_C_BTN_DANGER_H,
-        state=tk.DISABLED,
+        bg=_C_BTN_PROXY,
+        active_bg=_C_BTN_PROXY_H,
     )
-    btn_stop_interaction.pack(side=tk.LEFT, padx=(8, 2))
 
-    _flat_btn(
+    # Chuẩn bị dữ liệu, rồi đăng nhập, rồi thao tác trên dòng đã chọn.
+    _btn(data_btns, text="Ghép vào hàng", command=_on_merge, bg=_C_BTN_MERGE, active_bg=_C_BTN_MERGE_H)
+    _btn(data_btns, text="Check Live TK", command=_open_check_live_dialog, bg="#0f766e", active_bg="#115e59")
+    _btn(data_btns, text="Lưu nội dung", command=_on_save_inputs, bg=_C_BTN_SAVE, active_bg=_C_BTN_SAVE_H)
+
+    _btn(login_btns, text="Đăng nhập đã chọn", command=_on_login_selected, bg="#059669", active_bg="#047857")
+    _btn(login_btns, text="Đăng nhập tất cả", command=_on_login_all, bg="#10b981", active_bg="#059669")
+    _btn(
         login_btns,
-        text="🔑 Đăng nhập đã chọn",
-        command=_on_login_selected,
-        bg="#059669",
-        active_bg="#047857",
-    ).pack(side=tk.LEFT, padx=3)
-    _flat_btn(
-        login_btns,
-        text="Đăng nhập tất cả",
-        command=_on_login_all,
-        bg="#10b981",
-        active_bg="#059669",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        login_btns,
-        text="🌐 Mở trình duyệt",
+        text="Mở trình duyệt",
         command=_on_open_browser_login,
         bg=_C_BTN_SECONDARY,
         active_bg=_C_BTN_SECONDARY_H,
-        padx=8,
-    ).pack(side=tk.LEFT, padx=(8, 2))
-    btn_stop_login = _flat_btn(
+    )
+    btn_stop_login = _btn(
         login_btns,
-        text="■ DỪNG",
+        text="Dừng",
         command=_on_stop,
         bg=_C_BTN_DANGER,
         active_bg=_C_BTN_DANGER_H,
         state=tk.DISABLED,
     )
-    btn_stop_login.pack(side=tk.LEFT, padx=(12, 2))
 
-    btn_stop_global.configure(command=_on_stop)
+    _btn(run_btns, text="Chạy tất cả", command=_on_run_all, bg="#2563eb", active_bg="#1d4ed8")
+    _btn(run_btns, text="Chạy đã chọn", command=_on_run_selected, bg=_C_BTN_SECONDARY, active_bg=_C_BTN_SECONDARY_H)
+    _btn(run_btns, text="Chạy 1 dòng", command=_on_run_one, bg="#6366f1", active_bg="#4f46e5")
+    btn_stop_interaction = _btn(
+        run_btns,
+        text="Dừng",
+        command=_on_stop,
+        bg=_C_BTN_DANGER,
+        active_bg=_C_BTN_DANGER_H,
+        state=tk.DISABLED,
+    )
+    _btn(profile_btns, text="Đăng nhập lại", command=_on_relogin_selected, bg="#059669", active_bg="#047857")
+    _btn(profile_btns, text="Lưu cookie", command=_on_save_cookie_only, bg="#0891b2", active_bg="#0e7490")
+    _btn(profile_btns, text="Mở profile", command=_on_open_profile_browser, bg="#6366f1", active_bg="#4f46e5")
+    _btn(profile_btns, text="Lướt nhận thiết bị", command=_on_browse_for_device, bg="#0f766e", active_bg="#115e59")
+    _btn(profile_btns, text="Đóng profile", command=_on_close_profile_browser, bg="#64748b", active_bg="#475569")
+
+    btn_stop_global.configure(text="Dừng", command=_on_stop)
     state["btn_stop_all"] = [btn_stop_global, btn_stop_login, btn_stop_interaction]
 
-    _flat_btn(
-        login_row_btns,
-        text="↺ Đặt lại đã chọn",
-        command=_on_reset_selected,
-        bg="#94a3b8",
-        active_bg="#64748b",
-        fg="white",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        login_row_btns,
-        text="↺ Đặt lại tất cả",
-        command=_on_reset_all,
-        bg="#cbd5e1",
-        active_bg="#94a3b8",
-        fg="#1e293b",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        login_row_btns,
-        text="↻ Cập nhật proxy",
-        command=_on_reassign_proxy,
-        bg="#f59e0b",
-        active_bg="#d97706",
-        fg="white",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=(8, 2))
-    _flat_btn(
-        login_row_btns,
-        text="🗑 Xóa đã chọn",
-        command=_on_delete_selected,
-        bg="#f87171",
-        active_bg="#ef4444",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=(8, 2))
+    def _row_actions(bar: _FlowBar, *, export: bool) -> None:
+        """Cùng một hàng phụ trên cả hai tab: copy, đặt lại, proxy, xóa."""
+        _btn(
+            bar,
+            text="Copy đã chọn",
+            command=lambda: _copy_selected_accounts(full=False),
+            bg="#0369a1",
+            active_bg="#075985",
+        )
+        _btn(bar, text="Đặt lại đã chọn", command=_on_reset_selected, bg="#94a3b8", active_bg="#64748b")
+        _btn(bar, text="Đặt lại tất cả", command=_on_reset_all, bg="#cbd5e1", active_bg="#94a3b8", fg="#1e293b")
+        _btn(bar, text="Cập nhật proxy", command=_on_reassign_proxy, bg="#f59e0b", active_bg="#d97706")
+        if export:
+            _btn(
+                bar,
+                text="Sang tab Tài khoản",
+                command=_on_export_to_accounts_registry,
+                bg="#0d9488",
+                active_bg="#0f766e",
+            )
+        _btn(bar, text="Xóa đã chọn", command=_on_delete_selected, bg="#f87171", active_bg="#ef4444")
 
-    _flat_btn(
-        interaction_row_btns,
-        text="▶ Chạy 1 dòng",
-        command=_on_run_one,
-        bg="#6366f1",
-        active_bg="#4f46e5",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        interaction_row_btns,
-        text="↺ Đặt lại đã chọn",
-        command=_on_reset_selected,
-        bg="#94a3b8",
-        active_bg="#64748b",
-        fg="white",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        interaction_row_btns,
-        text="↺ Đặt lại tất cả",
-        command=_on_reset_all,
-        bg="#cbd5e1",
-        active_bg="#94a3b8",
-        fg="#1e293b",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        interaction_row_btns,
-        text="↻ Cập nhật proxy",
-        command=_on_reassign_proxy,
-        bg="#f59e0b",
-        active_bg="#d97706",
-        fg="white",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=(8, 2))
-    _flat_btn(
-        run_btns,
-        text="💾 Lưu cookie",
-        command=_on_save_cookie_only,
-        bg="#0891b2",
-        active_bg="#0e7490",
-        fg="white",
-        padx=10,
-    ).pack(side=tk.LEFT, padx=(8, 2))
-    _flat_btn(
-        run_btns,
-        text="🌐 Mở profile",
-        command=_on_open_profile_browser,
-        bg="#6366f1",
-        active_bg="#4f46e5",
-        fg="white",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        run_btns,
-        text="✕ Đóng profile",
-        command=_on_close_profile_browser,
-        bg="#64748b",
-        active_bg="#475569",
-        fg="white",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=2)
-    _flat_btn(
-        interaction_row_btns,
-        text="→ Tab Tài khoản",
-        command=_on_export_to_accounts_registry,
-        bg="#0d9488",
-        active_bg="#0f766e",
-        fg="white",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=(8, 2))
-    _flat_btn(
-        interaction_row_btns,
-        text="🗑 Xóa đã chọn",
-        command=_on_delete_selected,
-        bg="#f87171",
-        active_bg="#ef4444",
-        padx=8,
-    ).pack(side=tk.LEFT, padx=(8, 2))
+    _row_actions(login_row_btns, export=False)
+    _row_actions(interaction_row_btns, export=True)
 
     legend_fr = tk.Frame(interaction_inner, bg="#f8fafc", pady=2)
     legend_fr.grid(row=3, column=0, sticky="ew")
@@ -3164,25 +4439,49 @@ def build_human_interaction_tab(
         var_grid_cols.trace_add("write", _on_grid_settings_changed)
     except tk.TclError:
         pass
-    def _init_login_paned_sash() -> None:
+    def _fit_wrap(label: tk.Label, width: int) -> None:
+        """Chữ gợi ý xuống dòng theo bề rộng thật, không tràn ra ngoài khung."""
+        if width > 40:
+            label.configure(wraplength=max(240, width - 24))
+
+    def _on_login_inner_configure(event: tk.Event) -> None:
+        if event.widget is login_inner:
+            _fit_wrap(lbl_hint_login, int(event.width))
+            _fit_wrap(lbl_paste_help, int(event.width))
+
+    def _on_interaction_inner_configure(event: tk.Event) -> None:
+        if event.widget is interaction_inner:
+            _fit_wrap(lbl_hint_interaction, int(event.width))
+
+    login_inner.bind("<Configure>", _on_login_inner_configure, add="+")
+    interaction_inner.bind("<Configure>", _on_interaction_inner_configure, add="+")
+
+    def _place_sash(paned: ttk.Panedwindow, top: ttk.Frame, bottom: ttk.Frame, *, min_top: int, min_bottom: int) -> None:
+        """Đặt thanh kéo dưới khối nhập liệu, để nút và ô văn bản không bị bảng che."""
         try:
-            login_paned.pane(login_scroll_host, minsize=72)
-            login_paned.pane(login_table_fr, minsize=130)
-            h = int(login_paned.winfo_height())
-            if h > 220:
-                login_paned.sashpos(0, min(int(h * 0.38), h - 150))
+            paned.update_idletasks()
+            height = int(paned.winfo_height())
+            if height < 160:
+                return
+            paned.pane(top, minsize=min_top)
+            paned.pane(bottom, minsize=min_bottom)
+            need = int(top.winfo_reqheight()) + 12
+            sash = max(min_top, min(need, height - min_bottom))
+            paned.sashpos(0, sash)
         except tk.TclError:
             pass
 
+    def _init_login_paned_sash() -> None:
+        _place_sash(login_paned, login_scroll_host, login_table_fr, min_top=280, min_bottom=160)
+
     def _init_interaction_paned_sash() -> None:
-        try:
-            interaction_paned.pane(interaction_scroll_host, minsize=72)
-            interaction_paned.pane(interaction_bottom, minsize=150)
-            h = int(interaction_paned.winfo_height())
-            if h > 220:
-                interaction_paned.sashpos(0, min(int(h * 0.32), h - 160))
-        except tk.TclError:
-            pass
+        _place_sash(
+            interaction_paned,
+            interaction_scroll_host,
+            interaction_bottom,
+            min_top=220,
+            min_bottom=180,
+        )
 
     root.after_idle(_refresh_grid_hint)
     root.after_idle(_restore_mapped_session)

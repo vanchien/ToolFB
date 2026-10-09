@@ -373,6 +373,26 @@ def _ve_resolve_combo_display(
     return s
 
 
+def _follow_wrap(label: ttk.Label, host: ttk.Widget, *, pad: int = 28) -> None:
+    """Cho nhãn xuống dòng theo bề rộng thật, kể cả khi phóng to hoặc thu nhỏ cửa sổ."""
+
+    def _apply(_event: Any = None) -> None:
+        try:
+            if int(label.winfo_exists()) == 0:
+                return
+            width = int(host.winfo_width())
+        except (tk.TclError, ValueError):
+            return
+        if width > pad + 80:
+            try:
+                label.configure(wraplength=width - pad)
+            except tk.TclError:
+                pass
+
+    host.bind("<Configure>", _apply, add="+")
+    host.after_idle(_apply)
+
+
 def build_video_editor_tab(
     parent: ttk.Frame, root: tk.Tk
 ) -> tuple[Callable[[], None], Callable[[], None], Callable[[], None]]:
@@ -424,14 +444,16 @@ def build_video_editor_tab(
     top_project.pack(fill=tk.X, pady=(0, 4))
     top_job = ttk.Frame(top)
     top_job.pack(fill=tk.X)
-    ttk.Label(
+    lbl_flow_hint = ttk.Label(
         top,
-        text="Gợi ý: 1) chọn/tạo dự án → 2) nạp job tải → 3) import video vào Media → chỉnh timeline → preview / xuất (luồng xuất đang được thay mới).",
+        text="1) Chọn dự án  →  2) Nạp job  →  3) Import video  →  chỉnh timeline  →  preview hoặc xuất.",
         foreground="#555",
         font=("Segoe UI", 8),
-        wraplength=980,
+        wraplength=480,
         justify="left",
-    ).pack(anchor="w", pady=(4, 0))
+    )
+    lbl_flow_hint.pack(anchor="w", pady=(4, 0))
+    _follow_wrap(lbl_flow_hint, top)
     ttk.Label(top_project, text="B1 - Dự án:").pack(side=tk.LEFT, padx=(0, 6))
 
     project_ids = [p["id"] for p in pm.list_projects()]
@@ -970,17 +992,19 @@ def build_video_editor_tab(
     ttk.Button(top_job, text="2) Nạp danh sách job", command=refresh_download_job_combo).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(top_job, text="3) Import video vào Media", command=import_from_download_job).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(top_job, text="Mở thư mục metadata", command=_open_downloader_metadata_folder).pack(side=tk.LEFT, padx=(0, 4))
+    top_job_opts = ttk.Frame(top)
+    top_job_opts.pack(fill=tk.X, pady=(4, 0))
     ttk.Checkbutton(
-        top_job,
-        text="Hiện cả job rỗng/lỗi",
+        top_job_opts,
+        text="Hiện cả job rỗng hoặc lỗi",
         variable=var_show_empty_jobs,
         command=refresh_download_job_combo,
-    ).pack(side=tk.LEFT, padx=(8, 0))
+    ).pack(side=tk.LEFT)
     dl_meta_row = ttk.Frame(parent)
     dl_meta_row.pack(fill=tk.X, padx=6, pady=(0, 4))
-    ttk.Label(dl_meta_row, textvariable=var_dl_job_meta, wraplength=960, justify=tk.LEFT, foreground="#555").pack(
-        anchor="w"
-    )
+    lbl_dl_meta = ttk.Label(dl_meta_row, textvariable=var_dl_job_meta, wraplength=480, justify=tk.LEFT, foreground="#555")
+    lbl_dl_meta.pack(anchor="w")
+    _follow_wrap(lbl_dl_meta, dl_meta_row)
     root.after_idle(refresh_download_job_combo)
 
     status_fr = ttk.Frame(parent, padding=(6, 2, 6, 4))
@@ -989,9 +1013,10 @@ def build_video_editor_tab(
         status_fr,
         text="Trạng thái: sẵn sàng. Mỗi lần chỉnh/lưu/import/export sẽ hiện dòng có giờ bên dưới.",
         foreground="gray",
-        wraplength=960,
+        wraplength=480,
     )
-    lbl_status.pack(side=tk.LEFT, anchor="w")
+    lbl_status.pack(side=tk.LEFT, anchor="w", fill=tk.X, expand=True)
+    _follow_wrap(lbl_status, status_fr)
 
     def notify(msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -9553,17 +9578,16 @@ def build_video_editor_tab(
             btn_toggle_insp.configure(text="Ẩn phần Chỉnh sửa để tập trung Xuất")
 
     _sync_export_toggle_btn_text()
-    ttk.Label(
+    lbl_export_hint = ttk.Label(
         exp_inner,
-        text=(
-            "Xuất MP4 theo cấu hình bạn chọn: tỷ lệ khung hình, độ phân giải và FPS.\n"
-            "Một clip video → 1 file MP4. Nhiều clip → mỗi video 1 file riêng (theo ID nguồn), không ghép nối."
-        ),
+        text="Một clip ra một file MP4. Nhiều clip thì mỗi video một file, không ghép nối.",
         foreground="#555",
         font=("Segoe UI", 9),
-        wraplength=620,
+        wraplength=280,
         justify="left",
-    ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+    )
+    lbl_export_hint.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    _follow_wrap(lbl_export_hint, exp_fr, pad=36)
 
     fr_export_cfg = ttk.LabelFrame(exp_inner, text="Cấu hình xuất", padding=6)
     fr_export_cfg.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 6))

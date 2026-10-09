@@ -162,6 +162,20 @@ def test_try_reuse_skips_cookie_file_when_profile_ready() -> None:
     login_ck.assert_not_called()
 
 
+def test_profile_session_ready_rejects_saved_continue_even_with_c_user() -> None:
+    from unittest.mock import MagicMock, patch
+
+    page = MagicMock()
+    page.url = "https://www.facebook.com/"
+    with patch(
+        "src.services.facebook_session_recovery.facebook_page_is_saved_profile_continue",
+        return_value=True,
+    ):
+        ok, detail = profile_session_ready_for_interaction(page, {"id": "UID_12345"})
+    assert ok is False
+    assert "Continue" in detail
+
+
 def test_profile_session_ready_detects_c_user() -> None:
     from unittest.mock import MagicMock, patch
 

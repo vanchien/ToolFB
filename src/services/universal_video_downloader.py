@@ -2547,6 +2547,12 @@ class UniversalYTDLPWrapper:
                 n = 0
                 js_warn_logged = False
                 for line in proc.stderr:
+                    if cancel_event and cancel_event.is_set():
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        break
                     stderr_tail.append(line)
                     n += 1
                     if _YTDLP_JS_WARN_SNIP in line and "javascript" in line.lower():

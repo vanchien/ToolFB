@@ -143,6 +143,27 @@ def _format_worker_error(exc: BaseException) -> str:
     return msg[:200]
 
 
+def _queue_window_label(mapped: MappedAccount) -> str:
+    """Nhãn cửa sổ: số thứ tự kèm UID."""
+    from src.utils.browser_identity import format_account_window_label
+
+    uid = ""
+    try:
+        uid = str(mapped.display_uid() or "").strip()
+    except Exception:
+        uid = str(getattr(mapped, "account_id", "") or "").strip()
+    return format_account_window_label(int(getattr(mapped, "queue_no", 0) or 0), uid)
+
+
+def _show_queue_number_on_browser(context: Any, page: Page, mapped: MappedAccount) -> None:
+    """Gắn «#01 · UID» lên tab Firefox và góc trang."""
+    from src.utils.browser_identity import stamp_browser_account_label
+
+    label = _queue_window_label(mapped)
+    prof = str(getattr(getattr(mapped, "storage", None), "profile_path", "") or "").strip()
+    stamp_browser_account_label(context, page, label, prof)
+
+
 def run_human_interaction_worker(
 
     mapped: MappedAccount,
@@ -318,6 +339,7 @@ def run_human_interaction_worker(
 
         page: Page = context.pages[0] if context.pages else context.new_page()
         os.environ.pop("TOOLFB_NAV_MOBILE_FB", None)
+        _show_queue_number_on_browser(context, page, mapped)
 
         from src.services.facebook_session_persist import (
             apply_saved_cookie_path_to_mapped,
@@ -359,6 +381,27 @@ def run_human_interaction_worker(
                     cookie_path,
                 )
                 _status("running", f"Đã lưu cookie · {cookie_path[-42:]}")
+                try:
+                    from src.services.facebook_session_persist import sync_firefox_profile_before_close
+
+                    sync_firefox_profile_before_close(
+                        context,
+                        page,
+                        acc,
+                        cookie_path=cookie_path,
+                        mapped=mapped,
+                        log_label=log_label,
+                    )
+                    logger.info(
+                        "[Human] Đã ghi phiên vào profile trình duyệt account={}",
+                        mapped.account_id,
+                    )
+                except Exception as flush_exc:  # noqa: BLE001
+                    logger.warning(
+                        "[Human] Chưa ghi được lịch sử profile account={}: {}",
+                        mapped.account_id,
+                        flush_exc,
+                    )
             return bool(saved)
 
         mapped.storage.profile_path = str(acc.get("portable_path") or acc.get("profile_path") or mapped.storage.profile_path or "")
@@ -376,13 +419,164 @@ def run_human_interaction_worker(
             mapped.cookie_path,
         )
 
-        _status("running", "Khôi phục phiên profile/cookie đã lưu…")
-        ok_prep, prep_mode = prepare_persistent_session_after_launch(
-            context,
-            page,
-            acc,
-            cookie_path=cookie_path,
+        ok_prep, prep_mode = False, ""
+        cookie_injected = False
+        from src.automation.facebook_actions import (
+            _force_www_facebook_if_mobile_redirect,
+            login_with_cookie,
+            navigate_away_from_login_if_session_active,
+            prime_facebook_session_page,
         )
+        from src.services.facebook_session_persist import profile_session_ready_for_interaction
+
+        # Mở facebook.com một lần. Màn Continue phải bấm trước cookie và trước khi coi là đã login.
+        _status("running", "Kiểm tra Facebook…")
+        cur = (page.url or "").lower()
+        if "facebook.com" not in cur:
+            try:
+                prime_facebook_session_page(page)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human] Không mở được facebook.com account={}: {}", mapped.account_id, exc)
+        else:
+            _force_www_facebook_if_mobile_redirect(page)
+            navigate_away_from_login_if_session_active(page)
+
+        from src.services.facebook_session_recovery import (
+            complete_saved_continue_and_totp,
+            confirm_facebook_password_prompt,
+            facebook_page_has_visible_password_prompt,
+            facebook_page_is_full_login_form,
+            facebook_page_is_invalid_auth_request,
+            facebook_page_is_saved_profile_continue,
+        )
+
+        def _enter_via_password_prompt() -> bool:
+            """Hộp Password + Log in: gõ mật khẩu đã lưu rồi bấm Log in."""
+            if not facebook_page_has_visible_password_prompt(page):
+                return False
+            _status("running", "Nhập mật khẩu và bấm Log in…")
+            logger.info("[Human] Thấy hộp mật khẩu account={}", mapped.account_id)
+            try:
+                return bool(confirm_facebook_password_prompt(page, acc))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human] Nhập mật khẩu account={}: {}", mapped.account_id, exc)
+                return False
+
+        def _enter_via_saved_continue() -> bool:
+            """Continue → mật khẩu → 2FA, trên đúng trang đang mở. True khi đã vào feed."""
+            _status("running", "Bấm Continue, nhập mật khẩu hoặc 2FA nếu hỏi…")
+            try:
+                return bool(complete_saved_continue_and_totp(page, acc))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human] Continue/mật khẩu/2FA account={}: {}", mapped.account_id, exc)
+                return False
+
+        # Một mạch: Continue → mật khẩu → 2FA. Không chờ, không tải lại giữa chừng.
+        if _enter_via_saved_continue():
+            ok_prep, prep_mode = True, "continue_2fa"
+            logger.info("[Human] Vào Facebook sau Continue/mật khẩu/2FA account={}", mapped.account_id)
+            _status("running", "Đã vào — lưu phiên trình duyệt…")
+            _persist_session_immediately(log_label="continue_2fa", require_confirm=False)
+        if (
+            not ok_prep
+            and not acc.get("_invalid_retried")
+            and (acc.get("_invalid_request") or facebook_page_is_invalid_auth_request(page))
+        ):
+            from src.services.facebook_session_recovery import recover_from_invalid_auth_request
+
+            _status("running", "Facebook báo Invalid request — tải lại và đăng nhập lại…")
+            if recover_from_invalid_auth_request(page, acc):
+                ok_prep, prep_mode = True, "invalid_retry"
+                _status("running", "Đã vào — lưu phiên trình duyệt…")
+                _persist_session_immediately(log_label="invalid_request", require_confirm=False)
+        elif (
+            not ok_prep
+            and not acc.get("_continue_clicked")
+            and not facebook_page_is_saved_profile_continue(page)
+            and not facebook_page_has_visible_password_prompt(page)
+            and not facebook_page_is_full_login_form(page)
+        ):
+            ok_live, det_live = profile_session_ready_for_interaction(page, acc)
+            if ok_live:
+                ok_prep, prep_mode = True, det_live or "profile"
+                logger.info(
+                    "[Human] Facebook đã đăng nhập — bỏ cookie, không mở trang login account={}",
+                    mapped.account_id,
+                )
+                _status("running", "Đã đăng nhập — lưu phiên trình duyệt…")
+                _persist_session_immediately(log_label="profile_da_login", require_confirm=False)
+        if (
+            not ok_prep
+            and not acc.get("_continue_clicked")
+            and cookie_file_has_session(cookie_path)
+            and not facebook_page_is_saved_profile_continue(page)
+            and not facebook_page_has_visible_password_prompt(page)
+        ):
+            _status("running", "Chưa có phiên trình duyệt — nạp cookie…")
+            try:
+                login_with_cookie(page, cookie_path, force=True)
+                cookie_injected = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Human] Nạp cookie sau khi kiểm tra Facebook thất bại account={}: {}",
+                    mapped.account_id,
+                    exc,
+                )
+            if acc.get("_continue_clicked"):
+                logger.info("[Human] Đã gặp Continue/mật khẩu — không chạy lại sau cookie account={}", mapped.account_id)
+            elif _enter_via_saved_continue():
+                ok_prep, prep_mode = True, "continue_2fa"
+                logger.info("[Human] Vào Facebook sau Continue/mật khẩu account={}", mapped.account_id)
+                _status("running", "Đã vào — lưu phiên trình duyệt…")
+                _persist_session_immediately(log_label="continue_2fa", require_confirm=False)
+            else:
+                ok_ck, det_ck = profile_session_ready_for_interaction(page, acc)
+                if (
+                    ok_ck
+                    and not facebook_page_is_saved_profile_continue(page)
+                    and not facebook_page_is_full_login_form(page)
+                    and not facebook_page_has_visible_password_prompt(page)
+                ):
+                    ok_prep, prep_mode = True, det_ck or "cookie"
+                    logger.info("[Human] Vào Facebook bằng cookie account={}", mapped.account_id)
+                    _status("running", "Đã vào bằng cookie — lưu phiên trình duyệt…")
+                    _persist_session_immediately(log_label="cookie_da_vao", require_confirm=False)
+                else:
+                    logger.warning(
+                        "[Human] Cookie không vào được account={} — {}",
+                        mapped.account_id,
+                        det_ck,
+                    )
+
+        stuck_on_gate = bool(
+            not ok_prep
+            and (
+                facebook_page_is_saved_profile_continue(page)
+                or facebook_page_has_visible_password_prompt(page)
+            )
+        )
+        if stuck_on_gate:
+            acc["_skip_fresh_login"] = True
+            logger.warning(
+                "[Human] Còn màn Continue/mật khẩu sau một lượt — không tải lại trang login account={}",
+                mapped.account_id,
+            )
+
+        # Đã login hoặc vừa nạp cookie thì không F5 (F5 trang login làm rơi phiên).
+        if (
+            not ok_prep
+            and not cookie_injected
+            and not stuck_on_gate
+            and not acc.get("_continue_clicked")
+            and not _stopped()
+        ):
+            _status("running", "Khôi phục phiên profile/cookie đã lưu…")
+            ok_prep, prep_mode = prepare_persistent_session_after_launch(
+                context,
+                page,
+                acc,
+                cookie_path=cookie_path,
+            )
         if ok_prep:
             _persist_session_immediately(log_label=f"prep_{prep_mode}", require_confirm=False)
 
@@ -393,6 +587,18 @@ def run_human_interaction_worker(
                     from src.utils.win_browser_window import reposition_browser_to_grid_slot
 
                     if reposition_browser_to_grid_slot(prof, grid_slot, timeout_s=20.0):
+                        title = _queue_window_label(mapped)
+                        if title:
+                            from src.utils.browser_identity import stamp_browser_account_label
+
+                            stamp_browser_account_label(
+                                context,
+                                page,
+                                title,
+                                prof,
+                                install_init=False,
+                                title_timeout_s=1.5,
+                            )
                         logger.info(
                             "[Human] Đã xếp cửa sổ ô {} @ ({}, {}) {}×{}",
                             grid_slot.index + 1,
@@ -468,10 +674,21 @@ def run_human_interaction_worker(
 
         has_cookie_file = cookie_file_has_session(cookie_path)
         has_password = bool(str(getattr(mapped.auth, "password", "") or "").strip())
-        # Profile/cookie thất bại + có pass → luôn thử form (không phụ thuộc soft_login hay file cookie)
-        allow_form_login = bool(
-            login_only or (has_password and not ok_prep and not cookie_file_has_session(cookie_path))
-        )
+        # Dòng nick định dạng cookie: hết cookie thì không mở form mật khẩu.
+        cookie_only = bool(getattr(mapped, "login_via_cookie", False)) and has_cookie_file
+        # Mọi tài khoản có file cookie đều thử cookie trước form.
+        prefer_cookie = has_cookie_file
+        if acc.get("_skip_fresh_login"):
+            allow_form_login = False
+            logger.info("[Human] Bỏ form login lặp — đã xử lý Continue/mật khẩu một lượt.")
+        elif prefer_cookie:
+            allow_form_login = not cookie_only and has_password
+            _status("running", "Đăng nhập bằng cookie…")
+        else:
+            # Profile/cookie thất bại + có pass → luôn thử form (không phụ thuộc soft_login hay file cookie)
+            allow_form_login = bool(
+                login_only or (has_password and not ok_prep and not cookie_file_has_session(cookie_path))
+            )
 
         def _form_login_recover() -> bool:
             """Form / 2FA / captcha — sau khi profile + cookie file đã thử."""
@@ -527,6 +744,82 @@ def run_human_interaction_worker(
                 mapped.account_id,
                 prep_mode,
             )
+        elif (
+            not acc.get("_invalid_retried")
+            and (acc.get("_invalid_request") or facebook_page_is_invalid_auth_request(page))
+        ):
+            from src.services.facebook_session_recovery import recover_from_invalid_auth_request
+
+            _status("running", "Facebook báo Invalid request — tải lại và đăng nhập bằng UID…")
+            logger.warning("[Human] Invalid request account={} — OK, tải lại, rồi UID/mật khẩu/2FA", mapped.account_id)
+            if recover_from_invalid_auth_request(page, acc):
+                ok_sess, sess_detail = True, "Đăng nhập lại sau Invalid request"
+                _status("running", "Đã vào — lưu phiên trình duyệt…")
+                _persist_session_immediately(log_label="after_invalid_retry", require_confirm=False)
+            else:
+                ok_sess, sess_detail = False, "Invalid request — tải lại và UID/mật khẩu/2FA không vào được"
+        elif (
+            acc.get("_continue_clicked")
+            or acc.get("_skip_fresh_login")
+            or acc.get("_invalid_retried")
+            or facebook_page_is_saved_profile_continue(page)
+            or facebook_page_has_visible_password_prompt(page)
+        ):
+            from src.services.facebook_session_recovery import login_with_stored_uid_password
+
+            _status("running", "Chưa vào feed — đăng nhập bằng UID và mật khẩu…")
+            logger.info("[Human] Mở form UID/mật khẩu/2FA account={}", mapped.account_id)
+            if login_with_stored_uid_password(page, acc):
+                ok_sess, sess_detail = True, "Form UID, mật khẩu và 2FA"
+                _status("running", "Đã vào — lưu phiên trình duyệt…")
+                _persist_session_immediately(log_label="uid_password", require_confirm=False)
+            else:
+                ok_sess, sess_detail = False, "UID/mật khẩu/2FA không vào được"
+        elif prefer_cookie:
+            from src.services.facebook_session_persist import try_reuse_saved_cookie_session
+
+            _status("running", "Nạp cookie và vào Facebook…")
+            ok_sess, sess_detail = try_reuse_saved_cookie_session(
+                page,
+                acc,
+                cookie_path=cookie_path,
+                timeout_ms=28_000,
+            )
+            if ok_sess:
+                logger.info("[Human] Đăng nhập bằng cookie OK account={}", mapped.account_id)
+            elif cookie_only:
+                sess_detail = sess_detail or "Cookie không vào được Facebook"
+                logger.warning(
+                    "[Human] Cookie không đăng nhập được account={}: {}",
+                    mapped.account_id,
+                    sess_detail,
+                )
+            else:
+                logger.info(
+                    "[Human] Cookie chưa vào được account={} — thử form nếu có mật khẩu.",
+                    mapped.account_id,
+                )
+                from src.services.facebook_session_recovery import reload_facebook_page_f5
+
+                establish_retries = max(1, int(os.environ.get("FB_SESSION_ESTABLISH_F5_RETRIES", "2")))
+                for est_i in range(establish_retries):
+                    if est_i > 0:
+                        _status(
+                            "running",
+                            f"F5 — thử lại xác nhận phiên ({est_i + 1}/{establish_retries})",
+                        )
+                        reload_facebook_page_f5(page, label=f"human_establish_{est_i}")
+                        if aborted := _finish_if_aborted(notify_now=False):
+                            return aborted
+                    ok_sess, sess_detail = establish_facebook_session(
+                        page,
+                        acc,
+                        cookie_path=cookie_path,
+                        allow_form_login=allow_form_login,
+                        form_recover_fn=_form_login_recover if allow_form_login else None,
+                    )
+                    if ok_sess:
+                        break
         else:
             from src.services.facebook_session_recovery import reload_facebook_page_f5
 
@@ -555,11 +848,12 @@ def run_human_interaction_worker(
         if not ok_sess:
             if aborted := _finish_if_aborted(notify_now=False):
                 return aborted
-            hint = (
-                " — thử «Lưu cookie» hoặc bổ sung pass để đăng nhập form"
-                if has_cookie_file and not has_password
-                else ""
-            )
+            if cookie_only:
+                hint = " — cookie không vào được, không mở form mật khẩu"
+            elif has_cookie_file and not has_password:
+                hint = " — thử «Lưu cookie» hoặc bổ sung pass để đăng nhập form"
+            else:
+                hint = ""
             _status(
                 "login_failed",
                 (sess_detail or "Không đăng nhập được")[:220] + hint[:80],

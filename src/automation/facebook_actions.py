@@ -748,7 +748,7 @@ def _enable_view_only_guard(page: Page) -> None:
     bottom: '0',
     width: '100vw',
     height: '100vh',
-    zIndex: '2147483647',
+    zIndex: '2147483646',
     background: 'transparent',
     pointerEvents: 'auto',
     touchAction: 'none',
@@ -1022,6 +1022,26 @@ def facebook_session_appears_logged_in(page: Page) -> bool:
     Không thay thế xác minh đầy đủ; dùng để tránh nạp cookie khi đã đăng nhập.
     """
     try:
+        from src.services.facebook_session_recovery import (
+            facebook_page_has_visible_password_prompt,
+            facebook_page_is_full_login_form,
+            facebook_page_is_saved_profile_continue,
+        )
+
+        if facebook_page_is_saved_profile_continue(page):
+            logger.info("[FB] Màn Continue hồ sơ đã lưu — chưa vào tài khoản.")
+            return False
+        from src.services.facebook_session_recovery import facebook_page_is_invalid_auth_request
+
+        if facebook_page_is_invalid_auth_request(page):
+            logger.info("[FB] Hộp Invalid request — chưa vào tài khoản.")
+            return False
+        if facebook_page_is_full_login_form(page):
+            logger.info("[FB] Form đăng nhập email + mật khẩu — chưa vào tài khoản.")
+            return False
+        if facebook_page_has_visible_password_prompt(page):
+            logger.info("[FB] Hộp nhập mật khẩu sau Continue — chưa vào tài khoản.")
+            return False
         u = (page.url or "").lower()
         if "facebook.com" in u and _facebook_url_is_security_interstitial(page.url or ""):
             logger.debug("[FB] URL checkpoint/2FA — chưa có phiên hợp lệ (đang chờ captcha/TOTP).")
@@ -1284,15 +1304,52 @@ def _load_playwright_cookies(cookie_path: Path) -> list[dict[str, Any]]:
     return raw  # type: ignore[return-value]
 
 
-def login_with_cookie(page: Page, cookie_path: str | Path) -> None:
-    """
-    Mở Facebook, nạp cookie từ file rồi tải lại trang để tái sử dụng phiên.
+def _cookies_ready_for_context(cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Chuẩn hóa cookie file để ``add_cookies`` nhận trước khi mở Facebook."""
+    out: list[dict[str, Any]] = []
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        domain = str(item.get("domain") or ".facebook.com").strip() or ".facebook.com"
+        cookie: dict[str, Any] = {
+            "name": name,
+            "value": str(item.get("value") or ""),
+            "domain": domain,
+            "path": str(item.get("path") or "/").strip() or "/",
+            "secure": bool(item.get("secure", True)),
+            "httpOnly": bool(item.get("httpOnly", False)),
+        }
+        same = str(item.get("sameSite") or "Lax")
+        if same not in {"Strict", "Lax", "None"}:
+            same = "Lax"
+        if same == "None":
+            cookie["secure"] = True
+        cookie["sameSite"] = same
+        expires = item.get("expires")
+        try:
+            exp = float(expires) if expires is not None else -1
+        except (TypeError, ValueError):
+            exp = -1
+        if exp > 0:
+            cookie["expires"] = exp
+        out.append(cookie)
+    return out
 
-    Ưu tiên nạp cookie trước khi đăng nhập thủ công (theo quy tắc dự án).
+
+def login_with_cookie(page: Page, cookie_path: str | Path, *, force: bool = False) -> None:
+    """
+    Nạp cookie từ file rồi mới mở Facebook.
+
+    Không mở facebook.com trước khi ``add_cookies`` — lần mở đó rơi vào form login
+    và cookie không được dùng để vào.
 
     Args:
         page: Trang Playwright.
         cookie_path: Đường tới JSON cookie (tương đối hoặc tuyệt đối).
+        force: True = luôn ghi cookie file vào context, kể cả khi profile đang có phiên.
 
     Raises:
         FileNotFoundError / ValueError / PlaywrightTimeoutError: Theo từng bước thất bại.
@@ -1301,25 +1358,48 @@ def login_with_cookie(page: Page, cookie_path: str | Path) -> None:
     try:
         from src.services.facebook_session_persist import profile_session_ready_for_interaction
 
-        ok_prof, prof_detail = profile_session_ready_for_interaction(page)
-        if ok_prof:
-            logger.info(
-                "[FB] login_with_cookie — bỏ qua nạp file, profile đã có phiên: {}",
-                prof_detail,
-            )
-            _enable_view_only_guard(page)
+        from src.services.facebook_session_recovery import (
+            facebook_page_has_visible_password_prompt,
+            facebook_page_is_saved_profile_continue,
+        )
+
+        if facebook_page_is_saved_profile_continue(page) or facebook_page_has_visible_password_prompt(page):
+            logger.info("[FB] Đang ở màn Continue/mật khẩu — không mở lại facebook.com")
             return
-        cookies = _load_playwright_cookies(path)
-        start_fb = _fb_normalize_client_url("https://www.facebook.com/")
-        assert_safe_facebook_navigation_url(start_fb, label="login_with_cookie")
-        page.goto(start_fb, wait_until="domcontentloaded", timeout=60_000)
+        current = (page.url or "").lower()
+        on_login = "/login" in current or "checkpoint" in current or "two_step" in current
+        if not force and not on_login:
+            ok_prof, prof_detail = profile_session_ready_for_interaction(page)
+            if ok_prof:
+                logger.info(
+                    "[FB] login_with_cookie — bỏ qua nạp file, profile đã có phiên: {}",
+                    prof_detail,
+                )
+                _enable_view_only_guard(page)
+                return
+        cookies = _cookies_ready_for_context(_load_playwright_cookies(path))
+        if not cookies:
+            raise ValueError("File cookie không có cookie hợp lệ.")
+        try:
+            page.context.add_cookies(cookies)
+        except Exception as add_exc:  # noqa: BLE001
+            logger.warning("[FB] add_cookies trước khi mở trang thất bại ({}) — thử lại sau commit", add_exc)
+            page.goto(
+                "https://www.facebook.com/",
+                wait_until="commit",
+                timeout=20_000,
+            )
+            page.context.add_cookies(cookies)
+        logger.info("Đã nạp {} cookie từ {} — mở Facebook sau khi nạp", len(cookies), path)
+        home_after = _fb_normalize_client_url("https://www.facebook.com/")
+        assert_safe_facebook_navigation_url(home_after, label="login_with_cookie_home")
+        page.goto(home_after, wait_until="domcontentloaded", timeout=60_000)
         _force_www_facebook_if_mobile_redirect(page)
-        _wait_selector_or_fail(page, "[role='main'], body", timeout_ms=45_000)
-        page.context.add_cookies(cookies)
-        logger.info("Đã nạp {} cookie từ {}", len(cookies), path)
+        if facebook_page_is_saved_profile_continue(page) or facebook_page_has_visible_password_prompt(page):
+            logger.info("[FB] Sau cookie thấy Continue hoặc ô mật khẩu — không chờ feed, không tải lại")
+            return
+        navigate_away_from_login_if_session_active(page)
         _human_pause()
-        page.reload(wait_until="domcontentloaded", timeout=60_000)
-        _force_www_facebook_if_mobile_redirect(page)
         # m.facebook (Firefox/mobile) thường không có logo [aria-label='Facebook'][role='img'] — ưu tiên khung chuẩn.
         _wait_first_selector(
             page,
@@ -1338,7 +1418,7 @@ def login_with_cookie(page: Page, cookie_path: str | Path) -> None:
                 "body",
             ),
             step_timeout_ms=15_000,
-            error_label="login_with_cookie sau reload",
+            error_label="login_with_cookie sau vào trang chủ",
         )
         _enable_view_only_guard(page)
     except (PlaywrightTimeoutError, FileNotFoundError, ValueError):
@@ -8194,12 +8274,37 @@ def post_reel_via_page_dashboard(
         except Exception:
             still_processing = False
         try:
-            next_btn = dialog.get_by_role("button", name=re.compile(r"Next|Tiếp|Tiếp theo", re.I)).first
+            next_btn = dialog.get_by_role("button", name=re.compile(r"^Next$|^Tiếp$|^Tiếp theo$", re.I)).first
             next_ready = next_btn.is_visible(timeout=200) and (next_btn.get_attribute("aria-disabled") or "").lower() != "true"
         except Exception:
             next_ready = False
-        if ((not placeholder_vis) and not still_processing) or next_ready:
+        try:
+            preview_ready = dialog.locator("video").first.is_visible(timeout=200)
+        except Exception:
+            preview_ready = False
+        try:
+            pub_btn = dialog.get_by_role("button", name=re.compile(r"^Publish$|^Post$|^Đăng$", re.I)).first
+            publish_ready = (
+                pub_btn.is_visible(timeout=200)
+                and (pub_btn.get_attribute("aria-disabled") or "").lower() != "true"
+            )
+        except Exception:
+            publish_ready = False
+        if reel_upload_progress_settled(
+            placeholder_visible=placeholder_vis,
+            still_processing=still_processing,
+            next_ready=next_ready,
+            preview_ready=preview_ready,
+            publish_ready=publish_ready,
+        ):
             upload_ok = True
+            logger.info(
+                "{} Upload đã được nhận (preview={} next={} publish={}).",
+                stage,
+                preview_ready,
+                next_ready,
+                publish_ready,
+            )
             break
         page.wait_for_timeout(450)
     if not upload_ok:
@@ -8333,17 +8438,36 @@ def post_reel_via_page_dashboard(
     return
 
 
+def reel_upload_progress_settled(
+    *,
+    placeholder_visible: bool,
+    still_processing: bool,
+    next_ready: bool,
+    preview_ready: bool,
+    publish_ready: bool,
+) -> bool:
+    """
+    Upload Reel chỉ xong khi UI đã nhận file.
+
+    Không coi là xong chỉ vì chưa thấy chữ Processing — lúc đó video có thể chưa vào composer,
+    bấm Publish sẽ không đăng được.
+    """
+    if placeholder_visible or still_processing:
+        return False
+    return bool(next_ready or preview_ready or publish_ready)
+
+
 def _submit_button_is_enabled_js() -> str:
-    """JS check: tồn tại ít nhất một [role=button] có text Publish/Post/Đăng/Schedule enable."""
+    """JS check: nút đúng nhãn Publish/Post/Đăng/Schedule đang enable (không khớp «Posts»)."""
     return """() => {
-      const words = ['publish', 'post', 'đăng', 'schedule', 'lên lịch'];
+      const exact = new Set(['publish', 'post', 'đăng', 'schedule', 'lên lịch']);
       const nodes = Array.from(document.querySelectorAll("[role='button'], button"));
       for (const el of nodes) {
-        const t = (el.textContent || '').trim().toLowerCase();
-        if (!t) continue;
-        if (!words.some(w => t === w || t.includes(w))) continue;
+        const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        if (!exact.has(t)) continue;
         const dis = (el.getAttribute('aria-disabled') || '').toLowerCase();
         if (dis === 'true') continue;
+        if ((el.getAttribute('aria-busy') || '').toLowerCase() === 'true') continue;
         if (el.hasAttribute('disabled')) continue;
         const rect = el.getBoundingClientRect();
         if (rect.width < 4 || rect.height < 4) continue;
@@ -8353,8 +8477,46 @@ def _submit_button_is_enabled_js() -> str:
     }"""
 
 
+def _submit_locator_enabled(loc: Locator) -> bool:
+    """True khi nút Publish/Post không disabled và không đang busy."""
+    try:
+        if loc.count() <= 0 or not loc.is_visible(timeout=400):
+            return False
+    except Exception:
+        return False
+    try:
+        dis = str(loc.get_attribute("aria-disabled") or "").strip().lower()
+        busy = str(loc.get_attribute("aria-busy") or "").strip().lower()
+    except Exception:
+        return False
+    if dis == "true" or busy == "true":
+        return False
+    try:
+        if loc.get_attribute("disabled") is not None:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _wait_submit_locator_enabled(loc: Locator, *, timeout_ms: int = 120_000) -> bool:
+    """Chờ đúng nút Publish/Post bật sau upload — không nhận nhầm menu Posts."""
+    deadline = time.time() + max(1.0, timeout_ms / 1000.0)
+    while time.time() < deadline:
+        if _submit_locator_enabled(loc):
+            return True
+        try:
+            loc.page.wait_for_timeout(400)
+        except Exception:
+            return False
+    return False
+
+
 def _js_click_submit_button_locator(loc: Locator, *, label: str) -> bool:
     """Gọi ``el.click()`` trực tiếp trên element → bỏ qua mọi overlay (view-only guard)."""
+    if not _submit_locator_enabled(loc):
+        logger.info("Bỏ qua click {} — nút chưa enable (upload/xử lý chưa xong).", label)
+        return False
     try:
         loc.evaluate("el => { if (el && typeof el.click === 'function') el.click(); }")
         logger.info("Đã nhấn nút {} (JS click, bypass overlay).", label)
@@ -8393,7 +8555,10 @@ def click_post_button(page: Page) -> None:
                 pub = page.locator("[role='button']:has-text('Publish')").first
             if pub.count() > 0:
                 pub.wait_for(state="visible", timeout=30_000)
-                page.wait_for_function(_submit_button_is_enabled_js(), timeout=120_000)
+                if not _wait_submit_locator_enabled(pub, timeout_ms=120_000):
+                    raise PlaywrightTimeoutError(
+                        "Nút Publish đã hiện nhưng chưa bật — upload hoặc xử lý media chưa xong."
+                    )
                 # 1) Thử JS click trước — bypass overlay view-only guard.
                 if _js_click_submit_button_locator(pub, label="Publish"):
                     try:
@@ -8419,6 +8584,8 @@ def click_post_button(page: Page) -> None:
                     pass
                 _human_pause()
                 return
+        except PlaywrightTimeoutError:
+            raise
         except Exception:
             pass
         sel = _wait_first_selector(

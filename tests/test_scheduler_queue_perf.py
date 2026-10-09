@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -114,7 +115,8 @@ def test_tick_cross_platform_skips_when_idle(monkeypatch: pytest.MonkeyPatch) ->
 def test_drain_debounce_blocks_rapid_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
     import src.scheduler as sched
 
-    sched._queue_last_drain_mono = 1_000_000.0
+    # Gắn mốc vào đồng hồ monotonic hiện tại — số cố định sẽ hết hạn nếu máy đã bật lâu.
+    sched._queue_last_drain_mono = time.monotonic()
     calls: list[int] = []
 
     def _fake_tick() -> None:

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 import shutil
 from pathlib import Path
 
 import pytest
 
-from src.services.app_updater import _merge_exe_gui_bundle
+from src.services.app_updater import _merge_exe_gui_bundle, apply_update_package
 
 
 def test_merge_exe_gui_replaces_internal_not_overlay(tmp_path: Path) -> None:
@@ -56,3 +57,11 @@ def test_manual_extract_should_replace_exe_gui_folder(tmp_path: Path) -> None:
 
     assert stale.exists(), "Cảnh báo: extract đè từng file có thể giữ bytecode cũ"
     assert (target / "app.py").read_bytes() == b"v2"
+
+
+def test_zip_update_keeps_data_and_config() -> None:
+    """Bản zip không ghi đè dữ liệu người dùng."""
+    defaults = inspect.signature(apply_update_package).parameters
+    preserved = defaults["preserve_on_apply_dirs"].default
+    assert "data" in preserved
+    assert "config" in preserved

@@ -53,6 +53,8 @@ data/video_editor/remote_audio_config.json
 config/accounts.json
 config/account_credentials.json
 config/pages.json
+config/page_creation.json
+config/business_managers.json
 config/page_insights.json
 config/entities.json
 config/schedule.json
@@ -60,6 +62,7 @@ config/schedule_posts.json
 config/ai_image_config.json
 config/universal_video_downloader.json
 config/human_interaction_settings.json
+config/facebook_groups.json
 
 # Large local tool cache/binaries (không đẩy lên GitHub)
 tools/ffmpeg/

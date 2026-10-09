@@ -628,8 +628,31 @@ def confirm_facebook_session_logged_in(
     last_reload_at = 0.0
     reload_count = 0
     max_reload = max(0, int(os.environ.get("FB_CONFIRM_F5_RELOADS", "4")))
+    if isinstance(account, dict) and account.get("_continue_clicked"):
+        # Continue/mật khẩu vừa xử lý trên trang này — cấm F5 và cấm mở lại facebook.com.
+        max_reload = 0
+        navigated_home = True
 
+    surface_click_done = False
     while time.time() < deadline:
+        if (
+            facebook_page_is_saved_profile_continue(page)
+            or facebook_page_has_visible_password_prompt(page)
+            or facebook_page_is_password_method_choice(page)
+        ):
+            if not surface_click_done:
+                surface_click_done = True
+                logger.info("[FB recovery] Màn Continue/mật khẩu — bấm một lần, không tải lại trang.")
+                try:
+                    complete_saved_continue_and_totp(page, account)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[FB recovery] Continue/mật khẩu khi xác nhận phiên: {}", exc)
+            if (
+                facebook_page_is_saved_profile_continue(page)
+                or facebook_page_has_visible_password_prompt(page)
+                or facebook_page_is_password_method_choice(page)
+            ):
+                return False, "Màn Continue/mật khẩu — không F5, không mở lại trang"
         u = _url_lower(page)
         if facebook_page_is_hard_checkpoint(u):
             last_detail = f"Vẫn ở checkpoint ({page.url})"
@@ -663,6 +686,20 @@ def confirm_facebook_session_logged_in(
         if not _session_logged_in(page):
             last_detail = "Chưa có phiên hợp lệ (cookie/UI đăng nhập)"
             stable_hits = 0
+            c_user_now = _read_facebook_c_user(page)
+            if c_user_now:
+                # Cookie đã vào context — không F5. Reload lúc này dễ làm Facebook đăng xuất.
+                last_detail = f"Đã có cookie UID {c_user_now}, chờ vào bảng tin"
+                if not navigated_home:
+                    try:
+                        home = _fb_normalize_client_url("https://www.facebook.com/")
+                        assert_safe_facebook_navigation_url(home, label="confirm_cookie_home")
+                        page.goto(home, wait_until="domcontentloaded", timeout=60_000)
+                    except Exception as nav_exc:  # noqa: BLE001
+                        logger.warning("[FB recovery] Không mở bảng tin khi đã có cookie: {}", nav_exc)
+                    navigated_home = True
+                page.wait_for_timeout(700)
+                continue
             now = time.time()
             if reload_count < max_reload and (now - last_reload_at) >= 3.5:
                 if reload_facebook_page_f5(page, label=f"confirm_retry_{reload_count + 1}"):
@@ -705,7 +742,7 @@ def confirm_facebook_session_logged_in(
             return True, f"Đã vào tài khoản Facebook (UID {c_user})"
         return True, "Đã vào tài khoản Facebook"
 
-    if reload_count < max_reload:
+    if reload_count < max_reload and not _read_facebook_c_user(page):
         if reload_facebook_page_f5(page, label="confirm_final_f5"):
             page.wait_for_timeout(900)
             if _session_logged_in(page):
@@ -1199,6 +1236,1056 @@ def _click_totp_continue(page: Page) -> bool:
     return False
 
 
+_SAVED_PROFILE_MARKERS = (
+    "use another profile",
+    "use another account",
+    "create new account",
+    "dùng hồ sơ khác",
+    "tạo tài khoản mới",
+)
+
+# Nút xanh «Continue» — chữ đúng nút đó, không lấy khối chứa «Use another profile».
+_SAVED_CONTINUE_POINT_JS = r"""
+() => {
+  const exact = /^(continue|tiếp tục)$/i;
+  const bad = /use another profile|use another account|create new account|dùng hồ sơ khác|tạo tài khoản mới/i;
+  const nodes = Array.from(document.querySelectorAll('div, button, a, span'));
+  let best = null;
+  let bestArea = 0;
+  for (const el of nodes) {
+    const inner = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!exact.test(inner)) continue;
+    if (bad.test(inner)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 48 || r.height < 18 || r.height > 110) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') continue;
+    const area = r.width * r.height;
+    if (area > bestArea) {
+      best = r;
+      bestArea = area;
+    }
+  }
+  if (!best) return null;
+  return { x: best.x + best.width / 2, y: best.y + best.height / 2 };
+}
+"""
+
+
+_CONTINUE_EXACT = re.compile(r"^\s*(Continue|Tiếp tục)\s*$", re.I)
+
+# Bấm đúng node chữ Continue — không phụ thuộc hit-test (overlay chỉ-xem nuốt chuột).
+_SAVED_CONTINUE_DOM_CLICK_JS = r"""
+() => {
+  const exact = /^(continue|tiếp tục)$/i;
+  const bad = /use another profile|use another account|create new account|dùng hồ sơ khác|tạo tài khoản mới/i;
+  const nodes = Array.from(document.querySelectorAll('[role="button"], button, a, div, span'));
+  const hits = [];
+  for (const el of nodes) {
+    const label = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    const inner = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (bad.test(inner) && !exact.test(inner) && !exact.test(label)) continue;
+    if (!exact.test(inner) && !exact.test(label)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) continue;
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const score = (role === 'button' || el.tagName === 'BUTTON' ? 1000000 : 0) + r.width * r.height;
+    hits.push({ el, score });
+  }
+  if (!hits.length) return false;
+  hits.sort((a, b) => b.score - a.score);
+  const el = hits[0].el;
+  try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+  const opts = { bubbles: true, cancelable: true, view: window };
+  try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (_) {}
+  try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch (_) {}
+  try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (_) {}
+  try { el.dispatchEvent(new MouseEvent('mouseup', opts)); } catch (_) {}
+  el.click();
+  return true;
+}
+"""
+
+
+_LOGIN_GATE_PROBE_JS = r"""
+() => {
+  const text = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+  const low = text.toLowerCase();
+  const fullMarks = [
+    'email hoặc số di động', 'email hoặc số điện thoại',
+    'email or mobile number', 'email or phone number',
+    'đăng nhập vào facebook', 'log in to facebook', 'log into facebook'
+  ];
+  const full = fullMarks.some((m) => low.includes(m));
+  const choice = [
+    'continue with password', 'use your password to continue',
+    'tiếp tục bằng mật khẩu', 'tiếp tục với mật khẩu', 'dùng mật khẩu để tiếp tục'
+  ].some((m) => low.includes(m)) && [
+    'choose a way to log in', 'get code via email', 'nhận mã qua email', 'chọn cách đăng nhập'
+  ].some((m) => low.includes(m));
+  const totp = [
+    'authentication code', 'authentication app', 'enter the 6-digit', '6-digit code',
+    'mã xác thực', 'xác thực hai', 'two-factor', 'go to your authentication'
+  ].some((m) => low.includes(m));
+  let invalid = low.includes('could not validate your request')
+    || low.includes('không thể xác thực yêu cầu')
+    || low.includes('yêu cầu không hợp lệ')
+    || (low.includes('invalid request') && (low.includes('beginning') || low.includes('reload page')));
+  if (!invalid) {
+    for (const d of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+      const t = ((d.innerText || '') + ' ' + (d.getAttribute('aria-label') || '')).toLowerCase();
+      if (t.includes('invalid request') || t.includes('could not validate your request') || t.includes('không thể xác thực')) {
+        invalid = true;
+        break;
+      }
+    }
+  }
+  function box(el, minW, maxH) {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width < minW || r.height < 16 || r.height > maxH) return null;
+    const s = window.getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || s.pointerEvents === 'none') return null;
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2, area: r.width * r.height };
+  }
+  let password = null;
+  if (!full) {
+    const inputs = document.querySelectorAll(
+      'input[type="password"], input[placeholder="Password" i], input[aria-label="Password" i], input[placeholder*="mật khẩu" i], input[aria-label*="mật khẩu" i]'
+    );
+    for (const el of inputs) {
+      const hit = box(el, 24, 80);
+      if (hit) { password = { x: hit.x, y: hit.y }; break; }
+    }
+  }
+  let cont = null;
+  if (!full && !choice && !password) {
+    const exact = /^(continue|tiếp tục)$/i;
+    const bad = /use another|another profile|another account|create new|dùng hồ sơ|tạo tài khoản|forgotten|quên/i;
+    let best = 0;
+    for (const el of document.querySelectorAll('[role="button"], button, a, div, span')) {
+      const inner = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      const label = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      if (!exact.test(inner) && !exact.test(label)) continue;
+      if (bad.test(inner) || bad.test(label)) continue;
+      const hit = box(el, 48, 110);
+      if (!hit || hit.area <= best) continue;
+      best = hit.area;
+      cont = { x: hit.x, y: hit.y };
+    }
+  }
+  let login = null;
+  if (password) {
+    const exact = /^(log in|đăng nhập)$/i;
+    const bad = /forgotten|quên|email|phone|di động/i;
+    let best = 0;
+    for (const el of document.querySelectorAll('div, button, a, span')) {
+      const inner = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!exact.test(inner) || bad.test(inner)) continue;
+      const hit = box(el, 48, 90);
+      if (!hit || hit.area <= best) continue;
+      best = hit.area;
+      login = { x: hit.x, y: hit.y };
+    }
+  }
+  let okBtn = null;
+  if (invalid) {
+    const exact = /^(ok|okay)$/i;
+    let best = 0;
+    for (const el of document.querySelectorAll('[role="button"], button, div, span')) {
+      const inner = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!exact.test(inner)) continue;
+      const hit = box(el, 36, 80);
+      if (!hit || hit.area <= best) continue;
+      best = hit.area;
+      okBtn = { x: hit.x, y: hit.y };
+    }
+  }
+  return {
+    full: full, choice: choice, totp: totp, invalid: invalid,
+    password: password, continue: cont, login: login, ok: okBtn
+  };
+}
+"""
+
+
+def _probe_login_gate(page: Page) -> dict[str, Any] | None:
+    """Một lần đọc DOM: Continue, ô mật khẩu, form email, 2FA. Không chờ timeout locator."""
+    try:
+        raw = page.evaluate(_LOGIN_GATE_PROBE_JS)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _point_xy(raw: Any) -> tuple[float, float] | None:
+    if not isinstance(raw, dict):
+        return None
+    x, y = raw.get("x"), raw.get("y")
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        return float(x), float(y)
+    return None
+
+
+def _page_body_text(page: Page) -> str:
+    """Chữ đang hiện trên trang. Đọc nhanh bằng JS, không chờ timeout dài."""
+    try:
+        text = page.evaluate("() => (document.body && document.body.innerText) || ''")
+        if isinstance(text, str) and text.strip():
+            return text
+    except Exception:
+        pass
+    try:
+        text = page.locator("body").inner_text(timeout=400)
+        if isinstance(text, str) and text.strip():
+            return text
+    except Exception:
+        pass
+    return ""
+
+
+def _saved_profile_marker_visible(page: Page) -> bool:
+    """Có dòng «Use another profile» — màn hồ sơ đã lưu, chưa vào feed."""
+    low = _page_body_text(page).lower()
+    if not low:
+        return False
+    return (
+        "use another profile" in low
+        or "use another account" in low
+        or "dùng hồ sơ khác" in low
+    )
+
+
+def facebook_page_is_saved_profile_continue(page: Page) -> bool:
+    """
+    Màn hồ sơ đã lưu: nút Continue xanh đang hiện.
+
+    Không cần chờ chữ «Use another profile». Không coi cookie ``c_user`` là đã vào.
+    """
+    probe = _probe_login_gate(page)
+    if isinstance(probe, dict):
+        return _point_xy(probe.get("continue")) is not None
+    try:
+        if not _saved_profile_marker_visible(page):
+            return False
+        low = _page_body_text(page).lower()
+        return "continue" in low or "tiếp tục" in low
+    except Exception:
+        return False
+
+
+def _iter_page_surfaces(page: Page):
+    """Trang chính và frame con (nếu Facebook nhét form vào iframe)."""
+    yield page
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = []
+    main = getattr(page, "main_frame", None)
+    for frame in frames:
+        if frame is main:
+            continue
+        yield frame
+
+
+def _click_saved_profile_continue(page: Page) -> bool:
+    """Bấm nút Continue xanh bằng chuột thật, không bấm «Use another profile»."""
+    _disable_click_blocker(page)
+    point = None
+    try:
+        point = page.evaluate(_SAVED_CONTINUE_POINT_JS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[FB recovery] Tọa độ Continue: {}", exc)
+    if isinstance(point, dict) and isinstance(point.get("x"), (int, float)) and isinstance(point.get("y"), (int, float)):
+        try:
+            page.mouse.click(float(point["x"]), float(point["y"]))
+            logger.info(
+                "[FB recovery] Đã bấm Continue ({:.0f},{:.0f}).",
+                float(point["x"]),
+                float(point["y"]),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB recovery] Chuột không bấm được Continue: {}", exc)
+    try:
+        btn = page.get_by_role("button", name=_CONTINUE_EXACT)
+        count = btn.count()
+        if isinstance(count, int) and count > 0 and btn.first.is_visible(timeout=400) is True:
+            btn.first.click(timeout=2_000, force=True)
+            logger.info("[FB recovery] Đã bấm Continue (role=button).")
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[FB recovery] Không bấm được Continue: {}", exc)
+    return False
+
+
+def _wait_leave_saved_continue(page: Page, *, timeout_s: float = 12.0) -> None:
+    """Chờ màn Continue biến mất sau khi bấm."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not facebook_page_is_saved_profile_continue(page):
+            return
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            time.sleep(0.4)
+
+
+def _visible_password_input(page: Page):
+    """Ô mật khẩu đang hiện, kể cả trong hộp thoại."""
+    selectors = (
+        "[role='dialog'] input[type='password']",
+        "[role='dialog'] input[placeholder='Password' i]",
+        "[role='dialog'] input[aria-label='Password' i]",
+        "input[type='password']",
+        "input[placeholder='Password' i]",
+        "input[aria-label='Password' i]",
+        "input[placeholder*='mật khẩu' i]",
+        "input[aria-label*='mật khẩu' i]",
+    )
+    surfaces: list[Any] = [page]
+    try:
+        surfaces.extend(list(page.frames))
+    except Exception:
+        pass
+    for ctx in surfaces:
+        for sel in selectors:
+            try:
+                loc = ctx.locator(sel)
+                count = loc.count()
+                if not isinstance(count, int) or count < 1:
+                    continue
+                if loc.first.is_visible(timeout=250) is True:
+                    return loc.first
+            except Exception:
+                continue
+    return None
+
+
+_FULL_LOGIN_FORM_MARKERS = (
+    "email hoặc số di động",
+    "email hoặc số điện thoại",
+    "email or mobile number",
+    "email or phone number",
+    "đăng nhập vào facebook",
+    "log in to facebook",
+    "log into facebook",
+)
+
+
+def facebook_page_is_full_login_form(page: Page) -> bool:
+    """Form email + mật khẩu trên trang chủ. Không phải hộp Password sau Continue."""
+    probe = _probe_login_gate(page)
+    if isinstance(probe, dict):
+        return bool(probe.get("full"))
+    try:
+        low = _page_body_text(page).lower()
+    except Exception:
+        return False
+    if not low:
+        return False
+    return any(marker in low for marker in _FULL_LOGIN_FORM_MARKERS)
+
+
+def facebook_page_has_visible_password_prompt(page: Page) -> bool:
+    """
+    Hộp chỉ có ô Password + Log in, sau khi bấm Continue.
+
+    Form «Đăng nhập vào Facebook» (có ô email) không tính — chưa được nhập mật khẩu.
+    """
+    probe = _probe_login_gate(page)
+    if isinstance(probe, dict):
+        return _point_xy(probe.get("password")) is not None
+    try:
+        if facebook_page_is_full_login_form(page):
+            return False
+        low = _page_body_text(page).lower()
+    except Exception:
+        return False
+    if not low:
+        return False
+    if "email hoặc số" in low or "email or mobile" in low or "email or phone" in low:
+        return False
+    has_forgot = "forgotten password" in low or "quên mật khẩu" in low
+    has_login = "log in" in low or "đăng nhập" in low
+    if has_forgot and has_login and ("password" in low or "mật khẩu" in low):
+        return True
+    try:
+        return _visible_password_input(page) is not None and "email hoặc" not in low
+    except Exception:
+        return False
+
+
+def facebook_page_is_password_method_choice(page: Page) -> bool:
+    """Màn «Choose a way to log in» — có «Continue with password», chưa phải ô nhập."""
+    probe = _probe_login_gate(page)
+    if isinstance(probe, dict):
+        return bool(probe.get("choice"))
+    try:
+        low = _page_body_text(page).lower()
+    except Exception:
+        return False
+    if not low:
+        return False
+    has_password_choice = any(
+        marker in low
+        for marker in (
+            "continue with password",
+            "use your password to continue",
+            "tiếp tục bằng mật khẩu",
+            "tiếp tục với mật khẩu",
+            "dùng mật khẩu để tiếp tục",
+        )
+    )
+    if not has_password_choice:
+        return False
+    return any(
+        marker in low
+        for marker in (
+            "choose a way to log in",
+            "get code via email",
+            "nhận mã qua email",
+            "chọn cách đăng nhập",
+        )
+    )
+
+
+def _disable_click_blocker(page: Page) -> None:
+    """Gỡ lớp chỉ-xem để chuột chạm được nút Facebook."""
+    try:
+        from src.automation.facebook_actions import _disable_view_only_guard
+
+        _disable_view_only_guard(page)
+    except Exception:
+        pass
+
+
+def _choose_password_login_method(page: Page) -> bool:
+    """Chọn «Continue with password», không chọn «Get code via email»."""
+    _disable_click_blocker(page)
+    _recovery_pause(label="trước chọn mật khẩu", kind="click")
+    name = re.compile(r"continue with password|tiếp tục bằng mật khẩu|tiếp tục với mật khẩu", re.I)
+    for ctx in _iter_page_surfaces(page):
+        try:
+            radio = ctx.get_by_role("radio", name=name)
+            if radio.count() and radio.first.is_visible(timeout=800):
+                radio.first.click(timeout=4_000, force=True)
+                logger.info("[FB recovery] Đã chọn Continue with password.")
+                _recovery_pause(label="sau chọn mật khẩu", kind="click")
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FB recovery] radio mật khẩu: {}", exc)
+        for label in ("Continue with password", "Tiếp tục bằng mật khẩu", "Tiếp tục với mật khẩu"):
+            try:
+                loc = ctx.get_by_text(label, exact=True)
+                if loc.count() and loc.first.is_visible(timeout=600):
+                    loc.first.click(timeout=4_000, force=True)
+                    logger.info("[FB recovery] Đã chọn Continue with password (text).")
+                    _recovery_pause(label="sau chọn mật khẩu", kind="click")
+                    return True
+            except Exception:
+                continue
+    try:
+        clicked = page.evaluate(
+            r"""
+            () => {
+              const exact = /^(continue with password|tiếp tục bằng mật khẩu|tiếp tục với mật khẩu)$/i;
+              const nodes = Array.from(document.querySelectorAll('div, span, label'));
+              for (const el of nodes) {
+                const inner = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                if (!exact.test(inner)) continue;
+                let node = el;
+                for (let i = 0; i < 6 && node; i++) {
+                  const radio = node.querySelector('[role="radio"], input[type="radio"]');
+                  if (radio) { radio.click(); return true; }
+                  node = node.parentElement;
+                }
+                el.click();
+                return true;
+              }
+              return false;
+            }
+            """
+        )
+        if clicked is True:
+            logger.info("[FB recovery] Đã chọn Continue with password (DOM).")
+            _recovery_pause(label="sau chọn mật khẩu", kind="click")
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[FB recovery] Không chọn được Continue with password: {}", exc)
+    return False
+
+
+def _click_confirm_continue_button(page: Page) -> bool:
+    """Bấm nút Continue xanh, không bấm «Continue with password» hay «Not you?»."""
+    _disable_click_blocker(page)
+    _recovery_pause(label="trước Continue xác nhận", kind="click")
+    for ctx in _iter_page_surfaces(page):
+        try:
+            btn = ctx.get_by_role("button", name=_CONTINUE_EXACT)
+            count = min(int(btn.count()), 4)
+            for i in range(count):
+                cand = btn.nth(i)
+                if not cand.is_visible(timeout=500):
+                    continue
+                shown = (cand.inner_text(timeout=400) or "").strip().lower()
+                if shown not in {"continue", "tiếp tục"}:
+                    continue
+                cand.click(timeout=4_000, force=True)
+                logger.info("[FB recovery] Đã bấm Continue để sang ô mật khẩu.")
+                _recovery_pause(label="sau Continue xác nhận", kind="click")
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FB recovery] Continue xác nhận: {}", exc)
+    return False
+
+
+def _type_password_via_probe(page: Page, password: str) -> bool:
+    """Bấm đúng ô Password rồi gõ mật khẩu. Không ghi mật khẩu ra log."""
+    probe = _probe_login_gate(page)
+    if not isinstance(probe, dict) or probe.get("full"):
+        return False
+    point = _point_xy(probe.get("password"))
+    if point is None:
+        return False
+    _disable_click_blocker(page)
+    x, y = point
+    try:
+        page.mouse.click(x, y)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[FB recovery] Không bấm được ô mật khẩu: {}", exc)
+        return False
+    try:
+        page.keyboard.press("Control+A")
+        page.keyboard.type(password, delay=random.randint(35, 80))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[FB recovery] Không gõ được mật khẩu: {}", exc)
+        return False
+    logger.info("[FB recovery] Đã gõ mật khẩu vào ô Password.")
+    _gate_step_delay(page, "bấm Log in", lo_ms=2000, hi_ms=4000)
+    login = _point_xy(probe.get("login"))
+    if login is None:
+        again = _probe_login_gate(page)
+        login = _point_xy(again.get("login")) if isinstance(again, dict) else None
+    if login is not None:
+        try:
+            page.mouse.click(login[0], login[1])
+            logger.info("[FB recovery] Đã bấm Log in ({:.0f},{:.0f}).", login[0], login[1])
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB recovery] Chuột không bấm được Log in: {}", exc)
+    try:
+        page.keyboard.press("Enter")
+        logger.info("[FB recovery] Đã nhấn Enter sau mật khẩu.")
+        return True
+    except Exception:
+        return False
+
+
+def _submit_stored_password(page: Page, bundle: AccountCredentialBundle | None) -> bool:
+    """
+    Nhập mật khẩu đã lưu khi Facebook hỏi xác nhận.
+
+    Không ghi mật khẩu ra log.
+    """
+    password = str(bundle.password or "").strip() if bundle else ""
+    if not password:
+        logger.warning("[FB recovery] Facebook hỏi mật khẩu nhưng tài khoản chưa có mật khẩu đã lưu.")
+        return False
+    if facebook_page_is_full_login_form(page):
+        logger.info("[FB recovery] Form email + mật khẩu — chưa nhập, để cookie chạy trước.")
+        return False
+    if _type_password_via_probe(page, password):
+        return True
+    _disable_click_blocker(page)
+    if facebook_page_is_password_method_choice(page):
+        if not _choose_password_login_method(page):
+            return False
+        if not _click_confirm_continue_button(page):
+            return False
+        try:
+            page.wait_for_timeout(900)
+        except Exception:
+            time.sleep(0.9)
+        if facebook_page_is_full_login_form(page):
+            logger.info("[FB recovery] Sau Continue vẫn là form email — không nhập mật khẩu.")
+            return False
+    pass_el = _visible_password_input(page)
+    pass_deadline = time.time() + 8.0
+    while time.time() < pass_deadline and pass_el is None:
+        pass_el = _visible_password_input(page) or _locate_login_password_input(page, timeout_ms=400)
+        if pass_el is not None:
+            break
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            time.sleep(0.3)
+    if pass_el is None:
+        logger.warning("[FB recovery] Đã chọn mật khẩu nhưng chưa thấy ô nhập.")
+        return False
+    logger.info("[FB recovery] Nhập mật khẩu đã lưu để xác nhận.")
+    if not _fill_locator(pass_el, password, label="mật khẩu", submit_enter=True):
+        logger.warning("[FB recovery] Không điền được ô mật khẩu.")
+        return False
+    _recovery_pause(label="sau nhập mật khẩu xác nhận", kind="step")
+    try:
+        page.wait_for_timeout(700)
+    except Exception:
+        time.sleep(0.7)
+    _click_password_log_in_button(page)
+    return True
+
+
+_LOGIN_BUTTON_POINT_JS = r"""
+() => {
+  const exact = /^(log in|đăng nhập)$/i;
+  const bad = /forgotten|quên|email|phone|di động/i;
+  const nodes = Array.from(document.querySelectorAll('div, button, a, span'));
+  let best = null;
+  let bestArea = 0;
+  for (const el of nodes) {
+    const inner = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!exact.test(inner)) continue;
+    if (bad.test(inner)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 48 || r.height < 18 || r.height > 90) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') continue;
+    const area = r.width * r.height;
+    if (area > bestArea) {
+      best = r;
+      bestArea = area;
+    }
+  }
+  if (!best) return null;
+  return { x: best.x + best.width / 2, y: best.y + best.height / 2 };
+}
+"""
+
+
+def _click_password_log_in_button(page: Page) -> bool:
+    """Bấm nút Log in xanh trong hộp mật khẩu, không bấm «Forgotten password?»."""
+    _disable_click_blocker(page)
+    try:
+        point = page.evaluate(_LOGIN_BUTTON_POINT_JS)
+    except Exception:
+        point = None
+    if isinstance(point, dict) and isinstance(point.get("x"), (int, float)) and isinstance(point.get("y"), (int, float)):
+        try:
+            page.mouse.click(float(point["x"]), float(point["y"]))
+            logger.info("[FB recovery] Đã bấm Log in ({:.0f},{:.0f}).", float(point["x"]), float(point["y"]))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB recovery] Chuột không bấm được Log in: {}", exc)
+    name = re.compile(r"^\s*(Log in|Đăng nhập)\s*$", re.I)
+    for ctx in _iter_page_surfaces(page):
+        try:
+            btn = ctx.get_by_role("button", name=name)
+            count = btn.count()
+            if not isinstance(count, int):
+                continue
+            for i in range(min(count, 4)):
+                cand = btn.nth(i)
+                if cand.is_visible(timeout=500) is not True:
+                    continue
+                shown = (cand.inner_text(timeout=400) or "").strip().lower()
+                if "forgotten" in shown or "quên" in shown:
+                    continue
+                if shown not in {"log in", "đăng nhập"}:
+                    continue
+                cand.click(timeout=4_000, force=True)
+                logger.info("[FB recovery] Đã bấm Log in sau khi nhập mật khẩu.")
+                _recovery_pause(label="sau Log in mật khẩu", kind="click")
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FB recovery] nút Log in: {}", exc)
+    return _click_first(page, _LOGIN_BUTTON_SELECTORS, label="Đăng nhập")
+
+
+def confirm_facebook_password_prompt(page: Page, account: dict[str, Any] | None) -> bool:
+    """
+    Nếu đang hiện hộp Password thì nhập mật khẩu đã lưu và bấm Log in.
+
+    Returns:
+        True khi đã qua hộp mật khẩu và vào được tài khoản.
+    """
+    if not facebook_page_has_visible_password_prompt(page):
+        return False
+    bundle = _credential_bundle_for_gate(account)
+    if not _submit_stored_password(page, bundle):
+        return False
+    secret = bundle.totp_secret if bundle and bundle.totp_secret else ""
+    deadline = time.time() + 6.0
+    relogin = 0
+    while time.time() < deadline:
+        if not facebook_page_has_visible_password_prompt(page):
+            break
+        if relogin < 1:
+            relogin += 1
+            _click_password_log_in_button(page)
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            time.sleep(0.4)
+    if secret and facebook_page_looks_like_totp_prompt(page):
+        logger.info("[FB recovery] Sau mật khẩu — nhập mã 2FA.")
+        try:
+            _submit_totp_code(page, secret)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB recovery] Không nhập được 2FA: {}", exc)
+    if facebook_page_is_trust_device_prompt(page):
+        _handle_remember_browser_after_totp(page)
+    return _session_logged_in(page) and not facebook_page_has_visible_password_prompt(page)
+
+
+def _credential_bundle_for_gate(account: dict[str, Any] | None) -> AccountCredentialBundle | None:
+    """Mật khẩu/TOTP trong vault, fallback secret vừa import trên dòng tài khoản."""
+    bundle = load_account_credential_bundle(account)
+    mapped_pw = str((account or {}).get("_mapped_password") or "").strip()
+    mapped_totp = str((account or {}).get("_mapped_totp_secret") or "").strip()
+    if bundle is None and not mapped_pw and not mapped_totp:
+        return None
+    password = str(bundle.password or "").strip() if bundle else ""
+    secret = str(bundle.totp_secret or "").strip() if bundle else ""
+    if not password and mapped_pw:
+        password = mapped_pw
+    if not secret and mapped_totp:
+        secret = mapped_totp
+    if bundle and password == str(bundle.password or "").strip() and secret == str(bundle.totp_secret or "").strip():
+        return bundle
+    return AccountCredentialBundle(
+        account_id=str((bundle.account_id if bundle else (account or {}).get("id")) or ""),
+        facebook_uid=str((bundle.facebook_uid if bundle else (account or {}).get("facebook_uid")) or ""),
+        email=str((bundle.email if bundle else (account or {}).get("email")) or ""),
+        password=password,
+        totp_secret=secret,
+        totp_enabled=bool(secret),
+        recovery_email=str((bundle.recovery_email if bundle else (account or {}).get("recovery_email")) or ""),
+    )
+
+
+def _fast_totp_text(page: Page) -> bool:
+    """Nhận màn 2FA bằng chữ trên trang, không chờ ô nhập."""
+    low = _page_body_text(page).lower()
+    if not low:
+        return False
+    return any(
+        mark in low
+        for mark in (
+            "authentication code",
+            "authentication app",
+            "enter the 6-digit",
+            "6-digit code",
+            "mã xác thực",
+            "nhập mã",
+            "xác thực hai",
+            "two-factor",
+            "go to your authentication",
+        )
+    )
+
+
+def _gate_step(page: Page) -> str:
+    """Bước hiện tại sau Continue. Không coi cookie c_user là đã vào feed."""
+    if facebook_page_is_saved_profile_continue(page):
+        return "continue"
+    if facebook_page_is_password_method_choice(page):
+        return "choice"
+    if facebook_page_has_visible_password_prompt(page):
+        return "password"
+    if facebook_page_is_full_login_form(page):
+        return "full_login"
+    if facebook_page_is_trust_device_prompt(page):
+        return "trust"
+    url = (page.url or "").lower()
+    if any(mark in url for mark in ("two_factor", "two_step", "approvals_code")):
+        return "totp"
+    return ""
+
+
+def _page_pause(page: Page, ms: int) -> None:
+    try:
+        page.wait_for_timeout(ms)
+    except Exception:
+        time.sleep(ms / 1000.0)
+
+
+def _gate_step_delay(page: Page, label: str, *, lo_ms: int = 3000, hi_ms: int = 5000) -> None:
+    """Nghỉ ngẫu nhiên trước mỗi bước đăng nhập để không bấm dồn một lúc."""
+    ms = random.randint(lo_ms, hi_ms)
+    logger.info("[FB recovery] Chờ {:.1f}s trước {}.", ms / 1000.0, label)
+    _page_pause(page, ms)
+
+
+def facebook_page_is_invalid_auth_request(page: Page) -> bool:
+    """Hộp «Invalid request» — Facebook không xác thực được bước 2FA, cần tải lại."""
+    try:
+        low = _page_body_text(page).lower()
+    except Exception:
+        low = ""
+    url = ""
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    if "could not validate your request" in low or "không thể xác thực yêu cầu" in low:
+        return True
+    if "invalid request" in low and ("beginning" in low or "reload page" in low or "two_step" in url):
+        return True
+    if "yêu cầu không hợp lệ" in low:
+        return True
+    probe = _probe_login_gate(page)
+    return bool(isinstance(probe, dict) and probe.get("invalid"))
+
+
+def _dismiss_invalid_auth_request(page: Page) -> None:
+    """Bấm OK trên hộp Invalid request, không bấm nhầm nút khác."""
+    _disable_click_blocker(page)
+    probe = _probe_login_gate(page) or {}
+    point = _point_xy(probe.get("ok"))
+    if point is not None:
+        try:
+            page.mouse.click(point[0], point[1])
+            logger.info("[FB recovery] Đã bấm OK trên hộp Invalid request.")
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB recovery] Không bấm được OK Invalid request: {}", exc)
+    try:
+        btn = page.get_by_role("button", name=re.compile(r"^\s*OK\s*$", re.I))
+        count = btn.count()
+        if isinstance(count, int) and count > 0:
+            box = btn.first.bounding_box(timeout=1_000)
+            if isinstance(box, dict):
+                page.mouse.click(float(box["x"]) + float(box["width"]) / 2, float(box["y"]) + float(box["height"]) / 2)
+                logger.info("[FB recovery] Đã bấm OK (role=button) trên hộp Invalid request.")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[FB recovery] OK role=button: {}", exc)
+
+
+def login_with_stored_uid_password(page: Page, account: dict[str, Any] | None) -> bool:
+    """
+    Mở form Facebook và đăng nhập bằng UID, mật khẩu đã lưu, rồi mã 2FA nếu được hỏi.
+
+    Dùng khi cookie / Continue không vào được feed. Không coi cookie ``c_user`` cũ là đã vào.
+    """
+    if not isinstance(account, dict):
+        return False
+    if account.get("_uid_login_attempted"):
+        return False
+    account["_uid_login_attempted"] = True
+    account["_force_uid_login"] = True
+    account["_continue_clicked"] = False
+    account["_skip_fresh_login"] = False
+    bundle = _credential_bundle_for_gate(account)
+    password = str(bundle.password or "").strip() if bundle else ""
+    uid = str(bundle.facebook_uid or bundle.email or "").strip() if bundle else ""
+    if not password or not uid:
+        logger.warning("[FB recovery] Không đăng nhập UID — thiếu UID hoặc mật khẩu đã lưu.")
+        return False
+    logger.info("[FB recovery] Mở form đăng nhập UID (không dùng cookie cũ).")
+    url = (page.url or "").lower()
+    stuck = (
+        facebook_page_is_invalid_auth_request(page)
+        or "two_step" in url
+        or "two_factor" in url
+        or facebook_page_is_saved_profile_continue(page)
+    )
+    if stuck:
+        try:
+            clear_facebook_browser_session(page)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB recovery] Không reset được phiên cũ: {}", exc)
+            _goto_facebook_login(page)
+    else:
+        _goto_facebook_login(page)
+    _gate_step_delay(page, "nhập UID và mật khẩu", lo_ms=2000, hi_ms=4000)
+    try:
+        state = _submit_email_password(page, bundle, account=account)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[FB recovery] Form UID/mật khẩu lỗi: {}", exc)
+        return False
+    secret = str(bundle.totp_secret or "").strip()
+    if secret and (state == "totp" or facebook_page_looks_like_totp_prompt(page)):
+        _gate_step_delay(page, "nhập mã 2FA sau form UID")
+        try:
+            _submit_totp_code(page, secret)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB recovery] 2FA sau form UID lỗi: {}", exc)
+            return False
+    if facebook_page_is_trust_device_prompt(page):
+        _handle_remember_browser_after_totp(page)
+    ok = bool(
+        _session_logged_in(page)
+        and not facebook_page_is_invalid_auth_request(page)
+        and not facebook_page_is_saved_profile_continue(page)
+        and "two_step" not in (page.url or "").lower()
+    )
+    if ok:
+        logger.info("[FB recovery] Đã vào bằng UID và mật khẩu.")
+    else:
+        logger.warning("[FB recovery] Form UID/mật khẩu chưa vào được url={}", page.url)
+    return ok
+
+
+def recover_from_invalid_auth_request(page: Page, account: dict[str, Any] | None) -> bool:
+    """
+    Hộp Invalid request: bấm OK, tải lại, thử đăng nhập lại một lần.
+
+    Nếu vẫn không vào thì mở form và đăng nhập bằng UID, mật khẩu và 2FA.
+    """
+    if not isinstance(account, dict):
+        account = {}
+    if account.get("_invalid_retried"):
+        return False
+    account["_invalid_retried"] = True
+    account["_invalid_request"] = True
+    logger.warning("[FB recovery] Invalid request — bấm OK, tải lại, rồi đăng nhập lại.")
+    _dismiss_invalid_auth_request(page)
+    _gate_step_delay(page, "tải lại sau Invalid request", lo_ms=2000, hi_ms=4000)
+    reload_facebook_page_f5(page, label="invalid_request")
+    _gate_step_delay(page, "đăng nhập lại sau khi tải lại")
+    account["_continue_clicked"] = False
+    account["_skip_fresh_login"] = False
+    if not facebook_page_is_invalid_auth_request(page) and complete_saved_continue_and_totp(page, account):
+        logger.info("[FB recovery] Đã vào lại sau khi tải lại Invalid request.")
+        return True
+    if (
+        _session_logged_in(page)
+        and not facebook_page_is_invalid_auth_request(page)
+        and not facebook_page_is_saved_profile_continue(page)
+        and not facebook_page_has_visible_password_prompt(page)
+    ):
+        return True
+    logger.info("[FB recovery] Tải lại chưa vào — chuyển form UID, mật khẩu và 2FA.")
+    return login_with_stored_uid_password(page, account)
+
+
+def complete_saved_continue_and_totp(page: Page, account: dict[str, Any] | None) -> bool:
+    """
+    Continue → mật khẩu (nếu hỏi) → vào feed thì xong, hoặc nhập 2FA rồi mới xong.
+
+    Không tải lại trang.
+    """
+    bundle = _credential_bundle_for_gate(account)
+    secret = str(bundle.totp_secret or "").strip() if bundle else ""
+    clicks = 0
+    password_sent = False
+    totp_sent = False
+    waited_continue = False
+    waited_password = False
+    waited_totp = False
+    waited_choice = False
+    clicked_at = 0.0
+    opened_at = time.time()
+    deadline = time.time() + 48.0
+    while time.time() < deadline:
+        probe = _probe_login_gate(page) or {}
+        if probe.get("invalid") or facebook_page_is_invalid_auth_request(page):
+            if isinstance(account, dict) and account.get("_invalid_retried"):
+                return False
+            return recover_from_invalid_auth_request(page, account)
+        if probe.get("full") and not password_sent:
+            logger.info("[FB recovery] Form email + mật khẩu — dừng, không F5.")
+            return False
+        if probe.get("password"):
+            if isinstance(account, dict):
+                account["_continue_clicked"] = True
+            if not password_sent:
+                if not waited_password:
+                    _gate_step_delay(page, "nhập mật khẩu")
+                    waited_password = True
+                    continue
+                logger.info("[FB recovery] Hộp mật khẩu — nhập mật khẩu đã lưu.")
+                try:
+                    password_sent = _submit_stored_password(page, bundle)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[FB recovery] Nhập mật khẩu lỗi: {}", exc)
+                    password_sent = True
+            _page_pause(page, random.randint(2000, 4000))
+            continue
+        cont = _point_xy(probe.get("continue"))
+        if cont is not None:
+            if isinstance(account, dict):
+                account["_continue_clicked"] = True
+            if clicks >= 1 and clicked_at and (time.time() - clicked_at) < 3.0:
+                _page_pause(page, 400)
+                continue
+            if clicks >= 2:
+                logger.info("[FB recovery] Đã bấm Continue 2 lần — dừng, không tải lại.")
+                return False
+            if not waited_continue:
+                _gate_step_delay(page, "bấm Continue")
+                waited_continue = True
+                continue
+            _disable_click_blocker(page)
+            try:
+                fresh = _point_xy((_probe_login_gate(page) or {}).get("continue")) or cont
+                page.mouse.click(fresh[0], fresh[1])
+                clicks += 1
+                clicked_at = time.time()
+                logger.info("[FB recovery] Đã bấm Continue ({:.0f},{:.0f}).", fresh[0], fresh[1])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[FB recovery] Không bấm được Continue: {}", exc)
+            _page_pause(page, random.randint(2000, 4000))
+            continue
+        if probe.get("choice"):
+            if isinstance(account, dict):
+                account["_continue_clicked"] = True
+            if not waited_choice:
+                _gate_step_delay(page, "chọn đăng nhập bằng mật khẩu", lo_ms=2000, hi_ms=4000)
+                waited_choice = True
+                continue
+            _choose_password_login_method(page)
+            _click_confirm_continue_button(page)
+            _page_pause(page, random.randint(2000, 4000))
+            continue
+        if (probe.get("totp") or (secret and not totp_sent and _fast_totp_text(page))) and secret and not totp_sent:
+            if isinstance(account, dict):
+                account["_continue_clicked"] = True
+            if not waited_totp:
+                _gate_step_delay(page, "nhập mã 2FA")
+                waited_totp = True
+                continue
+            logger.info("[FB recovery] Màn 2FA — nhập mã.")
+            try:
+                _submit_totp_code(page, secret)
+                totp_sent = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[FB recovery] Nhập 2FA lỗi: {}", exc)
+                totp_sent = True
+            _page_pause(page, random.randint(2000, 4000))
+            continue
+        if clicked_at and (time.time() - clicked_at) < 3.0 and not password_sent and not totp_sent:
+            _page_pause(page, 200)
+            continue
+        # Nút Continue có thể vẽ sau cookie. Chưa kết luận đã vào trong 1.5s đầu.
+        if not password_sent and not totp_sent and (time.time() - opened_at) < 1.5:
+            _page_pause(page, 200)
+            continue
+        if (
+            not probe.get("full")
+            and not probe.get("password")
+            and not probe.get("continue")
+            and not probe.get("totp")
+            and _session_logged_in(page)
+        ):
+            logger.info("[FB recovery] Đã vào Facebook sau Continue.")
+            return True
+        _page_pause(page, 200)
+    if facebook_page_is_trust_device_prompt(page):
+        _handle_remember_browser_after_totp(page)
+    logged_in = (
+        _session_logged_in(page)
+        and not facebook_page_is_saved_profile_continue(page)
+        and not facebook_page_has_visible_password_prompt(page)
+    )
+    if logged_in:
+        logger.info("[FB recovery] Đã vào Facebook — giữ phiên, không tải lại.")
+    return logged_in
+
+
 def _click_first(ctx: _BrowserContext, selectors: tuple[str, ...], *, label: str = "") -> bool:
     el = _first_visible(ctx, selectors, timeout_ms=2_500)
     if el is None:
@@ -1630,7 +2717,8 @@ def _submit_email_password(
 ) -> PostLoginState:
     if should_stop and should_stop():
         return "timeout"
-    if _session_logged_in(page):
+    force_uid = bool(isinstance(account, dict) and account.get("_force_uid_login"))
+    if not force_uid and _session_logged_in(page):
         return "logged_in"
     _goto_facebook_login(page)
     if facebook_page_is_hard_checkpoint(_url_lower(page)):
@@ -1647,7 +2735,7 @@ def _submit_email_password(
 
             save_ui_failure_screenshot(page, "FACEBOOK_LOGIN: Không tìm thấy ô email/UID")
             _raise_manual("FACEBOOK_LOGIN: Không tìm thấy ô email/UID.")
-    if _session_logged_in(page):
+    if not force_uid and _session_logged_in(page):
         return "logged_in"
     login_id = bundle.login_identifier
     if not login_id:

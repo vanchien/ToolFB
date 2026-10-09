@@ -244,18 +244,192 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
     return placed
 
 
-def foreground_firefox_for_profile(
-    profile_dir: str | Path,
-    *,
-    timeout_s: float = 10.0,
-) -> bool:
-    """Đưa cửa sổ Firefox (theo profile) lên trước — Windows."""
+def set_firefox_window_title(profile_dir: str | Path, title: str, *, timeout_s: float = 8.0) -> bool:
+    """Ghi số thứ tự lên thanh tiêu đề cửa sổ Firefox của profile."""
+    if sys.platform != "win32":
+        return False
+    text = str(title or "").strip()
+    if not text:
+        return False
+    prof_key = str(Path(profile_dir).resolve()).lower().replace("/", "\\")
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    while time.monotonic() < deadline:
+        if _try_set_window_title(prof_key, text):
+            return True
+        time.sleep(0.35)
+    return False
+
+
+def _try_set_window_title(profile_key: str, title: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.SetWindowTextW.restype = wintypes.BOOL
+    target_pids = set(_firefox_pids_for_profile(profile_key))
+    if not target_pids:
+        return False
+    titled = False
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd: int, _lparam: int) -> bool:
+        nonlocal titled
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) not in target_pids:
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        if (rect.right - rect.left) < 200 or (rect.bottom - rect.top) < 200:
+            return True
+        user32.SetWindowTextW(hwnd, title)
+        titled = True
+        return False
+
+    user32.EnumWindows(_enum_cb, 0)
+    if titled:
+        logger.info("Đã gắn tiêu đề cửa sổ «{}» profile~{}", title, profile_key[-40:])
+    return titled
+
+
+def show_firefox_window_for_profile(profile_dir: str | Path, *, timeout_s: float = 6.0) -> bool:
+    """Hiện lại cửa sổ Firefox của profile để xem trang đang check."""
     if sys.platform != "win32":
         return False
     prof_key = str(Path(profile_dir).resolve()).lower().replace("/", "\\")
     deadline = time.monotonic() + max(1.0, float(timeout_s))
     while time.monotonic() < deadline:
-        if _try_set_window(prof_key, x=80, y=80, width=1280, height=900):
+        if _try_show_window(prof_key):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _try_show_window(profile_key: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    sw_restore = 9
+    hwnd_top = 0
+    swp_show = 0x0040
+    target_pids = set(_firefox_pids_for_profile(profile_key))
+    if not target_pids:
+        return False
+    shown = False
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd: int, _lparam: int) -> bool:
+        nonlocal shown
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) not in target_pids:
+            return True
+        user32.ShowWindow(hwnd, sw_restore)
+        user32.SetWindowPos(hwnd, hwnd_top, 40, 40, 1280, 860, swp_show)
+        shown = True
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    if shown:
+        logger.info("Đã hiện cửa sổ Firefox profile~{}", profile_key[-40:])
+    return shown
+
+
+def hide_firefox_window_for_profile(profile_dir: str | Path, *, timeout_s: float = 6.0) -> bool:
+    """Ẩn cửa sổ Firefox của profile. Trang vẫn tải, người dùng không phải nhìn trình duyệt."""
+    if sys.platform != "win32":
+        return False
+    prof_key = str(Path(profile_dir).resolve()).lower().replace("/", "\\")
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    while time.monotonic() < deadline:
+        if _try_hide_window(prof_key):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _try_hide_window(profile_key: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    sw_hide = 0
+    target_pids = set(_firefox_pids_for_profile(profile_key))
+    if not target_pids:
+        return False
+    hidden = False
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd: int, _lparam: int) -> bool:
+        nonlocal hidden
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) not in target_pids:
+            return True
+        user32.ShowWindow(hwnd, sw_hide)
+        hidden = True
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    if hidden:
+        logger.info("Đã ẩn cửa sổ Firefox profile~{}", profile_key[-40:])
+    return hidden
+
+
+def foreground_firefox_for_profile(
+    profile_dir: str | Path,
+    *,
+    timeout_s: float = 10.0,
+) -> bool:
+    """Đưa cửa sổ Firefox lên trước. Không đổi vị trí hay kích thước ô lưới."""
+    if sys.platform != "win32":
+        return False
+    prof_key = str(Path(profile_dir).resolve()).lower().replace("/", "\\")
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    while time.monotonic() < deadline:
+        if _try_focus_window(prof_key):
             return True
         time.sleep(0.35)
     return False
+
+
+def _try_focus_window(profile_key: str) -> bool:
+    """Hiện và đưa cửa sổ lên trước, giữ nguyên ô lưới đã đặt."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    sw_show = 5
+    target_pids = set(_firefox_pids_for_profile(profile_key))
+    if not target_pids:
+        return False
+    focused = False
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd: int, _lparam: int) -> bool:
+        nonlocal focused
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) not in target_pids:
+            return True
+        rect = wintypes.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            if w < 200 or h < 200:
+                return True
+        user32.ShowWindow(hwnd, sw_show)
+        try:
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        focused = True
+        return False
+
+    user32.EnumWindows(_enum_cb, 0)
+    return focused

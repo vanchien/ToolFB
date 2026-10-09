@@ -533,6 +533,24 @@ class AccountFormDialog:
             font=("Segoe UI", 8),
         ).grid(row=lr, column=0, columnspan=2, sticky="w")
         lr += 1
+        ttk.Label(lf_login, text="Cookie").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
+        cookie_row = ttk.Frame(lf_login)
+        cookie_row.grid(row=lr, column=1, sticky="ew", pady=2)
+        cookie_row.columnconfigure(0, weight=1)
+        self._txt_cookie_header = tk.Text(cookie_row, height=4, width=48, wrap="word", font=("Consolas", 9))
+        self._txt_cookie_header.insert("1.0", str(init.get("cookie_header") or ""))
+        self._txt_cookie_header.grid(row=0, column=0, sticky="ew")
+        ttk.Button(cookie_row, text="Copy", width=8, command=self._on_copy_cookie_header).grid(
+            row=0, column=1, padx=(6, 0), sticky="n"
+        )
+        lr += 1
+        ttk.Label(
+            lf_login,
+            text="Chuỗi cookie (c_user/xs hoặc JSON). Không dán email khôi phục vào ô này.",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=lr, column=0, columnspan=2, sticky="w")
+        lr += 1
         ttk.Label(lf_login, text="Mật khẩu").grid(row=lr, column=0, sticky="nw", padx=(0, 6), pady=2)
         pw_row = ttk.Frame(lf_login)
         pw_row.grid(row=lr, column=1, sticky="ew", pady=2)
@@ -1669,6 +1687,24 @@ class AccountFormDialog:
             return
         self._set_totp_code_display(code)
 
+    def _cookie_header_text(self) -> str:
+        if not hasattr(self, "_txt_cookie_header"):
+            return ""
+        return self._txt_cookie_header.get("1.0", "end").strip()
+
+    def _on_copy_cookie_header(self) -> None:
+        text = self._cookie_header_text()
+        if not text:
+            messagebox.showinfo("Copy", "Ô Cookie đang trống.", parent=self._top)
+            return
+        try:
+            self._top.clipboard_clear()
+            self._top.clipboard_append(text)
+        except tk.TclError as exc:
+            messagebox.showerror("Copy", str(exc), parent=self._top)
+            return
+        messagebox.showinfo("Copy", "Đã copy cookie.", parent=self._top)
+
     def _on_copy_totp_code(self) -> None:
         code = ""
         if hasattr(self, "_e_totp_code"):
@@ -2071,7 +2107,7 @@ class AccountFormDialog:
         br = _browser_storage_from_label(self._cb_browser_label.get())
         it = str(self._initial.get("import_type", "new") if self._initial else "new")
         exe = self._e_browser_exe.get().strip() if hasattr(self, "_e_browser_exe") else ""
-        return self._build_account_dict_core(
+        rec = self._build_account_dict_core(
             aid=aid,
             name=self._e_name.get().strip(),
             portable=portable,
@@ -2082,6 +2118,9 @@ class AccountFormDialog:
             import_type=it,
             browser_exe_path=exe,
         )
+        rec["cookie_header"] = self._cookie_header_text()
+        rec["recovery_email"] = self._form_recovery_email()
+        return rec
 
     def _build_default_portable(self, aid: str) -> str:
         sub = _browser_storage_from_label(self._cb_browser_label.get())

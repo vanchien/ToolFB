@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from unittest.mock import MagicMock, patch
 
 from src.utils.proxy_check import (
@@ -81,8 +82,9 @@ def test_verify_browser_facebook_via_proxy_neterror() -> None:
     assert "neterror" in msg.lower() or "proxy" in msg.lower()
 
 
+@pytest.mark.integration
 def test_user_proxy_socks5_live() -> None:
-    """Proxy mẫu user — SOCKS5, không phải HTTP."""
+    """Proxy mẫu user — SOCKS5, không phải HTTP. Cần mạng và proxy đang sống."""
     ok, ip, scheme = check_proxy(
         "203.175.96.175",
         25308,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import requests
 
 from src.utils.socks5_http_relay import Socks5HttpRelay, socks_proxy_needs_http_relay
@@ -15,7 +16,9 @@ def test_socks_proxy_needs_relay() -> None:
     assert not socks_proxy_needs_http_relay({"host": "203.1.1.1", "port": 8080, "user": "u"})
 
 
+@pytest.mark.integration
 def test_relay_forwards_to_ipify() -> None:
+    """Cần proxy SOCKS5 bên ngoài đang sống — không chạy trong bộ kiểm tra mặc định."""
     relay = Socks5HttpRelay(
         "203.175.96.175",
         25308,

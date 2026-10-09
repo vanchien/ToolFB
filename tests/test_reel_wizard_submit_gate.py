@@ -8,6 +8,7 @@ from src.automation.facebook_actions import (
     _reel_wizard_needs_next,
     _reel_wizard_ready_to_post,
     _reel_wizard_ready_to_share,
+    reel_upload_progress_settled,
 )
 
 
@@ -156,6 +157,47 @@ def test_ready_to_post_reel_settings_filled_without_strict_post() -> None:
         assert _reel_wizard_ready_to_post(
             page, payload="caption text", filled=True, next_clicks=2
         )
+
+
+def test_upload_not_settled_when_ui_still_empty() -> None:
+    """Chưa thấy preview/Next/Publish thì chưa được sang bước Publish."""
+    assert not reel_upload_progress_settled(
+        placeholder_visible=False,
+        still_processing=False,
+        next_ready=False,
+        preview_ready=False,
+        publish_ready=False,
+    )
+
+
+def test_upload_not_settled_while_processing() -> None:
+    assert not reel_upload_progress_settled(
+        placeholder_visible=False,
+        still_processing=True,
+        next_ready=True,
+        preview_ready=True,
+        publish_ready=False,
+    )
+
+
+def test_upload_settled_when_preview_and_next_ready() -> None:
+    assert reel_upload_progress_settled(
+        placeholder_visible=False,
+        still_processing=False,
+        next_ready=True,
+        preview_ready=True,
+        publish_ready=False,
+    )
+
+
+def test_upload_settled_on_way2_publish_ready() -> None:
+    assert reel_upload_progress_settled(
+        placeholder_visible=False,
+        still_processing=False,
+        next_ready=False,
+        preview_ready=True,
+        publish_ready=True,
+    )
 
 
 def test_needs_next_false_on_reel_settings_after_fill() -> None:

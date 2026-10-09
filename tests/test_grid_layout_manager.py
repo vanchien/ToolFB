@@ -7,20 +7,25 @@ from src.utils.grid_layout_manager import GridWindowSlot, _grid_dimensions, comp
 
 def test_grid_dimensions_four_threads() -> None:
     cols, rows = _grid_dimensions(4)
-    assert cols == 4
-    assert rows == 1
+    assert (cols, rows) == (2, 2)
 
 
 def test_compute_grid_layout_positions() -> None:
     slots = compute_grid_layout(4, screen_width=1920, screen_height=1080)
     assert len(slots) == 4
-    assert slots[0].height == 780
     assert slots[0].col == 0 and slots[0].row == 0
+    assert slots[1].col == 1 and slots[1].row == 0
+    assert slots[2].col == 0 and slots[2].row == 1
+    assert slots[3].col == 1 and slots[3].row == 1
+    assert slots[0].width == slots[1].width == slots[2].width == slots[3].width
+    assert slots[0].height == slots[1].height == slots[2].height == slots[3].height
     # Neo góc trên-trái (margin mặc định 8px).
     assert slots[0].x == 8
     assert slots[0].y == 8
     assert slots[1].x == slots[0].x + slots[0].width
-    assert slots[3].x == slots[0].x + 3 * slots[0].width
+    assert slots[2].y == slots[0].y + slots[0].height
+    assert slots[3].x == slots[1].x
+    assert slots[3].y == slots[2].y
 
 
 def test_compute_grid_layout_eight_threads_four_cols() -> None:

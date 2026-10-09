@@ -61,6 +61,18 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
+def save_account_credentials_store(data: dict[str, Any]) -> None:
+    """Ghi cả vault. Dùng khi gộp dữ liệu từ máy khác."""
+    if not isinstance(data, dict):
+        raise ValueError("Vault credentials phải là object.")
+    payload = dict(data)
+    if not isinstance(payload.get("accounts"), dict):
+        payload["accounts"] = {}
+    path = account_credentials_path()
+    with _credentials_file_lock:
+        _atomic_write_json(path, payload)
+
+
 def load_account_credentials_store(*, force_reload: bool = False) -> dict[str, Any]:
     global _store_cache, _store_mtime
     p = account_credentials_path()

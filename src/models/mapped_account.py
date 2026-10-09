@@ -20,6 +20,8 @@ class MappedAccountAuth:
     email: str = ""
     email_password: str = ""
     recovery_email: str = ""
+    # Cookie thô từ dòng nick — ghi ra file rồi xóa, không lưu vào settings.
+    imported_cookie: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -101,8 +103,12 @@ class MappedAccount:
     status: str = "pending"
     status_detail: str = ""
     grid_slot_index: int = 0
+    # Số thứ tự trong danh sách — hiện trên bảng và trên cửa sổ trình duyệt.
+    queue_no: int = 0
     # True = tab Tương tác: thử profile/cookie trước; chỉ form login khi mở browser mà chưa có phiên.
     soft_login_if_needed: bool = False
+    # True = dòng nick có cookie: đăng nhập bằng cookie, không mở form mật khẩu.
+    login_via_cookie: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -116,7 +122,9 @@ class MappedAccount:
             "status": self.status,
             "status_detail": self.status_detail,
             "grid_slot_index": self.grid_slot_index,
+            "queue_no": int(self.queue_no or 0),
             "soft_login_if_needed": self.soft_login_if_needed,
+            "login_via_cookie": self.login_via_cookie,
         }
 
     @classmethod
@@ -136,7 +144,9 @@ class MappedAccount:
             status=str(raw.get("status") or "pending").strip() or "pending",
             status_detail=str(raw.get("status_detail") or "").strip(),
             grid_slot_index=int(raw.get("grid_slot_index") or 0),
+            queue_no=int(raw.get("queue_no") or 0),
             soft_login_if_needed=bool(raw.get("soft_login_if_needed", False)),
+            login_via_cookie=bool(raw.get("login_via_cookie", False)),
         )
 
     def display_uid(self) -> str:

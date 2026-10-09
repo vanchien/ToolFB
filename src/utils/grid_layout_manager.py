@@ -60,13 +60,20 @@ def _grid_dimensions(thread_count: int, *, max_cols: int = 4) -> tuple[int, int]
     """
     Số cột × hàng cho ``thread_count`` luồng.
 
-    Mặc định tối đa ``max_cols`` cột (Full HD: 4 cột × ceil(N/4) hàng).
-  Ví dụ: N=4 → ``(4, 1)``; N=8 → ``(4, 2)``.
+    Chọn cách chia đều trong giới hạn ``max_cols``. Ví dụ 4 luồng → 2×2, 8 luồng → 4×2.
     """
     n = max(1, int(thread_count))
-    cols = max(1, min(int(max_cols), n))
-    rows = int(math.ceil(n / cols))
-    return cols, rows
+    cap = max(1, min(int(max_cols), n))
+    best_cols = 1
+    best_score: tuple[int, int, int] | None = None
+    for cols in range(1, cap + 1):
+        rows = int(math.ceil(n / cols))
+        empty = cols * rows - n
+        score = (empty, abs(cols - rows), -cols)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_cols = cols
+    return best_cols, int(math.ceil(n / best_cols))
 
 
 def grid_work_area(

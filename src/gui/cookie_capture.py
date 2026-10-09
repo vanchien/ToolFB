@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -140,10 +141,15 @@ def run_fb_cookie_capture_dialog(
     grid_viewport: tuple[int, int] | None = None,
     window_position: tuple[int, int] | None = None,
     dialog_title: str | None = None,
+    browser_label: str = "",
     session_registry: dict[str, Any] | None = None,
     close_button_label: str = "Hủy (đóng trình duyệt)",
     show_save_cookie_button: bool = True,
     ready_hint: str | None = None,
+    browse_only: bool = False,
+    on_block: Callable[[str], None] | None = None,
+    on_browse_note: Callable[[str], None] | None = None,
+    on_browse_done: Callable[[str], None] | None = None,
 ) -> None:
     """
     Mở trình duyệt persistent theo ``acc_preview``; user đăng nhập tay → «Lưu cookie».
@@ -303,6 +309,21 @@ def run_fb_cookie_capture_dialog(
                 page.bring_to_front()
             except Exception:
                 pass
+            identity = str(browser_label or "").strip()
+            if not identity:
+                raw_uid = str(
+                    acc_preview.get("facebook_uid")
+                    or acc_preview.get("username")
+                    or log_label
+                    or ""
+                ).strip()
+                if raw_uid.upper().startswith("UID_"):
+                    raw_uid = raw_uid[4:]
+                identity = raw_uid
+            if identity:
+                from src.utils.browser_identity import stamp_browser_account_label
+
+                stamp_browser_account_label(ctx, page, identity, prof, title_timeout_s=4.0)
             summary = prepare_manual_login_session(
                 page,
                 ctx,
@@ -312,10 +333,75 @@ def run_fb_cookie_capture_dialog(
             )
             prep_holder.append(summary)
             logger.info("[FB manual open] {} — {}", log_label, summary)
+            if identity and _page_usable(page):
+                from src.utils.browser_identity import stamp_browser_account_label
+
+                stamp_browser_account_label(
+                    ctx,
+                    page,
+                    identity,
+                    prof,
+                    install_init=False,
+                    title_timeout_s=1.5,
+                )
             progress_q.put("Sẵn sàng — dùng cửa sổ Firefox phía trước")
 
             cmd = ""
+            idle_ticks = 0
+            feed_ready = False
+            last_block = ""
+            browse_started = time.monotonic()
+            browse_noted = False
+            from src.services.device_browse import browse_limit_reached
+
             while not cmd:
+                if _page_usable(page):
+                    from src.services.device_browse import (
+                        describe_account_block,
+                        nudge_feed,
+                        open_home_feed,
+                        read_visible_text,
+                    )
+
+                    try:
+                        if browse_only and not browse_noted:
+                            browse_noted = True
+                            progress_q.put("NOTE\tĐang lướt bảng tin — 60 giây")
+                        if browse_only and not feed_ready:
+                            open_home_feed(page)
+                            feed_ready = True
+                        elif browse_only and idle_ticks % 4 == 0:
+                            nudge_feed(page)
+                        if idle_ticks % 3 == 0:
+                            reason = describe_account_block(
+                                str(getattr(page, "url", "") or ""),
+                                read_visible_text(page),
+                                expect_session=browse_only,
+                            )
+                            if reason and reason != last_block:
+                                last_block = reason
+                                progress_q.put("BLOCK\t" + reason)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Đọc trang tài khoản bỏ qua một nhịp: {}", exc)
+                if browse_only and (
+                    last_block or browse_limit_reached(browse_started, time.monotonic())
+                ):
+                    if not last_block:
+                        progress_q.put("FINISH\tĐã lướt 60 giây")
+                    cmd = "close"
+                    break
+                idle_ticks += 1
+                if identity and idle_ticks % 4 == 0 and _page_usable(page):
+                    from src.utils.browser_identity import stamp_browser_account_label
+
+                    stamp_browser_account_label(
+                        ctx,
+                        page,
+                        identity,
+                        prof,
+                        install_init=False,
+                        title_timeout_s=0.4,
+                    )
                 if not _page_usable(page):
                     err_holder.append(
                         "Trình duyệt đã đóng — mở lại từ «Mở profile» hoặc bấm «Đóng» trước khi đóng."
@@ -397,11 +483,26 @@ def run_fb_cookie_capture_dialog(
         pass
     tip.after(80, _start_worker)
 
+    block_holder: list[str] = []
+
     def poll() -> None:
         try:
             while True:
                 msg = progress_q.get_nowait()
-                if lbl_tip.winfo_exists():
+                if msg.startswith("BLOCK\t"):
+                    block_holder[:] = [msg[6:]]
+                    if on_block is not None:
+                        on_block(block_holder[0])
+                    continue
+                if msg.startswith("NOTE\t"):
+                    if on_browse_note is not None:
+                        on_browse_note(msg[5:])
+                    continue
+                if msg.startswith("FINISH\t"):
+                    if on_browse_done is not None:
+                        on_browse_done(msg[7:])
+                    continue
+                if lbl_tip.winfo_exists() and not block_holder:
                     lbl_tip.configure(
                         text=f"{msg}\n"
                         "Sau khi đăng nhập xong trên Firefox, bấm «Lưu cookie vào file».\n"
@@ -410,7 +511,12 @@ def run_fb_cookie_capture_dialog(
                     _fit_tip_window()
         except queue.Empty:
             pass
-        if prep_holder and lbl_tip.winfo_exists():
+        if block_holder and lbl_tip.winfo_exists():
+            lbl_tip.configure(
+                text=f"Lỗi tài khoản này:\n{block_holder[0]}\n{tip_extra}"
+            )
+            _fit_tip_window()
+        elif prep_holder and lbl_tip.winfo_exists():
             hint = ready_hint or (
                 "Hoàn tất đăng nhập / 2FA / captcha trên Firefox, rồi bấm «Lưu cookie vào file»."
                 if show_save_cookie_button
@@ -466,7 +572,12 @@ def run_fb_profile_browser_dialog(
     grid_viewport: tuple[int, int] | None = None,
     window_position: tuple[int, int] | None = None,
     dialog_title: str | None = None,
+    browser_label: str = "",
     tip_extra: str = "",
+    browse_only: bool = False,
+    on_block: Callable[[str], None] | None = None,
+    on_browse_note: Callable[[str], None] | None = None,
+    on_browse_done: Callable[[str], None] | None = None,
 ) -> None:
     """
     Mở Firefox theo profile portable đã chọn — xem/làm tay, đóng hoặc lưu cookie.
@@ -487,9 +598,18 @@ def run_fb_profile_browser_dialog(
         on_launch_failed=on_launch_failed,
         grid_viewport=grid_viewport,
         window_position=window_position,
-        dialog_title=dialog_title or f"Profile — {log_label}",
+        dialog_title=dialog_title or f"Profile — {browser_label or log_label}",
+        browser_label=browser_label,
         session_registry=session_registry,
         close_button_label="Đóng trình duyệt",
-        show_save_cookie_button=True,
-        ready_hint="Đã mở Facebook — đóng khi xong hoặc «Lưu cookie» nếu vừa đăng nhập.",
+        show_save_cookie_button=not browse_only,
+        ready_hint=(
+            "Đang lướt bảng tin 60 giây rồi tự đóng. Không cần bấm gì."
+            if browse_only
+            else "Đã mở Facebook — đóng khi xong hoặc «Lưu cookie» nếu vừa đăng nhập."
+        ),
+        browse_only=browse_only,
+        on_block=on_block,
+        on_browse_note=on_browse_note,
+        on_browse_done=on_browse_done,
     )

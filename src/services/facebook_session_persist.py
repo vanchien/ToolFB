@@ -79,8 +79,17 @@ def profile_session_ready_for_interaction(
     from src.services.facebook_session_recovery import (
         _facebook_uids_match,
         _read_facebook_c_user,
+        facebook_page_has_visible_password_prompt,
+        facebook_page_is_full_login_form,
+        facebook_page_is_saved_profile_continue,
     )
 
+    if facebook_page_is_saved_profile_continue(page):
+        return False, "Màn Continue hồ sơ đã lưu — cần bấm Continue rồi nhập 2FA"
+    if facebook_page_is_full_login_form(page):
+        return False, "Form đăng nhập — chạy cookie trước, chưa nhập mật khẩu"
+    if facebook_page_has_visible_password_prompt(page):
+        return False, "Hộp mật khẩu sau Continue — cần nhập mật khẩu đã lưu"
     expected = _expected_facebook_uid_from_account(account)
     c_user = _read_facebook_c_user(page)
     if c_user:
@@ -712,6 +721,29 @@ def establish_facebook_session(
             return True, det_p or detail
         return False, "Vào Facebook nhưng không lưu được cookie phiên"
 
+    from src.services.facebook_session_recovery import (
+        complete_saved_continue_and_totp,
+        facebook_page_has_visible_password_prompt,
+        facebook_page_is_password_method_choice,
+        facebook_page_is_saved_profile_continue,
+    )
+
+    def _on_continue_surface() -> bool:
+        return bool(
+            facebook_page_is_saved_profile_continue(page)
+            or facebook_page_has_visible_password_prompt(page)
+            or facebook_page_is_password_method_choice(page)
+        )
+
+    if account.get("_continue_clicked") or _on_continue_surface():
+        logger.info("[FB session] establish — màn Continue/mật khẩu, bấm một lần, không reload account={}", aid)
+        try:
+            if complete_saved_continue_and_totp(page, account) and not _on_continue_surface():
+                return _persist_ok("Đã qua Continue/mật khẩu", "establish_continue")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FB session] establish Continue: {}", exc)
+        return False, "Màn Continue/mật khẩu — không tải lại trang"
+
     # Mở Facebook một lần — profile persistent cần goto để Firefox nạp cookie từ thư mục profile
     if "facebook.com" not in (page.url or "").lower():
         logger.info("[FB session] establish — mở facebook.com account={}", aid)
@@ -813,6 +845,19 @@ def _establish_f5_recovery_pass(
     """Một vòng F5 + thử lại profile/cookie/probe (và form nếu được phép)."""
     from src.services.facebook_session_recovery import reload_facebook_page_f5
 
+    from src.services.facebook_session_recovery import (
+        facebook_page_has_visible_password_prompt,
+        facebook_page_is_password_method_choice,
+        facebook_page_is_saved_profile_continue,
+    )
+
+    if (
+        facebook_page_is_saved_profile_continue(page)
+        or facebook_page_has_visible_password_prompt(page)
+        or facebook_page_is_password_method_choice(page)
+    ):
+        logger.info("[FB session] Bỏ F5 — đang ở màn Continue/mật khẩu account={}", aid)
+        return None
     logger.info("[FB session] establish F5 retry {} account={}", attempt, aid)
     reload_facebook_page_f5(page, label=f"establish_f5_{attempt}")
 
@@ -988,14 +1033,7 @@ def probe_existing_facebook_session(
                 continue
             return False, last_detail
 
-        if attempt > 0:
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=45_000)
-                _force_www_facebook_if_mobile_redirect(page)
-                page.wait_for_timeout(800)
-            except Exception as reload_exc:  # noqa: BLE001
-                logger.debug("[FB session] probe reload (c_user): {}", reload_exc)
-
+        # Đã có c_user — không reload. F5 sau nạp cookie làm Facebook đăng xuất.
         ok, detail = confirm_facebook_session_logged_in(page, account, timeout_ms=per_try)
         if ok:
             logger.info(

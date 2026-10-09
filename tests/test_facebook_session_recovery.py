@@ -14,7 +14,11 @@ from src.services.facebook_session_recovery import (
     _normalize_facebook_uid,
     facebook_auth_flow_was_active,
     facebook_page_blocks_recovery_email,
+    facebook_page_has_visible_password_prompt,
+    facebook_page_is_full_login_form,
     facebook_page_is_hard_checkpoint,
+    facebook_page_is_invalid_auth_request,
+    facebook_page_is_password_method_choice,
     facebook_page_is_remember_browser,
 )
 from src.services.totp_service import generate_totp_code
@@ -267,3 +271,62 @@ def test_reload_facebook_page_f5_goto_when_not_on_facebook() -> None:
     assert ok is True
     page.goto.assert_called_once()
     page.keyboard.press.assert_not_called()
+
+
+def test_password_method_choice_detected() -> None:
+    from unittest.mock import MagicMock
+
+    page = MagicMock()
+    page.locator.return_value.inner_text.return_value = (
+        "Choose a way to log in\n"
+        "Get code via email\n"
+        "Continue with password\n"
+        "Use your password to continue\n"
+        "Continue\n"
+        "Not you?"
+    )
+    assert facebook_page_is_password_method_choice(page) is True
+
+    page.locator.return_value.inner_text.return_value = "Password\nLog in\nCreate new account"
+    assert facebook_page_is_password_method_choice(page) is False
+
+
+def test_password_dialog_detected_from_log_in_box() -> None:
+    from unittest.mock import MagicMock
+
+    page = MagicMock()
+    page.locator.return_value.inner_text.return_value = (
+        "Mireya Wang\nPassword\nLog in\nForgotten password?"
+    )
+    page.frames = []
+    assert facebook_page_has_visible_password_prompt(page) is True
+
+
+def test_full_login_form_is_not_password_prompt() -> None:
+    from unittest.mock import MagicMock
+
+    page = MagicMock()
+    page.locator.return_value.inner_text.return_value = (
+        "Đăng nhập vào Facebook\n"
+        "Email hoặc số di động\n"
+        "Mật khẩu\n"
+        "Đăng nhập\n"
+        "Quên mật khẩu?\n"
+        "Tạo tài khoản mới"
+    )
+    page.frames = []
+    assert facebook_page_is_full_login_form(page) is True
+    assert facebook_page_has_visible_password_prompt(page) is False
+
+
+def test_invalid_request_dialog_detected() -> None:
+    from unittest.mock import MagicMock
+
+    page = MagicMock()
+    page.locator.return_value.inner_text.return_value = (
+        "Invalid request\n"
+        "We could not validate your request. Please try starting the flow from the beginning.\n"
+        "OK"
+    )
+    page.frames = []
+    assert facebook_page_is_invalid_auth_request(page) is True

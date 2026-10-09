@@ -42,7 +42,7 @@ def flush_main_thread_queue(root: tk.Misc, *, max_items: int = _MAIN_DRAIN_PER_T
             try:
                 fn()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("[UI] main-thread callback: {}", exc)
+                logger.warning("[UI] callback main thread lỗi: {}", exc)
     except queue.Empty:
         pass
     return n
@@ -79,7 +79,7 @@ def schedule_on_main_thread(root: tk.Misc, fn: Callable[[], None]) -> None:
         try:
             fn()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[UI] main-thread callback (inline): {}", exc)
+            logger.warning("[UI] callback main thread lỗi: {}", exc)
         return
     if root not in _ROOT_QUEUES:
         register_main_thread_dispatcher(root)
@@ -203,3 +203,65 @@ def run_background_then_main(
         schedule_on_main_thread(root, _done)
 
     threading.Thread(target=_thread, daemon=True).start()
+
+
+_WRAP_AFTER: WeakKeyDictionary[tk.Misc, str] = WeakKeyDictionary()
+
+
+def install_adaptive_wrap(root: tk.Misc) -> None:
+    """Nhãn đã bật xuống dòng sẽ co theo khung cha khi thu phóng hoặc đổi kích thước."""
+
+    def _fit(widget: tk.Misc) -> None:
+        try:
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            if isinstance(child, (ttk.Label, tk.Label)):
+                try:
+                    current = int(float(child.cget("wraplength") or 0))
+                except (tk.TclError, TypeError, ValueError):
+                    current = 0
+                if current > 0:
+                    try:
+                        parent_width = int(child.master.winfo_width())
+                    except (tk.TclError, ValueError):
+                        parent_width = 0
+                    if parent_width > 100:
+                        target = max(140, parent_width - 20)
+                        if abs(target - current) > 12:
+                            try:
+                                child.configure(wraplength=target)
+                            except tk.TclError:
+                                pass
+            _fit(child)
+
+    def _run(top: tk.Misc) -> None:
+        _WRAP_AFTER.pop(top, None)
+        try:
+            if int(top.winfo_exists()) == 0:
+                return
+        except tk.TclError:
+            return
+        _fit(top)
+
+    def _on_configure(event: tk.Event) -> None:
+        widget = event.widget
+        if not isinstance(widget, (tk.Tk, tk.Toplevel, tk.Frame, ttk.Frame, ttk.LabelFrame, ttk.Panedwindow)):
+            return
+        try:
+            top = widget.winfo_toplevel()
+        except tk.TclError:
+            return
+        pending = _WRAP_AFTER.get(top)
+        if pending:
+            try:
+                top.after_cancel(pending)
+            except tk.TclError:
+                pass
+        try:
+            _WRAP_AFTER[top] = top.after(90, lambda t=top: _run(t))
+        except tk.TclError:
+            pass
+
+    root.bind_all("<Configure>", _on_configure, add="+")

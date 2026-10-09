@@ -24,6 +24,7 @@ def install_treeview_shortcuts(
     enable_context_menu: bool = True,
     enable_drag_select: bool = True,
     info_callback: Callable[[str], None] | None = None,
+    extra_context_items: Callable[[tk.Menu], None] | None = None,
 ) -> None:
     """
     Gắn thao tác dùng chung cho Treeview:
@@ -195,6 +196,9 @@ def install_treeview_shortcuts(
                 tree.selection_set((row,))
                 tree.focus(row)
         menu = tk.Menu(owner, tearoff=0)
+        if extra_context_items is not None:
+            extra_context_items(menu)
+            menu.add_separator()
         menu.add_command(label="Chọn hết (Ctrl+A)", command=_select_all)
         menu.add_command(label="Bỏ chọn", command=_clear_selection)
         menu.add_separator()

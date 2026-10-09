@@ -18,5 +18,5 @@ call ".venv\Scripts\python.exe" -m playwright install firefox
 echo Bootstrap config/data ...
 call ".venv\Scripts\python.exe" -c "from src.utils.first_run_bootstrap import bootstrap_all; bootstrap_all()"
 echo.
-echo Xong. Chay: Start_ToolFB_GUI.bat  hoac  .venv\Scripts\python.exe main.py --gui
+echo Xong. Bam dup: Start_ToolFB_GUI.bat
 endlocal

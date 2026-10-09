@@ -42,6 +42,7 @@ from src.gui.schedule_job_dialog import SchedulePostJobDialog
 from src.gui.ui_responsiveness import (
     ASYNC_PREP_MIN_ROWS,
     DEFAULT_TREE_CHUNK,
+    install_adaptive_wrap,
     register_main_thread_dispatcher,
     run_background_then_main,
     schedule_on_main_thread,
@@ -56,6 +57,7 @@ from src.services.app_updater import (
     apply_git_pull_ff,
     apply_update_package,
     check_git_updates,
+    git_working_tree_clean,
     github_latest_manifest_url,
     is_newer_version,
     maybe_auto_git_pull_on_startup,
@@ -129,6 +131,7 @@ from src.services.video_editor.layout import video_editor_schedule_jobs_json_pat
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.gui.tiktok_manager_tab import build_tiktok_manager_tab
 from src.gui.human_interaction_tab import build_human_interaction_tab
+from src.gui.share_tab import build_share_tab
 from src.gui.video_editor_tab import build_video_editor_tab
 from src.utils.proxy_check import check_proxy
 
@@ -159,6 +162,9 @@ class _GuiLogStream:
         self._root = root
         self._text = text
         self._max_chars = 200_000
+        self._buf: list[str] = []
+        self._buf_lock = threading.Lock()
+        self._flush_scheduled = False
 
     def write(self, s: str) -> int:
         """
@@ -172,18 +178,44 @@ class _GuiLogStream:
         """
         if not s:
             return 0
+        with self._buf_lock:
+            self._buf.append(s)
+            need_schedule = not self._flush_scheduled
+            self._flush_scheduled = True
+        if not need_schedule:
+            return len(s)
 
-        def append() -> None:
+        def _arm() -> None:
+            try:
+                self._root.after(40, self._flush_log_buf)
+            except tk.TclError:
+                self._flush_log_buf()
+
+        if threading.current_thread() is threading.main_thread():
+            _arm()
+        else:
+            schedule_on_main_thread(self._root, _arm)
+        return len(s)
+
+    def _flush_log_buf(self) -> None:
+        """Đổ một lần các dòng log đã gom — tránh insert từng dòng làm đơ cửa sổ."""
+        with self._buf_lock:
+            if not self._buf:
+                self._flush_scheduled = False
+                return
+            chunk = "".join(self._buf)
+            self._buf.clear()
+            self._flush_scheduled = False
+        try:
             self._text.configure(state="normal")
-            self._text.insert("end", s)
+            self._text.insert("end", chunk)
             line_no = int(self._text.index("end-1c").split(".")[0])
             if line_no > 4000:
                 self._text.delete("1.0", "800.0")
             self._text.see("end")
             self._text.configure(state="disabled")
-
-        schedule_on_main_thread(self._root, append)
-        return len(s)
+        except tk.TclError:
+            pass
 
     def flush(self) -> None:
         """
@@ -287,6 +319,8 @@ class _ManagerWindow:
         self._show_browser = os.environ.get("HEADLESS", "1").strip().lower() in {"0", "false", "off", "no"}
 
         self._root = tk.Tk()
+        # Ẩn cửa sổ đến khi dựng xong widget — tránh Windows gắn «Not Responding» lúc khởi tạo.
+        self._root.withdraw()
         register_main_thread_dispatcher(self._root)
         self._app_version_str = read_local_version(project_root())
         self._root.title(f"Facebook Automation — Bảng điều khiển (v{self._app_version_str})")
@@ -401,82 +435,68 @@ class _ManagerWindow:
 
         bar_rows = ttk.Frame(bar)
         bar_rows.grid(row=0, column=0, sticky="ew")
-        bar_status = ttk.Frame(bar)
+        bar_status = ttk.LabelFrame(bar, text="Trạng thái", padding=(6, 4))
         bar_status.grid(row=0, column=1, sticky="ne", padx=(8, 0))
 
-        row0 = ttk.Frame(bar_rows)
-        row0.pack(fill=tk.X, anchor="w")
-        row1 = ttk.Frame(bar_rows)
-        row1.pack(fill=tk.X, anchor="w", pady=(4, 0))
+        row_tools = ttk.Frame(bar_rows)
+        row_tools.pack(fill=tk.X, anchor="w")
 
-        # --- Hàng 1: lịch + làm mới + browser + chế độ giao diện (luôn thấy khi thu cửa sổ) ---
-        self._btn_start = ttk.Button(row0, text="Bắt đầu lịch", command=self._on_start)
+        box_sched = ttk.LabelFrame(row_tools, text="Lịch", padding=(6, 4))
+        box_sched.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 2))
+        self._btn_start = ttk.Button(box_sched, text="Bắt đầu", command=self._on_start)
         self._btn_start.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_stop = ttk.Button(row0, text="Dừng lịch", command=self._on_stop, state=tk.DISABLED)
+        self._btn_stop = ttk.Button(box_sched, text="Dừng", command=self._on_stop, state=tk.DISABLED)
         self._btn_stop.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_refresh = ttk.Button(
-            row0,
-            text="Làm mới" if self._compact_ui else "Làm mới tất cả",
-            command=self._refresh_all,
-        )
-        self._btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_show_browser = ttk.Button(row0, text="Hiện browser", command=lambda: self._set_browser_visibility(True))
-        self._btn_show_browser.pack(side=tk.LEFT, padx=(8, 4))
-        self._btn_hide_browser = ttk.Button(row0, text="Ẩn browser", command=lambda: self._set_browser_visibility(False))
+        self._btn_refresh = ttk.Button(box_sched, text="Làm mới", command=self._refresh_all)
+        self._btn_refresh.pack(side=tk.LEFT)
+
+        box_window = ttk.LabelFrame(row_tools, text="Cửa sổ", padding=(6, 4))
+        box_window.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 2))
+        self._btn_show_browser = ttk.Button(box_window, text="Hiện", command=lambda: self._set_browser_visibility(True))
+        self._btn_show_browser.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_hide_browser = ttk.Button(box_window, text="Ẩn", command=lambda: self._set_browser_visibility(False))
         self._btn_hide_browser.pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Separator(row0, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Label(row0, text="Giao diện:").pack(side=tk.LEFT, padx=(0, 4))
-        self._platform_view_var = tk.StringVar(value="TikTok")
+        ttk.Label(box_window, text="Nền").pack(side=tk.LEFT, padx=(4, 4))
+        self._platform_view_var = tk.StringVar(value="Facebook")
         self._cb_platform_view = ttk.Combobox(
-            row0,
+            box_window,
             state="readonly",
             width=10,
             values=("Facebook", "TikTok"),
             textvariable=self._platform_view_var,
         )
-        self._cb_platform_view.pack(side=tk.LEFT, padx=(0, 4))
+        self._cb_platform_view.pack(side=tk.LEFT)
         self._cb_platform_view.bind(
             "<<ComboboxSelected>>",
             lambda _e: self._apply_platform_view(self._platform_view_var.get()),
         )
 
-        # --- Hàng 2: dữ liệu / preset / cập nhật / công cụ (tách khỏi hàng lịch để kéo ngang không chồng nút) ---
-        self._btn_migrate = ttk.Button(
-            row1,
-            text="Migrate dữ liệu",
-            command=self._on_migrate_user_data,
-        )
-        self._btn_migrate.pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self._btn_compact_multi = ttk.Button(
-            row1,
-            text="Preset multi-page",
-            command=self._apply_multi_page_compact_preset,
-        )
-        self._btn_compact_multi.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_setup_help = ttk.Button(row1, text="?", width=3, command=self._on_setup_guide)
-        self._btn_setup_help.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_check_updates = ttk.Button(row1, text="Chỉ kiểm tra", command=self._on_check_updates)
+        box_sync = ttk.LabelFrame(row_tools, text="Máy khác", padding=(6, 4))
+        box_sync.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 2))
+        self._btn_migrate = ttk.Button(box_sync, text="Đồng bộ máy", command=self._on_migrate_user_data)
+        self._btn_migrate.pack(side=tk.LEFT)
+
+        box_update = ttk.LabelFrame(row_tools, text="Bản mới", padding=(6, 4))
+        box_update.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 2))
+        self._btn_check_updates = ttk.Button(box_update, text="Kiểm tra", command=self._on_check_updates)
         self._btn_check_updates.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_apply_update = ttk.Button(row1, text="Cập nhật ngay", command=self._on_apply_update)
+        self._btn_apply_update = ttk.Button(box_update, text="Cập nhật", command=self._on_apply_update)
         self._apply_update_pack_after = self._btn_check_updates
-        self._btn_update_channel = ttk.Button(
-            row1,
-            text="Kênh cập nhật",
-            command=self._on_configure_update_channel,
-        )
-        self._btn_update_channel.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_reset_veo3_profile = ttk.Button(
-            row1,
-            text="Reset VEO3",
-            command=self._on_reset_veo3_profiles,
-        )
-        self._btn_reset_veo3_profile.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_ai_video = ttk.Button(row1, text="AI Video (Gemini/Veo)", command=self._on_open_ai_video_dialog)
+        self._btn_update_channel = ttk.Button(box_update, text="Kênh", command=self._on_configure_update_channel)
+        self._btn_update_channel.pack(side=tk.LEFT)
+
+        box_tools = ttk.LabelFrame(row_tools, text="Công cụ", padding=(6, 4))
+        box_tools.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 2))
+        self._btn_compact_multi = ttk.Button(box_tools, text="Preset page", command=self._apply_multi_page_compact_preset)
+        self._btn_compact_multi.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_ai_video = ttk.Button(box_tools, text="AI Video", command=self._on_open_ai_video_dialog)
         self._btn_ai_video.pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self._lbl_browser_mode = ttk.Label(row1, text="", wraplength=260, justify=tk.LEFT)
-        self._lbl_browser_mode.pack(side=tk.LEFT, padx=(0, 8))
+        self._btn_reset_veo3_profile = ttk.Button(box_tools, text="Reset VEO3", command=self._on_reset_veo3_profiles)
+        self._btn_reset_veo3_profile.pack(side=tk.LEFT, padx=(0, 4))
+        self._btn_setup_help = ttk.Button(box_tools, text="Hướng dẫn", command=self._on_setup_guide)
+        self._btn_setup_help.pack(side=tk.LEFT)
+        self._lbl_browser_mode = ttk.Label(box_tools, text="", wraplength=180, justify=tk.LEFT)
+        self._lbl_browser_mode.pack(side=tk.LEFT, padx=(8, 0))
 
         self._lbl_state = ttk.Label(bar_status, text="Lịch: đang tắt")
         self._lbl_state.pack(anchor="e")
@@ -508,46 +528,42 @@ class _ManagerWindow:
         self._nb = nb
 
         tab_acc = ttk.Frame(nb, padding=4)
-        nb.add(tab_acc, text="  1. Tài khoản (accounts.json)  ")
+        nb.add(tab_acc, text="  Tài khoản  ")
         tab_acc.columnconfigure(0, weight=1)
         tab_acc.rowconfigure(2, weight=1)
         ttk.Label(
             tab_acc,
-            text="Danh tính: profile portable + proxy + cookie — không gộp Page/Group. "
-            "Cột «☐»: tick các profile cần thao tác — «Xóa» / «Verify Profile» / «Kiểm tra proxy» ưu tiên các dòng đã tick; "
-            "nếu không có tick nào thì dùng dòng đang chọn (Ctrl/Shift, kéo chuột, «Chọn tất cả»). "
-            "Chuột phải: «Tick ☑ các dòng đang chọn» / «Bỏ tick» (giữ vùng bôi xanh nếu click phải trên dòng đã chọn).",
+            text="Tick ô Chọn để làm nhiều tài khoản. Không tick thì dùng dòng đang bôi.",
             font=("Segoe UI", 9),
-            wraplength=640,
         ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
         acc_bar = ttk.Frame(tab_acc)
         acc_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-        ttk.Button(acc_bar, text="Thêm", command=self._on_add_account).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Sửa", command=self._on_edit_account).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Xóa", command=self._on_delete_account).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Nhân bản", command=self._on_duplicate_account).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Xuất JSON…", command=self._on_export_json).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Nhập JSON…", command=self._on_import_json).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Xuất dữ liệu tool…", command=self._on_export_tool_bundle).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Nhập dữ liệu tool…", command=self._on_import_tool_bundle).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Separator(acc_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(acc_bar, text="Verify Profile", command=self._on_verify_profile).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Mở profile browser", command=self._on_open_profile_browser).pack(side=tk.LEFT, padx=(0, 4))
+        acc_line = ttk.Frame(acc_bar)
+        acc_line.pack(fill=tk.X)
+        ttk.Button(acc_line, text="Thêm", command=self._on_add_account).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line, text="Sửa", command=self._on_edit_account).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line, text="Xóa", command=self._on_delete_account).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line, text="Nhân bản", command=self._on_duplicate_account).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(acc_line, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(acc_line, text="Mở profile", command=self._on_open_profile_browser).pack(side=tk.LEFT, padx=(0, 4))
         self._btn_close_open_profiles = ttk.Button(
-            acc_bar,
-            text="Đóng profile đang mở",
+            acc_line,
+            text="Đóng profile",
             command=self._on_close_open_profiles,
         )
         self._btn_close_open_profiles.pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Lấy cookie (Playwright)", command=self._on_capture_cookie_account).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-        ttk.Button(acc_bar, text="Kiểm tra proxy", command=self._on_check_proxy).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Làm mới tab này", command=self._refresh_tree).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Separator(acc_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(acc_bar, text="Chọn tất cả", command=self._on_accounts_select_all).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(acc_bar, text="Bỏ chọn", command=self._on_accounts_clear_selection).pack(side=tk.LEFT)
+        ttk.Button(acc_line, text="Lấy cookie", command=self._on_capture_cookie_account).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line, text="Proxy", command=self._on_check_proxy).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line, text="Verify", command=self._on_verify_profile).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line, text="Làm mới", command=self._refresh_tree).pack(side=tk.LEFT, padx=(8, 0))
+        acc_line2 = ttk.Frame(acc_bar)
+        acc_line2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(acc_line2, text="Chọn tất cả", command=self._on_accounts_select_all).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line2, text="Bỏ chọn", command=self._on_accounts_clear_selection).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(acc_line2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(acc_line2, text="Xuất JSON", command=self._on_export_json).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line2, text="Nhập JSON", command=self._on_import_json).pack(side=tk.LEFT)
 
         acc_tree_fr = ttk.Frame(tab_acc)
         acc_tree_fr.grid(row=2, column=0, sticky="nsew")
@@ -589,7 +605,7 @@ class _ManagerWindow:
         sy_acc.grid(row=0, column=1, sticky="ns")
 
         tab_pg = ttk.Frame(nb, padding=4)
-        nb.add(tab_pg, text="  2. Page / Group (pages.json)  ")
+        nb.add(tab_pg, text="  Page  ")
         tab_pg.columnconfigure(0, weight=1)
         tab_pg.rowconfigure(3, weight=1)
         ttk.Label(
@@ -607,6 +623,9 @@ class _ManagerWindow:
             text="Quét Page theo tài khoản",
             command=self._on_scan_pages_from_account,
         ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_bar, text="Tạo nhiều Page", command=self._on_open_page_creator).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_bar, text="Nhóm Facebook", command=self._on_open_group_manager).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_bar, text="Chia sẻ bài", command=self._on_open_share_tab).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_bar, text="Sửa", command=self._on_edit_page).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_bar, text="Job lịch đăng…", command=self._on_goto_jobs_for_page).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_bar, text="Xóa", command=self._on_delete_page).pack(side=tk.LEFT, padx=(0, 4))
@@ -646,14 +665,7 @@ class _ManagerWindow:
         pg_tree_fr.rowconfigure(0, weight=1)
 
         cols_pg = (
-            "id",
-            "account_id",
-            "page_kind",
             "page_name",
-            "followers",
-            "views",
-            "stats_at",
-            "ai_topic",
             "post_style",
             "schedule",
             "status",
@@ -669,22 +681,15 @@ class _ManagerWindow:
             selectmode="extended",
         )
         headings_pg = {
-            "id": "id",
-            "account_id": "owner",
-            "page_kind": "Loại",
             "page_name": "Tên Page",
-            "followers": "Followers",
-            "views": "Views",
-            "stats_at": "Cập nhật TK",
-            "ai_topic": "Chủ đề AI",
-            "post_style": "post_style",
+            "post_style": "Kiểu đăng",
             "schedule": "Lịch",
             "status": "Trạng thái",
             "last_post": "Đăng gần nhất",
             "fb_page_id": "Meta Page ID",
-            "url": "Page_URL",
+            "url": "Link Page",
         }
-        widths_pg = (72, 72, 56, 88, 72, 72, 88, 100, 56, 52, 72, 88, 110, 140)
+        widths_pg = (220, 88, 72, 96, 130, 150, 260)
         for c, w in zip(cols_pg, widths_pg):
             self._tree_pages.heading(c, text=headings_pg[c], command=lambda k=c: self._on_pages_sort_click(k))
             self._tree_pages.column(c, width=w, stretch=True)
@@ -696,19 +701,13 @@ class _ManagerWindow:
         sy_pg.grid(row=0, column=1, sticky="ns")
 
         tab_jobs = ttk.Frame(nb, padding=4)
-        nb.add(tab_jobs, text="  3. Job lịch đăng (schedule_posts.json)  ")
+        nb.add(tab_jobs, text="  Lịch đăng  ")
         tab_jobs.columnconfigure(0, weight=1)
         tab_jobs.rowconfigure(3, weight=1)
-        ttk.Label(
-            tab_jobs,
-            text="Mỗi job: lịch (một lần / hàng ngày), post_style, AI (topic, phong cách, ảnh, ai_config…). "
-            "Scheduler quét SCHEDULE_POSTS_POLL_SEC (mặc định 60s). Nội dung trống → AI (ưu tiên cấu hình trên job, fallback Page). "
-            "Hàng ngày: sau đăng thành công job tự pending với scheduled_at ngày kế.",
-            font=("Segoe UI", 9),
-            wraplength=640,
-        ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        jb = ttk.Frame(tab_jobs)
-        jb.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        job_box = ttk.LabelFrame(tab_jobs, text="Việc làm", padding=(6, 4))
+        job_box.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        jb = ttk.Frame(job_box)
+        jb.pack(fill=tk.X)
         ttk.Button(jb, text="Thêm job", command=self._on_add_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(jb, text="Thêm batch job…", command=self._on_add_batch_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(jb, text="Nạp job chờ đăng từ Export…", command=self._on_import_saved_export_job).pack(
@@ -719,21 +718,24 @@ class _ManagerWindow:
             side=tk.LEFT, padx=(0, 4)
         )
         ttk.Button(jb, text="Xóa job", command=self._on_delete_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(jb, text="Đăng luôn job đã chọn", command=self._on_run_selected_jobs_now).pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Button(jb, text="Chọn tất cả", command=self._on_jobs_select_all).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(jb, text="Bỏ chọn", command=self._on_jobs_clear_selection).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Đăng ngay", command=self._on_run_selected_jobs_now).pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Button(jb, text="Làm mới", command=self._on_refresh_schedule_jobs).pack(side=tk.LEFT, padx=(8, 0))
+        jb2 = ttk.Frame(job_box)
+        jb2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(jb2, text="Chọn tất cả", command=self._on_jobs_select_all).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb2, text="Bỏ chọn", command=self._on_jobs_clear_selection).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Checkbutton(
-            jb,
-            text="Khóa thao tác browser khi chạy job",
+            jb2,
+            text="Khóa browser khi chạy job",
             variable=self._var_lock_browser_job,
             command=self._on_toggle_lock_browser_job,
         ).pack(side=tk.LEFT, padx=(8, 4))
-        self._lbl_lock_browser_job = ttk.Label(jb, text="", foreground="gray")
+        self._lbl_lock_browser_job = ttk.Label(jb2, text="", foreground="gray")
         self._lbl_lock_browser_job.pack(side=tk.LEFT, padx=(0, 8))
         self._sync_lock_browser_job_label()
-        ttk.Label(jb, text="Song song/account").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Label(jb2, text="Song song").pack(side=tk.LEFT, padx=(8, 4))
         self._cb_per_account_parallel = ttk.Combobox(
-            jb,
+            jb2,
             textvariable=self._var_per_account_parallel,
             state="readonly",
             width=4,
@@ -741,13 +743,10 @@ class _ManagerWindow:
         )
         self._cb_per_account_parallel.pack(side=tk.LEFT, padx=(0, 4))
         self._cb_per_account_parallel.bind("<<ComboboxSelected>>", lambda _e: self._on_change_per_account_parallel())
-        self._lbl_per_account_parallel = ttk.Label(jb, text="", foreground="gray")
+        self._lbl_per_account_parallel = ttk.Label(jb2, text="", foreground="gray")
         self._lbl_per_account_parallel.pack(side=tk.LEFT, padx=(0, 8))
         self._sync_per_account_parallel_label()
-        ttk.Button(jb, text="Màn hình trực quan đăng bài", command=self._open_posting_visual_monitor).pack(
-            side=tk.LEFT, padx=(8, 4)
-        )
-        ttk.Button(jb, text="Làm mới tab này", command=self._on_refresh_schedule_jobs).pack(side=tk.LEFT)
+        ttk.Button(jb2, text="Màn hình đăng", command=self._open_posting_visual_monitor).pack(side=tk.LEFT, padx=(8, 4))
 
         self._build_schedule_jobs_filter_bar(tab_jobs, row=2)
 
@@ -834,7 +833,7 @@ class _ManagerWindow:
         self._lbl_jobs_regen_status.grid(row=0, column=9, sticky="w", padx=(8, 0))
 
         tab_ai_host = ttk.Frame(nb, padding=0)
-        nb.add(tab_ai_host, text="  4. Cài đặt AI Providers  ")
+        nb.add(tab_ai_host, text="  AI  ")
         tab_ai_host.columnconfigure(0, weight=1)
         tab_ai_host.rowconfigure(0, weight=1)
         ai_canvas = tk.Canvas(tab_ai_host, highlightthickness=0, borderwidth=0)
@@ -1065,7 +1064,7 @@ class _ManagerWindow:
         self._root.bind("<<OpenScheduleJobsTab>>", self._on_open_schedule_jobs_tab_event, add="+")
 
         tab_ve = ttk.Frame(nb, padding=4)
-        nb.add(tab_ve, text="  5. Video Editor  ")
+        nb.add(tab_ve, text="  Video  ")
         tab_ve.columnconfigure(0, weight=1)
         tab_ve.rowconfigure(0, weight=1)
         ve_host = ttk.Frame(tab_ve)
@@ -1080,7 +1079,7 @@ class _ManagerWindow:
         self._tab_ve_notebook_child = tab_ve
 
         tab_dl = ttk.Frame(nb, padding=4)
-        nb.add(tab_dl, text="  6. Tải Video  ")
+        nb.add(tab_dl, text="  Tải video  ")
         tab_dl.columnconfigure(0, weight=1)
         tab_dl.rowconfigure(0, weight=1)
         self._tab_dl_notebook_child = tab_dl
@@ -1106,7 +1105,7 @@ class _ManagerWindow:
             )
 
         tab_ve_pending = ttk.Frame(nb, padding=4)
-        nb.add(tab_ve_pending, text="  7.Job chờ đăng từ Video Editor  ")
+        nb.add(tab_ve_pending, text="  Chờ đăng  ")
         tab_ve_pending.columnconfigure(0, weight=1)
         tab_ve_pending.rowconfigure(3, weight=1)
         ttk.Label(
@@ -1266,7 +1265,7 @@ class _ManagerWindow:
         self._var_ve_pending_search.trace_add("write", lambda *_: self._fill_ve_pending_export_jobs_tree())
 
         tab_tt = ttk.Frame(nb, padding=4)
-        nb.add(tab_tt, text="  8. TikTok Manager  ")
+        nb.add(tab_tt, text="  TikTok  ")
         tab_tt.columnconfigure(0, weight=1)
         tab_tt.rowconfigure(0, weight=1)
         tt_host = ttk.Frame(tab_tt)
@@ -1278,7 +1277,7 @@ class _ManagerWindow:
         build_tiktok_manager_tab(tt_host, self._root)
 
         tab_human = ttk.Frame(nb, padding=4)
-        nb.add(tab_human, text="  9. Tương tác người dùng  ")
+        nb.add(tab_human, text="  Tương tác  ")
         tab_human.columnconfigure(0, weight=1)
         tab_human.rowconfigure(0, weight=1)
         build_human_interaction_tab(
@@ -1286,6 +1285,12 @@ class _ManagerWindow:
             self._root,
             on_accounts_registry_changed=self._on_human_accounts_exported,
         )
+
+        tab_share = ttk.Frame(nb, padding=4)
+        nb.add(tab_share, text="  Chia sẻ  ")
+        tab_share.columnconfigure(0, weight=1)
+        tab_share.rowconfigure(0, weight=1)
+        build_share_tab(tab_share, self._root)
 
         # --- Platform view (Facebook vs TikTok) ---
         self._tab_facebook_accounts = tab_acc
@@ -1295,30 +1300,33 @@ class _ManagerWindow:
         self._tab_ve_pending_notebook_child = tab_ve_pending
         self._tab_tiktok_manager = tab_tt
         self._tab_human_interaction = tab_human
+        self._tab_share = tab_share
+        self._tab_ai_host = tab_ai_host
         self._apply_platform_view(self._platform_view_var.get())
 
         self._nb.bind("<<NotebookTabChanged>>", self._on_manager_notebook_tab_changed, add="+")
         self._root.after_idle(self._on_manager_notebook_tab_changed)
         self._root.after_idle(self._warm_downloader_metadata_merge)
 
-        body.add(nb_host, weight=5)
-
-        log_fr = ttk.Frame(body, padding=4)
-        log_bar = ttk.Frame(log_fr)
-        log_bar.pack(fill=tk.X, anchor="w")
-        ttk.Label(log_bar, text="Nhật ký (INFO)").pack(side=tk.LEFT, anchor="w")
-        ttk.Button(log_bar, text="Clear", command=self._on_clear_log_text, width=8).pack(side=tk.RIGHT)
-        self._log_text = tk.Text(log_fr, height=self._log_rows, state="disabled", wrap="word", font=("Consolas", 9))
-        ly = ttk.Scrollbar(log_fr, orient=tk.VERTICAL, command=self._log_text.yview)
-        self._log_text.configure(yscrollcommand=ly.set)
-        self._log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ly.pack(side=tk.RIGHT, fill=tk.Y)
-        body.add(log_fr, weight=2)
+        body.add(nb_host, weight=1)
         try:
-            body.paneconfigure(nb_host, minsize=340)
-            body.paneconfigure(log_fr, minsize=150)
+            body.paneconfigure(nb_host, minsize=280)
         except tk.TclError:
             pass
+
+        log_fr = ttk.LabelFrame(main, text="Nhật ký", padding=(6, 2))
+        log_fr.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        log_bar = ttk.Frame(log_fr)
+        log_bar.pack(fill=tk.X)
+        self._log_visible = False
+        self._btn_log_toggle = ttk.Button(log_bar, text="Hiện nhật ký", command=self._toggle_log_panel, width=14)
+        self._btn_log_toggle.pack(side=tk.LEFT)
+        ttk.Button(log_bar, text="Xóa", command=self._on_clear_log_text, width=8).pack(side=tk.LEFT, padx=(6, 0))
+        self._log_text = tk.Text(log_fr, height=6, state="disabled", wrap="word", font=("Consolas", 9))
+        self._log_scroll = ttk.Scrollbar(log_fr, orient=tk.VERTICAL, command=self._log_text.yview)
+        self._log_text.configure(yscrollcommand=self._log_scroll.set)
+        body.pack_forget()
+        body.pack(fill=tk.BOTH, expand=True)
 
         self._root.minsize(860 if self._compact_ui else 960, 560 if self._compact_ui else 620)
 
@@ -1331,8 +1339,14 @@ class _ManagerWindow:
         self._apply_ai_provider_view()
         self._sync_ai_tab_scrollregion()
         self._start_ui_watchdog()
+        install_adaptive_wrap(self._root)
         self._start_multitask_reconcile_timer()
         self._root.after(900, self._schedule_startup_git_sync)
+        try:
+            self._root.deiconify()
+            self._root.lift()
+        except tk.TclError:
+            pass
         logger.info(
             "Đã mở giao diện quản lý — tab Tài khoản / Page / Job lịch / Cài đặt AI; «Bắt đầu lịch» chạy scheduler nền."
         )
@@ -1709,6 +1723,19 @@ class _ManagerWindow:
             except ValueError:
                 pass
             self._log_sink_id = None
+
+    def _toggle_log_panel(self) -> None:
+        """Hiện hoặc giấu ô nhật ký để tab làm việc không bị che khi thu phóng."""
+        if self._log_visible:
+            self._log_text.pack_forget()
+            self._log_scroll.pack_forget()
+            self._log_visible = False
+            self._btn_log_toggle.configure(text="Hiện nhật ký")
+            return
+        self._log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(4, 0))
+        self._log_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=(4, 0))
+        self._log_visible = True
+        self._btn_log_toggle.configure(text="Ẩn nhật ký")
 
     def _on_clear_log_text(self) -> None:
         """Xóa toàn bộ nội dung ô nhật ký INFO trong GUI."""
@@ -2204,21 +2231,13 @@ class _ManagerWindow:
     def _pages_tree_insert_specs(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         specs: list[dict[str, Any]] = []
         for p in rows:
-            url = str(p.get("page_url", ""))
-            if len(url) > 36:
-                url = url[:33] + "..."
-            top = str(p.get("topic", "") or "")
-            if len(top) > 28:
-                top = top[:25] + "..."
+            url = str(p.get("page_url", "") or "")
             raw_st = str(p.get("status", "")).strip()
             st_disp = _normalize_post_status(raw_st if raw_st else "pending")
-            last_post = str(p.get("last_post_at", "") or "")
-            if len(last_post) > 14:
-                last_post = last_post[:11] + "..."
+            last_post = str(p.get("last_post_at", "") or "").replace("T", " ")
+            if len(last_post) > 19:
+                last_post = last_post[:19]
             fb_pid = str(p.get("fb_page_id", "") or "")
-            if len(fb_pid) > 16:
-                fb_pid = fb_pid[:13] + "..."
-            fol, views, stats_at = self._page_insights_display(str(p.get("id", "")))
             row_tag = (
                 "pg_failed"
                 if st_disp == "failed"
@@ -2226,27 +2245,22 @@ class _ManagerWindow:
                 if st_disp == "success"
                 else "pg_pending"
             )
-            specs.append(
-                {
-                    "values": (
-                        p.get("id", ""),
-                        p.get("account_id", ""),
-                        p.get("page_kind", "") or "—",
-                        p.get("page_name", ""),
-                        fol,
-                        views,
-                        stats_at,
-                        top or "—",
-                        p.get("post_style", ""),
-                        p.get("schedule_time", "") or "—",
-                        st_disp,
-                        last_post or "—",
-                        fb_pid or "—",
-                        url,
-                    ),
-                    "tags": (row_tag,),
-                }
-            )
+            spec: dict[str, Any] = {
+                "values": (
+                    p.get("page_name", ""),
+                    p.get("post_style", "") or "—",
+                    p.get("schedule_time", "") or "—",
+                    st_disp,
+                    last_post or "—",
+                    fb_pid or "—",
+                    url or "—",
+                ),
+                "tags": (row_tag,),
+            }
+            page_id = str(p.get("id", "") or "").strip()
+            if page_id:
+                spec["iid"] = page_id
+            specs.append(spec)
         return specs
 
     def _pages_tree_finish_render(self, rows: list[dict[str, Any]]) -> None:
@@ -2531,13 +2545,7 @@ class _ManagerWindow:
 
     def _on_pages_sort_click(self, col_key: str) -> None:
         supported = {
-            "id": "id",
-            "account_id": "account_id",
-            "page_kind": "page_kind",
             "page_name": "page_name",
-            "followers": "followers",
-            "views": "views",
-            "stats_at": "stats_at",
             "post_style": "post_style",
             "status": "status",
             "last_post": "last_post_at",
@@ -2560,17 +2568,13 @@ class _ManagerWindow:
 
     def _update_pages_heading_sort_indicator(self) -> None:
         base = {
-            "id": "id",
-            "account_id": "owner",
-            "page_kind": "Loại",
             "page_name": "Tên Page",
-            "ai_topic": "Chủ đề AI",
-            "post_style": "post_style",
+            "post_style": "Kiểu đăng",
             "schedule": "Lịch",
             "status": "Trạng thái",
             "last_post": "Đăng gần nhất",
             "fb_page_id": "Meta Page ID",
-            "url": "Page_URL",
+            "url": "Link Page",
         }
         key_to_col = {
             "id": "id",
@@ -2725,75 +2729,71 @@ class _ManagerWindow:
         self._refresh_setup_banner()
         self._update_multitask_status_label()
 
+    def _on_open_page_creator(self) -> None:
+        """Mở cửa sổ tạo Page hàng loạt (queue + delay sau khi job xong)."""
+        from src.gui.page_creator_dialog import open_page_creator_dialog
+
+        open_page_creator_dialog(self._root)
+
+    def _on_open_group_manager(self) -> None:
+        """Mở tìm nhóm, tham gia và chia sẻ link trên profile account sẵn có."""
+        from src.gui.group_manager_dialog import open_group_manager_dialog
+
+        open_group_manager_dialog(self._root)
+
+    def _on_open_share_tab(self) -> None:
+        """Mở tab chia sẻ một link lên nhiều Page."""
+        if getattr(self, "_platform_view_is_tiktok", None):
+            self._platform_view_var.set("Facebook")
+            self._apply_platform_view("Facebook")
+        tab = getattr(self, "_tab_share", None)
+        if tab is not None and self._notebook_has_tab(tab):
+            self._nb.select(tab)
+
     def _refresh_all(self) -> None:
         self._refresh_tree()
         self._on_refresh_pages()
         self._on_refresh_schedule_jobs()
 
     def _on_migrate_user_data(self) -> None:
-        """Migrate nhanh dữ liệu từ thư mục ToolFB cũ sang thư mục hiện tại."""
-        old_dir = filedialog.askdirectory(parent=self._root, title="Chọn thư mục ToolFB CŨ")
-        if not old_dir:
-            return
-        new_dir = filedialog.askdirectory(
-            parent=self._root,
-            title="Chọn thư mục ToolFB MỚI (đích migrate)",
-            initialdir=str(project_root().resolve()),
-        )
-        if not new_dir:
-            return
-        script = project_root() / "tools" / "migrate_user_data.py"
-        if not script.is_file():
-            messagebox.showerror("Migrate", f"Không tìm thấy script:\n{script}", parent=self._root)
-            return
-        old_d, new_d = str(old_dir), str(new_dir)
-        script_s = str(script)
-        self._set_ui_busy("migrate_user_data")
-        self._root.configure(cursor="watch")
+        """Xuất gói sang máy khác, hoặc gộp gói vào máy này mà không xóa dữ liệu sẵn có."""
+        top = tk.Toplevel(self._root)
+        top.title("Đồng bộ dữ liệu giữa các máy")
+        top.transient(self._root)
+        top.resizable(False, False)
+        frame = ttk.Frame(top, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frame,
+            text=(
+                "Giữ tài khoản, page và cài đặt đang có. Chỉ thêm phần mới và chỗ trống.\n"
+                "Gói gồm profile, cookie, lịch, nhóm, AI và tương tác để máy kia dùng tiếp.\n"
+                "Đóng Firefox của tool trước khi xuất. Cửa sổ vẫn dùng được lúc đang chép."
+            ),
+            justify=tk.LEFT,
+            wraplength=420,
+        ).pack(anchor="w", pady=(0, 10))
 
-        def _migrate_worker() -> None:
-            result: dict[str, Any] = {"cp": None, "exc": None}
-            try:
-                result["cp"] = subprocess.run(
-                    [sys.executable, script_s, "--from", old_d, "--to", new_d],
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    check=False,
-                )
-            except Exception as exc:  # noqa: BLE001
-                result["exc"] = exc
+        def _export() -> None:
+            top.destroy()
+            self._on_export_tool_bundle()
 
-            def _migrate_done() -> None:
-                self._clear_ui_busy()
-                self._root.configure(cursor="")
-                if result["exc"] is not None:
-                    messagebox.showerror(
-                        "Migrate",
-                        f"Chạy migrate thất bại:\n{result['exc']}",
-                        parent=self._root,
-                    )
-                    return
-                cp = result["cp"]
-                if cp is None:
-                    messagebox.showerror("Migrate", "Không có kết quả subprocess.", parent=self._root)
-                    return
-                if cp.returncode != 0:
-                    msg = (cp.stderr or cp.stdout or "Unknown error").strip()
-                    messagebox.showerror("Migrate lỗi", msg[:2000], parent=self._root)
-                    return
-                self._refresh_all()
-                out = (cp.stdout or "").strip()
-                preview = "\n".join(out.splitlines()[:12])
-                messagebox.showinfo(
-                    "Migrate thành công",
-                    f"Đã migrate dữ liệu từ:\n{old_d}\n\nSang:\n{new_d}\n\n{preview}",
-                    parent=self._root,
-                )
+        def _import_file() -> None:
+            top.destroy()
+            self._on_import_tool_bundle()
 
-            schedule_on_main_thread(self._root, _migrate_done)
+        def _import_folder() -> None:
+            folder = filedialog.askdirectory(parent=top, title="Chọn thư mục ToolFB của máy kia")
+            if not folder:
+                return
+            top.destroy()
+            self._merge_bundle_from_folder(folder)
 
-        threading.Thread(target=_migrate_worker, name="migrate_user_data", daemon=True).start()
+        ttk.Button(frame, text="Xuất gói kèm profile…", command=_export).pack(fill=tk.X, pady=3)
+        ttk.Button(frame, text="Nạp thư mục gói và gộp…", command=_import_file).pack(fill=tk.X, pady=3)
+        ttk.Button(frame, text="Gộp từ thư mục ToolFB khác…", command=_import_folder).pack(fill=tk.X, pady=3)
+        ttk.Button(frame, text="Đóng", command=top.destroy).pack(anchor="e", pady=(8, 0))
+        top.grab_set()
 
     def _fill_schedule_jobs_tree(self) -> None:
         """Đọc dữ liệu gốc vào ``self._all_jobs`` rồi áp filter/sort và render (JSON ngoài main thread)."""
@@ -2805,12 +2805,29 @@ class _ManagerWindow:
         def _worker() -> None:
             err: str | None = None
             jobs: list[dict[str, Any]] | None = None
+            page_map: dict[str, str] = {}
+            account_map: dict[str, str] = {}
             try:
                 rows = self._schedule_posts.load_all()
                 jobs = [dict(r) for r in rows]
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
                 logger.warning("Không đọc schedule_posts: {}", exc)
+            try:
+                for p in self._pages.load_all():
+                    pid = str(p.get("id", "")).strip()
+                    name = str(p.get("page_name", "") or "").strip()
+                    if pid and name:
+                        page_map[pid] = name
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Không nạp map tên page cho tab jobs: {}", exc)
+            try:
+                for a in self._accounts.load_all():
+                    aid = str(a.get("id", "")).strip()
+                    if aid:
+                        account_map[aid] = str(a.get("name", "") or "").strip() or aid
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Không nạp map tên account cho tab jobs: {}", exc)
 
             def _done() -> None:
                 self._schedule_jobs_load_busy = False
@@ -2823,8 +2840,8 @@ class _ManagerWindow:
                     return
                 clear_file_exists_cache()
                 self._all_jobs = jobs
-                self._refresh_job_page_name_map()
-                self._refresh_job_account_name_map()
+                self._job_page_name_by_id = page_map
+                self._job_account_name_by_id = account_map
                 self._refresh_job_filter_choices()
                 self._render_schedule_jobs_tree()
                 self._root.after(50, self._fill_ve_pending_export_jobs_tree)
@@ -7360,24 +7377,16 @@ class _ManagerWindow:
             logger.info("Đã xóa {} schedule job", removed)
 
     def _selected_page_id(self) -> str | None:
-        sel = self._tree_pages.selection()
-        if not sel:
-            return None
-        vals = self._tree_pages.item(sel[0], "values")
-        if not vals:
-            return None
-        return str(vals[0]).strip() or None
+        ids = self._selected_page_ids()
+        return ids[0] if ids else None
 
     def _selected_page_ids(self) -> list[str]:
+        """Id Page nằm ở iid dòng, không hiện trên bảng."""
         ids: list[str] = []
         for iid in self._tree_pages.selection():
-            vals = self._tree_pages.item(iid, "values")
-            if not vals:
-                continue
-            pid = str(vals[0]).strip()
+            pid = str(iid).strip()
             if pid:
                 ids.append(pid)
-        # giữ thứ tự, bỏ trùng
         return list(dict.fromkeys(ids))
 
     def _record_page_by_id(self, page_id: str) -> PageRecord | None:
@@ -7589,12 +7598,13 @@ class _ManagerWindow:
 
         nb = self._nb
 
-        fb_accounts_text = "  1. Tài khoản (accounts.json)  "
-        fb_pages_text = "  2. Page / Group (pages.json)  "
-        fb_jobs_text = "  3. Job lịch đăng (schedule_posts.json)  "
-        ve_pending_text = "  7.Job chờ đăng từ Video Editor  "
-        tt_text = "  8. TikTok Manager  "
-        human_text = "  9. Tương tác người dùng  "
+        fb_accounts_text = "  Tài khoản  "
+        fb_pages_text = "  Page  "
+        fb_jobs_text = "  Lịch đăng  "
+        ve_pending_text = "  Chờ đăng  "
+        tt_text = "  TikTok  "
+        human_text = "  Tương tác  "
+        share_text = "  Chia sẻ  "
 
         if want_tiktok:
             # Ẩn tab Facebook
@@ -7604,15 +7614,18 @@ class _ManagerWindow:
             # Ẩn tab tương tác Facebook khi đang ở view TikTok.
             if self._tab_human_interaction is not None and self._notebook_has_tab(self._tab_human_interaction):
                 nb.forget(self._tab_human_interaction)
+            if getattr(self, "_tab_share", None) is not None and self._notebook_has_tab(self._tab_share):
+                nb.forget(self._tab_share)
             if self._tab_ve_pending_export is not None and not self._notebook_has_tab(self._tab_ve_pending_export):
                 nb.add(self._tab_ve_pending_export, text=ve_pending_text)
             # Hiện TikTok
             if self._tab_tiktok_manager is not None and not self._notebook_has_tab(self._tab_tiktok_manager):
                 nb.add(self._tab_tiktok_manager, text=tt_text)
-            if self._tab_tiktok_manager is not None and self._notebook_has_tab(self._tab_tiktok_manager):
-                nb.select(self._tab_tiktok_manager)
-            self._jobs_tab_index = 0
-            return
+        if self._tab_tiktok_manager is not None and self._notebook_has_tab(self._tab_tiktok_manager):
+            nb.select(self._tab_tiktok_manager)
+        self._jobs_tab_index = 0
+        self._arrange_notebook()
+        return
 
         # want facebook
         # Ẩn TikTok
@@ -7628,6 +7641,8 @@ class _ManagerWindow:
             nb.add(self._tab_facebook_jobs, text=fb_jobs_text)
         if self._tab_human_interaction is not None and not self._notebook_has_tab(self._tab_human_interaction):
             nb.add(self._tab_human_interaction, text=human_text)
+        if getattr(self, "_tab_share", None) is not None and not self._notebook_has_tab(self._tab_share):
+            nb.add(self._tab_share, text=share_text)
 
         # Cập nhật index tab jobs để nút điều hướng hoạt động đúng.
         if self._tab_facebook_jobs is not None and self._notebook_has_tab(self._tab_facebook_jobs):
@@ -7640,6 +7655,41 @@ class _ManagerWindow:
             nb.select(self._tab_facebook_pages)
         elif self._tab_facebook_accounts is not None and self._notebook_has_tab(self._tab_facebook_accounts):
             nb.select(self._tab_facebook_accounts)
+        self._arrange_notebook()
+
+    def _arrange_notebook(self) -> None:
+        """Xếp tab theo thứ tự dùng hàng ngày. Tab Facebook đứng trước công cụ video."""
+        if getattr(self, "_platform_view_is_tiktok", False):
+            order = (
+                self._tab_tiktok_manager,
+                self._tab_ve_pending_export,
+                getattr(self, "_tab_ai_host", None),
+                self._tab_ve_notebook_child,
+                self._tab_dl_notebook_child,
+            )
+        else:
+            order = (
+                self._tab_facebook_accounts,
+                self._tab_facebook_pages,
+                self._tab_facebook_jobs,
+                self._tab_human_interaction,
+                getattr(self, "_tab_share", None),
+                getattr(self, "_tab_ai_host", None),
+                self._tab_ve_notebook_child,
+                self._tab_dl_notebook_child,
+                self._tab_ve_pending_export,
+            )
+        pos = 0
+        for child in order:
+            if child is None or not self._notebook_has_tab(child):
+                continue
+            try:
+                self._nb.insert(pos, child)
+            except tk.TclError:
+                continue
+            pos += 1
+        if self._tab_facebook_jobs is not None and self._notebook_has_tab(self._tab_facebook_jobs):
+            self._jobs_tab_index = self._nb.index(self._tab_facebook_jobs)
 
     def _on_goto_jobs_for_page(self) -> None:
         """Chuyển sang tab Job; gợi ý tạo job cho Page đang chọn."""
@@ -8374,122 +8424,247 @@ class _ManagerWindow:
         self._refresh_tree()
         self._warn_if_scheduler_running_after_config_change()
 
+    def _begin_sync_work(self, text: str) -> None:
+        """Khóa nút đồng bộ và hiện trạng thái. Việc nặng chạy ở thread nền."""
+        self._set_ui_busy(text)
+        self._sync_status_backup = self._lbl_state.cget("text")
+        self._lbl_state.configure(text=text)
+        self._root.configure(cursor="watch")
+        if hasattr(self, "_btn_migrate"):
+            self._btn_migrate.configure(state=tk.DISABLED)
+
+    def _report_sync(self, text: str) -> None:
+        """Cập nhật dòng trạng thái từ thread nền, không khóa cửa sổ."""
+        label = text[:180]
+
+        def _apply() -> None:
+            self._lbl_state.configure(text=label)
+
+        schedule_on_main_thread(self._root, _apply)
+
+    def _finish_sync(self, done) -> None:
+        """Trả giao diện về bình thường rồi hiện kết quả trên luồng chính."""
+
+        def _apply() -> None:
+            self._root.configure(cursor="")
+            if hasattr(self, "_btn_migrate"):
+                self._btn_migrate.configure(state=tk.NORMAL)
+            backup = str(getattr(self, "_sync_status_backup", "") or "Lịch: đang tắt")
+            self._lbl_state.configure(text=backup)
+            self._clear_ui_busy()
+            done()
+
+        schedule_on_main_thread(self._root, _apply)
+
     def _on_export_tool_bundle(self) -> None:
-        """
-        Xuất gói dữ liệu để chuyển tool sang máy khác:
-        accounts + pages + schedule_posts.
-        """
-        self._set_ui_busy("export_tool_bundle")
-        try:
-            accounts = [dict(x) for x in self._accounts.load_all()]
-            pages = [dict(x) for x in self._pages.load_all()]
-            jobs = [dict(x) for x in self._schedule_posts.load_all()]
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Xuất dữ liệu", f"Không đọc được dữ liệu hiện tại:\n{exc}", parent=self._root)
+        """Xuất gói tài khoản, page, lịch và thư mục profile. Chép profile ở thread nền."""
+        if self._ui_busy_label.startswith("Đồng bộ"):
             return
+        parent_dir = filedialog.askdirectory(parent=self._root, title="Chọn chỗ lưu thư mục gói đồng bộ")
+        if not parent_dir:
+            return
+        package = Path(parent_dir) / f"toolfb_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self._begin_sync_work("Đồng bộ: đang đọc dữ liệu…")
 
-        payload = {
-            "bundle_type": "toolfb_data_bundle",
-            "bundle_version": 1,
-            "exported_at": datetime.now().replace(microsecond=0).isoformat(),
-            "project": "ToolFB",
-            "data": {
-                "accounts": accounts,
-                "pages": pages,
-                "schedule_posts": jobs,
-            },
-        }
-        default_name = f"toolfb_bundle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        target = filedialog.asksaveasfilename(
-            parent=self._root,
-            title="Xuất dữ liệu ToolFB",
-            defaultextension=".json",
-            initialfile=default_name,
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not target:
-            return
-        try:
-            Path(target).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Xuất dữ liệu", f"Không ghi được file bundle:\n{exc}", parent=self._root)
-            return
-        messagebox.showinfo(
-            "Xuất dữ liệu",
-            (
-                f"Đã xuất bundle thành công:\n{target}\n\n"
-                f"Tài khoản: {len(accounts)}\n"
-                f"Page/Group: {len(pages)}\n"
-                f"Job lịch: {len(jobs)}"
-            ),
-            parent=self._root,
-        )
-        self._clear_ui_busy()
+        def _worker() -> None:
+            try:
+                accounts = [dict(x) for x in self._accounts.load_all()]
+                pages = [dict(x) for x in self._pages.load_all()]
+                jobs = [dict(x) for x in self._schedule_posts.load_all()]
+                from src.services.tool_bundle_sync import build_bundle, export_profiles
+                from src.utils.account_credentials import load_account_credentials_store
 
-    def _on_import_tool_bundle(self) -> None:
-        """
-        Nhập gói dữ liệu ToolFB (ghi đè accounts/pages/schedule_posts).
-        """
-        self._set_ui_busy("import_tool_bundle")
-        source = filedialog.askopenfilename(
-            parent=self._root,
-            title="Nhập dữ liệu ToolFB",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not source:
-            self._clear_ui_busy()
+                payload = build_bundle(
+                    accounts=accounts,
+                    pages=pages,
+                    jobs=jobs,
+                    credentials=load_account_credentials_store(force_reload=True),
+                    project_root=project_root(),
+                )
+                package.mkdir(parents=True, exist_ok=False)
+                (package / "bundle.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+                def _progress(done_n: int, total_n: int, name: str) -> None:
+                    self._report_sync(f"Đồng bộ: chép profile {done_n}/{total_n} — {name}")
+
+                profiles_copied, profiles_missing = export_profiles(
+                    project_root(),
+                    accounts,
+                    package,
+                    on_progress=_progress,
+                )
+                cookie_count = len((payload.get("data") or {}).get("cookies") or [])
+                text = (
+                    f"Đã xuất cả thư mục:\n{package}\n\n"
+                    f"Tài khoản: {len(accounts)}\n"
+                    f"Page: {len(pages)}\n"
+                    f"Lịch: {len(jobs)}\n"
+                    f"Cookie: {cookie_count}\n"
+                    f"Profile đã chép: {profiles_copied}\n"
+                    f"Profile không thấy: {profiles_missing}\n\n"
+                    "Chép nguyên thư mục này sang máy kia, rồi bấm Đồng bộ máy → Nạp thư mục gói."
+                )
+                self._finish_sync(lambda: messagebox.showinfo("Xuất dữ liệu", text, parent=self._root))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self._finish_sync(lambda: messagebox.showerror("Xuất dữ liệu", f"Không ghi được gói:\n{err}", parent=self._root))
+
+        threading.Thread(target=_worker, name="export_tool_bundle", daemon=True).start()
+
+    def _merge_bundle_from_folder(self, folder: str) -> None:
+        """Đọc thư mục ToolFB khác ở thread nền rồi gộp vào máy này."""
+        if self._ui_busy_label.startswith("Đồng bộ"):
             return
-        try:
-            raw = json.loads(Path(source).read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Nhập dữ liệu", f"Không đọc được file bundle:\n{exc}", parent=self._root)
-            self._clear_ui_busy()
+        self._begin_sync_work("Đồng bộ: đang đọc thư mục máy kia…")
+
+        def _worker() -> None:
+            from src.services.tool_bundle_sync import bundle_from_project
+
+            try:
+                payload = bundle_from_project(Path(folder))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self._finish_sync(lambda: messagebox.showerror("Đồng bộ", f"Không đọc được thư mục:\n{err}", parent=self._root))
+                return
+            self._prepare_bundle_on_worker(payload, profile_root=folder)
+
+        threading.Thread(target=_worker, name="merge_tool_folder", daemon=True).start()
+
+    def _on_import_tool_bundle(self, source_path: str | None = None, profile_root: str | None = None) -> None:
+        """Gộp gói vào máy này. Đọc file và chép profile ở thread nền."""
+        if self._ui_busy_label.startswith("Đồng bộ"):
             return
+        if source_path:
+            source = source_path
+        else:
+            picked = filedialog.askdirectory(parent=self._root, title="Chọn thư mục gói đồng bộ")
+            if not picked:
+                return
+            bundle_file = Path(picked) / "bundle.json"
+            if not bundle_file.is_file():
+                messagebox.showerror(
+                    "Nhập dữ liệu",
+                    "Thư mục này chưa có bundle.json.\nHãy chọn đúng thư mục toolfb_sync vừa xuất.",
+                    parent=self._root,
+                )
+                return
+            source = str(bundle_file)
+            profile_root = profile_root or picked
+        self._begin_sync_work("Đồng bộ: đang đọc gói…")
+
+        def _worker() -> None:
+            try:
+                raw = json.loads(Path(source).read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self._finish_sync(
+                    lambda: messagebox.showerror("Nhập dữ liệu", f"Không đọc được file bundle:\n{err}", parent=self._root)
+                )
+                return
+            self._prepare_bundle_on_worker(raw, profile_root=profile_root or str(Path(source).parent))
+
+        threading.Thread(target=_worker, name="import_tool_bundle", daemon=True).start()
+
+    def _prepare_bundle_on_worker(self, raw: dict[str, Any], *, profile_root: str) -> None:
+        """Gộp trong bộ nhớ rồi hỏi xác nhận trên luồng giao diện."""
         if not isinstance(raw, dict):
-            messagebox.showerror("Nhập dữ liệu", "Bundle không hợp lệ: JSON gốc phải là object.", parent=self._root)
-            self._clear_ui_busy()
+            self._finish_sync(
+                lambda: messagebox.showerror("Nhập dữ liệu", "Bundle không hợp lệ: JSON gốc phải là object.", parent=self._root)
+            )
             return
-
         data = raw.get("data")
         if not isinstance(data, dict):
-            # tương thích bundle tối giản chỉ chứa 3 key
             data = raw
         accounts = data.get("accounts")
         pages = data.get("pages")
         jobs = data.get("schedule_posts")
         if not isinstance(accounts, list) or not isinstance(pages, list) or not isinstance(jobs, list):
-            messagebox.showerror(
-                "Nhập dữ liệu",
-                "Bundle không hợp lệ: cần có mảng accounts, pages, schedule_posts.",
-                parent=self._root,
+            self._finish_sync(
+                lambda: messagebox.showerror(
+                    "Nhập dữ liệu",
+                    "Bundle không hợp lệ: cần có mảng accounts, pages, schedule_posts.",
+                    parent=self._root,
+                )
             )
-            self._clear_ui_busy()
             return
         if not all(isinstance(x, dict) for x in accounts + pages + jobs):
-            messagebox.showerror(
-                "Nhập dữ liệu",
-                "Bundle không hợp lệ: mỗi phần tử trong accounts/pages/schedule_posts phải là object.",
+            self._finish_sync(
+                lambda: messagebox.showerror(
+                    "Nhập dữ liệu",
+                    "Bundle không hợp lệ: mỗi phần tử phải là object.",
+                    parent=self._root,
+                )
+            )
+            return
+        from src.services.tool_bundle_sync import plan_merge, preview_profile_install
+        from src.utils.account_credentials import load_account_credentials_store
+
+        try:
+            merged, sync_report = plan_merge(
+                local_accounts=[dict(row) for row in self._accounts.load_all()],
+                local_pages=[dict(row) for row in self._pages.load_all()],
+                local_jobs=[dict(row) for row in self._schedule_posts.load_all()],
+                local_credentials=load_account_credentials_store(force_reload=True),
+                bundle={
+                    "accounts": accounts,
+                    "pages": pages,
+                    "schedule_posts": jobs,
+                    "credentials": data.get("credentials") if isinstance(data.get("credentials"), dict) else {"accounts": {}},
+                    "cookies": data.get("cookies") if isinstance(data.get("cookies"), list) else [],
+                    "settings": data.get("settings") if isinstance(data.get("settings"), dict) else {},
+                },
+            )
+            from src.services.tool_bundle_sync import apply_settings
+
+            sync_report.settings_updated = apply_settings(
+                project_root(),
+                dict(merged.get("settings") or {}),
+                write=False,
+            )
+            preview_copied, preview_kept, preview_missing = preview_profile_install(
+                Path(profile_root),
+                project_root(),
+                list(merged.get("profile_jobs") or []),
+            )
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            self._finish_sync(lambda: messagebox.showerror("Nhập dữ liệu", f"Không gộp được gói:\n{err}", parent=self._root))
+            return
+        sync_report.profiles_copied = preview_copied
+        sync_report.profiles_kept = preview_kept
+        sync_report.profiles_missing = preview_missing
+        summary = sync_report.summary()
+
+        def _ask() -> None:
+            self._root.configure(cursor="")
+            confirm = messagebox.askyesno(
+                "Gộp vào máy này",
+                summary + "\n\nTiếp tục gộp? Tool lưu bản sao trước khi ghi.",
                 parent=self._root,
             )
-            self._clear_ui_busy()
-            return
+            if not confirm:
+                self._root.configure(cursor="")
+                if hasattr(self, "_btn_migrate"):
+                    self._btn_migrate.configure(state=tk.NORMAL)
+                backup = str(getattr(self, "_sync_status_backup", "") or "Lịch: đang tắt")
+                self._lbl_state.configure(text=backup)
+                self._clear_ui_busy()
+                return
+            self._root.configure(cursor="watch")
+            self._lbl_state.configure(text="Đồng bộ: đang gộp và chép profile…")
+            threading.Thread(
+                target=lambda: self._apply_bundle_on_worker(merged, sync_report, profile_root),
+                name="apply_tool_bundle",
+                daemon=True,
+            ).start()
 
-        confirm = messagebox.askyesno(
-            "Xác nhận nhập dữ liệu",
-            (
-                "Nhập bundle sẽ GHI ĐÈ dữ liệu hiện tại:\n"
-                "- accounts.json\n"
-                "- pages.json\n"
-                "- schedule_posts.json\n\n"
-                "Tool sẽ tự tạo backup trước khi ghi đè.\n"
-                "Bạn có muốn tiếp tục?"
-            ),
-            parent=self._root,
-        )
-        if not confirm:
-            self._clear_ui_busy()
-            return
+        schedule_on_main_thread(self._root, _ask)
 
+    def _apply_bundle_on_worker(self, merged: dict[str, Any], sync_report: Any, profile_root: str) -> None:
+        """Ghi dữ liệu đã gộp và chép profile thiếu. Chạy ngoài luồng giao diện."""
         backup_dir = project_root() / "data" / "backups" / f"bundle_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         try:
             backup_dir.mkdir(parents=True, exist_ok=True)
@@ -8506,10 +8681,19 @@ class _ManagerWindow:
                 encoding="utf-8",
             )
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Nhập dữ liệu", f"Không tạo được backup trước khi import:\n{exc}", parent=self._root)
-            self._clear_ui_busy()
+            err = str(exc)
+            self._finish_sync(
+                lambda: messagebox.showerror(
+                    "Nhập dữ liệu",
+                    f"Không tạo được backup trước khi import:\n{err}",
+                    parent=self._root,
+                )
+            )
             return
 
+        accounts = list(merged["accounts"])
+        pages = list(merged["pages"])
+        jobs = list(merged["schedule_posts"])
         normalized_accounts: list[dict[str, Any]] = []
         auto_fixed_exe = 0
         remapped_profile_path = 0
@@ -8517,23 +8701,30 @@ class _ManagerWindow:
             acc = dict(acc_raw)
             portable = str(acc.get("portable_path", "") or acc.get("profile_path", "")).strip()
             if portable:
-                p = Path(portable)
-                resolved = p if p.is_absolute() else (project_root() / p)
-                if not resolved.exists():
-                    portable_norm = portable.replace("\\", "/").lower()
-                    marker = "/data/profiles/"
-                    idx = portable_norm.find(marker)
-                    if idx >= 0:
-                        tail = portable_norm[idx + 1 :]  # data/profiles/...
-                        guess = (project_root() / Path(*tail.split("/"))).resolve()
-                        if guess.exists():
-                            resolved = guess
-                            remapped_profile_path += 1
+                from src.services.tool_bundle_sync import relativize_storage_path
                 from src.utils.account_browser_profile import relativize_account_storage_path
 
-                rel_pp = relativize_account_storage_path(str(resolved))
-                acc["portable_path"] = rel_pp
-                acc["profile_path"] = rel_pp
+                stored = relativize_storage_path(portable)
+                if stored.startswith("data/profiles/"):
+                    if stored != portable.replace("\\", "/"):
+                        remapped_profile_path += 1
+                    acc["portable_path"] = stored
+                    acc["profile_path"] = stored
+                    portable = stored
+                else:
+                    p = Path(portable)
+                    resolved = p if p.is_absolute() else (project_root() / p)
+                    rel_pp = relativize_account_storage_path(str(resolved))
+                    acc["portable_path"] = rel_pp
+                    acc["profile_path"] = rel_pp
+                    portable = rel_pp
+            cookie_path = str(acc.get("cookie_path") or "").strip()
+            if cookie_path:
+                from src.services.tool_bundle_sync import relativize_storage_path
+
+                stored_cookie = relativize_storage_path(cookie_path)
+                if stored_cookie.startswith("data/cookies/"):
+                    acc["cookie_path"] = stored_cookie
             exe = str(acc.get("browser_exe_path", "")).strip()
             exe_ok = bool(exe) and Path(exe).is_file()
             if not exe_ok and portable:
@@ -8561,37 +8752,61 @@ class _ManagerWindow:
             self._accounts.save_all(normalized_accounts)  # type: ignore[arg-type]
             self._pages.save_all([dict(x) for x in pages])  # type: ignore[arg-type]
             self._schedule_posts.save_all([dict(x) for x in jobs])  # type: ignore[arg-type]
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror(
-                "Nhập dữ liệu",
-                (
-                    "Import thất bại khi validate/ghi dữ liệu.\n"
-                    f"Lỗi: {exc}\n\n"
-                    f"Backup đã lưu tại:\n{backup_dir}"
-                ),
-                parent=self._root,
+            from src.services.tool_bundle_sync import write_missing_cookies
+            from src.utils.account_credentials import save_account_credentials_store
+
+            save_account_credentials_store(dict(merged["credentials"]))
+            copied_cookies, kept_cookies = write_missing_cookies(
+                project_root(),
+                list(merged.get("cookies") or []),
             )
-            self._clear_ui_busy()
+            from src.services.tool_bundle_sync import install_profiles
+
+            def _progress(done_n: int, total_n: int, name: str) -> None:
+                self._report_sync(f"Đồng bộ: chép profile {done_n}/{total_n}")
+
+            profiles_copied, profiles_kept, profiles_missing = install_profiles(
+                Path(profile_root),
+                project_root(),
+                list(merged.get("profile_jobs") or []),
+                on_progress=_progress,
+            )
+            sync_report.cookies_copied = copied_cookies
+            sync_report.cookies_kept = kept_cookies
+            from src.services.tool_bundle_sync import apply_settings
+
+            sync_report.profiles_copied = profiles_copied
+            sync_report.profiles_kept = profiles_kept
+            sync_report.profiles_missing = profiles_missing
+            sync_report.settings_updated = apply_settings(
+                project_root(),
+                dict(merged.get("settings") or {}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            detail = (
+                "Import thất bại khi ghi dữ liệu.\n"
+                f"Lỗi: {exc}\n\n"
+                f"Backup đã lưu tại:\n{backup_dir}"
+            )
+            self._finish_sync(lambda: messagebox.showerror("Nhập dữ liệu", detail, parent=self._root))
             return
 
-        self._refresh_tree()
-        self._fill_pages_tree()
-        self._on_refresh_schedule_jobs()
-        self._warn_if_scheduler_running_after_config_change()
-        messagebox.showinfo(
-            "Nhập dữ liệu",
-            (
-                "Đã import bundle thành công.\n\n"
-                f"Tài khoản: {len(accounts)}\n"
-                f"Page/Group: {len(pages)}\n"
-                f"Job lịch: {len(jobs)}\n\n"
-                f"Tự dò browser_exe_path: {auto_fixed_exe}\n"
-                f"Remap profile path: {remapped_profile_path}\n\n"
-                f"Backup dữ liệu cũ: {backup_dir}"
-            ),
-            parent=self._root,
+        summary = sync_report.summary()
+        done_text = (
+            "Đã gộp dữ liệu vào máy này. Không xóa tài khoản hay page sẵn có.\n\n"
+            f"{summary}\n\n"
+            f"Đường dẫn profile đã chỉnh: {remapped_profile_path}\n"
+            f"Bản sao trước khi gộp: {backup_dir}"
         )
-        self._clear_ui_busy()
+
+        def _done() -> None:
+            self._refresh_tree()
+            self._fill_pages_tree()
+            self._on_refresh_schedule_jobs()
+            self._warn_if_scheduler_running_after_config_change()
+            messagebox.showinfo("Nhập dữ liệu", done_text, parent=self._root)
+
+        self._finish_sync(_done)
 
     def _on_configure_update_channel(self) -> None:
         """
@@ -9338,6 +9553,26 @@ class _ManagerWindow:
                             )
 
                         schedule_on_main_thread(self._root, on_uptodate)
+                        return
+                    if not git_working_tree_clean(root):
+
+                        def on_dirty() -> None:
+                            self._clear_ui_busy()
+                            self._btn_check_updates.configure(state=tk.NORMAL)
+                            self._btn_apply_update.configure(state=tk.NORMAL)
+                            self._lbl_state.configure(text="")
+                            messagebox.showwarning(
+                                "Cập nhật (git)",
+                                (
+                                    "Có bản mới nhưng máy này đang sửa code chưa commit.\n"
+                                    "Tool không kéo git để tránh ghi đè phần đang sửa.\n\n"
+                                    "Tài khoản, page, cookie và thư mục profile không bị đụng.\n"
+                                    "Bản zip cũng giữ nguyên thư mục data và config."
+                                ),
+                                parent=self._root,
+                            )
+
+                        schedule_on_main_thread(self._root, on_dirty)
                         return
 
                     ui_evt = threading.Event()
