@@ -1,7 +1,7 @@
 {
-  "version": "1.0.95",
+  "version": "1.0.96",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "c7b4812adb018d117ce27f59bd4c7e83b5965cc5872bd6ae110984bbaf9ff537",
-  "notes": "Luot Reel truoc khi xem video. Moi page xem so giay ngau nhien. Tich page roi chia se link. Cot ket qua hien thanh cong hoac loi.",
-  "generated_at": "2026-10-10T00:30:43"
+  "sha256": "5f10de0c5e09e3605f26ba05a3e8a56933c98d4fbed3442c47bb9095ff26a745",
+  "notes": "Luoi 6x3, hen gio tung link, bam chia se tren video len Page va nhom.",
+  "generated_at": "2026-10-11T00:56:26"
 }
