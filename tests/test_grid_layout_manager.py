@@ -28,6 +28,20 @@ def test_compute_grid_layout_positions() -> None:
     assert slots[3].y == slots[2].y
 
 
+def test_six_by_three_is_eighteen_small_windows() -> None:
+    big = compute_grid_layout(4, screen_width=1920, screen_height=1080)
+    slots = compute_grid_layout(18, screen_width=1920, screen_height=1080, max_cols=6, rows=3)
+    assert len(slots) == 18
+    assert slots[0].col == 0 and slots[0].row == 0
+    assert slots[5].col == 5 and slots[5].row == 0
+    assert slots[6].col == 0 and slots[6].row == 1
+    assert slots[17].col == 5 and slots[17].row == 2
+    assert slots[0].width < big[0].width
+    assert slots[0].height < big[0].height
+    assert slots[5].x + slots[5].width <= 1920
+    assert slots[17].y + slots[17].height <= 1080
+
+
 def test_compute_grid_layout_eight_threads_four_cols() -> None:
     cols, rows = _grid_dimensions(8, max_cols=4)
     assert cols == 4

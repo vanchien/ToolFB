@@ -185,10 +185,30 @@ class FacebookGroupProvider:
         text: str,
         image_paths: list[str] | None = None,
         target_url: str = "",
+        page_name: str = "",
+        group_name: str = "",
     ) -> dict[str, Any]:
-        """Gõ chữ, link bài và ảnh người dùng đã chọn. Không tải video."""
+        """Bấm nút chia sẻ trên video nguồn, rồi gửi lên Page hoặc nhóm trong list."""
         if not source_url:
             return {"error_code": "TEMPORARY_ERROR", "error_message": "Thiếu URL"}
+        if self._page is not None and source_url not in str(getattr(self._page, "url", "") or ""):
+            self._load_html(account_id, source_url)
+        if self._fetch_html is None and self._page is not None:
+            from src.services.facebook_groups.video_engage import share_open_video
+
+            code = self._pause_code(str(getattr(self._page, "url", "") or ""), self._visible_text(self._page))
+            if code:
+                return {"error_code": code}
+            shared = share_open_video(
+                self._page,
+                kind="group" if group_id else "page",
+                target_id=group_id or page_id,
+                target_name=group_name if group_id else page_name,
+                caption=text,
+            )
+            if shared.get("error_code"):
+                return shared
+            return {"post_id": str(shared.get("post_id") or ""), "post_url": source_url}
         url = target_url.strip() if not group_id else ""
         if not url:
             url = f"https://www.facebook.com/groups/{group_id}" if group_id else f"https://www.facebook.com/{page_id}"

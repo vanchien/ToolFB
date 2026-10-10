@@ -680,7 +680,7 @@ def test_share_wave_watches_once_then_shares_with_page_text(tmp_path) -> None:
         cooldown_fixed=0,
     )
     engine.run_share_wave(wave["batch_ids"])
-    assert order == ["watch:12", "share:page-1", "watch:12", "share:page-2"]
+    assert order == ["watch:12", "share:page-1", "share:page-2"]
     assert fake.publish_calls[0]["text"] == "Đăng lên page của mình"
     assert engine.store.share_batches()[0]["source_prepared"] is True
 
@@ -743,7 +743,7 @@ def test_share_wave_browses_reels_then_watches_each_page(tmp_path) -> None:
     assert "share:page-1:" in order
     assert "share:page-1:g-ok" in order
     assert order.index("share:page-1:") > order.index(order[1])
-    assert sum(item.startswith("watch:") for item in order) == 2
+    assert sum(item.startswith("watch:") for item in order) == 1
     assert engine.store.share_batches()[0]["reels_browsed"] is True
 
 

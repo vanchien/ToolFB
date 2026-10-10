@@ -330,11 +330,17 @@ def build_human_interaction_tab(
         _grid_cols_default = max(1, min(8, int(_cols_raw)))
     except (TypeError, ValueError):
         _grid_cols_default = 4
+    _rows_raw = persisted.get("grid_rows")
+    try:
+        _grid_rows_default = max(0, min(4, int(_rows_raw)))
+    except (TypeError, ValueError):
+        _grid_rows_default = 0
 
     var_acc = tk.StringVar(value=str(persisted.get("accounts_path") or ""))
     var_px = tk.StringVar(value=str(persisted.get("proxies_path") or ""))
     var_threads = tk.IntVar(value=_threads_default)
     var_grid_cols = tk.IntVar(value=_grid_cols_default)
+    var_grid_rows = tk.IntVar(value=_grid_rows_default)
     var_headless = tk.BooleanVar(value=bool(persisted.get("headless", False)))
     var_profile = tk.StringVar(value=str(persisted.get("profile") or "normal"))
     try:
@@ -584,9 +590,11 @@ def build_human_interaction_tab(
     )
     cfg_login.grid(row=2, column=0, sticky="ew", pady=(0, 6))
     ttk.Label(cfg_login, text="Luồng", font=_FONT_UI).grid(row=0, column=0, sticky="w", padx=(0, 4))
-    ttk.Spinbox(cfg_login, from_=1, to=16, textvariable=var_threads, width=5).grid(row=0, column=1, sticky="w")
-    ttk.Label(cfg_login, text="Cột lưới", font=_FONT_UI).grid(row=0, column=2, sticky="w", padx=(12, 4))
+    ttk.Spinbox(cfg_login, from_=1, to=24, textvariable=var_threads, width=5).grid(row=0, column=1, sticky="w")
+    ttk.Label(cfg_login, text="Cột", font=_FONT_UI).grid(row=0, column=2, sticky="w", padx=(12, 4))
     ttk.Spinbox(cfg_login, from_=1, to=8, textvariable=var_grid_cols, width=4).grid(row=0, column=3, sticky="w")
+    ttk.Label(cfg_login, text="Hàng", font=_FONT_UI).grid(row=0, column=4, sticky="w", padx=(12, 4))
+    ttk.Spinbox(cfg_login, from_=0, to=4, textvariable=var_grid_rows, width=4).grid(row=0, column=5, sticky="w")
     lbl_grid_hint = ttk.Label(cfg_login, text="", font=_FONT_HINT, foreground="#555", wraplength=720)
     lbl_grid_hint.grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
@@ -625,7 +633,11 @@ def build_human_interaction_tab(
         row=0, column=2, sticky="w", padx=(12, 0)
     )
     ttk.Label(cfg_interaction, text="Luồng", font=_FONT_UI).grid(row=0, column=3, sticky="w", padx=(12, 4))
-    ttk.Spinbox(cfg_interaction, from_=1, to=16, textvariable=var_threads, width=5).grid(row=0, column=4, sticky="w")
+    ttk.Spinbox(cfg_interaction, from_=1, to=24, textvariable=var_threads, width=5).grid(row=0, column=4, sticky="w")
+    ttk.Label(cfg_interaction, text="Cột", font=_FONT_UI).grid(row=0, column=5, sticky="w", padx=(12, 4))
+    ttk.Spinbox(cfg_interaction, from_=1, to=8, textvariable=var_grid_cols, width=4).grid(row=0, column=6, sticky="w")
+    ttk.Label(cfg_interaction, text="Hàng", font=_FONT_UI).grid(row=0, column=7, sticky="w", padx=(8, 4))
+    ttk.Spinbox(cfg_interaction, from_=0, to=4, textvariable=var_grid_rows, width=4).grid(row=0, column=8, sticky="w")
     ttk.Label(cfg_interaction, text="Like %", font=_FONT_UI).grid(row=1, column=0, sticky="w", pady=(6, 0))
     ttk.Spinbox(cfg_interaction, from_=0, to=100, textvariable=var_like_pct, width=5).grid(
         row=1, column=1, sticky="w", pady=(6, 0)
@@ -643,13 +655,14 @@ def build_human_interaction_tab(
     ttk.Label(
         cfg_interaction,
         text=(
-            "Like/Comment = tỷ lệ trên số lần cuộn bảng tin. Profile «fast» nhanh hơn «normal». "
-            "«Luồng» = số TK chạy song song; các TK còn lại tự vào hàng đợi."
+            "Like/Comment = tỷ lệ trên số lần cuộn bảng tin. "
+            "Cột 6 và Hàng 3 = 18 cửa sổ nhỏ chạy cùng lúc. Hàng 0 thì tự chia. "
+            "«Luồng» theo cột × hàng; tài khoản còn lại vào hàng đợi."
         ),
         font=_FONT_HINT,
         foreground="#64748b",
         wraplength=720,
-    ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ).grid(row=2, column=0, columnspan=9, sticky="w", pady=(4, 0))
 
     interaction_toolbar = ttk.LabelFrame(
         interaction_inner, text="Thao tác tương tác", padding=6, style="Human.TLabelframe"
@@ -869,6 +882,7 @@ def build_human_interaction_tab(
             "proxies_text": txt_px.get("1.0", tk.END).strip(),
             "threads": max(1, int(var_threads.get())),
             "grid_cols": max(1, min(8, int(var_grid_cols.get()))),
+            "grid_rows": max(0, min(4, int(var_grid_rows.get()))),
             "headless": bool(var_headless.get()),
             "profile": var_profile.get().strip().lower() or "normal",
             "like_rate_pct": max(0, min(100, int(var_like_pct.get()))),
@@ -1115,6 +1129,13 @@ def build_human_interaction_tab(
         except (TypeError, ValueError, tk.TclError):
             return 4
 
+    def _grid_rows_value() -> int:
+        """0 = tự chia hàng. 3 với 6 cột thì thành 3 hàng, 18 cửa sổ."""
+        try:
+            return max(0, min(4, int(var_grid_rows.get())))
+        except (TypeError, ValueError, tk.TclError):
+            return 0
+
     def _max_capture_windows() -> int:
         return max(1, int(var_threads.get()))
 
@@ -1124,7 +1145,7 @@ def build_human_interaction_tab(
     def _allocate_capture_slots(need: int) -> list[GridWindowSlot]:
         """Cấp ``need`` ô lưới trống cho mở trình duyệt thủ công."""
         mc = _max_capture_windows()
-        slots = compute_grid_layout(mc, max_cols=_grid_cols_value())
+        slots = compute_grid_layout(mc, max_cols=_grid_cols_value(), rows=_grid_rows_value() or None)
         used = set((state.get("capture_slot_by_account") or {}).values())
         free = [s for s in slots if s.index not in used]
         return free[: max(0, int(need))]
@@ -2181,8 +2202,9 @@ def build_human_interaction_tab(
     def _refresh_grid_hint() -> None:
         mc = max(1, int(var_threads.get()))
         gc = _grid_cols_value()
+        gr = _grid_rows_value()
         sw, sh = get_screen_resolution()
-        slots = compute_grid_layout(mc, max_cols=gc)
+        slots = compute_grid_layout(mc, max_cols=gc, rows=gr or None)
         if slots:
             s0 = slots[0]
             cols = s0.col + 1 if slots else gc
@@ -2192,7 +2214,8 @@ def build_human_interaction_tab(
             lbl_grid_hint.configure(
                 text=(
                     f"Lưới góc trên-trái màn {sw}×{sh}: tối đa {len(slots)} cửa sổ "
-                    f"({cols} cột), ~{s0.width}×{s0.height}px/ô — ô 1 @ ({s0.x},{s0.y}). "
+                    f"({cols} cột × {max(s.row for s in slots) + 1} hàng), "
+                    f"~{s0.width}×{s0.height}px/ô — ô 1 @ ({s0.x},{s0.y}). "
                     f"Mở thủ công: {active}/{mc}. "
                     f"Cần {mc} proxy khác nhau cho {mc} luồng."
                 )
@@ -2461,6 +2484,7 @@ def build_human_interaction_tab(
             auto_profile=auto_profile and not login_only,
             login_only=login_only,
             max_cols=_grid_cols_value(),
+            max_rows=_grid_rows_value(),
             on_status=_on_status,
         )
         state["pool_generation"] = int(state.get("pool_generation") or 0) + 1
@@ -4434,9 +4458,23 @@ def build_human_interaction_tab(
     def _on_grid_settings_changed(*_args: object) -> None:
         _refresh_grid_hint()
 
+    def _sync_threads_from_grid(*_args: object) -> None:
+        """Cột × hàng thành số tài khoản chạy cùng lúc. Hàng 0 thì giữ số luồng đang đặt."""
+        rows = _grid_rows_value()
+        if rows >= 1:
+            target = max(1, min(24, _grid_cols_value() * rows))
+            try:
+                current = int(var_threads.get())
+            except (TypeError, ValueError, tk.TclError):
+                current = 0
+            if current != target:
+                var_threads.set(target)
+        _refresh_grid_hint()
+
     try:
         var_threads.trace_add("write", _on_grid_settings_changed)
-        var_grid_cols.trace_add("write", _on_grid_settings_changed)
+        var_grid_cols.trace_add("write", _sync_threads_from_grid)
+        var_grid_rows.trace_add("write", _sync_threads_from_grid)
     except tk.TclError:
         pass
     def _fit_wrap(label: tk.Label, width: int) -> None:

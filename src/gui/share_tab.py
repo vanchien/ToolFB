@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
@@ -12,6 +14,15 @@ from src.services.facebook_groups.engine import GroupEngine, parse_group_uids
 from src.services.facebook_groups.video_engage import clamp_reel_seconds, optional_watch_bounds
 from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
 from src.services.facebook_groups.fingerprint import normalize_share_images
+from src.services.facebook_groups.share_schedule import (
+    PlannedShareLink,
+    compose_clock,
+    hour_choices,
+    machine_clock_text,
+    make_queue_item,
+    minute_choices,
+    queue_state_from_results,
+)
 from src.services.facebook_groups.store import GroupStore
 
 def describe_page_jobs(jobs: list[dict[str, Any]], paused_note: str = "") -> tuple[str, str, str]:
@@ -58,6 +69,10 @@ class ShareTab:
         self.image_paths: list[str] = []
         self.batch_ids: list[str] = []
         self._running = False
+        self._cancel_schedule = threading.Event()
+        self._queue: list[PlannedShareLink] = []
+        self._queue_lock = threading.Lock()
+        self._queue_seq = 0
         self._build()
         self.reload_pages()
 
@@ -76,37 +91,72 @@ class ShareTab:
         form.columnconfigure(1, weight=1)
         ttk.Label(form, text="Link bài").grid(row=0, column=0, sticky="w")
         self.source_url = tk.StringVar()
-        ttk.Entry(form, textvariable=self.source_url).grid(row=0, column=1, columnspan=3, sticky="ew")
-        ttk.Label(form, text="Nội dung lên Page").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=self.source_url).grid(row=0, column=1, sticky="ew")
+        ttk.Label(form, text="Giờ").grid(row=0, column=2, sticky="e", padx=(8, 4))
+        clock = ttk.Frame(form)
+        clock.grid(row=0, column=3, sticky="w")
+        self.clock_hour = tk.StringVar()
+        self.clock_minute = tk.StringVar(value="00")
+        self.machine_clock = tk.StringVar()
+        self.hour_box = ttk.Combobox(
+            clock,
+            textvariable=self.clock_hour,
+            width=4,
+            state="readonly",
+            values=hour_choices(),
+        )
+        self.hour_box.pack(side=tk.LEFT)
+        self.hour_box.bind("<Button-1>", lambda _event: self._sync_hour_choices())
+        ttk.Label(clock, text=":").pack(side=tk.LEFT, padx=2)
+        ttk.Combobox(
+            clock,
+            textvariable=self.clock_minute,
+            width=4,
+            state="readonly",
+            values=minute_choices(),
+        ).pack(side=tk.LEFT)
+        ttk.Label(clock, textvariable=self.machine_clock).pack(side=tk.LEFT, padx=(8, 0))
+        self._sync_clock_to_machine()
+        add_row = ttk.Frame(form)
+        add_row.grid(row=1, column=1, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Button(add_row, text="Thêm vào list", command=self._add_scheduled).pack(side=tk.LEFT)
+        ttk.Button(add_row, text="Chia sẻ ngay", command=self._add_now).pack(side=tk.LEFT, padx=4)
+        ttk.Button(add_row, text="Xóa dòng", command=self._remove_queued).pack(side=tk.LEFT)
+        self.queue_tree = ttk.Treeview(form, columns=("when", "url", "state"), show="headings", height=4)
+        for key, title, width in (("when", "Giờ", 110), ("url", "Link chờ", 420), ("state", "Trạng thái", 110)):
+            self.queue_tree.heading(key, text=title)
+            self.queue_tree.column(key, width=width, stretch=(key == "url"))
+        self.queue_tree.grid(row=2, column=0, columnspan=4, sticky="ew", pady=4)
+        ttk.Label(form, text="Nội dung lên Page").grid(row=3, column=0, sticky="w", pady=4)
         self.caption = tk.StringVar()
-        ttk.Entry(form, textvariable=self.caption).grid(row=1, column=1, columnspan=3, sticky="ew")
-        ttk.Label(form, text="Bình luận").grid(row=2, column=0, sticky="nw")
-        self.comment_box = tk.Text(form, height=4, wrap="word", font=("Segoe UI", 9))
-        self.comment_box.grid(row=2, column=1, columnspan=3, sticky="ew", pady=4)
-        ttk.Label(form, text="Ảnh").grid(row=3, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.caption).grid(row=3, column=1, columnspan=3, sticky="ew")
+        ttk.Label(form, text="Bình luận").grid(row=4, column=0, sticky="nw")
+        self.comment_box = tk.Text(form, height=3, wrap="word", font=("Segoe UI", 9))
+        self.comment_box.grid(row=4, column=1, columnspan=3, sticky="ew", pady=4)
+        ttk.Label(form, text="Ảnh").grid(row=5, column=0, sticky="w")
         self.image_label = tk.StringVar(value="Chưa chọn ảnh")
         images = ttk.Frame(form)
-        images.grid(row=3, column=1, sticky="w")
+        images.grid(row=5, column=1, sticky="w")
         ttk.Button(images, text="Chọn ảnh", command=self._pick_images).pack(side=tk.LEFT)
         ttk.Label(images, textvariable=self.image_label).pack(side=tk.LEFT, padx=6)
         self.destination = tk.StringVar(value="page")
         dest = ttk.Frame(form)
-        dest.grid(row=4, column=1, columnspan=3, sticky="ew", pady=4)
+        dest.grid(row=6, column=1, columnspan=3, sticky="ew", pady=4)
         ttk.Radiobutton(dest, text="Lên Page của tôi", variable=self.destination, value="page", command=self._estimate).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Radiobutton(dest, text="Vào nhóm đã tham gia", variable=self.destination, value="joined", command=self._estimate).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Radiobutton(dest, text="Cả Page và nhóm", variable=self.destination, value="both", command=self._estimate).pack(side=tk.LEFT)
-        ttk.Label(form, text="List UID nhóm").grid(row=5, column=0, sticky="nw")
+        ttk.Label(form, text="List UID nhóm").grid(row=7, column=0, sticky="nw")
         self.group_uid_box = tk.Text(form, height=3, wrap="word", font=("Consolas", 9))
-        self.group_uid_box.grid(row=5, column=1, columnspan=3, sticky="ew", pady=4)
+        self.group_uid_box.grid(row=7, column=1, columnspan=3, sticky="ew", pady=4)
         self.group_uid_box.bind("<KeyRelease>", lambda _event: self._estimate())
         self.group_uid_count = tk.StringVar(value="Mỗi dòng một UID, hoặc cách nhau bằng dấu phẩy.")
-        ttk.Label(form, textvariable=self.group_uid_count).grid(row=6, column=1, columnspan=3, sticky="w")
+        ttk.Label(form, textvariable=self.group_uid_count).grid(row=8, column=1, columnspan=3, sticky="w")
         timing = ttk.Frame(form)
-        timing.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        timing.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         ttk.Label(timing, text="Lướt Reel (giây)").pack(side=tk.LEFT)
         self.reel_seconds = tk.StringVar(value="20")
         ttk.Entry(timing, textvariable=self.reel_seconds, width=5).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(timing, text="Xem từ (giây)").pack(side=tk.LEFT)
+        ttk.Label(timing, text="Xem từ (1–60 giây)").pack(side=tk.LEFT)
         self.watch_seconds = tk.StringVar(value="20")
         ttk.Entry(timing, textvariable=self.watch_seconds, width=6).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Label(timing, text="đến (giây)").pack(side=tk.LEFT)
@@ -116,15 +166,15 @@ class ShareTab:
         self.cooldown = tk.StringVar(value="30")
         ttk.Entry(timing, textvariable=self.cooldown, width=6).pack(side=tk.LEFT, padx=4)
         actions = ttk.Frame(form)
-        actions.grid(row=8, column=0, columnspan=4, sticky="w", pady=4)
+        actions.grid(row=10, column=0, columnspan=4, sticky="w", pady=4)
         ttk.Button(actions, text="Chia sẻ", command=self.start).pack(side=tk.LEFT)
         ttk.Button(actions, text="Dừng", command=self.stop).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Tiếp tục", command=self.resume).pack(side=tk.LEFT)
         self.status = tk.StringVar(
-            value="Tích page cần đăng. Ô để trống thì bỏ qua. Xem xong video rồi mới chia sẻ link lên page đã tích."
+            value="Chọn giờ trong khung 24 giờ của máy, rồi bấm Thêm vào list. Chia sẻ ngay thì vào list với chữ Ngay."
         )
         status_lbl = ttk.Label(form, textvariable=self.status, wraplength=360, justify=tk.LEFT)
-        status_lbl.grid(row=9, column=0, columnspan=4, sticky="ew")
+        status_lbl.grid(row=11, column=0, columnspan=4, sticky="ew")
 
         def _fit_status(_event: object = None) -> None:
             width = int(form.winfo_width() or 0)
@@ -404,13 +454,96 @@ class ShareTab:
             raise ValueError("Nghỉ giữa mỗi bài phải từ 0 giây")
         return seconds
 
+    def _clock_text(self) -> str:
+        """Giờ và phút đang chọn trên dropdown, theo đồng hồ máy."""
+        return compose_clock(self.clock_hour.get(), self.clock_minute.get())
+
+    def _sync_hour_choices(self) -> None:
+        """Xếp lại 24 giờ bắt đầu từ giờ máy hiện tại."""
+        selected = self.clock_hour.get()
+        choices = hour_choices()
+        self.hour_box.configure(values=choices)
+        if selected not in choices:
+            self.clock_hour.set(choices[0])
+        self.machine_clock.set(machine_clock_text())
+
+    def _sync_clock_to_machine(self) -> None:
+        """Đưa dropdown về đúng giờ và phút của máy."""
+        moment = datetime.now()
+        self._sync_hour_choices()
+        self.clock_hour.set(f"{moment.hour:02d}")
+        self.clock_minute.set(f"{moment.minute:02d}")
+
+    def _add_scheduled(self) -> None:
+        """Đưa link và giờ riêng vào list chờ."""
+        self._enqueue(immediate=False)
+
+    def _add_now(self) -> None:
+        """Đưa link vào list chờ để chia sẻ ngay, không cần giờ."""
+        self._enqueue(immediate=True)
+
+    def _remember_queue_item(self, item: PlannedShareLink) -> None:
+        """Gắn mã dòng rồi xếp theo giờ, link «Ngay» đứng trước giờ hẹn."""
+        self._queue_seq += 1
+        item.qid = f"q{self._queue_seq}"
+        with self._queue_lock:
+            self._queue.append(item)
+            self._queue.sort(key=lambda row: row.when)
+
+    def _enqueue(self, *, immediate: bool) -> None:
+        try:
+            item = make_queue_item(
+                self.source_url.get(),
+                self._clock_text(),
+                immediate=immediate,
+            )
+        except ValueError as exc:
+            messagebox.showwarning("List chờ", str(exc), parent=self.root)
+            return
+        self._remember_queue_item(item)
+        self.source_url.set("")
+        self._sync_clock_to_machine()
+        self._refresh_queue()
+        waiting = sum(1 for row in self._queue if row.state == "waiting")
+        self.status.set(f"Đã thêm vào list chờ. Còn {waiting} link.")
+
+    def _remove_queued(self) -> None:
+        """Bỏ link đang chọn khỏi list chờ nếu chưa chạy."""
+        picked = set(self.queue_tree.selection())
+        if not picked:
+            return
+        with self._queue_lock:
+            self._queue = [
+                item
+                for item in self._queue
+                if item.qid not in picked or item.state == "running"
+            ]
+        self._refresh_queue()
+
+    def _refresh_queue(self) -> None:
+        """Vẽ lại list chờ: giờ, link và trạng thái."""
+        labels = {
+            "waiting": "Đang chờ",
+            "running": "Đang chia sẻ",
+            "done": "Xong",
+            "partial": "Một phần",
+            "error": "Lỗi",
+            "skipped": "Bỏ qua",
+        }
+        with self._queue_lock:
+            rows = list(self._queue)
+        self.queue_tree.delete(*self.queue_tree.get_children())
+        for item in rows:
+            self.queue_tree.insert(
+                "",
+                tk.END,
+                iid=item.qid or item.label,
+                values=(item.label or item.when.strftime("%H:%M"), item.url, labels.get(item.state, item.state)),
+            )
+
     def start(self) -> None:
         if self._running:
             self.status.set("Đang chia sẻ. Bấm Dừng nếu muốn ngắt.")
-            return
-        url = self.source_url.get().strip()
-        if not url:
-            messagebox.showwarning("Thiếu link", "Dán link bài. Tool không tải video.", parent=self.root)
             return
         selected = self._selected_pages()
         if not selected:
@@ -421,8 +554,26 @@ class ShareTab:
             cooldown = self._cooldown_seconds()
             reel_seconds = clamp_reel_seconds(self.reel_seconds.get())
             watch_low, watch_high = optional_watch_bounds(self.watch_seconds.get(), self.watch_until.get())
+            if self.source_url.get().strip():
+                self._remember_queue_item(
+                    make_queue_item(
+                        self.source_url.get(),
+                        self._clock_text(),
+                        immediate=not self._clock_text().strip(),
+                    )
+                )
+                self.source_url.set("")
+                self._sync_clock_to_machine()
+                self._refresh_queue()
         except ValueError as exc:
             messagebox.showwarning("Chia sẻ", str(exc), parent=self.root)
+            return
+        if not any(item.state == "waiting" for item in self._queue):
+            messagebox.showwarning(
+                "Thiếu link",
+                "Thêm link vào list chờ, hoặc dán link rồi bấm Chia sẻ.",
+                parent=self.root,
+            )
             return
         place = self.destination.get()
         group_ids = parse_group_uids(self._group_uid_raw())
@@ -440,37 +591,113 @@ class ShareTab:
                 parent=self.root,
             )
             return
+        self.batch_ids = []
+        self._cancel_schedule.clear()
+        waiting = [item for item in self._queue if item.state == "waiting"]
+        first = min(waiting, key=lambda item: item.when)
         self._running = True
-        self.status.set("Đang xếp hàng…")
+        self.status.set(f"List chờ {len(waiting)} link. Link tới lượt lúc {first.label}.")
+
+        def _set_status(text: str) -> None:
+            schedule_on_main_thread(self.root, lambda text=text: self.status.set(text))
+
+        def _paint_queue() -> None:
+            schedule_on_main_thread(self.root, self._refresh_queue)
+
+        def _next_waiting() -> PlannedShareLink | None:
+            with self._queue_lock:
+                pending = [item for item in self._queue if item.state == "waiting"]
+            if not pending:
+                return None
+            return min(pending, key=lambda item: item.when)
+
+        def _wait_turn(item: PlannedShareLink) -> bool:
+            """Chờ đúng giờ của link này. Link mới sớm hơn thì nhường lượt."""
+            noted_at = 0.0
+            while True:
+                if self._cancel_schedule.is_set() or item.state != "waiting":
+                    return False
+                sooner = _next_waiting()
+                if sooner is not item:
+                    return False
+                left = (item.when - datetime.now()).total_seconds()
+                if left <= 0:
+                    with self._queue_lock:
+                        if item not in self._queue or item.state != "waiting":
+                            return False
+                        item.state = "running"
+                    return True
+                now_s = time.monotonic()
+                if now_s - noted_at >= 5:
+                    noted_at = now_s
+                    pending_left = sum(1 for row in self._queue if row.state == "waiting")
+                    if left >= 60:
+                        remain = f"còn khoảng {max(1, int(left // 60))} phút"
+                    else:
+                        remain = f"còn {max(1, int(left))} giây"
+                    _set_status(f"Chờ {item.label} — {remain}. List còn {pending_left} link.")
+                time.sleep(min(1.0, left))
 
         def _work() -> None:
             try:
-                result = self.engine.create_share_wave(
-                    pages=selected,
-                    source_url=url,
-                    text=self.caption.get().strip(),
-                    image_paths=images,
-                    destination=place,
-                    group_ids=group_ids,
-                    cooldown_fixed=cooldown,
-                    watch_seconds=watch_low,
-                    watch_max_seconds=watch_high,
-                    reel_seconds=reel_seconds,
-                    comment=self._comment_raw(),
-                )
-                self.batch_ids = list(result.get("batch_ids") or [])
-                created = int(result.get("created") or 0)
-                accounts = int(result.get("accounts") or 0)
-                schedule_on_main_thread(
-                    self.root,
-                    lambda: self.status.set(f"Đã xếp {created} bài trên {accounts} tài khoản. Đang gửi…"),
-                )
-                schedule_on_main_thread(self.root, self._fill_results)
-                if created:
-                    self.engine.run_share_wave(self.batch_ids)
+                while True:
+                    item = _next_waiting()
+                    if item is None:
+                        return
+                    if not _wait_turn(item):
+                        if self._cancel_schedule.is_set():
+                            _set_status("Đã dừng. Link chưa tới giờ vẫn nằm trong list chờ.")
+                            return
+                        continue
+                    item.state = "running"
+                    _paint_queue()
+                    pending_left = sum(1 for row in self._queue if row.state == "waiting")
+                    _set_status(f"{item.label} — đang chia sẻ. Còn {pending_left} link trong list.")
+                    result = self.engine.create_share_wave(
+                        pages=selected,
+                        source_url=item.url,
+                        text=self.caption.get().strip(),
+                        image_paths=images,
+                        destination=place,
+                        group_ids=group_ids,
+                        cooldown_fixed=cooldown,
+                        watch_seconds=watch_low,
+                        watch_max_seconds=watch_high,
+                        reel_seconds=reel_seconds,
+                        comment=self._comment_raw(),
+                    )
+                    ids = list(result.get("batch_ids") or [])
+                    self.batch_ids.extend(ids)
+                    schedule_on_main_thread(self.root, self._fill_results)
+                    if ids and not self._cancel_schedule.is_set():
+                        self.engine.run_share_wave(ids)
+                    jobs = [
+                        str(row.get("status") or "")
+                        for row in self.store.share_jobs()
+                        if str(row.get("batch_id") or "") in set(ids)
+                    ]
+                    paused = any(
+                        str(row.get("status") or "") == "PAUSED"
+                        for row in self.store.share_batches()
+                        if str(row.get("id") or "") in set(ids)
+                    )
+                    item.state = queue_state_from_results(
+                        created=int(result.get("created") or 0),
+                        job_statuses=jobs,
+                        paused=paused,
+                        cancelled=self._cancel_schedule.is_set(),
+                    )
+                    _paint_queue()
+                    if self._cancel_schedule.is_set():
+                        _set_status("Đã dừng. Link chưa tới giờ vẫn nằm trong list chờ.")
+                        return
             except Exception as exc:  # noqa: BLE001
+                for queued in self._queue:
+                    if queued.state == "running":
+                        queued.state = "waiting"
+                _paint_queue()
                 message = str(exc)
-                schedule_on_main_thread(self.root, lambda message=message: self.status.set(f"Lỗi chia sẻ: {message}"))
+                _set_status(f"Lỗi chia sẻ: {message}")
             finally:
                 self._running = False
                 schedule_on_main_thread(self.root, self._fill_results)
@@ -479,12 +706,13 @@ class ShareTab:
         threading.Thread(target=_work, name="share-wave", daemon=True).start()
 
     def stop(self) -> None:
+        self._cancel_schedule.set()
         for batch_id in list(self.batch_ids):
             try:
                 self.engine.pause(batch_id)
             except Exception:  # noqa: BLE001
                 continue
-        self.status.set("Sẽ dừng sau bài đang gửi. Bấm Tiếp tục để chạy nốt hàng chờ.")
+        self.status.set("Đã dừng lịch. Bài đang gửi sẽ dừng sau bước hiện tại.")
 
     def resume(self) -> None:
         if self._running or not self.batch_ids:
@@ -503,7 +731,7 @@ class ShareTab:
         threading.Thread(target=_work, name="share-wave-resume", daemon=True).start()
 
     def _finish_status(self) -> None:
-        if self._running:
+        if self._running or self._cancel_schedule.is_set():
             return
         self.status.set(self.outcome.get())
 

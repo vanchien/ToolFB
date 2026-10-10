@@ -8,6 +8,13 @@ from typing import Any, Callable
 _PLAY_LABELS = ("play", "phát", "play video", "phát video")
 _COMMENT_HINTS = ("comment", "bình luận", "binh luan", "viết bình luận", "write a comment")
 _COMMENT_SUBMIT = ("comment", "bình luận", "đăng bình luận", "post comment")
+_VIDEO_SHARE = ("share", "chia sẻ", "chia se")
+_SHARE_SKIP = ("story", "tin", "messenger", "whatsapp", "copy", "sao chép", "like", "thích", "comment", "bình luận")
+_PAGE_SHARE = ("page", "trang", "feed", "bảng tin", "share now", "chia sẻ ngay")
+_GROUP_SHARE = ("group", "nhóm", "nhom")
+_SHARE_CONFIRM = ("post", "đăng", "đăng bài")
+_SHARE_CONFIRM_ALT = ("share now", "chia sẻ ngay")
+_POST_AS = ("post as", "posting as", "đăng với tư cách", "đăng dưới tên")
 
 
 def parse_comment_lines(raw: str) -> list[str]:
@@ -82,14 +89,14 @@ def optional_watch_bounds(low_raw: object, high_raw: object) -> tuple[int, int]:
 
 
 def clamp_watch_bounds(low_raw: object, high_raw: object) -> tuple[int, int]:
-    """Khoảng giây xem video. Mỗi page nhận một số ngẫu nhiên trong khoảng này, tối đa 30 phút."""
+    """Khoảng giây xem video nguồn. Random trong khoảng người dùng đặt, từ 1 giây đến 1 phút."""
     try:
         low = int(str(low_raw if low_raw is not None else "").strip())
         high = int(str(high_raw if high_raw is not None else "").strip())
     except ValueError as exc:
-        raise ValueError("Thời gian xem video phải là số giây từ 5 đến 1800") from exc
-    if low < 5 or high < 5 or low > 1800 or high > 1800:
-        raise ValueError("Thời gian xem video phải từ 5 giây đến 30 phút")
+        raise ValueError("Thời gian xem video phải là số giây từ 1 đến 60") from exc
+    if low < 1 or high < 1 or low > 60 or high > 60:
+        raise ValueError("Thời gian xem video phải từ 1 giây đến 1 phút")
     if high < low:
         raise ValueError("Số giây xem đến phải lớn hơn hoặc bằng số giây bắt đầu")
     return low, high
@@ -201,6 +208,71 @@ def engage_source_video(
     return {"error_code": "", "watched_seconds": int(watch_seconds), "commented": True}
 
 
+def share_open_video(
+    page: Any,
+    *,
+    kind: str,
+    target_id: str = "",
+    target_name: str = "",
+    caption: str = "",
+) -> dict[str, Any]:
+    """Bấm nút chia sẻ ngay trên video đang mở, rồi gửi lên Page hoặc một nhóm.
+
+    Không mở tường Page để dán link thành bài mới. Video nguồn chính là bài được chia sẻ.
+    """
+    blocked = _session_block(page)
+    if blocked:
+        return {"error_code": blocked, "post_id": ""}
+    _close_share_sheet(page)
+    if _click_video_share(page) is None:
+        return {
+            "error_code": "TIMEOUT",
+            "post_id": "",
+            "error_message": "Chưa thấy nút chia sẻ trên video",
+        }
+    _pause(page, 500)
+    specific = ("page", "trang") if kind == "page" else _GROUP_SHARE
+    hints = _PAGE_SHARE if kind == "page" else _GROUP_SHARE
+    option = _click_share_option(page, specific) or _click_share_option(page, hints)
+    if option is None:
+        return {
+            "error_code": "TIMEOUT",
+            "post_id": "",
+            "error_message": "Chưa thấy Page hoặc nhóm trong hộp chia sẻ",
+        }
+    _pause(page, 400)
+    token = str(target_id or "").strip()
+    name = str(target_name or "").strip()
+    if kind == "page":
+        if (name or token) and not _choose_page(page, name, token):
+            _close_share_sheet(page)
+            return {
+                "error_code": "TIMEOUT",
+                "post_id": "",
+                "error_message": f"Chưa thấy Page {name or token} trong hộp chia sẻ",
+            }
+    elif (name or token) and not _pick_share_target(page, token, name):
+        _close_share_sheet(page)
+        return {
+            "error_code": "TIMEOUT",
+            "post_id": "",
+            "error_message": f"Chưa thấy nhóm {name or token} trong hộp chia sẻ",
+        }
+    note = str(caption or "").strip()
+    if note:
+        _type_share_caption(page, note)
+    if not _confirm_share(page):
+        _close_share_sheet(page)
+        return {
+            "error_code": "TIMEOUT",
+            "post_id": "",
+            "error_message": "Chưa bấm được nút gửi trong hộp chia sẻ",
+        }
+    _pause(page, 600)
+    _close_share_sheet(page)
+    return {"error_code": "", "post_id": f"{token or 'page'}-share", "post_url": str(getattr(page, "url", "") or "")}
+
+
 def _label(item: Any) -> str:
     """Nhãn nút hoặc ô nhập. Ưu tiên aria-label vì nút phát thường không có chữ."""
     for reader in (
@@ -214,6 +286,164 @@ def _label(item: Any) -> str:
         if text:
             return text
     return ""
+
+
+def _pause(page: Any, millis: int) -> None:
+    try:
+        page.wait_for_timeout(millis)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _is_video_share(label: str) -> bool:
+    """Nút chia sẻ của video, không phải mục «Share to…» trong hộp thoại."""
+    if not label or any(word in label for word in _SHARE_SKIP):
+        return False
+    if label in _VIDEO_SHARE:
+        return True
+    if any(hint in label for hint in (" to ", " lên ", " với ", "now", "ngay", "feed", "group", "nhóm", "page", "trang")):
+        return False
+    words = label.split()
+    return bool(words) and words[0] in _VIDEO_SHARE and len(label) <= 32
+
+
+def _click_video_share(page: Any) -> Any | None:
+    """Nút Share/Chia sẻ của video đang xem. Bỏ story, messenger và nút like."""
+    for item in _visible_role_items(page, "button", limit=40):
+        if not _is_video_share(_label(item)):
+            continue
+        try:
+            item.click(timeout=3_000)
+            return item
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _click_share_option(page: Any, hints: tuple[str, ...]) -> Any | None:
+    """Chọn Page hoặc nhóm trong hộp vừa mở. Không bấm lại nút chia sẻ của video."""
+    for role in ("menuitem", "button", "link", "option"):
+        for item in _visible_role_items(page, role, limit=40):
+            label = _label(item)
+            if not label or _is_video_share(label) or any(word in label for word in _SHARE_SKIP):
+                continue
+            if not any(hint in label for hint in hints):
+                continue
+            try:
+                item.click(timeout=3_000)
+                return item
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
+def _choose_page(page: Any, name: str, token: str) -> bool:
+    """Chọn Page của mình trong hộp. Bấm tên Page hoặc dòng «Đăng với tư cách»."""
+    if _click_named(page, name, token):
+        return True
+    for item in _visible_role_items(page, "button", limit=40):
+        label = _label(item)
+        if not any(hint in label for hint in _POST_AS):
+            continue
+        try:
+            item.click(timeout=3_000)
+        except Exception:  # noqa: BLE001
+            return False
+        _pause(page, 400)
+        return _click_named(page, name, token)
+    return False
+
+
+def _click_named(page: Any, name: str, token: str) -> bool:
+    for needle in (name.casefold(), token.casefold()):
+        if needle and _click_labeled_target(page, needle):
+            return True
+    return False
+
+
+def _pick_share_target(page: Any, token: str, name: str = "") -> bool:
+    """Chọn nhóm theo tên, rồi theo UID. Có ô tìm thì gõ tên nhóm."""
+    if _click_named(page, name, token):
+        return True
+    box = _share_textbox(page)
+    query = name or token
+    if box is None or not query:
+        return False
+    try:
+        box.click(timeout=3_000)
+        box.type(query, delay=30)
+        page.wait_for_timeout(700)
+    except Exception:  # noqa: BLE001
+        return False
+    return _click_named(page, name, token)
+
+
+def _close_share_sheet(page: Any) -> None:
+    """Đóng hộp chia sẻ còn mở để lần gửi sau bấm lại được nút trên video."""
+    labels = [_label(item) for item in _visible_role_items(page, "button", limit=40)]
+    open_sheet = any(label in {"close", "đóng"} or "share now" in label or "share to" in label for label in labels)
+    if not open_sheet:
+        return
+    keyboard = getattr(page, "keyboard", None)
+    if keyboard is None:
+        return
+    try:
+        keyboard.press("Escape")
+    except Exception:  # noqa: BLE001
+        return
+    _pause(page, 200)
+
+
+def _click_labeled_target(page: Any, needle: str) -> bool:
+    for role in ("option", "button", "link", "menuitem"):
+        for item in _visible_role_items(page, role, limit=30):
+            label = _label(item)
+            if needle and needle in label and label not in _VIDEO_SHARE:
+                try:
+                    item.click(timeout=3_000)
+                    return True
+                except Exception:  # noqa: BLE001
+                    return False
+    return False
+
+
+def _share_textbox(page: Any) -> Any | None:
+    """Ô trong hộp chia sẻ. Không dùng ô bình luận dưới video."""
+    for item in _visible_role_items(page, "textbox", limit=12):
+        label = _label(item)
+        if any(hint in label for hint in _COMMENT_HINTS):
+            continue
+        return item
+    return None
+
+
+def _type_share_caption(page: Any, text: str) -> None:
+    """Gõ nội dung kèm theo trong hộp chia sẻ. Link video không cần dán lại."""
+    box = _share_textbox(page)
+    if box is None:
+        return
+    try:
+        box.click(timeout=3_000)
+        box.type(text, delay=30)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _confirm_share(page: Any) -> bool:
+    """Bấm Đăng hoặc Chia sẻ ngay trong hộp. Không bấm lại nút Share của video."""
+    buttons = _visible_role_items(page, "button", limit=40)
+    preferred = [item for item in buttons if _label(item) in _SHARE_CONFIRM]
+    alternate = [item for item in buttons if _label(item) in _SHARE_CONFIRM_ALT]
+    plain = [item for item in buttons if _label(item) in _VIDEO_SHARE]
+    target = preferred[0] if preferred else (alternate[-1] if alternate else (plain[-1] if len(plain) > 1 else None))
+    if target is None:
+        return False
+    try:
+        target.click(timeout=3_000)
+        page.wait_for_timeout(400)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _press_play(page: Any) -> None:
@@ -286,6 +516,21 @@ def _comment_box(page: Any) -> Any | None:
     for item in _visible_role_items(page, "textbox", limit=12):
         if any(hint in _label(item) for hint in _COMMENT_HINTS):
             return item
+    locator = getattr(page, "locator", None)
+    if locator is None:
+        return None
+    try:
+        nodes = locator("[contenteditable='true']")
+        count = min(nodes.count(), 6)
+    except Exception:  # noqa: BLE001
+        return None
+    for index in range(count):
+        item = nodes.nth(index)
+        try:
+            if item.is_visible():
+                return item
+        except Exception:  # noqa: BLE001
+            continue
     return None
 
 

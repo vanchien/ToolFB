@@ -99,6 +99,7 @@ class HumanInteractionPool:
         auto_profile: bool = False,
         login_only: bool = False,
         max_cols: int = 4,
+        max_rows: int = 0,
         on_status: StatusCallback | None = None,
         on_done: DoneCallback | None = None,
     ) -> None:
@@ -119,7 +120,11 @@ class HumanInteractionPool:
         self._proxy_lock = threading.Lock()
         self._account_lock = threading.Lock()
         self._work_q: queue.Queue[MappedAccount | None] = queue.Queue()
-        self._grid_slots = compute_grid_layout(self._max_concurrent, max_cols=max(1, int(max_cols)))
+        self._grid_slots = compute_grid_layout(
+            self._max_concurrent,
+            max_cols=max(1, int(max_cols)),
+            rows=int(max_rows) if int(max_rows) > 0 else None,
+        )
         self._state_lock = threading.Lock()
         self._state_cv = threading.Condition(self._state_lock)
         self._running = 0

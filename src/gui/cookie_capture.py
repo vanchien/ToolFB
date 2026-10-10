@@ -181,6 +181,8 @@ def run_fb_cookie_capture_dialog(
         pass
     tip.geometry("520x240")
     tip.minsize(440, 200)
+    if browse_only:
+        tip.withdraw()
 
     def _fit_tip_window() -> None:
         """Co giãn chiều cao hộp thoại — tránh nhãn dài che mất hàng nút."""
@@ -192,13 +194,14 @@ def run_fb_cookie_capture_dialog(
         except tk.TclError:
             pass
 
-    try:
-        tip.lift()
-        tip.attributes("-topmost", True)
-        tip.after(350, lambda: tip.attributes("-topmost", False))
-        tip.focus_force()
-    except tk.TclError:
-        pass
+    if not browse_only:
+        try:
+            tip.lift()
+            tip.attributes("-topmost", True)
+            tip.after(350, lambda: tip.attributes("-topmost", False))
+            tip.focus_force()
+        except tk.TclError:
+            pass
 
     def send(cmd: str) -> None:
         action_holder.append(cmd)
@@ -542,7 +545,8 @@ def run_fb_cookie_capture_dialog(
             err_msg = err_holder[0]
             if on_launch_failed is not None:
                 on_launch_failed(err_msg)
-            messagebox.showerror("Trình duyệt", err_msg, parent=parent)
+            if not browse_only:
+                messagebox.showerror("Trình duyệt", err_msg, parent=parent)
         elif action_holder and action_holder[-1] == "save":
             extra = success_detail[0] if success_detail else "Đã xác nhận vào tài khoản"
             messagebox.showinfo(

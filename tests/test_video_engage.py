@@ -13,6 +13,7 @@ from src.services.facebook_groups.video_engage import (
     clamp_watch_max_minutes,
     clamp_watch_seconds,
     engage_source_video,
+    share_open_video,
     optional_watch_bounds,
     parse_comment_lines,
     pick_page_watch_seconds,
@@ -186,7 +187,12 @@ def test_blank_watch_fields_are_skipped() -> None:
 
 
 def test_watch_bounds_are_random_per_page() -> None:
+    assert clamp_watch_bounds("1", "60") == (1, 60)
     assert clamp_watch_bounds("20", "60") == (20, 60)
+    with pytest.raises(ValueError):
+        clamp_watch_bounds("0", "30")
+    with pytest.raises(ValueError):
+        clamp_watch_bounds("1", "61")
     assert clamp_reel_seconds("0") == 0
     assert clamp_reel_seconds("20") == 20
     with pytest.raises(ValueError):
@@ -196,6 +202,61 @@ def test_watch_bounds_are_random_per_page() -> None:
     drawn = {pick_page_watch_seconds(10, 25, random.Random(seed)) for seed in range(6)}
     assert drawn <= set(range(10, 26))
     assert len(drawn) > 1
+
+
+def test_share_now_picks_the_page_name_and_not_the_video_button() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    video_share = _Control("Share this reel")
+    share_now = _Control("Share now")
+    page_row = _Control("Cửa hàng")
+    post = _Control("Post")
+    page._roles = {
+        "button": [video_share, share_now, page_row, post],
+        "textbox": [_Control("Say something")],
+        "menuitem": [],
+    }
+    sent = share_open_video(page, kind="page", target_id="111", target_name="Cửa hàng", caption="Lên page")
+    assert sent["error_code"] == ""
+    assert video_share.clicked is True
+    assert share_now.clicked is True
+    assert page_row.clicked is True
+    assert post.clicked is True
+    assert page.keyboard.keys[-1] == "Escape"
+
+
+def test_share_button_on_the_video_goes_to_page_then_group() -> None:
+    page = _Page("https://www.facebook.com/watch/?v=9")
+    share = _Control("Share")
+    to_page = _Control("Share to a Page")
+    own_page = _Control("page-1 Cửa hàng")
+    post = _Control("Post")
+    to_group = _Control("Share to a group")
+    group = _Control("Nhóm g-ok")
+    comment = _Control("Write a comment")
+    caption = _Control("Say something about this")
+    page._roles = {
+        "button": [page.like, share, to_page, own_page, to_group, group, post],
+        "textbox": [comment, caption],
+        "menuitem": [],
+    }
+    sent = share_open_video(page, kind="page", target_id="page-1", caption="Lên page")
+    assert sent["error_code"] == ""
+    assert share.clicked is True
+    assert to_page.clicked is True
+    assert own_page.clicked is True
+    assert post.clicked is True
+    assert page.like.clicked is False
+    assert caption.typed == "Lên page"
+    assert comment.typed == ""
+    share.clicked = False
+    post.clicked = False
+    caption.typed = ""
+    sent_group = share_open_video(page, kind="group", target_id="g-ok", caption="Vào nhóm")
+    assert sent_group["error_code"] == ""
+    assert to_group.clicked is True
+    assert group.clicked is True
+    assert post.clicked is True
+    assert caption.typed == "Vào nhóm"
 
 
 def test_browse_reels_moves_down_without_clicking() -> None:

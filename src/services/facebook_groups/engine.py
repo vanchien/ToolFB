@@ -645,6 +645,8 @@ class GroupEngine:
                         "error_code": "",
                         "error_message": "",
                         "fingerprint": share_fingerprint(page_id, group_id, source_url, text, images),
+                        "page_name": str(page.get("page_name") or ""),
+                        "group_name": self._group_name(group_id),
                         "watch_seconds": page_watch[watch_key],
                         "started_at": "",
                         "finished_at": "",
@@ -782,6 +784,16 @@ class GroupEngine:
             chosen.append(group_id)
         return {"group_ids": chosen, "skipped": skipped}
 
+    def _group_name(self, group_id: str) -> str:
+        """Tên nhóm đã quét, để ô tìm trong hộp chia sẻ chọn đúng nhóm."""
+        token = str(group_id or "").strip()
+        if not token:
+            return ""
+        for row in self.store.groups():
+            if str(row.get("group_id") or "") == token:
+                return str(row.get("group_name") or "").strip()
+        return ""
+
     def _joined_group_ids(self, account_id: str, page_id: str) -> list[str]:
         found: list[str] = []
         for row in self.store.load().get("memberships") or []:
@@ -872,7 +884,7 @@ class GroupEngine:
         """Xem video theo số giây của page này, rồi mới chia sẻ. True khi phải dừng."""
         batch = self._batch(batch_id)
         watched = [str(item) for item in (batch.get("watched_page_ids") or [])]
-        already = page_id in watched
+        already = bool(batch.get("source_watched")) or page_id in watched
         comment = str(batch.get("comment") or "").strip()
         need_comment = bool(comment) and not batch.get("source_commented")
         if already and not need_comment:
@@ -915,10 +927,10 @@ class GroupEngine:
             return True
         if need_comment:
             batch["source_commented"] = True
-            self._note("Đã bình luận dưới video. Đang chia sẻ link.")
+            self._note("Đã bình luận. Đang bấm nút chia sẻ trên video.")
         else:
             batch["source_commented"] = True
-            self._note(f"Đã xem {seconds} giây. Đang chia sẻ link.")
+            self._note(f"Đã xem {seconds} giây. Đang bấm nút chia sẻ trên video.")
         batch["source_prepared"] = True
         batch["watch_note"] = ""
         self.store.save_share_batch(batch)
@@ -1017,7 +1029,7 @@ class GroupEngine:
             job["started_at"] = job.get("started_at") or _now()
             self.store.save_share_job(job)
             where = "Page" if str(job.get("destination") or "") == "page" else (group_id or "nhóm")
-            self._note(f"Đang gửi {page_id} → {where}")
+            self._note(f"Đang bấm chia sẻ trên video → {where}")
             published = self._call(
                 "publish_link",
                 account_id=account_id,
@@ -1027,6 +1039,8 @@ class GroupEngine:
                 text=payload["text"],
                 image_paths=list(job.get("image_paths") or []),
                 target_url=str(job.get("target_url") or ""),
+                page_name=str(job.get("page_name") or ""),
+                group_name=str(job.get("group_name") or ""),
             )
             if self._hold_share(batch, job, published):
                 return job
@@ -1034,6 +1048,9 @@ class GroupEngine:
                 return self._complete_share(job, published)
             code = str(published.get("error_code") or "")
             if code in TEMPORARY_ERROR_CODES or code == "TIMEOUT":
+                message = str(published.get("error_message") or "")
+                if message:
+                    return self._retry_share(batch, job, code or "TIMEOUT", message)
                 job["status"] = SHARE_VERIFY_FIRST
                 job["error_code"] = code or "TIMEOUT"
                 self.store.save_share_job(job)

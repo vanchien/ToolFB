@@ -104,8 +104,8 @@ def grid_work_area(
 
 
 def _cell_height(wh: int, rows: int) -> int:
-    """Chiều cao mỗi ô — giới hạn để cửa sổ gọn, không full màn 1440px."""
-    per_row = max(400, int(wh) // max(1, rows))
+    """Chiều cao mỗi ô. Nhiều hàng thì ô thấp hơn để vừa màn hình."""
+    per_row = max(1, int(wh) // max(1, rows))
     cap = _env_int("FB_GRID_MAX_CELL_HEIGHT", 780)
     if cap <= 0:
         return per_row
@@ -118,6 +118,7 @@ def compute_grid_layout(
     screen_width: int | None = None,
     screen_height: int | None = None,
     max_cols: int | None = None,
+    rows: int | None = None,
 ) -> list[GridWindowSlot]:
     """
     Tính lưới cửa sổ cho ``thread_count`` luồng chạy đồng thời.
@@ -139,9 +140,16 @@ def compute_grid_layout(
     mc = max_cols if max_cols is not None else _env_int("FB_GRID_MAX_COLS", 4)
     ox, oy, ww, wh = grid_work_area(screen_width=screen_width, screen_height=screen_height)
 
-    cols, rows = _grid_dimensions(n, max_cols=mc)
-    cell_w = max(320, ww // cols)
-    cell_h = _cell_height(wh, rows)
+    forced_rows = int(rows) if rows else 0
+    if forced_rows > 0:
+        cols = max(1, min(int(mc), n))
+        row_count = forced_rows
+        if n > cols * row_count:
+            row_count = int(math.ceil(n / cols))
+    else:
+        cols, row_count = _grid_dimensions(n, max_cols=mc)
+    cell_w = max(1, ww // cols)
+    cell_h = _cell_height(wh, row_count)
     # Neo lưới sát góc trên-trái (ox/oy đã gồm margin trong grid_work_area).
     y0 = oy
 
