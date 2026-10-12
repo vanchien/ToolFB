@@ -1,7 +1,7 @@
 {
-  "version": "1.0.96",
+  "version": "1.0.97",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "5f10de0c5e09e3605f26ba05a3e8a56933c98d4fbed3442c47bb9095ff26a745",
-  "notes": "Luoi 6x3, hen gio tung link, bam chia se tren video len Page va nhom.",
-  "generated_at": "2026-10-11T00:56:26"
+  "sha256": "9d15a595ffd4c65db19645098eb0c0709cf4a2148bacc3dfda4ab6f3fdbef4f3",
+  "notes": "Dong bo may giu proxy theo tai khoan, AI Agent va anh ChatGPT khi het credit API.",
+  "generated_at": "2026-10-12T16:12:50"
 }
