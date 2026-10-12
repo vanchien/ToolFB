@@ -132,6 +132,7 @@ from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.gui.tiktok_manager_tab import build_tiktok_manager_tab
 from src.gui.human_interaction_tab import build_human_interaction_tab
 from src.gui.share_tab import build_share_tab
+from src.gui.ai_fleet_tab import build_ai_fleet_tab
 from src.gui.video_editor_tab import build_video_editor_tab
 from src.utils.proxy_check import check_proxy
 
@@ -1292,6 +1293,12 @@ class _ManagerWindow:
         tab_share.rowconfigure(0, weight=1)
         build_share_tab(tab_share, self._root)
 
+        tab_fleet = ttk.Frame(nb, padding=4)
+        nb.add(tab_fleet, text="  AI Agent  ")
+        tab_fleet.columnconfigure(0, weight=1)
+        tab_fleet.rowconfigure(0, weight=1)
+        build_ai_fleet_tab(tab_fleet, self._root, on_scheduler_start=self._ensure_scheduler_running)
+
         # --- Platform view (Facebook vs TikTok) ---
         self._tab_facebook_accounts = tab_acc
         self._tab_facebook_pages = tab_pg
@@ -1301,6 +1308,7 @@ class _ManagerWindow:
         self._tab_tiktok_manager = tab_tt
         self._tab_human_interaction = tab_human
         self._tab_share = tab_share
+        self._tab_ai_fleet = tab_fleet
         self._tab_ai_host = tab_ai_host
         self._apply_platform_view(self._platform_view_var.get())
 
@@ -1342,6 +1350,7 @@ class _ManagerWindow:
         install_adaptive_wrap(self._root)
         self._start_multitask_reconcile_timer()
         self._root.after(900, self._schedule_startup_git_sync)
+        self._root.after(1200, self._maybe_start_fleet_scheduler)
         try:
             self._root.deiconify()
             self._root.lift()
@@ -7616,16 +7625,18 @@ class _ManagerWindow:
                 nb.forget(self._tab_human_interaction)
             if getattr(self, "_tab_share", None) is not None and self._notebook_has_tab(self._tab_share):
                 nb.forget(self._tab_share)
+            if getattr(self, "_tab_ai_fleet", None) is not None and self._notebook_has_tab(self._tab_ai_fleet):
+                nb.forget(self._tab_ai_fleet)
             if self._tab_ve_pending_export is not None and not self._notebook_has_tab(self._tab_ve_pending_export):
                 nb.add(self._tab_ve_pending_export, text=ve_pending_text)
             # Hiện TikTok
             if self._tab_tiktok_manager is not None and not self._notebook_has_tab(self._tab_tiktok_manager):
                 nb.add(self._tab_tiktok_manager, text=tt_text)
-        if self._tab_tiktok_manager is not None and self._notebook_has_tab(self._tab_tiktok_manager):
-            nb.select(self._tab_tiktok_manager)
-        self._jobs_tab_index = 0
-        self._arrange_notebook()
-        return
+            if self._tab_tiktok_manager is not None and self._notebook_has_tab(self._tab_tiktok_manager):
+                nb.select(self._tab_tiktok_manager)
+            self._jobs_tab_index = 0
+            self._arrange_notebook()
+            return
 
         # want facebook
         # Ẩn TikTok
@@ -7643,6 +7654,8 @@ class _ManagerWindow:
             nb.add(self._tab_human_interaction, text=human_text)
         if getattr(self, "_tab_share", None) is not None and not self._notebook_has_tab(self._tab_share):
             nb.add(self._tab_share, text=share_text)
+        if getattr(self, "_tab_ai_fleet", None) is not None and not self._notebook_has_tab(self._tab_ai_fleet):
+            nb.add(self._tab_ai_fleet, text="  AI Agent  ")
 
         # Cập nhật index tab jobs để nút điều hướng hoạt động đúng.
         if self._tab_facebook_jobs is not None and self._notebook_has_tab(self._tab_facebook_jobs):
@@ -7674,6 +7687,7 @@ class _ManagerWindow:
                 self._tab_facebook_jobs,
                 self._tab_human_interaction,
                 getattr(self, "_tab_share", None),
+                getattr(self, "_tab_ai_fleet", None),
                 getattr(self, "_tab_ai_host", None),
                 self._tab_ve_notebook_child,
                 self._tab_dl_notebook_child,
@@ -8490,21 +8504,29 @@ class _ManagerWindow:
                 def _progress(done_n: int, total_n: int, name: str) -> None:
                     self._report_sync(f"Đồng bộ: chép profile {done_n}/{total_n} — {name}")
 
+                profile_rows = [dict(row) for row in (data.get("profile_rows") or []) if isinstance(row, dict)]
                 profiles_copied, profiles_missing = export_profiles(
                     project_root(),
-                    accounts,
+                    accounts + profile_rows,
                     package,
                     on_progress=_progress,
                 )
-                cookie_count = len((payload.get("data") or {}).get("cookies") or [])
+                from src.services.tool_bundle_sync import export_ai_account_dirs
+
+                ai_accounts_copied = export_ai_account_dirs(project_root(), package)
+                data = payload.get("data") or {}
+                cookie_count = len(data.get("cookies") or [])
+                settings_count = len(data.get("settings") or {})
                 text = (
                     f"Đã xuất cả thư mục:\n{package}\n\n"
                     f"Tài khoản: {len(accounts)}\n"
                     f"Page: {len(pages)}\n"
                     f"Lịch: {len(jobs)}\n"
                     f"Cookie: {cookie_count}\n"
+                    f"File cài đặt: {settings_count}\n"
                     f"Profile đã chép: {profiles_copied}\n"
-                    f"Profile không thấy: {profiles_missing}\n\n"
+                    f"Profile không thấy: {profiles_missing}\n"
+                    f"Phiên AI đã chép: {ai_accounts_copied}\n\n"
                     "Chép nguyên thư mục này sang máy kia, rồi bấm Đồng bộ máy → Nạp thư mục gói."
                 )
                 self._finish_sync(lambda: messagebox.showinfo("Xuất dữ liệu", text, parent=self._root))
@@ -8782,6 +8804,14 @@ class _ManagerWindow:
                 project_root(),
                 dict(merged.get("settings") or {}),
             )
+            from src.utils.account_proxy_mapper import stamp_registry_rows_from_interaction
+            from src.utils.human_interaction_settings import load_human_interaction_settings
+
+            if stamp_registry_rows_from_interaction(normalized_accounts, load_human_interaction_settings()):
+                self._accounts.save_all(normalized_accounts)  # type: ignore[arg-type]
+            from src.services.tool_bundle_sync import install_ai_account_dirs
+
+            install_ai_account_dirs(Path(profile_root), project_root())
         except Exception as exc:  # noqa: BLE001
             detail = (
                 "Import thất bại khi ghi dữ liệu.\n"
@@ -8803,6 +8833,10 @@ class _ManagerWindow:
             self._refresh_tree()
             self._fill_pages_tree()
             self._on_refresh_schedule_jobs()
+            for tab in (getattr(self, "_tab_human_interaction", None), getattr(self, "_tab_ai_fleet", None)):
+                reload = getattr(tab, "reload_from_sync", None)
+                if callable(reload):
+                    reload()
             self._warn_if_scheduler_running_after_config_change()
             messagebox.showinfo("Nhập dữ liệu", done_text, parent=self._root)
 
@@ -9714,6 +9748,33 @@ class _ManagerWindow:
                 schedule_on_main_thread(self._root, on_err)
 
         threading.Thread(target=worker_manifest_apply, name="apply_update_manifest", daemon=True).start()
+
+    def _maybe_start_fleet_scheduler(self) -> None:
+        """Page đang chạy thì bật lịch nền, không cần bấm thêm. Dừng khẩn cấp thì không tự bật."""
+        try:
+            from src.services.ai_fleet.store import FleetStore
+
+            doc = FleetStore().load()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không đọc được AI Fleet lúc mở app: {}", exc)
+            return
+        if doc.get("emergency_stop"):
+            return
+        active = any(
+            str(profile.get("status") or "").upper() == "ACTIVE"
+            for profile in (doc.get("profiles") or {}).values()
+            if isinstance(profile, dict)
+        )
+        if not active:
+            return
+        self._ensure_scheduler_running()
+
+    def _ensure_scheduler_running(self) -> None:
+        """Bật lịch đăng nếu đang tắt, để bài AI vừa vào hàng được chạy tiếp."""
+        worker = getattr(self, "_worker", None)
+        if worker is not None and worker.is_alive():
+            return
+        self._on_start()
 
     def _on_start(self) -> None:
         """

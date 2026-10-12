@@ -10,6 +10,14 @@ import google.generativeai as genai
 from src.ai.providers.base import TextProvider, TextResult
 
 
+def _hashtag_list(raw: object) -> list[str]:
+    if isinstance(raw, str):
+        parts = raw.replace(",", " ").split()
+    else:
+        parts = list(raw or [])
+    return [str(item).strip() for item in parts if str(item).strip()]
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     raw = text.strip()
     if raw.startswith("```"):
@@ -35,6 +43,40 @@ class GeminiTextProvider(TextProvider):
             raise RuntimeError("Thiếu GEMINI_API_KEY cho provider Gemini.")
         genai.configure(api_key=key)
         return genai.GenerativeModel((model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")).strip())
+
+    def generate_content_package(self, *, prompt: str, model: str | None = None) -> dict[str, Any]:
+        """Gói bài viết JSON cùng cấu trúc với ChatGPT: tiêu đề, thân, caption, hashtag."""
+        model_name = (model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")).strip()
+        try:
+            response = self._model(model_name).generate_content(prompt)
+            data = _extract_json_object((response.text or "").strip())
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError("Gemini chưa trả được bài viết.") from exc
+        title = str(data.get("title") or "").strip()
+        body = str(data.get("body") or "").strip()
+        caption = str(data.get("caption") or "").strip()
+        hashtags = _hashtag_list(data.get("hashtags"))
+        if not title or not body or not caption or not hashtags:
+            raise RuntimeError("Gemini thiếu title, body, caption hoặc hashtag.")
+        usage_raw = getattr(response, "usage_metadata", None)
+        return {
+            "title": title,
+            "body": body,
+            "caption": caption,
+            "hashtags": hashtags,
+            "image_prompt": str(data.get("image_prompt") or "").strip(),
+            "language": str(data.get("language") or "").strip(),
+            "provider": "gemini",
+            "model": model_name,
+            "usage": {
+                "provider": "gemini",
+                "model": model_name,
+                "input_tokens": int(getattr(usage_raw, "prompt_token_count", 0) or 0),
+                "output_tokens": int(getattr(usage_raw, "candidates_token_count", 0) or 0),
+            },
+        }
 
     def generate_post(self, *, prompt: str, model: str | None = None) -> TextResult:
         resp = self._model(model).generate_content(prompt)

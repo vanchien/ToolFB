@@ -213,16 +213,30 @@ class SchedulePostsManager:
         logger.debug("schedule_posts load_all: {} job", len(out))
         return list(out)
 
-    def save_all(self, rows: Iterable[SchedulePostJob]) -> None:
+    def save_all(self, rows: Iterable[SchedulePostJob], *, enforce_fleet_gate: bool = True) -> None:
+        """Ghi lại danh sách job. Khi xóa thì không duyệt lại các job còn giữ."""
         with json_file_lock(self.file_path):
             lst = list(rows)
             for r in lst:
                 self._validate_row(dict(r))
+                if enforce_fleet_gate:
+                    self._reject_unapproved_fleet_job(dict(r))
             self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
             self._rows_cache = list(lst)
             self._rows_mtime = self.file_path.stat().st_mtime
             self._rebuild_id_index(self._rows_cache)
             logger.info("Đã ghi {} job schedule_posts vào {}", len(lst), self.file_path)
+
+    def _reject_unapproved_fleet_job(self, row: dict[str, Any]) -> None:
+        """Job của AI Fleet chỉ vào lịch khi cổng duyệt cho phép. Job đăng tay không có cờ này."""
+        content_id = str(row.get("fleet_content_id") or "").strip()
+        if not content_id:
+            return
+        from src.services.ai_fleet.gate import schedule_block_reason
+
+        reason = schedule_block_reason(content_id, job=row)
+        if reason:
+            raise ValueError(reason)
 
     def upsert(self, row: SchedulePostJob) -> None:
         with json_file_lock(self.file_path):
@@ -230,6 +244,7 @@ class SchedulePostsManager:
             if not str(d.get("id", "")).strip():
                 d["id"] = uuid.uuid4().hex[:16]
             self._validate_row(d)
+            self._reject_unapproved_fleet_job(d)
             now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             if not str(d.get("created_at", "")).strip():
                 d["created_at"] = now
@@ -261,6 +276,7 @@ class SchedulePostsManager:
                 if not str(d.get("id", "")).strip():
                     d["id"] = uuid.uuid4().hex[:16]
                 self._validate_row(d)
+                self._reject_unapproved_fleet_job(d)
                 if not str(d.get("created_at", "")).strip():
                     d["created_at"] = now
                 incoming.append(d)
@@ -294,7 +310,7 @@ class SchedulePostsManager:
         new_list = [x for x in cur if str(x.get("id")) != jid]
         if len(new_list) == len(cur):
             return False
-        self.save_all(new_list)
+        self.save_all(new_list, enforce_fleet_gate=False)
         return True
 
     def delete_by_ids(self, job_ids: Iterable[str]) -> tuple[int, list[str]]:
@@ -308,7 +324,7 @@ class SchedulePostsManager:
         new_list = [x for x in cur if str(x.get("id", "")).strip() not in want_set]
         removed = len(cur) - len(new_list)
         if removed:
-            self.save_all(new_list)
+            self.save_all(new_list, enforce_fleet_gate=False)
         missing = [j for j in want if j not in existing]
         return (removed, missing)
 

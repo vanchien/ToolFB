@@ -874,6 +874,8 @@ def build_human_interaction_tab(
         return login, interaction
 
     def _save_settings() -> None:
+        if state.get("_suspend_save"):
+            return
         login_snap, interaction_snap = _mapped_snapshot_for_save()
         payload = {
             "accounts_path": var_acc.get().strip(),
@@ -904,6 +906,8 @@ def build_human_interaction_tab(
 
     def _schedule_save_settings() -> None:
         """Ghi cài đặt + bảng đã ghép (debounce khi cập nhật trạng thái liên tục)."""
+        if state.get("_suspend_save"):
+            return
         prev = state.get("_save_debounce_id")
         if prev is not None:
             try:
@@ -948,6 +952,48 @@ def build_human_interaction_tab(
             _refresh_trees()
 
         run_background_then_main(root, _sync_storage, _sync_done)
+
+    def reload_from_sync() -> None:
+        """Đọc lại tài khoản tương tác sau khi nạp gói. Không ghi đè file vừa gộp."""
+        prev = state.get("_save_debounce_id")
+        if prev is not None:
+            try:
+                root.after_cancel(prev)
+            except tk.TclError:
+                pass
+            state["_save_debounce_id"] = None
+        state["_suspend_save"] = True
+        fresh = load_human_interaction_settings()
+        var_acc.set(str(fresh.get("accounts_path") or ""))
+        var_px.set(str(fresh.get("proxies_path") or ""))
+        txt_acc.delete("1.0", tk.END)
+        txt_px.delete("1.0", tk.END)
+        if fresh.get("accounts_text"):
+            txt_acc.insert("1.0", str(fresh.get("accounts_text")))
+        if fresh.get("proxies_text"):
+            txt_px.insert("1.0", str(fresh.get("proxies_text")))
+        login_restored: list[MappedAccount] = []
+        interaction_restored: list[MappedAccount] = []
+        for item in load_login_queue_from_settings(fresh):
+            try:
+                login_restored.append(MappedAccount.from_dict(item))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Bỏ qua dòng login sau đồng bộ: {}", exc)
+        for item in load_interaction_queue_from_settings(fresh):
+            try:
+                interaction_restored.append(MappedAccount.from_dict(item))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Bỏ qua dòng tương tác sau đồng bộ: {}", exc)
+        state["mapped_login"] = login_restored
+        state["mapped_interaction"] = interaction_restored
+        _refresh_trees()
+
+        def _release() -> None:
+            state["_suspend_save"] = False
+
+        root.after(1500, _release)
+
+    parent.reload_from_sync = reload_from_sync
 
     def _select_main_page(page: ttk.Frame) -> None:
         try:

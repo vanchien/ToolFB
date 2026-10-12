@@ -603,6 +603,7 @@ def execute_facebook_post_sequence(
     reel_content: str | None = None,
     reel_video_path: str | None = None,
     account_record: dict[str, Any] | None = None,
+    fleet_content_id: str | None = None,
 ) -> None:
     """
     Mở Facebook → phiên → composer → nội dung / Reel → đăng → verify.
@@ -610,6 +611,13 @@ def execute_facebook_post_sequence(
     ``posting_engine``: ``firefox`` hoặc ``chromium`` — mặc định scheduler theo ``browser_type`` (hiện ưu tiên Firefox).
     Phải khớp context đã mở (``BrowserFactory``).
     """
+    fleet_id = str(fleet_content_id or "").strip()
+    if fleet_id:
+        from src.services.ai_fleet.gate import publish_block_reason
+
+        blocked = publish_block_reason(fleet_id, posted_text=text_body)
+        if blocked:
+            raise RuntimeError(blocked)
     eng = str(posting_engine or "firefox").strip().lower()
     if eng == "firefox":
         _run_firefox_posting_flow(

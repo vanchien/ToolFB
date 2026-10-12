@@ -815,6 +815,18 @@ def _extract_reel_description_from_queue_job(queue_job: dict[str, Any] | None, f
     return str(fallback or "").strip()
 
 
+def _note_fleet_issue(job: dict[str, Any] | None, message: str) -> None:
+    """Đưa lỗi đăng của bài AI ra chỗ người dùng xem. Job đăng tay thì bỏ qua."""
+    if not str((job or {}).get("fleet_content_id") or "").strip():
+        return
+    try:
+        from src.services.ai_fleet.store import FleetStore
+
+        FleetStore().note_attention(str((job or {}).get("page_id") or ""), message)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không ghi được nhắc AI Fleet: {}", exc)
+
+
 def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_note: str = "") -> None:
     """Cập nhật ``schedule_posts.json`` khi job queue gọi ``run_scheduled_post_for_account``."""
     if not job_id:
@@ -826,9 +838,21 @@ def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_
         job = sp.get_by_id(jid)
         rc = int((job or {}).get("retry_count", 0))
         if success:
+            note = str(error_note or "")[:900]
+            fleet_done = str((job or {}).get("fleet_content_id") or "").strip()
+            if fleet_done:
+                try:
+                    from src.services.ai_fleet.store import FleetStore
+
+                    fleet = FleetStore()
+                    fleet.mark_published(fleet_done)
+                    fleet.clear_attention(str((job or {}).get("page_id") or ""))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Không đánh dấu đã đăng cho {}: {}", fleet_done, exc)
+                sp.update_job_fields(jid, status="success", posted_at=now_iso, error_note=note, retry_count=0)
+                return
             rec = str((job or {}).get("schedule_recurrence", "")).strip().lower()
             slot = str((job or {}).get("schedule_slot", "")).strip()
-            note = str(error_note or "")[:900]
             if rec == "daily" and slot:
                 try:
                     nxt = compute_next_daily_scheduled_utc_iso(slot)
@@ -848,6 +872,12 @@ def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_
                 sp.update_job_fields(jid, status="success", posted_at=now_iso, error_note=note, retry_count=0)
         else:
             note = (error_note or "Đăng thất bại")[:900]
+            from src.services.ai_fleet.gate import is_approval_block
+
+            if is_approval_block(note):
+                sp.update_job_fields(jid, status="failed", error_note=note, retry_count=rc)
+                _note_fleet_issue(job, note)
+                return
             manual = "need_manual_check" in note.lower()
             # Rule mới: lỗi thì retry tối đa 3 lần, mỗi lần cách nhau 5 phút.
             # Nếu 1 lần thành công thì dừng ngay (đã xử lý ở nhánh success phía trên).
@@ -856,6 +886,7 @@ def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_
             new_rc = rc + 1
             if manual:
                 sp.update_job_fields(jid, status="need_manual_check", error_note=note, retry_count=new_rc)
+                _note_fleet_issue(job, note)
             elif new_rc <= max_retry:
                 nxt = (datetime.now(timezone.utc) + timedelta(minutes=retry_delay_min)).replace(microsecond=0)
                 nxt_iso = nxt.isoformat()
@@ -875,6 +906,7 @@ def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_
                 )
             else:
                 sp.update_job_fields(jid, status="failed", error_note=note, retry_count=new_rc)
+                _note_fleet_issue(job, note)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không cập nhật schedule_posts job {}: {}", job_id, exc)
 
@@ -1730,6 +1762,15 @@ def run_scheduled_post_for_account(
                     queue_job = dict(qrow)
             except Exception:  # noqa: BLE001
                 queue_job = None
+        fleet_id = str((queue_job or {}).get("fleet_content_id") or "").strip()
+        if fleet_id:
+            from src.services.ai_fleet.gate import publish_block_reason
+
+            blocked = publish_block_reason(fleet_id)
+            if blocked:
+                err_msg = blocked
+                logger.error("[Approval] {}", blocked)
+                return False
         content_page_row = merge_queue_job_content_into_page_row(page_row, queue_job)
         page_slot_id = str((page_row or content_page_row or {}).get("id") or pid_raw or "").strip()
         if page_slot_id:
@@ -1946,6 +1987,7 @@ def run_scheduled_post_for_account(
                 reel_content=reel_content,
                 reel_video_path=reel_video_path,
                 account_record=acc_runtime,
+                fleet_content_id=str((queue_job or {}).get("fleet_content_id") or "").strip() or None,
             )
             post_ok = True
         except Exception as exc:  # noqa: BLE001
@@ -2281,9 +2323,32 @@ def build_scheduler(
             "pending→ready_queue→dispatch theo schedule_time.",
             poll_sec,
         )
+    fleet_minutes = int(os.environ.get("FLEET_REPLENISH_MINUTES", "15") or "15")
+    if fleet_minutes >= 5:
+        from src.services.ai_fleet.pipeline import replenish_fleet_posts
+
+        scheduler.add_job(
+            _safe_replenish_fleet,
+            IntervalTrigger(minutes=fleet_minutes),
+            id="ai_fleet_replenish",
+            replace_existing=True,
+        )
+        logger.info("Đã đăng ký viết bù AI Fleet mỗi {} phút cho Page đang chạy.", fleet_minutes)
     else:
         logger.info("Bỏ qua quét schedule_posts (SCHEDULE_POSTS_POLL_SEC={} < {}).", poll_sec, min_poll)
     return scheduler
+
+
+def _safe_replenish_fleet() -> None:
+    """Một vòng viết bù. Lỗi nhà cung cấp không được làm dừng lịch đăng."""
+    try:
+        from src.services.ai_fleet.pipeline import replenish_fleet_posts
+
+        rows = replenish_fleet_posts()
+        if rows:
+            logger.info("AI Fleet viết bù: {}", "; ".join(f"{row.get('page_id')}: {row.get('result')}" for row in rows[:8]))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("AI Fleet viết bù lỗi: {}", exc)
 
 
 def run_forever(

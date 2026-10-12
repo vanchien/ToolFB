@@ -832,7 +832,14 @@ class BrowserFactory:
         if acc is None:
             logger.error("Không tìm thấy account_id={}", account_id)
             raise ValueError(f"Không tìm thấy tài khoản: {account_id}")
-        return self.launch_persistent_context_from_account_dict(dict(acc), headless=headless)
+        acc = dict(acc)
+        try:
+            from src.utils.account_proxy_mapper import refresh_post_account_from_login_page
+
+            acc = refresh_post_account_from_login_page(acc, persist=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chưa gắn được proxy từ tab Tương tác cho {}: {}", account_id, exc)
+        return self.launch_persistent_context_from_account_dict(acc, headless=headless)
 
     def launch_persistent_context_from_account_dict(
         self,
@@ -863,6 +870,15 @@ class BrowserFactory:
             raise RuntimeError("Playwright đã bị stop; tạo BrowserFactory mới hoặc không gọi close() quá sớm.")
 
         account_id = str(acc.get("id", "")).strip() or "(preview)"
+        if account_use_proxy_enabled(acc) and not proxy_host_port_configured(
+            acc.get("proxy") if isinstance(acc.get("proxy"), dict) else None
+        ):
+            try:
+                from src.utils.account_proxy_mapper import refresh_post_account_from_login_page
+
+                acc = refresh_post_account_from_login_page(dict(acc), persist=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Chưa gắn được proxy từ tab Tương tác cho {}: {}", account_id, exc)
         _raw_bt = acc.get("browser_type", "firefox")
         browser_key = str(_raw_bt if _raw_bt is not None else "firefox").strip().lower() or "firefox"
         user_data_dir = self._resolve_portable_dir(acc)  # type: ignore[arg-type]

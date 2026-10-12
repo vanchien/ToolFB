@@ -216,6 +216,19 @@ def _cleanup_previous_background_instances() -> None:
         logger.warning("Không thể dọn tiến trình nền lúc startup: {}", exc)
 
 
+def _recover_ai_fleet_tasks() -> None:
+    """Đưa tác vụ AI của lần chạy trước về hàng chờ. Lỗi kho này không chặn phần còn lại của tool."""
+    try:
+        from src.services.ai_fleet.store import FleetStore
+        from src.services.ai_fleet.tasks import recover_running
+
+        restored = recover_running(FleetStore())
+        if restored:
+            logger.info("Đã đưa {} tác vụ AI đang dở về hàng chờ.", restored)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không khôi phục được hàng tác vụ AI: {}", exc)
+
+
 def main() -> None:
     """
     Khởi động CLI hoặc GUI theo tham số dòng lệnh.
@@ -262,6 +275,7 @@ def main() -> None:
     cleanup_runtime_junk()
     logger.info("Facebook Automation — Giai đoạn 4 (AI + lịch). Đang khởi động...")
     _ensure_minimal_config_for_first_run()
+    _recover_ai_fleet_tasks()
     apply_saved_gemini_key_to_environ()
     apply_saved_openai_key_to_environ()
     apply_saved_nanobanana_key_to_environ()

@@ -7,6 +7,7 @@ import json
 from src.services.tool_bundle_sync import (
     apply_settings,
     build_bundle,
+    export_ai_account_dirs,
     export_profiles,
     install_profiles,
     merge_accounts,
@@ -256,6 +257,275 @@ def test_settings_keep_local_values_and_add_new_file(tmp_path) -> None:
     groups = json.loads((config / "facebook_groups.json").read_text(encoding="utf-8"))
     assert groups[0]["id"] == "g1"
     assert not (tmp_path / "accounts.json").exists()
+
+
+def test_empty_proxy_is_replaced_by_synced_proxy() -> None:
+    accounts, _id_map, report = merge_accounts(
+        [
+            {
+                "id": "local-1",
+                "facebook_uid": "10001",
+                "name": "Máy này",
+                "proxy": {"host": "", "port": 0, "user": "", "pass": ""},
+                "use_proxy": True,
+            }
+        ],
+        [
+            {
+                "id": "other-1",
+                "facebook_uid": "10001",
+                "name": "Máy kia",
+                "proxy": {"host": "9.9.9.9", "port": 1080, "user": "u", "pass": "p"},
+                "use_proxy": True,
+            }
+        ],
+    )
+    assert report.accounts_added == 0
+    kept = accounts[0]
+    assert kept["proxy"]["host"] == "9.9.9.9"
+    assert kept["proxy"]["port"] == 1080
+    assert kept["use_proxy"] is True
+
+
+def test_plan_merge_stamps_registry_proxy_from_interaction() -> None:
+    merged, _report = plan_merge(
+        local_accounts=[
+            {
+                "id": "acc_registry",
+                "facebook_uid": "10001",
+                "name": "Page",
+                "proxy": {"host": "", "port": 0, "user": "", "pass": ""},
+            }
+        ],
+        local_pages=[],
+        local_jobs=[],
+        local_credentials={"accounts": {}},
+        bundle={
+            "accounts": [],
+            "settings": {
+                "human_interaction_settings.json": {
+                    "mapped_accounts_interaction": [
+                        {
+                            "account_id": "UID_10001",
+                            "auth": {"username": "10001"},
+                            "network": {
+                                "proxy_server": "socks5://8.8.8.8:1080",
+                                "proxy_username": "uu",
+                                "proxy_password": "pp",
+                            },
+                            "use_proxy": True,
+                            "status": "login_ok",
+                        }
+                    ]
+                }
+            },
+        },
+    )
+    proxy = merged["accounts"][0]["proxy"]
+    assert proxy["user"] == "uu"
+    assert "8.8.8.8" in str(proxy["host"])
+    assert merged["accounts"][0]["use_proxy"] is True
+
+
+def test_proxy_follows_account_onto_another_machine(tmp_path) -> None:
+    """Xuất máy này rồi nạp máy kia: proxy, profile và TikTok vẫn gắn đúng tài khoản."""
+    source = tmp_path / "source"
+    interaction_profile = source / "data" / "profiles" / "firefox" / "UID_10001"
+    interaction_profile.mkdir(parents=True)
+    (interaction_profile / "cookies.sqlite").write_bytes(b"session")
+    (source / "data" / "profiles" / "firefox" / "acc_local").mkdir(parents=True)
+    (source / "config").mkdir()
+    (source / "config" / "accounts.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "acc_local",
+                    "facebook_uid": "10001",
+                    "name": "Nick",
+                    "proxy": {"host": "", "port": 0, "user": "", "pass": ""},
+                    "portable_path": "data/profiles/firefox/acc_local",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (source / "config" / "pages.json").write_text("[]", encoding="utf-8")
+    (source / "config" / "schedule_posts.json").write_text("[]", encoding="utf-8")
+    (source / "config" / "human_interaction_settings.json").write_text(
+        json.dumps(
+            {
+                "accounts_text": "10001|pass",
+                "proxies_text": "9.9.9.9:1080:uu:pp",
+                "mapped_accounts_interaction": [
+                    {
+                        "account_id": "UID_10001",
+                        "auth": {"username": "10001", "password": "pass"},
+                        "network": {
+                            "proxy_server": "socks5://9.9.9.9:1080",
+                            "proxy_username": "uu",
+                            "proxy_password": "pp",
+                        },
+                        "storage": {"profile_path": "data/profiles/firefox/UID_10001"},
+                        "use_proxy": True,
+                        "status": "login_ok",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    tiktok_profile = source / "data" / "tiktok" / "profiles" / "tt1"
+    tiktok_profile.mkdir(parents=True)
+    (tiktok_profile / "cookies.sqlite").write_bytes(b"tt")
+    (source / "data" / "tiktok" / "accounts.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "tt1",
+                    "name": "TT",
+                    "profile_path": "data/tiktok/profiles/tt1",
+                    "proxy": {
+                        "enabled": True,
+                        "server": "socks5://7.7.7.7:1080",
+                        "username": "tu",
+                        "password": "tp",
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    from src.services.tool_bundle_sync import bundle_from_project, export_profiles, install_profiles
+
+    payload = bundle_from_project(source)
+    data = payload["data"]
+    assert data["accounts"][0]["proxy"]["user"] == "uu"
+    assert data["accounts"][0]["use_proxy"] is True
+    assert any(row["portable_path"].endswith("UID_10001") for row in data["profile_rows"])
+    assert any(row["portable_path"].endswith("tt1") for row in data["profile_rows"])
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    export_profiles(source, list(data["accounts"]) + list(data["profile_rows"]), package)
+    assert (package / "data" / "profiles" / "firefox" / "UID_10001" / "cookies.sqlite").is_file()
+    assert (package / "data" / "tiktok" / "profiles" / "tt1" / "cookies.sqlite").is_file()
+
+    merged, _report = plan_merge(
+        local_accounts=[
+            {
+                "id": "acc_other",
+                "facebook_uid": "10001",
+                "name": "Máy kia",
+                "proxy": {"host": "", "port": 0, "user": "", "pass": ""},
+            }
+        ],
+        local_pages=[],
+        local_jobs=[],
+        local_credentials={"accounts": {}},
+        bundle=data,
+    )
+    assert merged["accounts"][0]["id"] == "acc_other"
+    assert merged["accounts"][0]["proxy"]["user"] == "uu"
+    assert any(str(job.get("source") or "").endswith("UID_10001") for job in merged["profile_jobs"])
+
+    dest = tmp_path / "dest"
+    (dest / "config").mkdir(parents=True)
+    (dest / "config" / "human_interaction_settings.json").write_text(
+        json.dumps(
+            {
+                "mapped_accounts_interaction": [
+                    {
+                        "account_id": "import_10001",
+                        "auth": {"username": "10001", "password": ""},
+                        "network": {"proxy_server": "", "proxy_username": "", "proxy_password": ""},
+                        "use_proxy": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert apply_settings(dest, data["settings"]) >= 1
+    saved = json.loads((dest / "config" / "human_interaction_settings.json").read_text(encoding="utf-8"))
+    mapped = saved["mapped_accounts_interaction"]
+    assert len(mapped) == 1
+    assert mapped[0]["account_id"] == "import_10001"
+    assert mapped[0]["network"]["proxy_username"] == "uu"
+    assert "9.9.9.9" in mapped[0]["network"]["proxy_server"]
+    assert mapped[0]["auth"]["password"] == "pass"
+    tiktok = json.loads((dest / "data" / "tiktok" / "accounts.json").read_text(encoding="utf-8"))
+    assert "7.7.7.7" in tiktok[0]["proxy"]["server"]
+    install_profiles(package, dest, merged["profile_jobs"])
+    assert (dest / "data" / "profiles" / "firefox" / "UID_10001" / "cookies.sqlite").is_file()
+
+
+def test_interaction_accounts_merge_by_account_id(tmp_path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "human_interaction_settings.json").write_text(
+        json.dumps(
+            {
+                "accounts_text": "cu@local",
+                "mapped_accounts_interaction": [{"account_id": "a1", "status": "login_ok", "auth": {"password": ""}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    updated = apply_settings(
+        tmp_path,
+        {
+            "human_interaction_settings.json": {
+                "accounts_text": "cu@local\nmoi@maykia",
+                "proxies_text": "1.1.1.1:1080\n2.2.2.2:1080",
+                "mapped_accounts_interaction": [
+                    {"account_id": "a1", "status": "login_ok", "auth": {"password": "da-co"}},
+                    {"account_id": "a2", "status": "login_ok", "auth": {"password": "mk2"}},
+                ],
+            }
+        },
+    )
+    assert updated == 1
+    saved = json.loads((config / "human_interaction_settings.json").read_text(encoding="utf-8"))
+    assert "moi@maykia" in saved["accounts_text"]
+    assert saved["proxies_text"].splitlines()[-1] == "2.2.2.2:1080"
+    ids = [row["account_id"] for row in saved["mapped_accounts_interaction"]]
+    assert ids == ["a1", "a2"]
+    assert saved["mapped_accounts_interaction"][0]["auth"]["password"] == "da-co"
+
+
+def test_bundle_includes_settings_cookies_and_ai_login(tmp_path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "ai_fleet.json").write_text(json.dumps({"auto_enabled": True}), encoding="utf-8")
+    (config / "app_secrets.json").write_text(json.dumps({"openai_keys": [{"id": "k1"}]}), encoding="utf-8")
+    (config / "update_channel.json").write_text(json.dumps({"channel": "stable"}), encoding="utf-8")
+    cookies = tmp_path / "data" / "cookies"
+    cookies.mkdir(parents=True)
+    (cookies / "acc.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "data" / "tiktok").mkdir(parents=True)
+    (tmp_path / "data" / "tiktok" / "accounts.json").write_text(json.dumps([{"id": "tt1"}]), encoding="utf-8")
+    profile = tmp_path / "data" / "ai_accounts" / "chatgpt" / "k1" / "Default" / "Network"
+    profile.mkdir(parents=True)
+    (profile / "Cookies").write_bytes(b"session")
+    payload = build_bundle(
+        accounts=[{"id": "acc", "name": "A"}],
+        pages=[],
+        jobs=[],
+        credentials={"accounts": {"acc": {"password": "secret"}}},
+        project_root=tmp_path,
+    )
+    settings = payload["data"]["settings"]
+    assert settings["ai_fleet.json"]["auto_enabled"] is True
+    assert settings["app_secrets.json"]["openai_keys"][0]["id"] == "k1"
+    assert settings["update_channel.json"]["channel"] == "stable"
+    assert settings["data/tiktok/accounts.json"][0]["id"] == "tt1"
+    assert payload["data"]["cookies"][0]["relative_path"] == "data/cookies/acc.json"
+    package = tmp_path / "pkg"
+    package.mkdir()
+    copied = export_ai_account_dirs(tmp_path, package)
+    assert copied == 1
+    assert (package / "data" / "ai_accounts" / "chatgpt" / "k1" / "Default" / "Network" / "Cookies").is_file()
 
 
 def test_bundle_rewrites_old_machine_profile_path(tmp_path) -> None:

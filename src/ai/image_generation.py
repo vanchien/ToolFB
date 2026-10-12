@@ -65,7 +65,13 @@ def _fast_chromium_args(*, locale_lang: str, direct_no_proxy: bool) -> list[str]
     return [f"--lang={locale_lang}"]
 
 
-def _launch_nb_context(pw, *, profile_dir: Path):
+def chatgpt_profile_dir(account_id: str) -> Path:
+    """Thư mục phiên ChatGPT của một tài khoản. Không nhận đường dẫn hay khóa."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(account_id or ""))[:48] or "default"
+    return project_root() / "data" / "ai_accounts" / "chatgpt" / safe
+
+
+def _launch_nb_context(pw, *, profile_dir: Path, fallback_clean: bool = True, headless: bool = False, background: bool = False):
     """
     Ưu tiên Chrome hệ thống cho tốc độ tải như browser ngoài.
     Fallback Chromium mặc định của Playwright nếu máy không có Chrome.
@@ -76,12 +82,16 @@ def _launch_nb_context(pw, *, profile_dir: Path):
         "yes",
         "on",
     }
+    launch_args = _fast_chromium_args(locale_lang="en-US", direct_no_proxy=not keep_system_proxy)
+    if background:
+        headless = False
+        launch_args.append("--start-minimized")
     kwargs = dict(
         user_data_dir=str(profile_dir),
-        headless=False,
+        headless=bool(headless),
         viewport={"width": 1366, "height": 900},
         locale="en-US",
-        args=_fast_chromium_args(locale_lang="en-US", direct_no_proxy=not keep_system_proxy),
+        args=launch_args,
     )
     channel = str(os.environ.get("NANOBANANA_CHROMIUM_CHANNEL", "chrome")).strip().lower()
     if channel and channel not in {"bundled", "none", "0", "false", "off"}:
@@ -92,6 +102,8 @@ def _launch_nb_context(pw, *, profile_dir: Path):
     try:
         return pw.chromium.launch_persistent_context(**kwargs)
     except Exception as exc:
+        if not fallback_clean:
+            raise
         # Fallback cuối: profile sạch để tránh profile cũ bị corrupt/lock làm chết browser ngay lúc launch.
         clean_profile = profile_dir.parent / f"{profile_dir.name}_clean"
         clean_profile.mkdir(parents=True, exist_ok=True)
@@ -590,23 +602,31 @@ def _locked_submit_selectors() -> list[str]:
     ]
 
 
-def open_nanobanana_login_browser(*, wait_sec: int = 180) -> dict[str, str]:
+def open_nanobanana_login_browser(
+    *,
+    wait_sec: int = 180,
+    web_url: str | None = None,
+    profile_dir: Path | None = None,
+    fallback_clean: bool = True,
+) -> dict[str, str]:
     """
-    Mở trình duyệt profile riêng để user đăng nhập Gemini Image/Nano Banana thủ công.
+    Mở trình duyệt profile riêng để user đăng nhập thủ công. Đóng cửa sổ là phiên được giữ.
 
     Returns:
         Dict chứa ``url``/``title`` hiện tại sau khi chờ.
     """
     web_url = (
-        os.environ.get("NANOBANANA_WEB_URL", "https://gemini.google.com/app?hl=en").strip()
+        str(web_url or "").strip()
+        or os.environ.get("NANOBANANA_WEB_URL", "https://gemini.google.com/app?hl=en").strip()
         or "https://gemini.google.com/app?hl=en"
     )
-    profile_dir = _nanobanana_browser_profile_dir()
+    profile_dir = Path(profile_dir) if profile_dir is not None else _nanobanana_browser_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
     pw = sync_playwright().start()
     context = None
     try:
         t0 = time.perf_counter()
-        context = _launch_nb_context(pw, profile_dir=profile_dir)
+        context = _launch_nb_context(pw, profile_dir=profile_dir, fallback_clean=fallback_clean)
         t1 = time.perf_counter()
         try:
             stealth = Stealth()
@@ -1846,3 +1866,277 @@ def generate_and_save_images_for_page_batch(
         logger.info("Đã lưu ảnh AI: {}", path)
         _img_status("SAVE_FILE", f"{path}")
     return paths
+
+
+def generate_chatgpt_browser_text(prompt: str, *, account_id: str) -> str:
+    """Viết bài trên chatgpt.com, chạy ngầm. Dùng khi API hết credit."""
+    text = str(prompt or "").strip()
+    if not text:
+        raise RuntimeError("Chưa có nội dung để gửi lên ChatGPT.")
+    with _chatgpt_web_session(account_id, headless=False, background=True) as page:
+        if not _chatgpt_prompt_ready(page):
+            _chatgpt_web_screenshot(page, "chua_dang_nhap")
+            raise RuntimeError(_chatgpt_entry_error(page, "viết lại"))
+        before = len(_chatgpt_assistant_texts(page))
+        _chatgpt_type_and_send(page, text[:6000])
+        reply = _chatgpt_wait_reply(page, before)
+        if not reply:
+            _chatgpt_web_screenshot(page, "chua_co_bai")
+            raise RuntimeError("ChatGPT web chưa trả bài.")
+        return reply
+
+
+def generate_chatgpt_browser_images(prompt: str, *, account_id: str, number_of_images: int = 1) -> list[bytes]:
+    """Tạo ảnh trên chatgpt.com, chạy ngầm. API hết credit vẫn dùng được cách này."""
+    text = str(prompt or "").strip()
+    if not text:
+        raise RuntimeError("Chưa có mô tả ảnh để gửi lên ChatGPT.")
+    with _chatgpt_web_session(account_id, headless=False, background=True) as page:
+        if not _chatgpt_prompt_ready(page):
+            _chatgpt_web_screenshot(page, "chua_dang_nhap")
+            raise RuntimeError(_chatgpt_entry_error(page, "tạo ảnh lại"))
+        _chatgpt_enable_image_tool(page)
+        _human_pause(0.8, 1.6)
+        before = _chatgpt_image_sources(page)
+        _chatgpt_type_and_send(page, text[:2000])
+        blob = _chatgpt_wait_image(page, before)
+        if not blob:
+            _chatgpt_web_screenshot(page, "chua_co_anh")
+            raise RuntimeError("ChatGPT web chưa trả ảnh.")
+        _ = number_of_images
+        return [blob]
+
+
+def _chatgpt_web_session(account_id: str, *, headless: bool, background: bool = False):
+    """Mở phiên ChatGPT đã đăng nhập rồi đóng. headless=True thì không hiện cửa sổ."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _open():
+        profile = chatgpt_profile_dir(account_id)
+        if not profile.is_dir() or not any(profile.iterdir()):
+            raise RuntimeError("Chưa đăng nhập ChatGPT trên web. Bấm Mở ChatGPT, đăng nhập, đóng cửa sổ rồi chạy lại.")
+        pw = sync_playwright().start()
+        context = None
+        try:
+            try:
+                context = _launch_nb_context(
+                    pw,
+                    profile_dir=profile,
+                    fallback_clean=False,
+                    headless=headless,
+                    background=background,
+                )
+            except Exception as exc:
+                raise RuntimeError("Cửa sổ ChatGPT đang mở. Đóng cửa sổ đó để chạy ngầm.") from exc
+            try:
+                Stealth().apply_stealth_sync(context)
+            except Exception:
+                pass
+            page = _open_fresh_page(context, target_url="https://chatgpt.com/")
+            _human_pause(1.0, 2.0)
+            logger.info("ChatGPT web chạy thu nhỏ, headless={}", headless)
+            yield page
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            time.sleep(0.2)
+            try:
+                pw.stop()
+            except Exception:
+                pass
+
+    return _open()
+
+
+def _chatgpt_prompt_ready(page) -> bool:
+    """Chờ ô chat. Trình duyệt ngầm hay bị Cloudflare hỏi, khi đó hiện cửa sổ để người dùng tick."""
+    if _wait_chatgpt_prompt(page, 15_000):
+        return True
+    if _chatgpt_needs_human_check(page):
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        logger.info("ChatGPT web cần tick Verify you are human")
+        return _wait_chatgpt_prompt(page, 90_000)
+    return _wait_chatgpt_prompt(page, 10_000)
+
+
+def _wait_chatgpt_prompt(page, timeout_ms: int) -> bool:
+    try:
+        page.locator("#prompt-textarea").first.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+def _chatgpt_needs_human_check(page) -> bool:
+    try:
+        body = page.locator("body").inner_text(timeout=3_000)
+    except Exception:
+        body = ""
+    text = str(body or "")
+    return "Verify you are human" in text or "Just a moment" in text
+
+
+def _chatgpt_entry_error(page, again: str) -> str:
+    if _chatgpt_needs_human_check(page):
+        return (
+            "ChatGPT web đang hỏi xác minh. Cửa sổ đã hiện, tick Verify you are human, "
+            f"đợi vào được ô chat rồi {again}."
+        )
+    return f"Chưa vào được ô chat ChatGPT. Bấm Mở ChatGPT, đăng nhập, đóng cửa sổ rồi {again}."
+
+
+def _chatgpt_enable_image_tool(page) -> None:
+    """Bật Create image trên ô chat. Không có nút thì vẫn gửi prompt."""
+    pattern = re.compile(r"create image|tạo hình ảnh|tạo ảnh", re.IGNORECASE)
+    button = page.get_by_role("button", name=pattern)
+    try:
+        if button.count() and button.first.is_visible():
+            button.first.click(timeout=4_000)
+            return
+    except Exception:
+        pass
+    for label in ("Add files and more", "Open tools menu", "Tools", "Thêm"):
+        opener = page.get_by_role("button", name=re.compile(re.escape(label), re.IGNORECASE))
+        try:
+            if not opener.count() or not opener.first.is_visible():
+                continue
+            opener.first.click(timeout=3_000)
+            _human_pause(0.5, 1.0)
+            item = page.get_by_role("menuitem", name=pattern)
+            if not item.count():
+                item = page.get_by_text(pattern)
+            if item.count():
+                item.first.click(timeout=3_000)
+                return
+        except Exception:
+            continue
+
+
+def _chatgpt_type_and_send(page, text: str) -> None:
+    box = page.locator("#prompt-textarea").first
+    box.click()
+    page.keyboard.type(text, delay=random.randint(8, 16))
+    _human_pause(0.6, 1.2)
+    _chatgpt_send(page)
+
+
+def _chatgpt_assistant_texts(page) -> list[str]:
+    try:
+        rows = page.locator("[data-message-author-role='assistant']").all_inner_texts()
+    except Exception:
+        return []
+    return [str(item).strip() for item in rows or [] if str(item).strip()]
+
+
+def _chatgpt_streaming(page) -> bool:
+    for selector in (
+        "button[data-testid='stop-button']",
+        "button[aria-label='Stop streaming']",
+        "button[aria-label='Dừng']",
+    ):
+        button = page.locator(selector).first
+        try:
+            if button.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _chatgpt_wait_reply(page, previous: int) -> str:
+    deadline = time.time() + 180
+    last = ""
+    stable = 0
+    while time.time() < deadline:
+        texts = _chatgpt_assistant_texts(page)
+        current = texts[-1] if len(texts) > previous else ""
+        if current and current == last and not _chatgpt_streaming(page):
+            stable += 1
+            if stable >= 2:
+                return current
+        else:
+            stable = 0
+            last = current
+        time.sleep(2)
+    return last
+
+
+def _chatgpt_send(page) -> None:
+    for selector in (
+        "button[data-testid='send-button']",
+        "button[aria-label='Send prompt']",
+        "button[aria-label='Gửi lời nhắc']",
+    ):
+        button = page.locator(selector).first
+        try:
+            if button.is_visible():
+                button.click(timeout=4_000)
+                return
+        except Exception:
+            continue
+    page.keyboard.press("Enter")
+
+
+def _chatgpt_image_sources(page) -> set[str]:
+    try:
+        rows = page.evaluate(
+            """() => [...document.querySelectorAll('img')]
+                .filter((img) => (img.naturalWidth || img.width || 0) >= 240)
+                .map((img) => img.currentSrc || img.src || '')
+                .filter(Boolean)"""
+        )
+    except Exception:
+        return set()
+    return {str(item) for item in rows or []}
+
+
+def _chatgpt_wait_image(page, before: set[str]) -> bytes:
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        current = _chatgpt_image_sources(page)
+        fresh = [item for item in current if item not in before]
+        if fresh:
+            blob = _chatgpt_image_bytes(page, fresh[-1])
+            if blob:
+                return blob
+        time.sleep(2)
+    return b""
+
+
+def _chatgpt_image_bytes(page, src: str) -> bytes:
+    if src.startswith("data:image"):
+        payload = src.split(",", 1)[-1]
+        try:
+            return base64.b64decode(payload)
+        except Exception:
+            return b""
+    if src.startswith("http"):
+        try:
+            response = page.context.request.get(src, timeout=30_000)
+            data = response.body() if response.ok else b""
+            if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:4] == b"RIFF":
+                return data
+        except Exception:
+            pass
+    try:
+        shot = page.locator("img").last.screenshot(type="png")
+        return bytes(shot or b"")
+    except Exception:
+        return b""
+
+
+def _chatgpt_web_screenshot(page, reason: str) -> None:
+    try:
+        folder = project_root() / "logs" / "screenshots"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        page.screenshot(path=str(folder / f"chatgpt_image_{reason}_{stamp}.png"), full_page=False)
+    except Exception:
+        pass

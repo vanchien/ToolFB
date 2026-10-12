@@ -63,6 +63,7 @@ config/ai_image_config.json
 config/universal_video_downloader.json
 config/human_interaction_settings.json
 config/facebook_groups.json
+config/ai_fleet.json
 
 # Large local tool cache/binaries (không đẩy lên GitHub)
 tools/ffmpeg/

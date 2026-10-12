@@ -847,6 +847,34 @@ def _sync_login_secrets_onto_registry(mapped: MappedAccount, registry_id: str) -
         set_account_credentials(rid, **kwargs)
 
 
+def stamp_registry_rows_from_interaction(
+    rows: list[dict[str, Any]],
+    settings: dict[str, Any] | None,
+) -> int:
+    """Gắn proxy tab Tương tác vào accounts.json khi dòng registry chưa có host/port."""
+    from src.utils.proxy_check import proxy_dict_from_accounts_json, proxy_host_port_configured
+
+    if not isinstance(settings, dict) or not isinstance(rows, list):
+        return 0
+    stamped = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        current = proxy_dict_from_accounts_json(row.get("proxy"))
+        if proxy_host_port_configured(current):
+            continue
+        mapped = _pick_login_page_account_for_post(row, settings)
+        if mapped is None or not mapped.use_proxy:
+            continue
+        px = network_to_proxy_config(mapped.network)
+        if not proxy_host_port_configured(px):
+            continue
+        row["proxy"] = px
+        row["use_proxy"] = True
+        stamped += 1
+    return stamped
+
+
 def refresh_post_account_from_login_page(
     acc: dict[str, Any],
     *,
@@ -1102,7 +1130,18 @@ def prepare_mapped_account_for_browser_run(mapped: MappedAccount) -> dict[str, A
     """
     from src.utils.account_browser_profile import ensure_account_browser_profile_ready
 
+    had_proxy = bool(str(mapped.network.proxy_server or "").strip())
     acc = sync_mapped_account_storage_from_registry(mapped)
+    from src.utils.proxy_check import proxy_dict_from_accounts_json, proxy_host_port_configured
+
+    run_px = proxy_dict_from_accounts_json(acc.get("proxy"))
+    if not had_proxy and proxy_host_port_configured(run_px):
+        mapped.network = proxy_dict_to_network(run_px)
+        mapped.use_proxy = True
+        acc["proxy"] = network_to_proxy_config(mapped.network)
+        acc["use_proxy"] = True
+    elif had_proxy:
+        persist_mapped_proxy_to_accounts_json(mapped, only_if_missing=True)
     ensure_account_browser_profile_ready(acc)
     prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
     ck = str(acc.get("cookie_path") or mapped.cookie_path or "").strip()
@@ -2220,7 +2259,11 @@ def reassign_proxies_from_pool(
     return {"updated": updated, "skipped": skipped, "assignments": assignments}
 
 
-def persist_mapped_proxy_to_accounts_json(mapped: MappedAccount) -> bool:
+def persist_mapped_proxy_to_accounts_json(
+    mapped: MappedAccount,
+    *,
+    only_if_missing: bool = False,
+) -> bool:
     """Ghi proxy mới vào ``accounts.json`` nếu có bản ghi khớp id/UID."""
     from src.utils.db_manager import AccountsDatabaseManager
 
@@ -2243,6 +2286,11 @@ def persist_mapped_proxy_to_accounts_json(mapped: MappedAccount) -> bool:
             )
     if rec is None:
         return False
+    if only_if_missing:
+        from src.utils.proxy_check import proxy_dict_from_accounts_json, proxy_host_port_configured
+
+        if proxy_host_port_configured(proxy_dict_from_accounts_json(rec.get("proxy"))):
+            return False
     reg_id = str(rec.get("id") or "").strip()
     if not reg_id:
         return False

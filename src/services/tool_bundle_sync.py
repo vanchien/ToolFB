@@ -29,6 +29,16 @@ SETTINGS_FILES = (
     "ai_video_styles.json",
     "video_styles.json",
     "goal_registry.json",
+    "ai_fleet.json",
+    "update_channel.json",
+    "ai_video_config.json",
+    "ai_video_prompt_presets.json",
+)
+EXTRA_DATA_FILES = (
+    "data/tiktok/accounts.json",
+    "data/tiktok/upload_jobs.json",
+    "data/runtime/gui_prefs.json",
+    "data/dispatch_queue.json",
 )
 
 
@@ -116,16 +126,59 @@ def _blank(value: Any) -> bool:
     if isinstance(value, str):
         return not value.strip()
     if isinstance(value, dict):
+        if _is_proxy_block(value):
+            return not _proxy_block_configured(value)
         return not any(str(item or "").strip() for item in value.values())
     if isinstance(value, list):
         return len(value) == 0
     return False
 
 
+def _is_proxy_block(value: dict[str, Any]) -> bool:
+    """Nhận khối proxy của accounts.json, tab Tương tác hoặc TikTok."""
+    keys = set(value)
+    if "proxy_server" in keys:
+        return True
+    if "host" in keys and "port" in keys:
+        return True
+    return "server" in keys and ("enabled" in keys or "username" in keys)
+
+
+def _proxy_block_configured(value: dict[str, Any]) -> bool:
+    """True khi khối proxy có địa chỉ dùng được. Port 0 hoặc server rỗng là chưa gắn."""
+    if "proxy_server" in value:
+        return bool(str(value.get("proxy_server") or "").strip())
+    if "server" in value and "host" not in value:
+        if "enabled" in value and not value.get("enabled"):
+            return False
+        return bool(str(value.get("server") or "").strip())
+    from src.utils.proxy_check import proxy_dict_from_accounts_json, proxy_host_port_configured
+
+    return proxy_host_port_configured(proxy_dict_from_accounts_json(value))
+
+
+def _take_incoming_proxy(local: dict[str, Any], key: str, value: Any) -> bool:
+    """Gắn proxy từ gói khi máy này chưa có host/port. Giữ proxy đang dùng."""
+    current = local.get(key)
+    if not isinstance(current, dict) or not isinstance(value, dict):
+        return False
+    if not _is_proxy_block(current) or not _is_proxy_block(value):
+        return False
+    if _proxy_block_configured(current) or not _proxy_block_configured(value):
+        return False
+    local[key] = value
+    if key == "proxy" and value.get("enabled") is not False:
+        local["use_proxy"] = True
+    return True
+
+
 def _fill_blanks(local: dict[str, Any], incoming: dict[str, Any]) -> bool:
     """Điền trường đang trống. Giữ giá trị máy này nếu cả hai đều có."""
     changed = False
     for key, value in incoming.items():
+        if _take_incoming_proxy(local, key, value):
+            changed = True
+            continue
         if key not in local or _blank(local.get(key)):
             if _blank(value):
                 continue
@@ -350,24 +403,22 @@ def build_bundle(
         exported_accounts.append(item)
     cookies: list[dict[str, str]] = []
     if project_root is not None:
-        root = Path(project_root).resolve()
-        for row in accounts:
-            rel = relativize_storage_path(str(row.get("cookie_path") or ""))
-            if not rel or ".." in rel.replace("\\", "/"):
-                continue
-            source = (root / rel).resolve()
-            try:
-                source.relative_to(root)
-            except ValueError:
-                continue
-            if not source.is_file() or source.stat().st_size > _COOKIE_MAX_BYTES:
-                continue
-            try:
-                cookie_text = source.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            cookies.append({"relative_path": rel.replace("\\", "/"), "text": cookie_text})
+        cookies = _read_cookies(Path(project_root), accounts)
     settings = _read_settings(Path(project_root)) if project_root is not None else {}
+    interaction = settings.get("human_interaction_settings.json")
+    if isinstance(interaction, dict):
+        from src.utils.account_proxy_mapper import stamp_registry_rows_from_interaction
+
+        stamp_registry_rows_from_interaction(exported_accounts, interaction)
+    account_paths = {
+        relativize_storage_path(str(row.get("portable_path") or row.get("profile_path") or "")).replace("\\", "/")
+        for row in exported_accounts
+    }
+    profile_rows = [
+        row
+        for row in collect_profile_rows(settings)
+        if row["portable_path"] not in account_paths
+    ]
     return {
         "bundle_type": BUNDLE_TYPE,
         "bundle_version": BUNDLE_VERSION,
@@ -380,16 +431,23 @@ def build_bundle(
             "credentials": credentials or {"accounts": {}},
             "cookies": cookies,
             "settings": settings,
+            "profile_rows": profile_rows,
         },
     }
+
+
+def _settings_paths(project_root: Path) -> list[tuple[str, Path]]:
+    """File cấu hình được mang sang máy khác. Khóa là tên file hoặc đường dẫn trong project."""
+    root = Path(project_root)
+    rows = [(name, root / "config" / name) for name in SETTINGS_FILES]
+    rows.extend((name, root / name) for name in EXTRA_DATA_FILES)
+    return rows
 
 
 def _read_settings(project_root: Path) -> dict[str, Any]:
     """Đọc các file cài đặt được phép mang sang máy khác."""
     found: dict[str, Any] = {}
-    root = Path(project_root)
-    for name in SETTINGS_FILES:
-        path = root / "config" / name
+    for name, path in _settings_paths(project_root):
         if not path.is_file() or path.stat().st_size > 8_000_000:
             continue
         try:
@@ -401,17 +459,177 @@ def _read_settings(project_root: Path) -> dict[str, Any]:
     return found
 
 
+def _read_cookies(project_root: Path, accounts: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Cookie của từng tài khoản và mọi file trong data/cookies."""
+    root = Path(project_root).resolve()
+    wanted: list[str] = []
+    for row in accounts:
+        if not isinstance(row, dict):
+            continue
+        rel = relativize_storage_path(str(row.get("cookie_path") or ""))
+        account_id = str(row.get("id") or "").strip()
+        if not rel and account_id:
+            rel = f"data/cookies/{account_id}.json"
+        if rel:
+            wanted.append(rel.replace("\\", "/"))
+    cookie_dir = root / "data" / "cookies"
+    if cookie_dir.is_dir():
+        wanted.extend(f"data/cookies/{path.name}" for path in cookie_dir.glob("*.json"))
+    cookies: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for rel in wanted:
+        if rel in seen or ".." in rel:
+            continue
+        seen.add(rel)
+        source = (root / rel).resolve()
+        try:
+            source.relative_to(root)
+        except ValueError:
+            continue
+        if not source.is_file() or source.stat().st_size > _COOKIE_MAX_BYTES:
+            continue
+        try:
+            cookie_text = source.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        cookies.append({"relative_path": rel, "text": cookie_text})
+    return cookies
+
+
+def _mapped_identity(item: dict[str, Any]) -> str:
+    """Khóa tài khoản tương tác: UID số, rồi email, rồi account_id."""
+    auth = item.get("auth") if isinstance(item.get("auth"), dict) else {}
+    username = str(auth.get("username") or "").strip()
+    if username.upper().startswith("UID_"):
+        username = username[4:]
+    digits = "".join(ch for ch in username if ch.isdigit())
+    account_id = str(item.get("account_id") or "").strip()
+    if len(digits) >= 5 and (username.isdigit() or account_id.upper().startswith("UID_")):
+        return f"uid:{digits}"
+    email = str(auth.get("email") or "").strip().casefold()
+    if "@" in email:
+        return f"mail:{email}"
+    return account_id
+
+
+def _record_key(item: Any) -> str:
+    """Khóa bản ghi. Tài khoản tương tác khớp theo UID dù account_id khác nhau."""
+    if not isinstance(item, dict):
+        return ""
+    if item.get("account_id") and ("network" in item or "auth" in item):
+        identity = _mapped_identity(item)
+        if identity:
+            return identity
+    return str(item.get("id") or item.get("account_id") or "").strip()
+
+
+def collect_profile_rows(settings: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Profile của tài khoản tương tác và TikTok, ngoài danh sách accounts.json."""
+    if not isinstance(settings, dict):
+        return []
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(raw: Any, label: str) -> None:
+        rel = relativize_storage_path(str(raw or "")).replace("\\", "/")
+        if not rel.startswith("data/") or rel in seen or ".." in rel:
+            return
+        seen.add(rel)
+        rows.append({"id": label, "name": label, "portable_path": rel, "profile_path": rel})
+
+    interaction = settings.get("human_interaction_settings.json")
+    if isinstance(interaction, dict):
+        for key in ("mapped_accounts_login", "mapped_accounts_interaction", "mapped_accounts"):
+            for item in interaction.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                storage = item.get("storage") if isinstance(item.get("storage"), dict) else {}
+                add(storage.get("profile_path"), str(item.get("account_id") or "profile"))
+    tiktok = settings.get("data/tiktok/accounts.json")
+    if isinstance(tiktok, list):
+        for item in tiktok:
+            if isinstance(item, dict):
+                add(item.get("profile_path"), str(item.get("id") or item.get("name") or "tiktok"))
+    return rows
+
+
+def _text_lines(value: str) -> list[str]:
+    return [line.strip() for line in str(value or "").splitlines() if line.strip()]
+
+
+def _merge_text_lines(local: str, incoming: str) -> tuple[str, bool]:
+    """Ghép từng dòng. Dòng máy này giữ nguyên, dòng mới được thêm."""
+    lines = _text_lines(local)
+    seen = set(lines)
+    changed = False
+    for text in _text_lines(incoming):
+        if text in seen:
+            continue
+        lines.append(text)
+        seen.add(text)
+        changed = True
+    if not changed:
+        return local, False
+    return "\n".join(lines), True
+
+
+def _merge_paired_account_proxy_text(
+    local_accounts: str,
+    local_proxies: str,
+    incoming_accounts: str,
+    incoming_proxies: str,
+) -> tuple[str, str, bool]:
+    """Thêm tài khoản mới kèm đúng dòng proxy cùng vị trí trong gói."""
+    accounts = _text_lines(local_accounts)
+    proxies = _text_lines(local_proxies)
+    incoming_account_lines = _text_lines(incoming_accounts)
+    incoming_proxy_lines = _text_lines(incoming_proxies)
+    changed = False
+    index_of = {line: pos for pos, line in enumerate(accounts)}
+    for pos, line in enumerate(incoming_account_lines):
+        paired = incoming_proxy_lines[pos] if pos < len(incoming_proxy_lines) else ""
+        if line in index_of:
+            local_pos = index_of[line]
+            if paired and local_pos < len(proxies) and not proxies[local_pos]:
+                proxies[local_pos] = paired
+                changed = True
+            elif paired and local_pos == len(proxies):
+                proxies.append(paired)
+                changed = True
+            continue
+        accounts.append(line)
+        index_of[line] = len(accounts) - 1
+        if paired:
+            proxies.append(paired)
+        changed = True
+    seen_proxies = set(proxies)
+    for line in incoming_proxy_lines:
+        if line in seen_proxies:
+            continue
+        proxies.append(line)
+        seen_proxies.add(line)
+        changed = True
+    if not changed:
+        return local_accounts, local_proxies, False
+    return "\n".join(accounts), "\n".join(proxies), True
+
+
 def _merge_json_list(local: list[Any], incoming: list[Any]) -> bool:
-    """Thêm phần tử chưa có. Bản ghi có id thì so theo id."""
-    seen = {str(item.get("id")) for item in local if isinstance(item, dict) and item.get("id")}
+    """Thêm bản ghi chưa có. Trùng id hoặc account_id thì chỉ điền chỗ trống."""
+    index = {key: pos for pos, item in enumerate(local) if (key := _record_key(item))}
     changed = False
     for item in incoming:
-        if isinstance(item, dict) and item.get("id"):
-            key = str(item.get("id"))
-            if key in seen:
-                continue
+        key = _record_key(item)
+        if key and key in index:
+            current = local[index[key]]
+            if isinstance(current, dict) and isinstance(item, dict):
+                merged, sub = _merge_json_value(current, item)
+                local[index[key]] = merged
+                changed = changed or sub
+            continue
+        if key:
             local.append(item)
-            seen.add(key)
+            index[key] = len(local) - 1
             changed = True
             continue
         if item not in local:
@@ -426,7 +644,26 @@ def _merge_json_value(local: Any, incoming: Any) -> tuple[Any, bool]:
         return incoming, not _blank(incoming)
     if isinstance(local, dict) and isinstance(incoming, dict):
         changed = False
+        paired_text = False
         for key, value in incoming.items():
+            if key in {"accounts_text", "proxies_text"}:
+                if paired_text:
+                    continue
+                paired_text = True
+                accounts_text, proxies_text, text_changed = _merge_paired_account_proxy_text(
+                    str(local.get("accounts_text") or ""),
+                    str(local.get("proxies_text") or ""),
+                    str(incoming.get("accounts_text") or ""),
+                    str(incoming.get("proxies_text") or ""),
+                )
+                if text_changed:
+                    local["accounts_text"] = accounts_text
+                    local["proxies_text"] = proxies_text
+                    changed = True
+                continue
+            if _take_incoming_proxy(local, key, value):
+                changed = True
+                continue
             if key not in local or _blank(local.get(key)):
                 if _blank(value):
                     continue
@@ -447,14 +684,14 @@ def apply_settings(project_root: Path, incoming: dict[str, Any], *, write: bool 
     if not isinstance(incoming, dict):
         return 0
     root = Path(project_root).resolve()
-    config_dir = root / "config"
     updated = 0
+    allowed = {name: path for name, path in _settings_paths(root)}
     for name, payload in incoming.items():
-        if name not in SETTINGS_FILES or not isinstance(payload, (dict, list)):
+        if name not in allowed or not isinstance(payload, (dict, list)):
             continue
-        target = (config_dir / name).resolve()
+        target = allowed[name].resolve()
         try:
-            target.relative_to(config_dir.resolve())
+            target.relative_to(root)
         except ValueError:
             continue
         current: Any = None
@@ -490,6 +727,12 @@ def plan_merge(
         dict(bundle.get("credentials") or {}),
         id_map,
     )
+    settings = dict(bundle.get("settings") or {}) if isinstance(bundle.get("settings"), dict) else {}
+    interaction = settings.get("human_interaction_settings.json")
+    if isinstance(interaction, dict):
+        from src.utils.account_proxy_mapper import stamp_registry_rows_from_interaction
+
+        stamp_registry_rows_from_interaction(accounts, interaction)
     report = SyncReport(
         accounts_added=account_report.accounts_added,
         accounts_filled=account_report.accounts_filled,
@@ -508,8 +751,12 @@ def plan_merge(
         "schedule_posts": jobs,
         "credentials": credentials,
         "cookies": list(bundle.get("cookies") or []),
-        "settings": dict(bundle.get("settings") or {}) if isinstance(bundle.get("settings"), dict) else {},
-        "profile_jobs": profile_transfer_jobs(list(bundle.get("accounts") or []), accounts, id_map),
+        "settings": settings,
+        "profile_jobs": profile_transfer_jobs(
+            list(bundle.get("accounts") or []) + list(bundle.get("profile_rows") or []),
+            accounts + list(bundle.get("profile_rows") or []),
+            id_map,
+        ),
     }, report
 
 
@@ -550,10 +797,10 @@ def profile_has_login(path: Path) -> bool:
 
 
 def _safe_profile_path(root: Path, relative: str) -> Path | None:
-    """Chỉ cho đường dẫn nằm trong data/profiles của đúng thư mục gốc."""
+    """Chỉ cho profile nằm trong data/profiles hoặc data/tiktok của đúng thư mục gốc."""
     rel = str(relative or "").replace("\\", "/").lstrip("/")
     parts = [part for part in rel.split("/") if part]
-    if not parts or ".." in parts or parts[0] != "data" or len(parts) < 3 or parts[1] != "profiles":
+    if not parts or ".." in parts or parts[0] != "data" or len(parts) < 3 or parts[1] not in {"profiles", "tiktok"}:
         return None
     root_resolved = Path(root).resolve()
     target = root_resolved.joinpath(*parts).resolve()
@@ -593,7 +840,11 @@ def profile_transfer_jobs(
         dest = relativize_storage_path(str(dest_row.get("portable_path") or dest_row.get("profile_path") or ""))
         if not dest:
             dest = source
-        if not source.startswith("data/profiles/") or not dest.startswith("data/profiles/"):
+        if not (
+            source.startswith("data/profiles/") or source.startswith("data/tiktok/")
+        ) or not (
+            dest.startswith("data/profiles/") or dest.startswith("data/tiktok/")
+        ):
             continue
         key = (dest, source)
         if key in seen:
@@ -628,6 +879,37 @@ def export_profiles(
         shutil.copytree(source, dest, dirs_exist_ok=True, ignore=_ignore_profile_junk)
         copied += 1
     return copied, missing
+
+
+def export_ai_account_dirs(project_root: Path, package_dir: Path) -> int:
+    """Chép phiên trình duyệt ChatGPT và tài khoản AI. Bỏ cache."""
+    copied, _kept = install_ai_account_dirs(project_root, package_dir, replace=True)
+    return copied
+
+
+def install_ai_account_dirs(source_root: Path, dest_root: Path, *, replace: bool = False) -> tuple[int, int]:
+    """Chép thư mục data/ai_accounts. Phiên máy này đã đăng nhập thì giữ, trừ khi đang xuất gói mới."""
+    source = Path(source_root) / "data" / "ai_accounts"
+    if not source.is_dir():
+        return 0, 0
+    copied = 0
+    kept = 0
+    for provider in source.iterdir():
+        if not provider.is_dir():
+            continue
+        accounts = [item for item in provider.iterdir() if item.is_dir()] or [provider]
+        for account in accounts:
+            if account == provider and any(child.is_dir() for child in provider.iterdir()):
+                continue
+            relative = account.relative_to(Path(source_root))
+            dest = Path(dest_root) / relative
+            if not replace and profile_has_login(dest):
+                kept += 1
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(account, dest, dirs_exist_ok=True, ignore=_ignore_profile_junk)
+            copied += 1
+    return copied, kept
 
 
 def profile_install_action(source_root: Path, dest_root: Path, job: dict[str, str]) -> str:
