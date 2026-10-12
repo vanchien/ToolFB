@@ -8500,6 +8500,7 @@ class _ManagerWindow:
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )
+                data = payload.get("data") or {}
 
                 def _progress(done_n: int, total_n: int, name: str) -> None:
                     self._report_sync(f"Đồng bộ: chép profile {done_n}/{total_n} — {name}")
@@ -8514,7 +8515,6 @@ class _ManagerWindow:
                 from src.services.tool_bundle_sync import export_ai_account_dirs
 
                 ai_accounts_copied = export_ai_account_dirs(project_root(), package)
-                data = payload.get("data") or {}
                 cookie_count = len(data.get("cookies") or [])
                 settings_count = len(data.get("settings") or {})
                 text = (
