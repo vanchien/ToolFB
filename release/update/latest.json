@@ -1,7 +1,7 @@
 {
-  "version": "1.0.103",
+  "version": "1.0.104",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "59308e0ff04e6bd1a170ee35b5da5d7fe83a871e1526ecac9574937f20fa2eff",
-  "notes": "Hien ten Facebook that tren bang dang nhap, STT va bo loc cac bang.",
-  "generated_at": "2026-10-13T17:08:16"
+  "sha256": "1b64c9cd2d5c8e8f41ebd1cb78ea31adaa95bfde21c71bbe3953012e35dc22f7",
+  "notes": "Dong bo ca thu muc profile Firefox, khong chi file cookie.",
+  "generated_at": "2026-10-13T18:08:53"
 }
