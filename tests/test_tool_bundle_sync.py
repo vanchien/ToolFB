@@ -610,6 +610,11 @@ def test_logged_in_firefox_is_packed_without_old_machine_lock(tmp_path) -> None:
     profile = tmp_path / "data" / "profiles" / "firefox" / "UID_61580000000001"
     profile.mkdir(parents=True)
     (profile / "cookies.sqlite").write_bytes(b"facebook-session")
+    (profile / "prefs.js").write_text(
+        'user_pref("network.proxy.http", "0.0.3.188");\nuser_pref("browser.startup.homepage", "http://0.0.3.188");\n',
+        encoding="utf-8",
+    )
+    (profile / "sessionstore.jsonlz4").write_bytes(b"old-tab")
     (profile / "compatibility.ini").write_text("LastPlatformDir=C:\\Users\\Old\\firefox", encoding="utf-8")
     (profile / "user.js").write_text('user_pref("network.proxy.http", "10.0.0.1");\n', encoding="utf-8")
     payload = build_bundle(accounts=[], pages=[], jobs=[], project_root=tmp_path)
@@ -622,4 +627,8 @@ def test_logged_in_firefox_is_packed_without_old_machine_lock(tmp_path) -> None:
     packed = package / "data" / "profiles" / "firefox" / "UID_61580000000001"
     assert (packed / "cookies.sqlite").is_file()
     assert not (packed / "compatibility.ini").exists()
-    assert "network.proxy" not in (packed / "user.js").read_text(encoding="utf-8")
+    assert "network.proxy.http" not in (packed / "user.js").read_text(encoding="utf-8")
+    prefs = packed / "prefs.js"
+    assert "network.proxy.type" in prefs.read_text(encoding="utf-8")
+    assert 'user_pref("network.proxy.type", 0);' in prefs.read_text(encoding="utf-8")
+    assert not (packed / "sessionstore.jsonlz4").exists()

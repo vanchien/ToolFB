@@ -847,31 +847,54 @@ def collect_tiktok_profile_rows(project_root: Path) -> list[dict[str, str]]:
     return rows
 
 
+def _strip_proxy_pref_lines(path: Path) -> None:
+    """Bỏ proxy và trang khởi động của máy chủ. Firefox máy kia không mở lại địa chỉ proxy cũ."""
+    if not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    kept: list[str] = []
+    for line in lines:
+        low = line.lower()
+        if "network.proxy." in low or "browser.startup.homepage" in low or "browser.startup.page" in low:
+            continue
+        kept.append(line)
+    if path.name == "prefs.js":
+        kept.append('user_pref("network.proxy.type", 0);')
+        kept.append('user_pref("browser.startup.page", 0);')
+        kept.append('user_pref("browser.startup.homepage", "about:blank");')
+    if kept == lines:
+        return
+    try:
+        path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _make_firefox_profile_portable(profile_dir: Path) -> None:
-    """Bản sao sang máy khác không còn file khóa và đường dẫn Firefox của máy chủ."""
+    """Bản sao sang máy khác không còn khóa, proxy và tab của máy chủ. Giữ cookie và storage."""
     if not profile_dir.is_dir():
         return
-    for name in ("compatibility.ini", "parent.lock", "lock", ".parentlock"):
+    for name in (
+        "compatibility.ini",
+        "parent.lock",
+        "lock",
+        ".parentlock",
+        "sessionstore.jsonlz4",
+    ):
         target = profile_dir / name
         if target.exists():
             try:
                 target.unlink()
             except OSError:
                 pass
-    user_js = profile_dir / "user.js"
-    if not user_js.is_file():
-        return
-    try:
-        lines = user_js.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return
-    kept = [line for line in lines if "network.proxy." not in line.lower()]
-    if len(kept) == len(lines):
-        return
-    try:
-        user_js.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-    except OSError:
-        pass
+    backups = profile_dir / "sessionstore-backups"
+    if backups.is_dir():
+        shutil.rmtree(backups, ignore_errors=True)
+    _strip_proxy_pref_lines(profile_dir / "user.js")
+    _strip_proxy_pref_lines(profile_dir / "prefs.js")
 
 
 def profile_has_login(path: Path) -> bool:

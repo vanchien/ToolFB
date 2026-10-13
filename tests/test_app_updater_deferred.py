@@ -63,6 +63,7 @@ def test_deferred_batch_excludes_internal_and_relaunch_portable(tmp_path: Path) 
       preserve_on_apply_dirs=("data", "config"),
   )
   text = bat.read_text(encoding="utf-8")
+  assert "/MIR /IS /IT" in text
   assert "/XD" in text and "_internal" in text
   assert "/XF ToolFB_GUI.exe" in text
   assert "main.py" in text or "python" in text.lower()

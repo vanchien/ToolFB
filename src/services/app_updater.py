@@ -1264,7 +1264,7 @@ def _stage_deferred_full_apply_windows(
         "if %tries% gtr 120 goto FAIL",
         "ping -n 2 127.0.0.1 >nul",
         (
-            f'robocopy "{st_s}\\portable_apply" "{pr_s}" /E /R:3 /W:2 /NP '
+            f'robocopy "{st_s}\\portable_apply" "{pr_s}" /MIR /IS /IT /R:3 /W:2 /NP '
             f"/XF ToolFB_GUI.exe /XD {robocopy_xd}"
         ),
         "if errorlevel 8 goto L",
