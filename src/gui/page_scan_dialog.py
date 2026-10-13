@@ -140,6 +140,7 @@ class PageScanDialog:
         tfrm.rowconfigure(0, weight=1)
 
         cols = (
+            "stt",
             "select",
             "page_name",
             "fb_page_id",
@@ -151,6 +152,7 @@ class PageScanDialog:
         )
         self._tree = ttk.Treeview(tfrm, columns=cols, show="headings", selectmode="extended")
         headings = {
+            "stt": "STT",
             "select": "✓",
             "page_name": "Tên Page",
             "fb_page_id": "Meta Page ID",
@@ -161,6 +163,7 @@ class PageScanDialog:
             "role": "Vai trò",
         }
         widths = {
+            "stt": 44,
             "select": 40,
             "page_name": 180,
             "fb_page_id": 110,
@@ -329,12 +332,13 @@ class PageScanDialog:
     def _populate_tree(self, rows: list[ScannedPage]) -> None:
         for i in self._tree.get_children():
             self._tree.delete(i)
-        for p in rows:
+        for index, p in enumerate(rows, start=1):
             checked = "☑" if p.get("fb_page_id") else "☐"
             self._tree.insert(
                 "",
                 tk.END,
                 values=(
+                    index,
                     checked,
                     p.get("page_name", ""),
                     p.get("fb_page_id", ""),
@@ -349,26 +353,28 @@ class PageScanDialog:
     def _on_tree_click(self, event: tk.Event) -> None:
         col = self._tree.identify_column(event.x)
         row = self._tree.identify_row(event.y)
-        if not row or col != "#1":
+        if not row or col != "#2":
             return
         vals = list(self._tree.item(row, "values"))
-        if not vals:
+        if len(vals) < 2:
             return
-        vals[0] = "☐" if vals[0] == "☑" else "☑"
+        vals[1] = "☐" if vals[1] == "☑" else "☑"
         self._tree.item(row, values=vals)
 
     def _toggle_all(self, checked: bool) -> None:
         mark = "☑" if checked else "☐"
         for iid in self._tree.get_children():
             vals = list(self._tree.item(iid, "values"))
-            vals[0] = mark
+            if len(vals) > 1:
+                vals[1] = mark
             self._tree.item(iid, values=vals)
 
     def _select_only_with_id(self) -> None:
         for iid in self._tree.get_children():
             vals = list(self._tree.item(iid, "values"))
-            has_id = bool((vals[2] if len(vals) > 2 else "").strip())  # Meta Page ID
-            vals[0] = "☑" if has_id else "☐"
+            has_id = bool((vals[3] if len(vals) > 3 else "").strip())  # Meta Page ID
+            if len(vals) > 1:
+                vals[1] = "☑" if has_id else "☐"
             self._tree.item(iid, values=vals)
 
     # --- Save ---
@@ -380,17 +386,17 @@ class PageScanDialog:
         to_save: list[ScannedPage] = []
         for iid in self._tree.get_children():
             vals = self._tree.item(iid, "values")
-            if not vals or vals[0] != "☑":
+            if len(vals) < 2 or vals[1] != "☑":
                 continue
             to_save.append(
                 ScannedPage(
-                    page_name=str(vals[1]),
-                    fb_page_id=str(vals[2]).strip(),
-                    business_name=str(vals[3]).strip(),
-                    business_id=str(vals[4]).strip(),
-                    page_url=str(vals[5]),
-                    source=str(vals[6]),
-                    role=str(vals[7]).strip() if len(vals) > 7 else "unknown",
+                    page_name=str(vals[2]),
+                    fb_page_id=str(vals[3]).strip(),
+                    business_name=str(vals[4]).strip(),
+                    business_id=str(vals[5]).strip(),
+                    page_url=str(vals[6]),
+                    source=str(vals[7]),
+                    role=str(vals[8]).strip() if len(vals) > 8 else "unknown",
                 )
             )
         if not to_save:

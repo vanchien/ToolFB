@@ -79,6 +79,70 @@ def read_visible_text(page: Any) -> str:
     return str(text or "")[:4000]
 
 
+_READ_DISPLAY_NAME_JS = """(uid) => {
+  const labels = [];
+  for (const el of document.querySelectorAll("[aria-label]")) {
+    const value = (el.getAttribute("aria-label") || "").trim();
+    if (value && value.length <= 180) labels.push(value);
+    if (labels.length >= 300) break;
+  }
+  const links = [];
+  if (uid) {
+    for (const anchor of document.querySelectorAll("a[href]")) {
+      const href = anchor.getAttribute("href") || "";
+      if (!href.includes(uid)) continue;
+      const text = (anchor.innerText || "").trim().split("\\n")[0].trim();
+      if (text && text.length <= 80) links.push({href, text});
+      if (links.length >= 40) break;
+    }
+  }
+  return {labels, links};
+}"""
+
+
+def read_logged_in_display_name(page: Any) -> str:
+    """Đọc tên người dùng trên Facebook đã đăng nhập. Rỗng nếu trang chưa hiện tên."""
+    from src.utils.account_proxy_mapper import (
+        facebook_display_name_from_page_bits,
+        facebook_href_is_own_profile,
+    )
+
+    uid = ""
+    try:
+        cookies = page.context.cookies("https://www.facebook.com")
+    except Exception:
+        cookies = []
+    for item in cookies or []:
+        if str(item.get("name") or "").strip().lower() != "c_user":
+            continue
+        uid = "".join(ch for ch in str(item.get("value") or "") if ch.isdigit())
+        break
+    try:
+        payload = page.evaluate(_READ_DISPLAY_NAME_JS, uid)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    labels = payload.get("labels") if isinstance(payload.get("labels"), list) else []
+    raw_links = payload.get("links") if isinstance(payload.get("links"), list) else []
+    own_texts: list[str] = []
+    for item in raw_links:
+        if isinstance(item, dict):
+            href = str(item.get("href") or "")
+            text = str(item.get("text") or "")
+        else:
+            href = ""
+            text = str(item or "")
+        if uid and not facebook_href_is_own_profile(href, uid):
+            continue
+        if text:
+            own_texts.append(text)
+    return facebook_display_name_from_page_bits(
+        [str(item) for item in labels],
+        own_texts,
+    )
+
+
 def feed_can_scroll(url: str) -> bool:
     """Trang đăng nhập hoặc checkpoint thì không cuộn."""
     raw = str(url or "").casefold()

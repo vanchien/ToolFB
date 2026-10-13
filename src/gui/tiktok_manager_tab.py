@@ -56,19 +56,15 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
 
     ttk.Label(
         parent,
-        text="TikTok Manager — mỗi tài khoản một profile browser; đăng nhập TikTok thủ công một lần. "
-        "Upload qua trình duyệt (Playwright), không dùng API chính thức. "
-        "Lên lịch đăng: cùng «Bắt đầu lịch» và chu kỳ quét như tab Job lịch Facebook (schedule_posts) — không thêm scheduler riêng.",
-        wraplength=920,
-        font=("Segoe UI", 9),
+        text="Mỗi tài khoản một profile. Đăng nhập một lần, rồi tạo job để đăng video.",
     ).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
 
     nb = ttk.Notebook(parent)
     nb.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
     tab_acc = ttk.Frame(nb, padding=4)
     tab_job = ttk.Frame(nb, padding=4)
-    nb.add(tab_acc, text="  1. Tài khoản  ")
-    nb.add(tab_job, text="  2. Job & lịch đăng  ")
+    nb.add(tab_acc, text="  Tài khoản  ")
+    nb.add(tab_job, text="  Lịch đăng  ")
     tab_acc.columnconfigure(0, weight=1)
     tab_acc.rowconfigure(0, weight=1)
     tab_job.columnconfigure(0, weight=1)
@@ -76,7 +72,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     tab_job.rowconfigure(1, weight=2)
     tab_job.rowconfigure(2, weight=1)
 
-    acc_fr = ttk.LabelFrame(tab_acc, text="Quản lý tài khoản TikTok", padding=6)
+    acc_fr = ttk.LabelFrame(tab_acc, text="Tài khoản", padding=6)
     acc_fr.grid(row=0, column=0, sticky="nsew")
     acc_fr.columnconfigure(0, weight=1)
     acc_fr.rowconfigure(1, weight=1)
@@ -115,7 +111,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
             rows = [dict(r) for r in acc_store.load_all()]
             specs: list[dict[str, Any]] = []
             ids: list[str] = []
-            for r in rows:
+            for index, r in enumerate(rows, start=1):
                 rid = str(r.get("id") or "").strip()
                 if rid:
                     ids.append(rid)
@@ -124,6 +120,7 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
                 px_on = bool(px.get("enabled")) and str(px.get("server", "")).strip()
                 row_spec: dict[str, Any] = {
                         "values": (
+                            index,
                             str(r.get("name", "")),
                             str(r.get("username", "")),
                             prof_used,
@@ -167,13 +164,14 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     def refresh_jobs() -> None:
         def _worker() -> list[dict[str, Any]]:
             specs: list[dict[str, Any]] = []
-            for r in job_store.load_all():
+            for index, r in enumerate(job_store.load_all(), start=1):
                 vp = str(r.get("video_path", ""))[:80]
                 sat = str(r.get("scheduled_at") or r.get("schedule_time") or "").strip()
                 specs.append(
                     {
                         "iid": str(r.get("id")),
                         "values": (
+                            index,
                             str(r.get("id", "")),
                             str(r.get("account_id", "")),
                             vp,
@@ -204,14 +202,15 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
 
         run_background_then_main(root, _worker, _on_main)
 
-    cols_acc = ("name", "username", "profile_path", "proxy", "status")
+    cols_acc = ("stt", "name", "username", "profile_path", "proxy", "status")
     tree_acc = ttk.Treeview(acc_fr, columns=cols_acc, show="headings", height=10, selectmode="extended")
     _acc_col_cfg: list[tuple[str, str, int, int, bool]] = [
+        ("stt", "STT", 44, 36, False),
         ("name", "Tên", 140, 80, True),
-        ("username", "Username", 120, 72, True),
-        ("profile_path", "Profile path", 260, 120, True),
+        ("username", "Tên đăng nhập", 120, 72, True),
+        ("profile_path", "Thư mục profile", 260, 120, True),
         ("proxy", "Proxy", 72, 56, False),
-        ("status", "Status", 88, 64, True),
+        ("status", "Trạng thái", 88, 64, True),
     ]
     for c, title, w, mw, st in _acc_col_cfg:
         tree_acc.heading(c, text=title)
@@ -222,11 +221,11 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     sy1.grid(row=1, column=1, sticky="ns")
     install_treeview_shortcuts(tree_acc, owner=root, info_callback=log_tt)
 
-    job_fr = ttk.LabelFrame(tab_job, text="Tạo / sửa thông tin job đăng", padding=6)
+    job_fr = ttk.LabelFrame(tab_job, text="Job đăng", padding=6)
     job_fr.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
     job_fr.columnconfigure(1, weight=1)
 
-    ttk.Label(job_fr, text="Chọn tài khoản:").grid(row=0, column=0, sticky="w", pady=2)
+    ttk.Label(job_fr, text="Tài khoản").grid(row=0, column=0, sticky="w", pady=2)
     var_acc = tk.StringVar(value="")
     cb_acc = ttk.Combobox(job_fr, textvariable=var_acc, width=28, state="readonly")
     cb_acc.grid(row=0, column=1, sticky="w", pady=2)
@@ -235,15 +234,15 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     var_video = tk.StringVar(value="")
     ttk.Entry(job_fr, textvariable=var_video, width=56).grid(row=1, column=1, columnspan=3, sticky="ew", pady=2)
 
-    ttk.Label(job_fr, text="Caption:").grid(row=2, column=0, sticky="nw", pady=2)
+    ttk.Label(job_fr, text="Nội dung").grid(row=2, column=0, sticky="nw", pady=2)
     txt_cap = tk.Text(job_fr, height=3, width=60, wrap="word")
     txt_cap.grid(row=2, column=1, columnspan=5, sticky="ew", pady=2)
 
-    ttk.Label(job_fr, text="Hashtags (cách space):").grid(row=3, column=0, sticky="w", pady=2)
+    ttk.Label(job_fr, text="Hashtag").grid(row=3, column=0, sticky="w", pady=2)
     var_tags = tk.StringVar(value="")
     ttk.Entry(job_fr, textvariable=var_tags, width=56).grid(row=3, column=1, columnspan=5, sticky="ew", pady=2)
 
-    ttk.Label(job_fr, text="Privacy:").grid(row=4, column=0, sticky="w", pady=2)
+    ttk.Label(job_fr, text="Ai xem").grid(row=4, column=0, sticky="w", pady=2)
     var_privacy = tk.StringVar(value="public")
     ttk.Combobox(
         job_fr,
@@ -257,18 +256,16 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     var_allow_d = tk.BooleanVar(value=True)
     var_allow_s = tk.BooleanVar(value=True)
     var_schedule = tk.BooleanVar(value=False)
-    ttk.Checkbutton(job_fr, text="Allow comments", variable=var_allow_c).grid(row=5, column=0, sticky="w")
-    ttk.Checkbutton(job_fr, text="Allow duet", variable=var_allow_d).grid(row=5, column=1, sticky="w")
-    ttk.Checkbutton(job_fr, text="Allow stitch", variable=var_allow_s).grid(row=5, column=2, sticky="w")
-    ttk.Checkbutton(job_fr, text="Lên lịch (một lần, cần Bắt đầu lịch)", variable=var_schedule).grid(
-        row=5, column=3, sticky="w"
-    )
+    ttk.Checkbutton(job_fr, text="Cho bình luận", variable=var_allow_c).grid(row=5, column=0, sticky="w")
+    ttk.Checkbutton(job_fr, text="Cho duet", variable=var_allow_d).grid(row=5, column=1, sticky="w")
+    ttk.Checkbutton(job_fr, text="Cho stitch", variable=var_allow_s).grid(row=5, column=2, sticky="w")
+    ttk.Checkbutton(job_fr, text="Hẹn giờ", variable=var_schedule).grid(row=5, column=3, sticky="w")
 
     tz_name = os.environ.get("SCHEDULER_TZ", "Asia/Ho_Chi_Minh").strip() or "Asia/Ho_Chi_Minh"
-    ttk.Label(job_fr, text="Hẹn đăng (YYYY-MM-DD HH:MM):").grid(row=6, column=0, sticky="w", pady=2)
+    ttk.Label(job_fr, text="Giờ đăng").grid(row=6, column=0, sticky="w", pady=2)
     var_sched_wall = tk.StringVar(value="")
     ttk.Entry(job_fr, textvariable=var_sched_wall, width=22).grid(row=6, column=1, sticky="w", pady=2)
-    ttk.Label(job_fr, text=f"wall = {tz_name}", font=("Segoe UI", 8)).grid(row=6, column=2, columnspan=2, sticky="w")
+    ttk.Label(job_fr, text=tz_name, foreground="#64748b").grid(row=6, column=2, columnspan=2, sticky="w")
 
     jb = ttk.Frame(job_fr)
     jb.grid(row=7, column=0, columnspan=6, sticky="w", pady=(8, 0))
@@ -278,17 +275,18 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
     list_fr.columnconfigure(0, weight=1)
     list_fr.rowconfigure(0, weight=1)
 
-    cols_j = ("id", "account_id", "video_path", "scheduled_at", "status", "step", "error")
+    cols_j = ("stt", "id", "account_id", "video_path", "scheduled_at", "status", "step", "error")
     tree_job = ttk.Treeview(list_fr, columns=cols_j, show="headings", height=10, selectmode="extended")
-    heads = ("id", "account", "video", "hẹn (UTC)", "status", "step", "lỗi")
+    heads = ("STT", "Mã", "Tài khoản", "Video", "Giờ hẹn", "Trạng thái", "Bước", "Lỗi")
     _job_col_cfg: list[tuple[str, str, int, int, bool]] = [
-        ("id", heads[0], 100, 72, False),
-        ("account_id", heads[1], 100, 72, True),
-        ("video_path", heads[2], 180, 100, True),
-        ("scheduled_at", heads[3], 130, 96, True),
-        ("status", heads[4], 80, 64, True),
-        ("step", heads[5], 88, 64, True),
-        ("error", heads[6], 160, 80, True),
+        ("stt", heads[0], 44, 36, False),
+        ("id", heads[1], 100, 72, False),
+        ("account_id", heads[2], 100, 72, True),
+        ("video_path", heads[3], 180, 100, True),
+        ("scheduled_at", heads[4], 130, 96, True),
+        ("status", heads[5], 80, 64, True),
+        ("step", heads[6], 88, 64, True),
+        ("error", heads[7], 160, 80, True),
     ]
     for c, t, w, mw, st in _job_col_cfg:
         tree_job.heading(c, text=t)
@@ -754,21 +752,22 @@ def build_tiktok_manager_tab(parent: ttk.Frame, root: tk.Misc) -> None:
             job_store.delete(jid)
             refresh_jobs()
 
-    ttk.Button(acc_bar, text="Thêm tài khoản", command=lambda: add_account_dialog()).pack(side=tk.LEFT, padx=(0, 6))
-    ttk.Button(acc_bar, text="Sửa tài khoản", command=on_edit_account).pack(side=tk.LEFT, padx=(0, 6))
-    ttk.Button(acc_bar, text="Kiểm tra login", command=on_check_login).pack(side=tk.LEFT, padx=(0, 6))
-    ttk.Button(acc_bar, text="Mở profile", command=on_open_profile).pack(side=tk.LEFT, padx=(0, 6))
-    ttk.Button(acc_bar, text="Đóng profile đang mở", command=on_close_profile).pack(side=tk.LEFT, padx=(0, 6))
-    ttk.Checkbutton(acc_bar, text="Hiện browser", variable=var_show_browser).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(acc_bar, text="Xóa tài khoản", command=on_delete_account).pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Button(acc_bar, text="Thêm", command=lambda: add_account_dialog()).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(acc_bar, text="Sửa", command=on_edit_account).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(acc_bar, text="Xóa", command=on_delete_account).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Separator(acc_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+    ttk.Button(acc_bar, text="Mở profile", command=on_open_profile).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(acc_bar, text="Đóng profile", command=on_close_profile).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(acc_bar, text="Kiểm tra", command=on_check_login).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Checkbutton(acc_bar, text="Hiện trình duyệt", variable=var_show_browser).pack(side=tk.LEFT, padx=(4, 8))
     ttk.Button(acc_bar, text="Làm mới", command=lambda: (refresh_accounts(), refresh_jobs())).pack(side=tk.LEFT)
 
-    ttk.Button(job_fr, text="Video Library…", command=pick_video_library).grid(row=1, column=4, padx=4)
-    ttk.Button(job_fr, text="File local…", command=pick_local_video).grid(row=1, column=5, padx=4)
+    ttk.Button(job_fr, text="Thư viện", command=pick_video_library).grid(row=1, column=4, padx=4)
+    ttk.Button(job_fr, text="Chọn file", command=pick_local_video).grid(row=1, column=5, padx=4)
 
-    ttk.Button(jb, text="Tạo job", command=on_create_job).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(jb, text="Chạy ngay (job đang chọn)", command=on_run_selected_job).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(jb, text="Xóa job chọn", command=on_delete_job).pack(side=tk.LEFT)
+    ttk.Button(jb, text="Thêm", command=on_create_job).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(jb, text="Đăng ngay", command=on_run_selected_job).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(jb, text="Xóa", command=on_delete_job).pack(side=tk.LEFT)
 
     refresh_accounts()
     refresh_jobs()

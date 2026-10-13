@@ -24,6 +24,7 @@ from src.services.facebook_groups.share_schedule import (
     queue_state_from_results,
 )
 from src.services.facebook_groups.store import GroupStore
+from src.utils.schedule_posts_filters import format_account_filter_label
 
 def describe_page_jobs(jobs: list[dict[str, Any]], paused_note: str = "") -> tuple[str, str, str]:
     """Kết quả một page: nhãn, câu chi tiết, và màu (ok, fail, part, run, wait)."""
@@ -82,19 +83,19 @@ class ShareTab:
         parent.rowconfigure(1, weight=1)
         parent.rowconfigure(2, weight=1)
 
-        form = ttk.LabelFrame(
-            parent,
-            text="Lướt Reel, xem video, bình luận, rồi chia sẻ link. Không tải video",
-            padding=8,
-        )
+        form = ttk.LabelFrame(parent, text="Nội dung chia sẻ", padding=8)
         form.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
         form.columnconfigure(1, weight=1)
-        ttk.Label(form, text="Link bài").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            form,
+            text="Chọn giờ, thêm link vào list, rồi chọn Page của một tài khoản phía dưới.",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(form, text="Link bài").grid(row=1, column=0, sticky="w")
         self.source_url = tk.StringVar()
-        ttk.Entry(form, textvariable=self.source_url).grid(row=0, column=1, sticky="ew")
-        ttk.Label(form, text="Giờ").grid(row=0, column=2, sticky="e", padx=(8, 4))
+        ttk.Entry(form, textvariable=self.source_url).grid(row=1, column=1, sticky="ew")
+        ttk.Label(form, text="Giờ").grid(row=1, column=2, sticky="e", padx=(8, 4))
         clock = ttk.Frame(form)
-        clock.grid(row=0, column=3, sticky="w")
+        clock.grid(row=1, column=3, sticky="w")
         self.clock_hour = tk.StringVar()
         self.clock_minute = tk.StringVar(value="00")
         self.machine_clock = tk.StringVar()
@@ -118,41 +119,46 @@ class ShareTab:
         ttk.Label(clock, textvariable=self.machine_clock).pack(side=tk.LEFT, padx=(8, 0))
         self._sync_clock_to_machine()
         add_row = ttk.Frame(form)
-        add_row.grid(row=1, column=1, columnspan=3, sticky="w", pady=(4, 0))
+        add_row.grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Button(add_row, text="Thêm vào list", command=self._add_scheduled).pack(side=tk.LEFT)
         ttk.Button(add_row, text="Chia sẻ ngay", command=self._add_now).pack(side=tk.LEFT, padx=4)
         ttk.Button(add_row, text="Xóa dòng", command=self._remove_queued).pack(side=tk.LEFT)
-        self.queue_tree = ttk.Treeview(form, columns=("when", "url", "state"), show="headings", height=4)
-        for key, title, width in (("when", "Giờ", 110), ("url", "Link chờ", 420), ("state", "Trạng thái", 110)):
+        self.queue_tree = ttk.Treeview(form, columns=("stt", "when", "url", "state"), show="headings", height=4)
+        for key, title, width in (
+            ("stt", "STT", 44),
+            ("when", "Giờ", 110),
+            ("url", "Link chờ", 420),
+            ("state", "Trạng thái", 110),
+        ):
             self.queue_tree.heading(key, text=title)
             self.queue_tree.column(key, width=width, stretch=(key == "url"))
-        self.queue_tree.grid(row=2, column=0, columnspan=4, sticky="ew", pady=4)
-        ttk.Label(form, text="Nội dung lên Page").grid(row=3, column=0, sticky="w", pady=4)
+        self.queue_tree.grid(row=3, column=0, columnspan=4, sticky="ew", pady=4)
+        ttk.Label(form, text="Nội dung lên Page").grid(row=4, column=0, sticky="w", pady=4)
         self.caption = tk.StringVar()
-        ttk.Entry(form, textvariable=self.caption).grid(row=3, column=1, columnspan=3, sticky="ew")
-        ttk.Label(form, text="Bình luận").grid(row=4, column=0, sticky="nw")
+        ttk.Entry(form, textvariable=self.caption).grid(row=4, column=1, columnspan=3, sticky="ew")
+        ttk.Label(form, text="Bình luận").grid(row=5, column=0, sticky="nw")
         self.comment_box = tk.Text(form, height=3, wrap="word", font=("Segoe UI", 9))
-        self.comment_box.grid(row=4, column=1, columnspan=3, sticky="ew", pady=4)
-        ttk.Label(form, text="Ảnh").grid(row=5, column=0, sticky="w")
+        self.comment_box.grid(row=5, column=1, columnspan=3, sticky="ew", pady=4)
+        ttk.Label(form, text="Ảnh").grid(row=6, column=0, sticky="w")
         self.image_label = tk.StringVar(value="Chưa chọn ảnh")
         images = ttk.Frame(form)
-        images.grid(row=5, column=1, sticky="w")
+        images.grid(row=6, column=1, sticky="w")
         ttk.Button(images, text="Chọn ảnh", command=self._pick_images).pack(side=tk.LEFT)
         ttk.Label(images, textvariable=self.image_label).pack(side=tk.LEFT, padx=6)
         self.destination = tk.StringVar(value="page")
         dest = ttk.Frame(form)
-        dest.grid(row=6, column=1, columnspan=3, sticky="ew", pady=4)
+        dest.grid(row=7, column=1, columnspan=3, sticky="ew", pady=4)
         ttk.Radiobutton(dest, text="Lên Page của tôi", variable=self.destination, value="page", command=self._estimate).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Radiobutton(dest, text="Vào nhóm đã tham gia", variable=self.destination, value="joined", command=self._estimate).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Radiobutton(dest, text="Cả Page và nhóm", variable=self.destination, value="both", command=self._estimate).pack(side=tk.LEFT)
-        ttk.Label(form, text="List UID nhóm").grid(row=7, column=0, sticky="nw")
+        ttk.Label(form, text="List UID nhóm").grid(row=8, column=0, sticky="nw")
         self.group_uid_box = tk.Text(form, height=3, wrap="word", font=("Consolas", 9))
-        self.group_uid_box.grid(row=7, column=1, columnspan=3, sticky="ew", pady=4)
+        self.group_uid_box.grid(row=8, column=1, columnspan=3, sticky="ew", pady=4)
         self.group_uid_box.bind("<KeyRelease>", lambda _event: self._estimate())
         self.group_uid_count = tk.StringVar(value="Mỗi dòng một UID, hoặc cách nhau bằng dấu phẩy.")
-        ttk.Label(form, textvariable=self.group_uid_count).grid(row=8, column=1, columnspan=3, sticky="w")
+        ttk.Label(form, textvariable=self.group_uid_count).grid(row=9, column=1, columnspan=3, sticky="w")
         timing = ttk.Frame(form)
-        timing.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        timing.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         ttk.Label(timing, text="Lướt Reel (giây)").pack(side=tk.LEFT)
         self.reel_seconds = tk.StringVar(value="20")
         ttk.Entry(timing, textvariable=self.reel_seconds, width=5).pack(side=tk.LEFT, padx=(4, 8))
@@ -166,7 +172,7 @@ class ShareTab:
         self.cooldown = tk.StringVar(value="30")
         ttk.Entry(timing, textvariable=self.cooldown, width=6).pack(side=tk.LEFT, padx=4)
         actions = ttk.Frame(form)
-        actions.grid(row=10, column=0, columnspan=4, sticky="w", pady=4)
+        actions.grid(row=11, column=0, columnspan=4, sticky="w", pady=4)
         ttk.Button(actions, text="Chia sẻ", command=self.start).pack(side=tk.LEFT)
         ttk.Button(actions, text="Dừng", command=self.stop).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Tiếp tục", command=self.resume).pack(side=tk.LEFT)
@@ -174,7 +180,7 @@ class ShareTab:
             value="Chọn giờ trong khung 24 giờ của máy, rồi bấm Thêm vào list. Chia sẻ ngay thì vào list với chữ Ngay."
         )
         status_lbl = ttk.Label(form, textvariable=self.status, wraplength=360, justify=tk.LEFT)
-        status_lbl.grid(row=11, column=0, columnspan=4, sticky="ew")
+        status_lbl.grid(row=12, column=0, columnspan=4, sticky="ew")
 
         def _fit_status(_event: object = None) -> None:
             width = int(form.winfo_width() or 0)
@@ -189,19 +195,29 @@ class ShareTab:
         listing.rowconfigure(1, weight=1)
         bar = ttk.Frame(listing)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Label(bar, text="Lọc").pack(side=tk.LEFT)
+        ttk.Label(bar, text="Tài khoản").pack(side=tk.LEFT)
+        self.filter_account = tk.StringVar(value="Chọn tài khoản")
+        self._account_chosen = False
+        self._account_labels: dict[str, str] = {}
+        self.filter_account_box = ttk.Combobox(
+            bar, textvariable=self.filter_account, width=42, state="readonly"
+        )
+        self.filter_account_box.pack(side=tk.LEFT, padx=(4, 8))
+        self.filter_account_box.bind("<<ComboboxSelected>>", self._on_account_filter)
+        ttk.Label(bar, text="Tìm").pack(side=tk.LEFT)
         self.filter_text = tk.StringVar()
         self.filter_text.trace_add("write", lambda *_args: self._fill_pages())
-        ttk.Entry(bar, textvariable=self.filter_text, width=28).pack(side=tk.LEFT, padx=4)
+        ttk.Entry(bar, textvariable=self.filter_text, width=24).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text="Chọn tất cả", command=self._select_all).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text="Bỏ chọn", command=self._clear_selection).pack(side=tk.LEFT)
         ttk.Button(bar, text="Làm mới", command=self.reload_pages).pack(side=tk.LEFT, padx=4)
         self.estimate = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.estimate).pack(side=tk.LEFT, padx=8)
 
-        cols = ("pick", "account", "page", "result", "url")
+        cols = ("stt", "pick", "account", "page", "result", "url")
         self.tree = ttk.Treeview(listing, columns=cols, show="headings", selectmode="browse")
         for key, title, width, stretch in (
+            ("stt", "STT", 44, False),
             ("pick", "Đăng", 52, False),
             ("account", "Tài khoản", 140, False),
             ("page", "Page", 200, True),
@@ -231,9 +247,10 @@ class ShareTab:
                 outcome_lbl.configure(wraplength=max(200, width - 16))
 
         result.bind("<Configure>", _fit_outcome, add="+")
-        result_cols = ("page", "status", "detail")
+        result_cols = ("stt", "page", "status", "detail")
         self.results = ttk.Treeview(result, columns=result_cols, show="headings", height=6)
         for key, title, width in (
+            ("stt", "STT", 44),
             ("page", "Page", 220),
             ("status", "Kết quả", 110),
             ("detail", "Chi tiết", 420),
@@ -276,6 +293,7 @@ class ShareTab:
         alive = {row["iid"] for row in rows}
         self._checked &= alive
         self.pages = rows
+        self._refresh_account_filter()
         self._fill_pages()
 
     def _account_names(self) -> dict[str, str]:
@@ -301,19 +319,66 @@ class ShareTab:
             counts[key] = counts.get(key, 0) + 1
         return counts
 
-    def _fill_pages(self) -> None:
-        self._refresh_outcomes()
-        needle = self.filter_text.get().strip().casefold()
-        self.tree.delete(*self.tree.get_children())
+    def _on_account_filter(self, _event: object = None) -> None:
+        """Ghi nhận người dùng đã chọn tài khoản rồi vẽ lại bảng."""
+        self._account_chosen = True
+        self._fill_pages()
+
+    def _refresh_account_filter(self) -> None:
+        """Đổ danh sách tài khoản. Lần đầu chỉ hiện Page của tài khoản đầu tiên."""
+        labels = ["Chọn tài khoản"]
+        mapping: dict[str, str] = {}
+        seen: set[str] = set()
         for row in self.pages:
+            aid = row["account_id"]
+            if aid in seen:
+                continue
+            seen.add(aid)
+            label = format_account_filter_label(aid, row["account_name"])
+            if label in mapping:
+                label = f"{label} ({aid})"
+            mapping[label] = aid
+            labels.append(label)
+        if seen:
+            labels.append("Tất cả tài khoản")
+        self._account_labels = mapping
+        self.filter_account_box.configure(values=tuple(labels))
+        current = self.filter_account.get()
+        if current in labels and self._account_chosen:
+            return
+        if not self._account_chosen and len(labels) > 1 and labels[1] != "Tất cả tài khoản":
+            self.filter_account.set(labels[1])
+            self._account_chosen = True
+            return
+        if current not in labels:
+            self.filter_account.set(labels[1] if len(labels) > 1 else "Chọn tài khoản")
+
+    def _visible_pages(self) -> list[dict[str, str]]:
+        """Page đang được lọc theo tài khoản và ô tìm."""
+        choice = self.filter_account.get().strip()
+        account_id = self._account_labels.get(choice, "")
+        needle = self.filter_text.get().strip().casefold()
+        out: list[dict[str, str]] = []
+        if choice in ("", "Chọn tài khoản"):
+            return out
+        for row in self.pages:
+            if choice != "Tất cả tài khoản" and row["account_id"] != account_id:
+                continue
             blob = " ".join((row["account_name"], row["page_name"], row["page_id"])).casefold()
             if needle and needle not in blob:
                 continue
+            out.append(row)
+        return out
+
+    def _fill_pages(self) -> None:
+        self._refresh_outcomes()
+        self.tree.delete(*self.tree.get_children())
+        for index, row in enumerate(self._visible_pages(), start=1):
             self.tree.insert(
                 "",
                 tk.END,
                 iid=row["iid"],
-                values=self._page_values(row),
+                values=self._page_values(row, index),
                 tags=self._page_tags(row),
             )
         self._estimate()
@@ -347,7 +412,7 @@ class ShareTab:
             found[key] = describe_page_jobs(grouped.get(key, []), notes.get(row["account_id"], ""))
         self._outcomes = found
 
-    def _page_values(self, row: dict[str, str]) -> tuple[str, str, str, str, str]:
+    def _page_values(self, row: dict[str, str], index: int = 0) -> tuple[str, str, str, str, str, str]:
         label, detail, _tag = self._outcomes.get((row["account_id"], row["page_id"]), ("", "", ""))
         shown = ""
         if label and detail:
@@ -355,6 +420,7 @@ class ShareTab:
         elif label:
             shown = label
         return (
+            str(index),
             "☑" if row["iid"] in self._checked else "☐",
             row["account_name"],
             row["page_name"],
@@ -376,8 +442,8 @@ class ShareTab:
         else:
             self._checked.add(row)
         values = list(self.tree.item(row, "values"))
-        if values:
-            values[0] = "☑" if row in self._checked else "☐"
+        if len(values) > 1:
+            values[1] = "☑" if row in self._checked else "☐"
             self.tree.item(row, values=values)
         self._estimate()
         return "break"
@@ -396,6 +462,12 @@ class ShareTab:
         self._fill_pages()
 
     def _row_visible(self, row: dict[str, str]) -> bool:
+        """Page này có đang nằm trong bộ lọc tài khoản và ô tìm hay không."""
+        choice = self.filter_account.get().strip()
+        if choice in ("", "Chọn tài khoản"):
+            return False
+        if choice != "Tất cả tài khoản" and row["account_id"] != self._account_labels.get(choice, ""):
+            return False
         needle = self.filter_text.get().strip().casefold()
         if not needle:
             return True
@@ -533,12 +605,17 @@ class ShareTab:
         with self._queue_lock:
             rows = list(self._queue)
         self.queue_tree.delete(*self.queue_tree.get_children())
-        for item in rows:
+        for index, item in enumerate(rows, start=1):
             self.queue_tree.insert(
                 "",
                 tk.END,
                 iid=item.qid or item.label,
-                values=(item.label or item.when.strftime("%H:%M"), item.url, labels.get(item.state, item.state)),
+                values=(
+                    index,
+                    item.label or item.when.strftime("%H:%M"),
+                    item.url,
+                    labels.get(item.state, item.state),
+                ),
             )
 
     def start(self) -> None:
@@ -751,14 +828,16 @@ class ShareTab:
         self.results.delete(*self.results.get_children())
         ok_names: list[str] = []
         bad_lines: list[str] = []
-        for row in self.pages:
+        shown = 0
+        for row in self._visible_pages():
             label, detail, tag = self._outcomes.get((row["account_id"], row["page_id"]), ("", "", ""))
             if not label:
                 continue
+            shown += 1
             self.results.insert(
                 "",
                 tk.END,
-                values=(row["page_name"], label, detail),
+                values=(shown, row["page_name"], label, detail),
                 tags=(tag,) if tag else (),
             )
             if tag == "ok":

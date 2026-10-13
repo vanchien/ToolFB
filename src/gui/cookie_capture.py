@@ -150,6 +150,7 @@ def run_fb_cookie_capture_dialog(
     on_block: Callable[[str], None] | None = None,
     on_browse_note: Callable[[str], None] | None = None,
     on_browse_done: Callable[[str], None] | None = None,
+    on_account_name: Callable[[str], None] | None = None,
 ) -> None:
     """
     Mở trình duyệt persistent theo ``acc_preview``; user đăng nhập tay → «Lưu cookie».
@@ -355,6 +356,7 @@ def run_fb_cookie_capture_dialog(
             last_block = ""
             browse_started = time.monotonic()
             browse_noted = False
+            found_name = ""
             from src.services.device_browse import browse_limit_reached
 
             while not cmd:
@@ -375,6 +377,12 @@ def run_fb_cookie_capture_dialog(
                             feed_ready = True
                         elif browse_only and idle_ticks % 4 == 0:
                             nudge_feed(page)
+                        if not found_name and idle_ticks % 8 == 1:
+                            from src.services.device_browse import read_logged_in_display_name
+
+                            found_name = read_logged_in_display_name(page)
+                            if found_name:
+                                progress_q.put("NAME\t" + found_name)
                         if idle_ticks % 3 == 0:
                             reason = describe_account_block(
                                 str(getattr(page, "url", "") or ""),
@@ -390,6 +398,12 @@ def run_fb_cookie_capture_dialog(
                     last_block or browse_limit_reached(browse_started, time.monotonic())
                 ):
                     if not last_block:
+                        if not found_name and _page_usable(page):
+                            from src.services.device_browse import read_logged_in_display_name
+
+                            found_name = read_logged_in_display_name(page)
+                        if found_name:
+                            progress_q.put("NAME\t" + found_name)
                         progress_q.put("FINISH\tĐã lướt 60 giây")
                     cmd = "close"
                     break
@@ -501,6 +515,10 @@ def run_fb_cookie_capture_dialog(
                     if on_browse_note is not None:
                         on_browse_note(msg[5:])
                     continue
+                if msg.startswith("NAME\t"):
+                    if on_account_name is not None:
+                        on_account_name(msg[5:])
+                    continue
                 if msg.startswith("FINISH\t"):
                     if on_browse_done is not None:
                         on_browse_done(msg[7:])
@@ -582,6 +600,7 @@ def run_fb_profile_browser_dialog(
     on_block: Callable[[str], None] | None = None,
     on_browse_note: Callable[[str], None] | None = None,
     on_browse_done: Callable[[str], None] | None = None,
+    on_account_name: Callable[[str], None] | None = None,
 ) -> None:
     """
     Mở Firefox theo profile portable đã chọn — xem/làm tay, đóng hoặc lưu cookie.
@@ -616,4 +635,5 @@ def run_fb_profile_browser_dialog(
         on_block=on_block,
         on_browse_note=on_browse_note,
         on_browse_done=on_browse_done,
+        on_account_name=on_account_name,
     )

@@ -176,8 +176,9 @@ def test_empty_search_returns_all(sample_jobs: list[dict]) -> None:
 def test_format_filter_labels() -> None:
     assert "Minh Tuyết" in format_page_filter_label("538b89cc73f2", "Minh Tuyết")
     assert "538b89cc73f2" in format_page_filter_label("538b89cc73f2", "Minh Tuyết")
-    assert "facebok1" in format_account_filter_label("acc_1", "facebok1")
-    assert "acc_1" in format_account_filter_label("acc_1", "facebok1")
+    assert format_account_filter_label("acc_1", "facebok1") == "facebok1"
+    assert format_account_filter_label("acc_04e7df5e18", "acc_04e7df5e18") == "acc_04e7df5e18"
+    assert format_account_filter_label("acc_1dbaa72b8f", "Tài khoản mới") == "Tài khoản mới"
 
 
 def test_split_hashtags_csv() -> None:

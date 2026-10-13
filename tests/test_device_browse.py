@@ -74,6 +74,32 @@ def test_browse_stops_at_60_seconds() -> None:
     assert browse_limit_reached(10, 70) is True
 
 
+def test_read_logged_in_display_name_uses_session_label() -> None:
+    from src.services.device_browse import read_logged_in_display_name
+
+    class _Context:
+        def cookies(self, _url: str) -> list[dict[str, str]]:
+            return [{"name": "c_user", "value": "61581337018549"}]
+
+    class _NamedPage:
+        context = _Context()
+
+        def evaluate(self, _script: str, uid: str) -> dict[str, list[str]]:
+            assert uid == "61581337018549"
+            return {
+                "labels": ["Quản lý cài đặt thông báo của Anna"],
+                "links": [
+                    {
+                        "href": "https://www.facebook.com/story.php?id=999&__user=61581337018549",
+                        "text": "Trần Thị Tình",
+                    }
+                ],
+            }
+
+    assert read_logged_in_display_name(_NamedPage()) == "Anna"
+    assert read_logged_in_display_name(_Page("https://www.facebook.com/")) == ""
+
+
 def test_open_home_feed_skips_when_already_on_facebook() -> None:
     page = _Page("https://www.facebook.com/")
     open_home_feed(page)

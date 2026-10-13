@@ -1850,6 +1850,220 @@ def probe_facebook_uid_live(
     return last
 
 
+def facebook_uid_from_cookie_export(raw: Any) -> str:
+    """Lấy UID ``c_user`` từ file cookie Playwright. Không ghi log giá trị cookie."""
+    cookies: list[Any]
+    if isinstance(raw, dict):
+        cookies = list(raw.get("cookies") or [])
+    elif isinstance(raw, list):
+        cookies = raw
+    else:
+        return ""
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "") != "c_user":
+            continue
+        value = "".join(ch for ch in str(item.get("value") or "") if ch.isdigit())
+        if 6 <= len(value) <= 20:
+            return value
+    return ""
+
+
+def profile_name_from_live_detail(detail: str) -> str:
+    """Tách tên hồ sơ khỏi câu «Còn hoạt động — Tên». Bỏ nhãn chung không phải tên người."""
+    text = " ".join(str(detail or "").split())
+    head, sep, tail = text.partition("—")
+    if not sep or head.strip().casefold() != "còn hoạt động":
+        return ""
+    text = tail.strip()
+    low = text.casefold()
+    if not text or low in {"hồ sơ công khai", "ho so cong khai"}:
+        return ""
+    return text[:80]
+
+
+def lookup_public_profile_name(uid: str, *, proxy_url: str | None = None) -> str:
+    """Đọc tên hồ sơ công khai theo UID. Rỗng nếu Facebook không trả tên."""
+    status, detail = probe_facebook_uid_live(uid, proxy_url=proxy_url, timeout=12.0)
+    if status != "login_ok":
+        return ""
+    return profile_name_from_live_detail(detail)
+
+
+def _facebook_session_cookie_header(cookie_path: Path) -> str:
+    """Ghép cookie phiên Facebook. Không ghi log nội dung."""
+    path = Path(cookie_path)
+    if not path.is_file():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    items = payload.get("cookies") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return ""
+    wanted = {"c_user", "xs", "datr", "sb", "fr"}
+    pairs: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        domain = str(item.get("domain") or "").lower()
+        if "facebook.com" not in domain:
+            continue
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "")
+        if name not in wanted or not value:
+            continue
+        pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
+_FACEBOOK_UI_NAMES = frozenset(
+    {
+        "home",
+        "notifications",
+        "facebook",
+        "messenger",
+        "menu",
+        "trang chủ",
+        "trang chu",
+        "thông báo",
+        "thong bao",
+        "đoạn chat",
+        "doan chat",
+        "trang cá nhân của bạn",
+        "your profile",
+    }
+)
+
+
+def facebook_account_name_from_labels(labels: list[str]) -> str:
+    """Lấy tên tài khoản từ nhãn của chính phiên đăng nhập, không lấy tác giả bài viết."""
+    prefixes = (
+        "quản lý cài đặt thông báo của ",
+        "manage notification settings for ",
+        "bạn đang nghĩ gì, ",
+        "bạn đang nghĩ gì thế, ",
+        "what's on your mind, ",
+    )
+    for raw in labels:
+        text = " ".join(str(raw or "").split())
+        low = text.casefold()
+        for prefix in prefixes:
+            if low.startswith(prefix):
+                name = text[len(prefix) :].strip(" .?")
+                if (
+                    name
+                    and not name.isdigit()
+                    and name.casefold() not in _FACEBOOK_UI_NAMES
+                    and name.casefold() not in {"bạn", "you"}
+                    and _profile_name_is_usable(name)
+                ):
+                    return name[:80]
+    return ""
+
+
+def facebook_href_is_own_profile(href: str, uid: str) -> bool:
+    """Chỉ đúng hồ sơ của UID. Bỏ link bài viết dù URL có gắn mã người xem."""
+    target = str(uid or "").strip()
+    raw = str(href or "").strip()
+    if not target.isdigit() or not raw or target not in raw:
+        return False
+    from urllib.parse import parse_qs, urlparse
+
+    if raw.startswith("/"):
+        raw = "https://www.facebook.com" + raw
+    parsed = urlparse(raw)
+    path = str(parsed.path or "")
+    if "profile.php" in path.casefold():
+        return (parse_qs(parsed.query).get("id") or [""])[0] == target
+    parts = [part for part in path.split("/") if part]
+    return len(parts) == 1 and parts[0] == target
+
+
+def facebook_display_name_from_page_bits(
+    labels: list[str],
+    own_link_texts: list[str] | None = None,
+) -> str:
+    """Tên người dùng: nhãn phiên đăng nhập, rồi chữ trên link hồ sơ của đúng UID."""
+    named = facebook_account_name_from_labels(labels)
+    if named:
+        return named
+    for raw in own_link_texts or []:
+        text = " ".join(str(raw or "").split())
+        if not text or text.isdigit() or text.casefold() in _FACEBOOK_UI_NAMES:
+            continue
+        if text.casefold() in {"bạn", "you", "xem trang cá nhân", "see profile"}:
+            continue
+        if _profile_name_is_usable(text):
+            return text[:80]
+    return ""
+
+
+def name_from_profile_html(html: str) -> str:
+    """Lấy tên người từ title hoặc og:title. Bỏ trang đăng nhập và trang lỗi."""
+    for candidate in (_profile_meta_name(html), _profile_title(html)):
+        if _profile_name_is_usable(candidate):
+            return candidate[:80]
+    return ""
+
+
+def lookup_logged_in_profile_name(cookie_path: Path, *, proxy_url: str | None = None) -> str:
+    """Đọc tên hồ sơ bằng cookie đăng nhập sẵn. Không gọi Graph API, không ghi log cookie."""
+    header = _facebook_session_cookie_header(cookie_path)
+    if "c_user=" not in header or "xs=" not in header:
+        return ""
+    import requests
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+        "Accept": "text/html",
+        "Cookie": header,
+    }
+    proxies = {"http": proxy_url, "https": proxy_url} if str(proxy_url or "").strip() else None
+    for url in (
+        "https://mbasic.facebook.com/me",
+        "https://m.facebook.com/me",
+    ):
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=20,
+                allow_redirects=True,
+                proxies=proxies,
+            )
+        except requests.RequestException:
+            continue
+        name = name_from_profile_html(response.text or "")
+        if name:
+            return name
+    return ""
+
+
+def lookup_account_public_name(cookie_path: Path, *, proxy_url: str | None = None) -> str:
+    """Lấy tên thật: ưu tiên phiên đăng nhập, rồi hồ sơ công khai. Không ghi log cookie."""
+    path = Path(cookie_path)
+    logged_in = lookup_logged_in_profile_name(path, proxy_url=proxy_url)
+    if logged_in:
+        return logged_in
+    if not path.is_file():
+        return ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    uid = facebook_uid_from_cookie_export(raw)
+    if not uid:
+        return ""
+    return lookup_public_profile_name(uid, proxy_url=proxy_url)
+
+
 def classify_account_live(status: str, detail: str = "") -> str:
     """Nhãn kết quả check live: Live / Die / Checkpoint / Lỗi proxy / Đã hủy / Lỗi."""
     st = str(status or "").strip().lower()

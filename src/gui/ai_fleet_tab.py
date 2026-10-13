@@ -212,7 +212,7 @@ class AiFleetTab:
         parent.rowconfigure(1, weight=1)
         guide = ttk.Label(
             parent,
-            text="Lịch tự viết trước, tự duyệt và tự đăng. Chỉ cần mở bước 1 khi có dòng cần xem.",
+            text="Lịch tự viết, tự duyệt và tự đăng. Mở Agent tổng khi có dòng cần xem.",
         )
         guide.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 0))
         book = ttk.Notebook(parent)
@@ -225,7 +225,7 @@ class AiFleetTab:
 
     def _build_master(self, book: ttk.Notebook) -> None:
         frame = ttk.Frame(book, padding=12)
-        book.add(frame, text="  1. Agent tổng  ")
+        book.add(frame, text="  Agent tổng  ")
         frame.columnconfigure(0, weight=1)
         ttk.Label(
             frame,
@@ -239,7 +239,7 @@ class AiFleetTab:
         ttk.Button(actions, text="Dừng khẩn cấp", command=lambda: self._set_stop(True)).pack(side=tk.LEFT)
         ttk.Button(actions, text="Cho chạy lại", command=lambda: self._set_stop(False)).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Làm mới", command=self.refresh).pack(side=tk.LEFT)
-        login = ttk.LabelFrame(frame, text="Đăng nhập ChatGPT hoặc Gemini. Chỉ tài khoản kiểm tra đạt mới hiện ở bước chạy.", padding=8)
+        login = ttk.LabelFrame(frame, text="Tài khoản viết bài", padding=8)
         login.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         login.columnconfigure(1, weight=1)
         self.login_kind = tk.StringVar(value="ChatGPT")
@@ -257,7 +257,7 @@ class AiFleetTab:
         ttk.Button(login_actions, text="Mở ChatGPT", command=self._open_chatgpt_browser).pack(side=tk.LEFT)
         ttk.Button(login_actions, text="Xóa tài khoản", command=self._delete_ready_accounts).pack(side=tk.LEFT, padx=6)
         ttk.Label(login, textvariable=self.login_status, wraplength=720).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        orders = ttk.LabelFrame(frame, text="Ra lệnh cho agent tổng. Bấm Áp dụng ngay, vòng đang chạy nhận liền.", padding=8)
+        orders = ttk.LabelFrame(frame, text="Lệnh cho agent tổng", padding=8)
         orders.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         orders.columnconfigure(0, weight=1)
         self.master_order = tk.Text(orders, height=4, wrap="word", font=("Segoe UI", 10))
@@ -310,7 +310,7 @@ class AiFleetTab:
 
     def _build_pages(self, book: ttk.Notebook) -> None:
         frame = ttk.Frame(book, padding=8)
-        book.add(frame, text="  2. Agent Page  ")
+        book.add(frame, text="  Page  ")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
         bar = ttk.Frame(frame)
@@ -320,7 +320,7 @@ class AiFleetTab:
         self._account_by_label: dict[str, str] = {"Tất cả tài khoản": ""}
         self.account_box = ttk.Combobox(bar, textvariable=self.account_pick, state="readonly", width=28)
         self.account_box.pack(side=tk.LEFT, padx=(6, 12))
-        self.account_box.bind("<<ComboboxSelected>>", lambda _event: self._fill_pages())
+        self.account_box.bind("<<ComboboxSelected>>", self._on_fleet_account_picked)
         ttk.Label(bar, text="Trạng thái").pack(side=tk.LEFT)
         self.page_status_filter = tk.StringVar(value="Mọi trạng thái")
         status_filter = ttk.Combobox(
@@ -475,7 +475,7 @@ class AiFleetTab:
 
     def _build_writer(self, book: ttk.Notebook) -> None:
         outer = ttk.Frame(book, padding=8)
-        book.add(outer, text="  3. Viết bài  ")
+        book.add(outer, text="  Viết bài  ")
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
         host, frame = self._scroll_host(outer)
@@ -492,7 +492,7 @@ class AiFleetTab:
         self.auto_all = tk.BooleanVar(value=False)
         self.max_items = tk.StringVar(value="3")
         self.token_budget = tk.StringVar(value="0")
-        self.link_status = tk.StringVar(value="Chưa có tài khoản đạt. Sang bước 1 để kiểm tra.")
+        self.link_status = tk.StringVar(value="Chưa có tài khoản đạt. Mở tab Agent tổng để kiểm tra.")
         self._ready_rows: list[dict[str, str]] = []
         ready_bar = ttk.Frame(pick)
         ready_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
@@ -522,26 +522,20 @@ class AiFleetTab:
         ttk.Button(flags, text="Xóa tài khoản", command=self._delete_ready_accounts).pack(side=tk.LEFT, padx=8)
         ttk.Label(pick, textvariable=self.link_status, wraplength=720).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._fill_ready_accounts()
-        self.chosen_page_label = tk.StringVar(value="Chưa chọn Page ở bước 2.")
+        self.chosen_page_label = tk.StringVar(value="Chưa chọn Page ở tab Page.")
         auto_row = ttk.Frame(frame)
         auto_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 8))
         self.auto_switch = tk.Button(
             auto_row,
             text="Tự động: TẮT",
             command=self._toggle_auto,
-            font=("Segoe UI", 12, "bold"),
-            width=24,
+            font=("Segoe UI", 9, "bold"),
+            width=16,
             relief="raised",
-            bd=2,
+            bd=1,
         )
-        self.auto_switch.pack(side=tk.LEFT, padx=(0, 12))
-        self.test_write_button = tk.Button(
-            auto_row,
-            text="Test tạo bài viết",
-            command=self._test_write,
-            font=("Segoe UI", 11, "bold"),
-            width=18,
-        )
+        self.auto_switch.pack(side=tk.LEFT, padx=(0, 8))
+        self.test_write_button = ttk.Button(auto_row, text="Test tạo bài viết", command=self._test_write)
         self.test_write_button.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(auto_row, textvariable=self.chosen_page_label, wraplength=420).pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._paint_auto_switch()
@@ -570,7 +564,7 @@ class AiFleetTab:
 
     def _build_review(self, book: ttk.Notebook) -> None:
         outer = ttk.Frame(book, padding=8)
-        book.add(outer, text="  4. Duyệt và lên lịch  ")
+        book.add(outer, text="  Duyệt  ")
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
         host, frame = self._scroll_host(outer)
@@ -735,7 +729,18 @@ class AiFleetTab:
             labels.append(label)
         self._account_by_label = mapping
         self.account_box["values"] = labels
-        self.account_pick.set(current if current in mapping else labels[0])
+        if not getattr(self, "_fleet_account_chosen", False) and len(labels) > 1:
+            self.account_pick.set(labels[1])
+            self._fleet_account_chosen = True
+        elif current in mapping:
+            self.account_pick.set(current)
+        else:
+            self.account_pick.set(labels[1] if len(labels) > 1 else labels[0])
+
+    def _on_fleet_account_picked(self, _event: object = None) -> None:
+        """Người dùng chọn tài khoản trên tab đội AI, rồi chỉ hiện Page của tài khoản đó."""
+        self._fleet_account_chosen = True
+        self._fill_pages()
 
     def _fill_pages(self) -> None:
         if not hasattr(self, "page_tree"):
@@ -1269,7 +1274,7 @@ class AiFleetTab:
         self.link_status.set(
             f"{count} tài khoản đã kiểm tra đạt. Chọn một hoặc nhiều dòng rồi bật tự động."
             if count
-            else "Chưa có tài khoản đạt. Sang bước 1, dán khóa và bấm Kiểm tra và lưu."
+            else "Chưa có tài khoản đạt. Mở tab Agent tổng, dán khóa và bấm Kiểm tra và lưu."
         )
 
     def _image_name(self) -> str:
@@ -1281,7 +1286,7 @@ class AiFleetTab:
         self._book.select(self._book.tabs()[0])
         self.login_kind.set("ChatGPT")
         self.login_entry.focus_set()
-        self.login_status.set("Dán khóa mới vào ô Khóa, rồi bấm Kiểm tra và lưu. Tài khoản sẽ hiện ở bước 3.")
+        self.login_status.set("Dán khóa mới vào ô Khóa, rồi bấm Kiểm tra và lưu. Tài khoản sẽ hiện ở tab Viết bài.")
 
     def _delete_ready_accounts(self) -> None:
         """Xóa tài khoản đang chọn khỏi danh sách và khỏi kho khóa."""
@@ -1289,7 +1294,7 @@ class AiFleetTab:
             return
         indexes = list(self.ready_list.curselection())
         if not indexes:
-            messagebox.showwarning("Tài khoản AI", "Chọn tài khoản cần xóa ở bước 3.", parent=self.root)
+            messagebox.showwarning("Tài khoản AI", "Chọn tài khoản cần xóa ở tab Viết bài.", parent=self.root)
             return
         rows = [self._ready_rows[index] for index in indexes]
         if not messagebox.askyesno("Tài khoản AI", f"Xóa {len(rows)} tài khoản đã chọn? Có thể thêm khóa mới ngay sau đó.", parent=self.root):
@@ -1362,11 +1367,11 @@ class AiFleetTab:
 
     def _after_check(self, kind: str, key_id: str, reason: str) -> None:
         if reason or not key_id:
-            self.login_status.set(reason or "Kiểm tra chưa đạt. Tài khoản chưa được đưa vào bước chạy.")
+            self.login_status.set(reason or "Kiểm tra chưa đạt. Tài khoản chưa hiện ở tab Viết bài.")
             return
         self.store.mark_verified(kind, key_id)
         self._fill_ready_accounts()
-        self.login_status.set("Kiểm tra đạt. Tài khoản đã hiện ở bước 3 để chọn.")
+        self.login_status.set("Kiểm tra đạt. Tài khoản đã hiện ở tab Viết bài để chọn.")
 
     def _open_chatgpt_browser(self) -> None:
         """Mở chatgpt.com bằng phiên đã lưu của tài khoản đang chọn. Đóng cửa sổ thì lần sau vẫn đăng nhập."""
@@ -1556,7 +1561,7 @@ class AiFleetTab:
             return
         pages = self._pages_for_auto()
         if not pages:
-            messagebox.showwarning("Tự động", "Chọn một Page ở bước 2, hoặc tick nhận mọi Page.", parent=self.root)
+            messagebox.showwarning("Tự động", "Chọn một Page ở tab Page, hoặc tick nhận mọi Page.", parent=self.root)
             return
         text_name = "openai"
         image_name = self._image_name()
@@ -1599,7 +1604,7 @@ class AiFleetTab:
         """Viết thử đúng một bài cho Page đang chọn. Không xếp lịch đăng."""
         page_id = self._selected_page_id()
         if not page_id:
-            messagebox.showwarning("Test tạo bài viết", "Chọn một Page ở bước 2.", parent=self.root)
+            messagebox.showwarning("Test tạo bài viết", "Chọn một Page ở tab Page.", parent=self.root)
             return
         self._save_ready_selection()
         from src.services.ai_fleet.account_check import apply_account_rotation
@@ -1610,7 +1615,7 @@ class AiFleetTab:
         ):
             messagebox.showwarning(
                 "Test tạo bài viết",
-                "Sang bước 1, dán khóa ChatGPT rồi bấm Kiểm tra và lưu trước.",
+                "Mở tab Agent tổng, dán khóa ChatGPT rồi bấm Kiểm tra và lưu trước.",
                 parent=self.root,
             )
             return
@@ -1655,7 +1660,7 @@ class AiFleetTab:
                 elif created.get("image_error"):
                     message = f"{credit}Chưa lưu bài vì chưa có ảnh: {created['image_error']}"
                 elif created.get("asset_id"):
-                    message = f"{credit}Đã viết «{title}» và đã tạo ảnh. Mở bước 4 để xem."
+                    message = f"{credit}Đã viết «{title}» và đã tạo ảnh. Mở tab Duyệt để xem."
                 elif self.make_image.get():
                     message = f"{credit}Đã viết «{title}». Ảnh chưa được gắn vào bài."
                 else:
@@ -1670,7 +1675,7 @@ class AiFleetTab:
         page_id = self._selected_page_id()
         topics = [line.strip() for line in self.topic_box.get("1.0", "end").splitlines() if line.strip()]
         if not page_id or not topics:
-            messagebox.showwarning("Viết bài", "Chọn Page ở bước 2 và nhập chủ đề.", parent=self.root)
+            messagebox.showwarning("Viết bài", "Chọn Page ở tab Page và nhập chủ đề.", parent=self.root)
             return
         text_name = self.text_provider.get().strip().lower()
         image_name = self._image_name()
@@ -1704,7 +1709,7 @@ class AiFleetTab:
                 message = (
                     f"{credit}Đã tạo {len(made)} bài bằng {used}. "
                     f"Ảnh, nếu có, do {image_name} và đã vào thư viện media. "
-                    f"Bỏ qua {len(skipped)}. Token ra đã dùng {result['output_tokens']}. Sang bước 4 để duyệt."
+                    f"Bỏ qua {len(skipped)}. Token ra đã dùng {result['output_tokens']}. Mở tab Duyệt để xem."
                 )
             except Exception as exc:  # noqa: BLE001
                 message = f"Chưa viết được: {exc}"

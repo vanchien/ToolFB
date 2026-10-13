@@ -80,23 +80,24 @@ class GroupManagerDialog(tk.Toplevel):
 
         actions = ttk.Frame(self, padding=8)
         actions.pack(fill=tk.X)
-        ttk.Button(actions, text="Tìm nhóm", command=self._search).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Lưu hồ sơ tìm", command=self._save_profile).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Tìm", command=self._search).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Lưu hồ sơ", command=self._save_profile).pack(side=tk.LEFT, padx=4)
         self.profile_name = tk.StringVar()
         self.profile_box = ttk.Combobox(actions, textvariable=self.profile_name, width=22, state="readonly")
         self.profile_box.pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Chạy hồ sơ đã lưu", command=self._run_profile).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Chạy hồ sơ", command=self._run_profile).pack(side=tk.LEFT)
         ttk.Button(actions, text="Tạm dừng", command=self._pause_search).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Tiếp tục", command=self._resume_search).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Tham gia nhóm đã chọn", command=self._join_selected).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Tham gia", command=self._join_selected).pack(side=tk.LEFT, padx=4)
         self._discovery_job_id = ""
         self._refresh_profiles()
         self.status = tk.StringVar(value=self._summary())
         ttk.Label(actions, textvariable=self.status).pack(side=tk.LEFT, padx=8)
 
-        cols = ("group", "members", "count_status", "country", "lang", "topic", "url")
+        cols = ("stt", "group", "members", "count_status", "country", "lang", "topic", "url")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended", height=12)
         for key, title, width in (
+            ("stt", "STT", 44),
             ("group", "Nhóm", 240),
             ("members", "Thành viên", 90),
             ("count_status", "Số đếm", 90),
@@ -106,7 +107,12 @@ class GroupManagerDialog(tk.Toplevel):
             ("url", "Link", 220),
         ):
             self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, stretch=True)
+            self.tree.column(
+                key,
+                width=width,
+                stretch=key != "stt",
+                anchor="center" if key == "stt" else "w",
+            )
         self.tree.pack(fill=tk.BOTH, expand=True, padx=8)
 
         share = ttk.LabelFrame(self, text="Chia sẻ bài — link Page khác, chữ và ảnh. Không tải video", padding=8)
@@ -383,13 +389,14 @@ class GroupManagerDialog(tk.Toplevel):
             account_id=self.account_id.get().strip(),
             page_id=self._selected_page_id(),
         )
-        for row in rows:
+        for index, row in enumerate(rows, start=1):
             group_id = str(row.get("group_id") or "")
             self.tree.insert(
                 "",
                 tk.END,
                 iid=group_id,
                 values=(
+                    index,
                     row.get("group_name") or group_id,
                     f"{int(row.get('member_count') or 0):,}" if row.get("member_count") else "—",
                     row.get("member_count_status") or "UNKNOWN",

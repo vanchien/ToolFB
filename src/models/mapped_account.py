@@ -109,6 +109,8 @@ class MappedAccount:
     soft_login_if_needed: bool = False
     # True = dòng nick có cookie: đăng nhập bằng cookie, không mở form mật khẩu.
     login_via_cookie: bool = False
+    # Tên người dùng trên Facebook. Không thay UID đăng nhập.
+    display_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -125,6 +127,7 @@ class MappedAccount:
             "queue_no": int(self.queue_no or 0),
             "soft_login_if_needed": self.soft_login_if_needed,
             "login_via_cookie": self.login_via_cookie,
+            "display_name": self.display_name,
         }
 
     @classmethod
@@ -147,6 +150,7 @@ class MappedAccount:
             queue_no=int(raw.get("queue_no") or 0),
             soft_login_if_needed=bool(raw.get("soft_login_if_needed", False)),
             login_via_cookie=bool(raw.get("login_via_cookie", False)),
+            display_name=str(raw.get("display_name") or "").strip(),
         )
 
     def display_uid(self) -> str:

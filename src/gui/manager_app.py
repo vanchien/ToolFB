@@ -105,6 +105,7 @@ from src.utils.page_schedule import parse_date_only_yyyy_mm_dd, scheduler_tz
 from src.utils.schedule_batch_preview import build_schedule_by_daily_slots, page_post_style_for_post_type
 from src.utils.schedule_job_content import build_schedule_slot_hhmm, internal_post_title_from_body
 from src.utils.schedule_posts_filters import (
+    account_name_is_placeholder,
     format_account_filter_label,
     format_page_filter_label,
     split_hashtags_csv,
@@ -129,6 +130,7 @@ from src.services.tiktok.job_manager import TikTokJobStore, default_job_dict
 from src.services.universal_video_downloader import ensure_downloader_layout
 from src.services.video_editor.layout import video_editor_schedule_jobs_json_path
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
+from src.gui.ui_theme import apply_app_theme
 from src.gui.tiktok_manager_tab import build_tiktok_manager_tab
 from src.gui.human_interaction_tab import build_human_interaction_tab
 from src.gui.share_tab import build_share_tab
@@ -320,6 +322,7 @@ class _ManagerWindow:
         self._show_browser = os.environ.get("HEADLESS", "1").strip().lower() in {"0", "false", "off", "no"}
 
         self._root = tk.Tk()
+        apply_app_theme(self._root)
         # Ẩn cửa sổ đến khi dựng xong widget — tránh Windows gắn «Not Responding» lúc khởi tạo.
         self._root.withdraw()
         register_main_thread_dispatcher(self._root)
@@ -356,6 +359,7 @@ class _ManagerWindow:
         self._filtered_jobs: list[dict[str, Any]] = []
         self._job_page_name_by_id: dict[str, str] = {}
         self._job_account_name_by_id: dict[str, str] = {}
+        self._account_name_lookup_started = False
         self._jobs_filter_account_label_to_id: dict[str, str] = {}
         self._jobs_filter_page_label_to_id: dict[str, str] = {}
         self._jobs_sort_key: str = "scheduled_at"
@@ -571,11 +575,12 @@ class _ManagerWindow:
         acc_tree_fr.columnconfigure(0, weight=1)
         acc_tree_fr.rowconfigure(0, weight=1)
 
-        cols_acc = ("tick", "id", "name", "browser", "portable", "proxy", "cookie")
+        cols_acc = ("stt", "tick", "id", "name", "browser", "portable", "proxy", "cookie")
         self._tree_accounts = ttk.Treeview(
             acc_tree_fr, columns=cols_acc, show="headings", height=self._tree_rows_main, selectmode="extended"
         )
         headings_acc = {
+            "stt": "STT",
             "tick": "Chọn",
             "id": "id",
             "name": "Tên",
@@ -584,11 +589,12 @@ class _ManagerWindow:
             "proxy": "proxy host:port",
             "cookie": "cookie_path",
         }
-        widths_acc = (44, 96, 112, 68, 150, 100, 180)
+        widths_acc = (44, 44, 96, 112, 68, 150, 100, 180)
         for c, w in zip(cols_acc, widths_acc):
             self._tree_accounts.heading(c, text=headings_acc[c])
             stretch = c in ("name", "portable", "cookie")
-            self._tree_accounts.column(c, width=w, minwidth=28, stretch=stretch)
+            anchor = "center" if c in ("stt", "tick") else "w"
+            self._tree_accounts.column(c, width=w, minwidth=28, stretch=stretch, anchor=anchor)
         sy_acc = ttk.Scrollbar(acc_tree_fr, orient=tk.VERTICAL, command=self._tree_accounts.yview)
         self._tree_accounts.configure(yscrollcommand=sy_acc.set)
         self._tree_accounts.grid(row=0, column=0, sticky="nsew")
@@ -611,33 +617,32 @@ class _ManagerWindow:
         tab_pg.rowconfigure(3, weight=1)
         ttk.Label(
             tab_pg,
-            text="Thêm / sửa Page (URL, owner…). Thống kê: tối đa vài Page/lần, cache 12h (tránh checkpoint) — "
-            "chỉ bật «Bỏ qua cache» khi cần. Cần fb_page_id + đăng nhập. Lịch/AI: tab «3. Job lịch đăng».",
+            text="Mỗi lần xem Page của một tài khoản. Thống kê lấy vài Page một lần và nhớ 12 giờ.",
             font=("Segoe UI", 9),
-            wraplength=640,
         ).grid(row=0, column=0, sticky="w", pady=(0, 4))
         pg_bar = ttk.Frame(tab_pg)
         pg_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-        ttk.Button(pg_bar, text="Thêm Page/Group", command=self._on_add_page).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(
-            pg_bar,
-            text="Quét Page theo tài khoản",
-            command=self._on_scan_pages_from_account,
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Tạo nhiều Page", command=self._on_open_page_creator).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Nhóm Facebook", command=self._on_open_group_manager).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Chia sẻ bài", command=self._on_open_share_tab).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Sửa", command=self._on_edit_page).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Job lịch đăng…", command=self._on_goto_jobs_for_page).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Xóa", command=self._on_delete_page).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Xuất CSV…", command=self._on_export_pages_csv).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Dọn trùng Meta ID", command=self._on_dedupe_pages_by_meta_id).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-        ttk.Label(pg_bar, text="Thống kê:").pack(side=tk.LEFT, padx=(8, 2))
+        pg_line = ttk.Frame(pg_bar)
+        pg_line.pack(fill=tk.X)
+        ttk.Button(pg_line, text="Thêm", command=self._on_add_page).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Sửa", command=self._on_edit_page).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Xóa", command=self._on_delete_page).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(pg_line, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(pg_line, text="Quét Page", command=self._on_scan_pages_from_account).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Tạo nhiều Page", command=self._on_open_page_creator).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Nhóm", command=self._on_open_group_manager).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Chia sẻ", command=self._on_open_share_tab).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Lịch đăng", command=self._on_goto_jobs_for_page).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(pg_line, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(pg_line, text="Xuất CSV", command=self._on_export_pages_csv).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Dọn trùng", command=self._on_dedupe_pages_by_meta_id).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Làm mới", command=self._on_refresh_pages).pack(side=tk.LEFT)
+        pg_line2 = ttk.Frame(pg_bar)
+        pg_line2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(pg_line2, text="Thống kê").pack(side=tk.LEFT, padx=(0, 4))
         self._var_pages_insights_period = tk.StringVar(value="7 ngày")
         self._cb_pages_insights_period = ttk.Combobox(
-            pg_bar,
+            pg_line2,
             textvariable=self._var_pages_insights_period,
             state="readonly",
             width=14,
@@ -647,17 +652,14 @@ class _ManagerWindow:
         self._cb_pages_insights_period.bind("<<ComboboxSelected>>", lambda _e: self._render_pages_tree())
         self._var_pages_insights_force = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            pg_bar,
+            pg_line2,
             text="Bỏ qua cache",
             variable=self._var_pages_insights_force,
         ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(pg_bar, text="Lấy thống kê (đã chọn)", command=self._on_fetch_page_insights_selected).pack(
+        ttk.Button(pg_line2, text="Lấy đã chọn", command=self._on_fetch_page_insights_selected).pack(
             side=tk.LEFT, padx=(0, 4)
         )
-        ttk.Button(pg_bar, text="Lấy thống kê (đã lọc)", command=self._on_fetch_page_insights_filtered).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-        ttk.Button(pg_bar, text="Làm mới tab này", command=self._on_refresh_pages).pack(side=tk.LEFT)
+        ttk.Button(pg_line2, text="Lấy đã lọc", command=self._on_fetch_page_insights_filtered).pack(side=tk.LEFT)
         self._build_pages_filter_bar(tab_pg, row=2)
 
         pg_tree_fr = ttk.Frame(tab_pg)
@@ -666,6 +668,7 @@ class _ManagerWindow:
         pg_tree_fr.rowconfigure(0, weight=1)
 
         cols_pg = (
+            "stt",
             "page_name",
             "post_style",
             "schedule",
@@ -682,6 +685,7 @@ class _ManagerWindow:
             selectmode="extended",
         )
         headings_pg = {
+            "stt": "STT",
             "page_name": "Tên Page",
             "post_style": "Kiểu đăng",
             "schedule": "Lịch",
@@ -690,10 +694,14 @@ class _ManagerWindow:
             "fb_page_id": "Meta Page ID",
             "url": "Link Page",
         }
-        widths_pg = (220, 88, 72, 96, 130, 150, 260)
+        widths_pg = (44, 220, 88, 72, 96, 130, 150, 260)
         for c, w in zip(cols_pg, widths_pg):
-            self._tree_pages.heading(c, text=headings_pg[c], command=lambda k=c: self._on_pages_sort_click(k))
-            self._tree_pages.column(c, width=w, stretch=True)
+            if c == "stt":
+                self._tree_pages.heading(c, text=headings_pg[c])
+                self._tree_pages.column(c, width=w, stretch=False, anchor="center")
+            else:
+                self._tree_pages.heading(c, text=headings_pg[c], command=lambda k=c: self._on_pages_sort_click(k))
+                self._tree_pages.column(c, width=w, stretch=True)
         sy_pg = ttk.Scrollbar(pg_tree_fr, orient=tk.VERTICAL, command=self._tree_pages.yview)
         self._tree_pages.configure(yscrollcommand=sy_pg.set)
         self._tree_pages.grid(row=0, column=0, sticky="nsew")
@@ -709,18 +717,15 @@ class _ManagerWindow:
         job_box.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         jb = ttk.Frame(job_box)
         jb.pack(fill=tk.X)
-        ttk.Button(jb, text="Thêm job", command=self._on_add_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(jb, text="Thêm batch job…", command=self._on_add_batch_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(jb, text="Nạp job chờ đăng từ Export…", command=self._on_import_saved_export_job).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-        ttk.Button(jb, text="Sửa job", command=self._on_edit_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(jb, text="Sửa nội dung hàng loạt…", command=self._on_jobs_bulk_edit_content).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-        ttk.Button(jb, text="Xóa job", command=self._on_delete_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(jb, text="Đăng ngay", command=self._on_run_selected_jobs_now).pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Button(jb, text="Làm mới", command=self._on_refresh_schedule_jobs).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(jb, text="Thêm", command=self._on_add_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Thêm nhiều", command=self._on_add_batch_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Nạp chờ đăng", command=self._on_import_saved_export_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Sửa", command=self._on_edit_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Sửa hàng loạt", command=self._on_jobs_bulk_edit_content).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Xóa", command=self._on_delete_schedule_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Separator(jb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(jb, text="Đăng ngay", command=self._on_run_selected_jobs_now).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(jb, text="Làm mới", command=self._on_refresh_schedule_jobs).pack(side=tk.LEFT)
         jb2 = ttk.Frame(job_box)
         jb2.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(jb2, text="Chọn tất cả", command=self._on_jobs_select_all).pack(side=tk.LEFT, padx=(0, 4))
@@ -756,6 +761,7 @@ class _ManagerWindow:
         j_tree_fr.columnconfigure(0, weight=1)
         j_tree_fr.rowconfigure(0, weight=1)
         cols_j = (
+            "stt",
             "id",
             "page_id",
             "account_id",
@@ -773,6 +779,7 @@ class _ManagerWindow:
             j_tree_fr, columns=cols_j, show="headings", height=self._tree_rows_jobs, selectmode="extended"
         )
         heads_j = {
+            "stt": "STT",
             "id": "id",
             "page_id": "page",
             "account_id": "account",
@@ -786,13 +793,14 @@ class _ManagerWindow:
             "retry": "retry",
             "missing": "Thiếu field",
         }
-        widths_j = (120, 72, 72, 88, 78, 120, 240, 160, 88, 220, 44, 160)
+        widths_j = (44, 120, 72, 72, 88, 78, 120, 240, 160, 88, 220, 44, 160)
         for c, w in zip(cols_j, widths_j):
             self._tree_jobs.heading(c, text=heads_j[c])
             self._tree_jobs.column(
                 c,
                 width=w,
                 stretch=c in ("title", "image_prompt", "scheduled_at", "last_error", "missing"),
+                anchor="center" if c == "stt" else "w",
             )
         sy_j = ttk.Scrollbar(j_tree_fr, orient=tk.VERTICAL, command=self._tree_jobs.yview)
         self._tree_jobs.configure(yscrollcommand=sy_j.set)
@@ -886,13 +894,15 @@ class _ManagerWindow:
         gtree_fr.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(8, 4))
         gtree_fr.columnconfigure(0, weight=1)
         gtree_fr.rowconfigure(0, weight=1)
-        gcols = ("mark", "label", "preview")
+        gcols = ("stt", "mark", "label", "preview")
         self._tree_gemini = ttk.Treeview(
             gtree_fr, columns=gcols, show="headings", height=self._tree_rows_small, selectmode="browse"
         )
+        self._tree_gemini.heading("stt", text="STT")
         self._tree_gemini.heading("mark", text="Mặc định")
         self._tree_gemini.heading("label", text="Nhãn")
         self._tree_gemini.heading("preview", text="Key (đã che)")
+        self._tree_gemini.column("stt", width=44, stretch=False, anchor="center")
         self._tree_gemini.column("mark", width=72, stretch=False)
         self._tree_gemini.column("label", width=160, stretch=False)
         self._tree_gemini.column("preview", width=320, stretch=True)
@@ -948,13 +958,15 @@ class _ManagerWindow:
         otree_fr.grid(row=13, column=0, columnspan=2, sticky="nsew", pady=(8, 4))
         otree_fr.columnconfigure(0, weight=1)
         otree_fr.rowconfigure(0, weight=1)
-        ocols = ("mark", "label", "preview")
+        ocols = ("stt", "mark", "label", "preview")
         self._tree_openai = ttk.Treeview(
             otree_fr, columns=ocols, show="headings", height=self._tree_rows_small, selectmode="browse"
         )
+        self._tree_openai.heading("stt", text="STT")
         self._tree_openai.heading("mark", text="Mặc định")
         self._tree_openai.heading("label", text="Nhãn")
         self._tree_openai.heading("preview", text="Key (đã che)")
+        self._tree_openai.column("stt", width=44, stretch=False, anchor="center")
         self._tree_openai.column("mark", width=72, stretch=False)
         self._tree_openai.column("label", width=160, stretch=False)
         self._tree_openai.column("preview", width=320, stretch=True)
@@ -1003,13 +1015,15 @@ class _ManagerWindow:
         nbtree_fr.grid(row=22, column=0, columnspan=2, sticky="nsew", pady=(8, 4))
         nbtree_fr.columnconfigure(0, weight=1)
         nbtree_fr.rowconfigure(0, weight=1)
-        nbcols = ("mark", "label", "preview")
+        nbcols = ("stt", "mark", "label", "preview")
         self._tree_nanobanana = ttk.Treeview(
             nbtree_fr, columns=nbcols, show="headings", height=self._tree_rows_small, selectmode="browse"
         )
+        self._tree_nanobanana.heading("stt", text="STT")
         self._tree_nanobanana.heading("mark", text="Mặc định")
         self._tree_nanobanana.heading("label", text="Nhãn")
         self._tree_nanobanana.heading("preview", text="Key (đã che)")
+        self._tree_nanobanana.column("stt", width=44, stretch=False, anchor="center")
         self._tree_nanobanana.column("mark", width=72, stretch=False)
         self._tree_nanobanana.column("label", width=160, stretch=False)
         self._tree_nanobanana.column("preview", width=320, stretch=True)
@@ -1111,51 +1125,35 @@ class _ManagerWindow:
         tab_ve_pending.rowconfigure(3, weight=1)
         ttk.Label(
             tab_ve_pending,
-            text="Job chờ đăng từ Video Editor (file video_editor_schedule_jobs.json)",
-            font=("Segoe UI", 10, "bold"),
+            text="Job xuất từ tab Video, chờ đưa vào lịch đăng.",
         ).grid(row=0, column=0, sticky="w", pady=(0, 4))
         ve_top_pe = ttk.Frame(tab_ve_pending)
         ve_top_pe.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-        ve_top_pe.columnconfigure(0, weight=1)
-        ttk.Label(
-            ve_top_pe,
-            text=(
-                "Chọn job trong ô xổ bên dưới — phần «Chi tiết job» hiện metadata; bảng cuối liệt kê từng video "
-                "(tiêu đề, nội dung, hashtag, đường dẫn file…). Double‑click bảng video để mở «Nạp từ Export…»."
-            ),
-            foreground="#555",
-            font=("Segoe UI", 8),
-            wraplength=720,
-            justify="left",
-        ).grid(row=0, column=0, sticky="w")
-        ve_pe_btns = ttk.Frame(ve_top_pe)
-        ve_pe_btns.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        ttk.Button(ve_pe_btns, text="Làm mới", command=self._fill_ve_pending_export_jobs_tree).pack(
-            side=tk.LEFT, padx=(0, 6)
+        ve_pe_line = ttk.Frame(ve_top_pe)
+        ve_pe_line.pack(fill=tk.X)
+        ttk.Button(ve_pe_line, text="Làm mới", command=self._fill_ve_pending_export_jobs_tree).pack(
+            side=tk.LEFT, padx=(0, 4)
         )
-        ttk.Button(ve_pe_btns, text="Nạp từ Export…", command=self._on_import_saved_export_job).pack(
-            side=tk.LEFT, padx=(0, 6)
+        ttk.Button(ve_pe_line, text="Nạp vào lịch", command=self._on_import_saved_export_job).pack(
+            side=tk.LEFT, padx=(0, 4)
         )
-        ttk.Button(
-            ve_pe_btns,
-            text="Mở folder chứa file job chờ…",
-            command=self._on_open_ve_pending_export_jobs_folder,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(ve_pe_btns, text="Xóa job chọn", command=self._on_delete_ve_pending_export_jobs).pack(
-            side=tk.LEFT, padx=(6, 0)
+        ttk.Button(ve_pe_line, text="Mở thư mục", command=self._on_open_ve_pending_export_jobs_folder).pack(
+            side=tk.LEFT, padx=(0, 4)
         )
+        ttk.Separator(ve_pe_line, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(ve_pe_line, text="Xóa", command=self._on_delete_ve_pending_export_jobs).pack(side=tk.LEFT)
 
         ve_filter_pe = ttk.Frame(tab_ve_pending)
         ve_filter_pe.grid(row=2, column=0, sticky="ew", pady=(0, 4))
         ve_filter_pe.columnconfigure(1, weight=1)
-        ttk.Label(ve_filter_pe, text="Tìm job").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(ve_filter_pe, text="Tìm:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         ttk.Entry(ve_filter_pe, textvariable=self._var_ve_pending_search, width=36).grid(
             row=0, column=1, sticky="ew", padx=(0, 8)
         )
         ttk.Button(ve_filter_pe, text="Xóa lọc", command=lambda: self._var_ve_pending_search.set("")).grid(
             row=0, column=2, sticky="w", padx=(0, 10)
         )
-        ttk.Label(ve_filter_pe, text="Sắp xếp job").grid(row=0, column=3, sticky="w", padx=(0, 6))
+        ttk.Label(ve_filter_pe, text="Sắp xếp").grid(row=0, column=3, sticky="w", padx=(0, 6))
         self._cb_ve_pending_sort_field = ttk.Combobox(
             ve_filter_pe,
             textvariable=self._var_ve_pending_sort_ui,
@@ -1165,17 +1163,11 @@ class _ManagerWindow:
         )
         self._cb_ve_pending_sort_field.grid(row=0, column=4, sticky="w", padx=(0, 6))
         self._cb_ve_pending_sort_field.bind("<<ComboboxSelected>>", self._on_ve_pending_sort_field_changed)
-        ttk.Button(ve_filter_pe, text="Đảo chiều ↑/↓", command=self._on_ve_pending_sort_dir_toggle, width=12).grid(
+        ttk.Button(ve_filter_pe, text="Đảo chiều", command=self._on_ve_pending_sort_dir_toggle).grid(
             row=0, column=5, sticky="w"
         )
-        ttk.Label(
-            ve_filter_pe,
-            text="Lọc theo id / tên / đích / số video / thời gian / trạng thái — danh sách trong ô «Chọn job».",
-            foreground="#666",
-            font=("Segoe UI", 8),
-        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
-        lf_job = ttk.LabelFrame(tab_ve_pending, text="Chi tiết job đang chọn", padding=(8, 6))
+        lf_job = ttk.LabelFrame(tab_ve_pending, text="Job đang chọn", padding=(8, 6))
         lf_job.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
         lf_job.columnconfigure(1, weight=1)
         lf_job.rowconfigure(1, weight=0)
@@ -1192,7 +1184,7 @@ class _ManagerWindow:
         self._frm_ve_pending_job_meta = ttk.Frame(lf_job)
         self._frm_ve_pending_job_meta.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         self._frm_ve_pending_job_meta.columnconfigure(0, weight=1)
-        ttk.Label(lf_job, text="Từng video trong job", font=("Segoe UI", 9, "bold")).grid(
+        ttk.Label(lf_job, text="Video trong job").grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(0, 4)
         )
         vf = ttk.Frame(lf_job)
@@ -1201,18 +1193,12 @@ class _ManagerWindow:
         vf.rowconfigure(1, weight=1)
         ve_tb = ttk.Frame(vf)
         ve_tb.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Button(ve_tb, text="Thêm video (chọn nhiều)…", command=self._on_ve_pending_add_video_files).pack(
-            side=tk.LEFT, padx=(0, 6)
+        ttk.Button(ve_tb, text="Thêm video", command=self._on_ve_pending_add_video_files).pack(
+            side=tk.LEFT, padx=(0, 4)
         )
-        ttk.Button(ve_tb, text="Gán đích đăng cho dòng đã chọn…", command=self._on_ve_pending_assign_dest_for_selection).pack(
-            side=tk.LEFT, padx=(0, 6)
+        ttk.Button(ve_tb, text="Gán đích", command=self._on_ve_pending_assign_dest_for_selection).pack(
+            side=tk.LEFT, padx=(0, 4)
         )
-        ttk.Label(
-            ve_tb,
-            text="Ctrl/Shift + click để chọn nhiều dòng. Double-click «Đích clip» để sửa. Kéo viền tiêu đề cột để rộng/hẹp cột.",
-            foreground="#666",
-            font=("Segoe UI", 8),
-        ).pack(side=tk.LEFT, padx=(8, 0))
         vf_inner = ttk.Frame(vf)
         vf_inner.grid(row=1, column=0, sticky="nsew")
         vf_inner.columnconfigure(0, weight=1)
@@ -1226,7 +1212,7 @@ class _ManagerWindow:
             selectmode="extended",
         )
         heads_v = {
-            "stt": "#",
+            "stt": "STT",
             "title": "Tiêu đề",
             "content": "Nội dung",
             "hashtags": "Hashtag",
@@ -1782,6 +1768,7 @@ class _ManagerWindow:
                 {
                     "iid": aid,
                     "values": (
+                        idx + 1,
                         tick_sym,
                         acc.get("id", ""),
                         acc.get("name", ""),
@@ -2155,7 +2142,7 @@ class _ManagerWindow:
         owner_val = (
             self._var_pages_filter_account.get()
             if hasattr(self, "_var_pages_filter_account")
-            else "Tất cả owner"
+            else "Chọn tài khoản"
         )
         kind_val = (
             self._var_pages_filter_kind.get()
@@ -2167,8 +2154,12 @@ class _ManagerWindow:
             if hasattr(self, "_var_pages_filter_status")
             else "Tất cả trạng thái"
         )
-        if owner_val and owner_val != "Tất cả owner":
-            rows = [r for r in rows if str(r.get("account_id", "")).strip() == owner_val]
+        if owner_val in ("", "Chọn tài khoản"):
+            rows = []
+        elif owner_val not in ("Tất cả tài khoản", "Tất cả owner"):
+            mapped = getattr(self, "_pages_filter_account_label_to_id", {}) or {}
+            owner_id = str(mapped.get(owner_val, owner_val)).strip()
+            rows = [r for r in rows if str(r.get("account_id", "")).strip() == owner_id]
         if kind_val and kind_val != "Tất cả loại":
             rows = [r for r in rows if str(r.get("page_kind", "")).strip().lower() == kind_val]
         if status_val and status_val != "Tất cả trạng thái":
@@ -2239,7 +2230,7 @@ class _ManagerWindow:
 
     def _pages_tree_insert_specs(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         specs: list[dict[str, Any]] = []
-        for p in rows:
+        for idx, p in enumerate(rows, start=1):
             url = str(p.get("page_url", "") or "")
             raw_st = str(p.get("status", "")).strip()
             st_disp = _normalize_post_status(raw_st if raw_st else "pending")
@@ -2256,6 +2247,7 @@ class _ManagerWindow:
             )
             spec: dict[str, Any] = {
                 "values": (
+                    idx,
                     p.get("page_name", ""),
                     p.get("post_style", "") or "—",
                     p.get("schedule_time", "") or "—",
@@ -2280,7 +2272,7 @@ class _ManagerWindow:
         if hasattr(self, "_lbl_pages_stats"):
             try:
                 self._lbl_pages_stats.configure(
-                    text=f"Hiển thị {len(rows)} / {len(getattr(self, '_all_pages', []))} Page"
+                    text=f"Đang hiện {len(rows)} / {len(getattr(self, '_all_pages', []))} Page"
                 )
             except Exception:
                 pass
@@ -2622,17 +2614,22 @@ class _ManagerWindow:
         ent.grid(row=0, column=1, sticky="ew", padx=(4, 6))
         ent.bind("<KeyRelease>", self._on_pages_search_changed)
 
-        self._var_pages_filter_account = tk.StringVar(value="Tất cả owner")
+        self._var_pages_filter_account = tk.StringVar(value="Chọn tài khoản")
+        self._pages_account_chosen = False
+        self._pages_filter_account_label_to_id: dict[str, str] = {}
         self._cb_pages_filter_account = ttk.Combobox(
             fr,
             textvariable=self._var_pages_filter_account,
             state="readonly",
-            width=18,
+            width=42,
         )
         self._cb_pages_filter_account.grid(row=0, column=2, padx=(0, 4))
-        self._cb_pages_filter_account.bind("<<ComboboxSelected>>", lambda _e: self._render_pages_tree())
+        self._cb_pages_filter_account.bind("<<ComboboxSelected>>", self._on_pages_account_filter_selected)
+        self._lbl_pages_stats = ttk.Label(fr, text="", foreground="gray")
+        self._lbl_pages_stats.grid(row=0, column=3, sticky="w", padx=(8, 0))
 
         self._var_pages_filter_kind = tk.StringVar(value="Tất cả loại")
+        ttk.Label(fr, text="Loại").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self._cb_pages_filter_kind = ttk.Combobox(
             fr,
             textvariable=self._var_pages_filter_kind,
@@ -2640,7 +2637,7 @@ class _ManagerWindow:
             width=12,
             values=("Tất cả loại", "fanpage", "profile", "group"),
         )
-        self._cb_pages_filter_kind.grid(row=0, column=3, padx=(0, 4))
+        self._cb_pages_filter_kind.grid(row=1, column=1, sticky="w", padx=(4, 6), pady=(4, 0))
         self._cb_pages_filter_kind.bind("<<ComboboxSelected>>", lambda _e: self._render_pages_tree())
 
         self._var_pages_filter_status = tk.StringVar(value="Tất cả trạng thái")
@@ -2651,7 +2648,7 @@ class _ManagerWindow:
             width=16,
             values=("Tất cả trạng thái", "pending", "success", "failed"),
         )
-        self._cb_pages_filter_status.grid(row=0, column=4, padx=(0, 4))
+        self._cb_pages_filter_status.grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(4, 0))
         self._cb_pages_filter_status.bind("<<ComboboxSelected>>", lambda _e: self._render_pages_tree())
 
         self._var_pages_sort = tk.StringVar(value="Tên Page (A-Z)")
@@ -2659,32 +2656,171 @@ class _ManagerWindow:
             fr,
             textvariable=self._var_pages_sort,
             state="readonly",
-            width=16,
+            width=18,
             values=("Tên Page (A-Z)", "Owner", "Meta Page ID", "Trạng thái", "Lần đăng gần nhất"),
         )
-        self._cb_pages_sort.grid(row=0, column=5, padx=(0, 4))
+        self._cb_pages_sort.grid(row=1, column=3, sticky="w", padx=(0, 4), pady=(4, 0))
         self._cb_pages_sort.bind("<<ComboboxSelected>>", self._on_pages_sort_combo_changed)
 
         self._var_pages_sort_desc = tk.BooleanVar(value=False)
         ttk.Checkbutton(fr, text="Giảm dần", variable=self._var_pages_sort_desc, command=self._on_pages_sort_desc_changed).grid(
-            row=0, column=6, padx=(0, 4)
+            row=1, column=4, padx=(0, 4), pady=(4, 0)
         )
-        ttk.Button(fr, text="Xóa lọc", command=self._on_pages_clear_filters).grid(row=0, column=7, padx=(4, 0))
-        self._lbl_pages_stats = ttk.Label(fr, text="", foreground="gray")
-        self._lbl_pages_stats.grid(row=0, column=8, sticky="e", padx=(10, 0))
+        ttk.Button(fr, text="Xóa lọc", command=self._on_pages_clear_filters).grid(row=1, column=5, padx=(4, 0), pady=(4, 0))
         self._refresh_pages_filter_choices()
 
+    def _schedule_placeholder_account_names(self) -> None:
+        """Lấy tên Facebook cho tài khoản đang hiện mã nội bộ, rồi cập nhật ô chọn."""
+        if self._account_name_lookup_started:
+            return
+        self._account_name_lookup_started = True
+
+        def _work() -> None:
+            from src.utils.account_proxy_mapper import lookup_account_public_name
+            from src.utils.proxy_check import _requests_proxies_url, _strip_proxy_scheme
+
+            found: dict[str, str] = {}
+            try:
+                rows = self._accounts.load_all()
+            except Exception:
+                logger.warning("Không đọc được danh sách tài khoản để lấy tên hiển thị")
+                return
+            root = project_root()
+            for acc in rows:
+                aid = str(acc.get("id") or "").strip()
+                if not aid or not account_name_is_placeholder(str(acc.get("name") or ""), aid):
+                    continue
+                cookie_rel = str(acc.get("cookie_path") or "").strip()
+                if not cookie_rel:
+                    continue
+                cookie_path = Path(cookie_rel)
+                if not cookie_path.is_absolute():
+                    cookie_path = root / cookie_rel
+                proxy_url = None
+                if bool(acc.get("use_proxy")):
+                    proxy = acc.get("proxy") if isinstance(acc.get("proxy"), dict) else {}
+                    host = str(proxy.get("host") or "").strip()
+                    try:
+                        port = int(proxy.get("port") or 0)
+                    except (TypeError, ValueError):
+                        port = 0
+                    if not host or port <= 0:
+                        continue
+                    scheme = str(proxy.get("scheme_hint") or "socks5").strip().lower()
+                    if scheme not in ("http", "https", "socks4", "socks5"):
+                        scheme = "socks5"
+                    try:
+                        proxy_url = _requests_proxies_url(
+                            scheme,
+                            _strip_proxy_scheme(host),
+                            port,
+                            str(proxy.get("user") or "").strip(),
+                            str(proxy.get("pass") or ""),
+                        )
+                    except (TypeError, ValueError):
+                        proxy_url = None
+                    if not proxy_url:
+                        continue
+                try:
+                    public_name = lookup_account_public_name(cookie_path, proxy_url=proxy_url)
+                except Exception:
+                    logger.warning("Không lấy được tên Facebook cho tài khoản {}", aid)
+                    continue
+                if public_name and not account_name_is_placeholder(public_name, aid):
+                    found[aid] = public_name
+
+            def _apply() -> None:
+                if not found:
+                    return
+                for aid, public_name in found.items():
+                    try:
+                        self._accounts.update_account_fields(aid, {"name": public_name})
+                    except Exception:
+                        logger.warning("Không lưu được tên hiển thị cho tài khoản {}", aid)
+                try:
+                    self._fill_tree(self._accounts.load_all())
+                except Exception:
+                    logger.warning("Không vẽ lại bảng tài khoản sau khi có tên")
+                self._job_account_name_by_id.update(found)
+                if hasattr(self, "_cb_pages_filter_account"):
+                    self._refresh_pages_filter_choices()
+                    self._render_pages_tree()
+                if hasattr(self, "_cb_jobs_filter_account"):
+                    self._refresh_job_filter_choices()
+                    self._render_schedule_jobs_tree()
+
+            try:
+                self._root.after(0, _apply)
+            except tk.TclError:
+                return
+
+        threading.Thread(target=_work, name="account-display-names", daemon=True).start()
+
+    def _page_account_name_map(self) -> dict[str, str]:
+        """Tên hiển thị theo id tài khoản, dùng cho bộ lọc Page."""
+        names: dict[str, str] = {}
+        try:
+            for acc in self._accounts.load_all():
+                aid = str(acc.get("id") or "").strip()
+                if aid:
+                    names[aid] = str(acc.get("name") or "").strip()
+        except Exception:
+            logger.exception("Không đọc được tên tài khoản cho bộ lọc Page")
+        return names
+
+    def _on_pages_account_filter_selected(self, _event: tk.Event | None = None) -> None:
+        """Người dùng đã chọn một tài khoản hoặc mục Tất cả."""
+        self._pages_account_chosen = True
+        self._render_pages_tree()
+
     def _refresh_pages_filter_choices(self) -> None:
+        """Đổ combobox tài khoản. Lần đầu chỉ hiện Page của tài khoản đầu, không đổ hết."""
         rows = list(getattr(self, "_all_pages", []) or [])
         owners = sorted({str(r.get("account_id", "")).strip() for r in rows if str(r.get("account_id", "")).strip()})
-        values = ("Tất cả owner", *owners)
-        if hasattr(self, "_cb_pages_filter_account"):
-            cur = self._var_pages_filter_account.get()
-            self._cb_pages_filter_account.configure(values=values)
-            if cur in values:
-                self._var_pages_filter_account.set(cur)
-            else:
-                self._var_pages_filter_account.set("Tất cả owner")
+        names = self._page_account_name_map()
+        selected_id = ""
+        if hasattr(self, "_var_pages_filter_account"):
+            selected_id = str(self._pages_filter_account_label_to_id.get(self._var_pages_filter_account.get(), "") or "")
+        labels = ["Chọn tài khoản"]
+        mapping: dict[str, str] = {}
+        for aid in owners:
+            label = format_account_filter_label(aid, names.get(aid, ""))
+            if label in mapping:
+                label = f"{label} ({aid})"
+            mapping[label] = aid
+            labels.append(label)
+        if owners:
+            labels.append("Tất cả tài khoản")
+        self._pages_filter_account_label_to_id = mapping
+        if not hasattr(self, "_cb_pages_filter_account"):
+            return
+        cur = self._var_pages_filter_account.get()
+        self._cb_pages_filter_account.configure(values=tuple(labels))
+        if cur == "Tất cả owner":
+            cur = "Tất cả tài khoản"
+        if cur in labels and getattr(self, "_pages_account_chosen", False):
+            self._var_pages_filter_account.set(cur)
+            self._schedule_placeholder_account_names()
+            return
+        if selected_id:
+            for label, aid in mapping.items():
+                if aid == selected_id:
+                    self._var_pages_filter_account.set(label)
+                    self._pages_account_chosen = True
+                    self._schedule_placeholder_account_names()
+                    return
+        if not getattr(self, "_pages_account_chosen", False) and len(labels) > 1 and labels[1] != "Tất cả tài khoản":
+            self._var_pages_filter_account.set(labels[1])
+            self._pages_account_chosen = True
+            self._schedule_placeholder_account_names()
+            return
+        if cur in labels:
+            self._var_pages_filter_account.set(cur)
+        elif len(labels) > 1 and labels[1] != "Tất cả tài khoản":
+            self._var_pages_filter_account.set(labels[1])
+        else:
+            self._var_pages_filter_account.set("Chọn tài khoản")
+        self._schedule_placeholder_account_names()
 
     def _on_pages_search_changed(self, _event: tk.Event | None = None) -> None:
         if hasattr(self, "_pages_search_after_id") and self._pages_search_after_id:
@@ -2695,8 +2831,14 @@ class _ManagerWindow:
         self._pages_search_after_id = self._root.after(150, self._render_pages_tree)
 
     def _on_pages_clear_filters(self) -> None:
+        """Xóa chữ tìm và loại. Giữ đúng một tài khoản, không đổ lại toàn bộ Page."""
         self._var_pages_search.set("")
-        self._var_pages_filter_account.set("Tất cả owner")
+        labels = list(self._cb_pages_filter_account.cget("values") or ())
+        current = self._var_pages_filter_account.get()
+        if current in ("", "Chọn tài khoản", "Tất cả tài khoản", "Tất cả owner"):
+            first = next((item for item in labels if item not in ("Chọn tài khoản", "Tất cả tài khoản")), "")
+            self._var_pages_filter_account.set(first or "Chọn tài khoản")
+        self._pages_account_chosen = True
         self._var_pages_filter_kind.set("Tất cả loại")
         self._var_pages_filter_status.set("Tất cả trạng thái")
         self._var_pages_sort.set("Tên Page (A-Z)")
@@ -4389,9 +4531,9 @@ class _ManagerWindow:
         ent.bind("<KeyRelease>", self._on_jobs_search_changed)
 
         self._var_jobs_filter_account = tk.StringVar(value="Tất cả account")
-        self._cb_jobs_filter_account = ttk.Combobox(fr, textvariable=self._var_jobs_filter_account, state="readonly", width=32)
+        self._cb_jobs_filter_account = ttk.Combobox(fr, textvariable=self._var_jobs_filter_account, state="readonly", width=42)
         self._cb_jobs_filter_account.grid(row=0, column=2, padx=(0, 4))
-        self._cb_jobs_filter_account.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
+        self._cb_jobs_filter_account.bind("<<ComboboxSelected>>", self._on_jobs_account_filter_selected)
 
         self._var_jobs_filter_page = tk.StringVar(value="Tất cả page")
         self._cb_jobs_filter_page = ttk.Combobox(fr, textvariable=self._var_jobs_filter_page, state="readonly", width=32)
@@ -4399,6 +4541,7 @@ class _ManagerWindow:
         self._cb_jobs_filter_page.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
 
         self._var_jobs_filter_post_type = tk.StringVar(value="Tất cả loại")
+        ttk.Label(fr, text="Loại").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self._cb_jobs_filter_post_type = ttk.Combobox(
             fr,
             textvariable=self._var_jobs_filter_post_type,
@@ -4406,7 +4549,7 @@ class _ManagerWindow:
             width=14,
             values=("Tất cả loại", "text", "image", "video", "text_image", "text_video"),
         )
-        self._cb_jobs_filter_post_type.grid(row=0, column=4, padx=(0, 4))
+        self._cb_jobs_filter_post_type.grid(row=1, column=1, sticky="w", padx=(4, 6), pady=(4, 0))
         self._cb_jobs_filter_post_type.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
 
         self._var_jobs_filter_status = tk.StringVar(value="Tất cả trạng thái")
@@ -4426,7 +4569,7 @@ class _ManagerWindow:
                 "need_manual_check",
             ),
         )
-        self._cb_jobs_filter_status.grid(row=0, column=5, padx=(0, 4))
+        self._cb_jobs_filter_status.grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(4, 0))
         self._cb_jobs_filter_status.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
 
         self._var_jobs_filter_retry = tk.StringVar(value="Retry: tất cả")
@@ -4437,7 +4580,7 @@ class _ManagerWindow:
             width=14,
             values=("Retry: tất cả", "Retry = 0", "Retry > 0", "Retry ≥ 2"),
         )
-        self._cb_jobs_filter_retry.grid(row=0, column=6, padx=(0, 4))
+        self._cb_jobs_filter_retry.grid(row=1, column=3, sticky="w", padx=(0, 4), pady=(4, 0))
         self._cb_jobs_filter_retry.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
 
         self._var_jobs_filter_missing = tk.StringVar(value=MISSING_FIELD_LABELS[0])
@@ -4445,28 +4588,50 @@ class _ManagerWindow:
             fr,
             textvariable=self._var_jobs_filter_missing,
             state="readonly",
-            width=30,
+            width=28,
             values=MISSING_FIELD_LABELS,
         )
-        self._cb_jobs_filter_missing.grid(row=0, column=7, padx=(0, 4))
+        self._cb_jobs_filter_missing.grid(row=1, column=4, sticky="w", padx=(0, 4), pady=(4, 0))
         self._cb_jobs_filter_missing.bind("<<ComboboxSelected>>", lambda _e: self._render_schedule_jobs_tree())
 
-        ttk.Button(fr, text="Xóa lọc", command=self._on_jobs_clear_filters).grid(row=0, column=8, padx=(4, 0))
+        ttk.Button(fr, text="Xóa lọc", command=self._on_jobs_clear_filters).grid(
+            row=1, column=5, sticky="w", padx=(4, 0), pady=(4, 0)
+        )
 
     def _refresh_job_filter_choices(self) -> None:
         """Cập nhật options Account/Page combobox theo dữ liệu đang có (tên + id)."""
         if not hasattr(self, "_cb_jobs_filter_account"):
             return
         accs = sorted({str(j.get("account_id", "")).strip() for j in self._all_jobs if j.get("account_id")})
-        pages = sorted({str(j.get("page_id", "")).strip() for j in self._all_jobs if j.get("page_id")})
 
         acc_label_to_id: dict[str, str] = {}
         acc_labels = ["Tất cả account"]
         for aid in accs:
             lbl = format_account_filter_label(aid, self._job_account_name_by_id.get(aid, ""))
+            if lbl in acc_label_to_id:
+                lbl = f"{lbl} ({aid})"
             acc_label_to_id[lbl] = aid
             acc_labels.append(lbl)
         self._jobs_filter_account_label_to_id = acc_label_to_id
+
+        cur_acc_id = self._resolve_jobs_filter_account_id(self._var_jobs_filter_account.get())
+        self._cb_jobs_filter_account.configure(values=tuple(acc_labels))
+        if not getattr(self, "_jobs_account_chosen", False) and len(acc_labels) > 1:
+            self._var_jobs_filter_account.set(acc_labels[1])
+            self._jobs_account_chosen = True
+            cur_acc_id = acc_label_to_id.get(acc_labels[1], "")
+        elif cur_acc_id and cur_acc_id in accs:
+            self._var_jobs_filter_account.set(
+                format_account_filter_label(cur_acc_id, self._job_account_name_by_id.get(cur_acc_id, ""))
+            )
+        elif self._var_jobs_filter_account.get() not in acc_labels:
+            self._var_jobs_filter_account.set(acc_labels[1] if len(acc_labels) > 1 else "Tất cả account")
+            cur_acc_id = acc_label_to_id.get(self._var_jobs_filter_account.get(), "")
+
+        page_jobs = self._all_jobs
+        if cur_acc_id:
+            page_jobs = [j for j in self._all_jobs if str(j.get("account_id", "")).strip() == cur_acc_id]
+        pages = sorted({str(j.get("page_id", "")).strip() for j in page_jobs if j.get("page_id")})
 
         pg_label_to_id: dict[str, str] = {}
         pg_labels = ["Tất cả page"]
@@ -4475,15 +4640,6 @@ class _ManagerWindow:
             pg_label_to_id[lbl] = pid
             pg_labels.append(lbl)
         self._jobs_filter_page_label_to_id = pg_label_to_id
-
-        cur_acc_id = self._resolve_jobs_filter_account_id(self._var_jobs_filter_account.get())
-        self._cb_jobs_filter_account.configure(values=tuple(acc_labels))
-        if cur_acc_id and cur_acc_id in accs:
-            self._var_jobs_filter_account.set(
-                format_account_filter_label(cur_acc_id, self._job_account_name_by_id.get(cur_acc_id, ""))
-            )
-        elif self._var_jobs_filter_account.get() not in acc_labels:
-            self._var_jobs_filter_account.set("Tất cả account")
 
         cur_pg_id = self._resolve_jobs_filter_page_id(self._var_jobs_filter_page.get())
         self._cb_jobs_filter_page.configure(values=tuple(pg_labels))
@@ -4524,15 +4680,26 @@ class _ManagerWindow:
                 pass
         self._jobs_search_after_id = self._root.after(180, self._render_schedule_jobs_tree)
 
+    def _on_jobs_account_filter_selected(self, _event: tk.Event | None = None) -> None:
+        """Đổi tài khoản trên lịch đăng: chỉ hiện Page và job của tài khoản đó."""
+        self._jobs_account_chosen = True
+        self._var_jobs_filter_page.set("Tất cả page")
+        self._refresh_job_filter_choices()
+        self._render_schedule_jobs_tree()
+
     def _on_jobs_clear_filters(self) -> None:
         self._var_jobs_search.set("")
-        self._var_jobs_filter_account.set("Tất cả account")
+        labels = list(self._cb_jobs_filter_account.cget("values") or ())
+        first = next((item for item in labels if item != "Tất cả account"), "")
+        self._var_jobs_filter_account.set(first or "Tất cả account")
+        self._jobs_account_chosen = True
         self._var_jobs_filter_page.set("Tất cả page")
         self._var_jobs_filter_post_type.set("Tất cả loại")
         self._var_jobs_filter_status.set("Tất cả trạng thái")
         self._var_jobs_filter_retry.set("Retry: tất cả")
         if hasattr(self, "_var_jobs_filter_missing"):
             self._var_jobs_filter_missing.set(MISSING_FIELD_LABELS[0])
+        self._refresh_job_filter_choices()
         self._render_schedule_jobs_tree()
 
     def _install_schedule_jobs_column_sort(self) -> None:
@@ -4613,7 +4780,7 @@ class _ManagerWindow:
                 match_mode=missing_preset.get("match_mode", "any"),
             )
         filtered = sort_jobs(filtered, sort_key=sort_key, ascending=sort_asc)
-        rows = [self._job_tree_row_values(j) for j in filtered]
+        rows = [(idx, *self._job_tree_row_values(j)) for idx, j in enumerate(filtered, start=1)]
         return rows, filtered
 
     def _insert_job_tree_rows_chunked(
@@ -5388,12 +5555,12 @@ class _ManagerWindow:
     def _fill_openai_keys_tree(self) -> None:
         for iid in self._tree_openai.get_children():
             self._tree_openai.delete(iid)
-        for row in list_openai_key_rows_for_ui():
+        for index, row in enumerate(list_openai_key_rows_for_ui(), start=1):
             self._tree_openai.insert(
                 "",
                 tk.END,
                 iid=row["id"],
-                values=("★" if row["is_active"] else "", row["label"], row["preview"]),
+                values=(index, "★" if row["is_active"] else "", row["label"], row["preview"]),
             )
 
     def _selected_openai_key_id(self) -> str | None:
@@ -5414,12 +5581,12 @@ class _ManagerWindow:
     def _fill_gemini_keys_tree(self) -> None:
         for iid in self._tree_gemini.get_children():
             self._tree_gemini.delete(iid)
-        for row in list_gemini_key_rows_for_ui():
+        for index, row in enumerate(list_gemini_key_rows_for_ui(), start=1):
             self._tree_gemini.insert(
                 "",
                 tk.END,
                 iid=row["id"],
-                values=("★" if row["is_active"] else "", row["label"], row["preview"]),
+                values=(index, "★" if row["is_active"] else "", row["label"], row["preview"]),
             )
 
     def _selected_gemini_key_id(self) -> str | None:
@@ -5440,12 +5607,12 @@ class _ManagerWindow:
     def _fill_nanobanana_keys_tree(self) -> None:
         for iid in self._tree_nanobanana.get_children():
             self._tree_nanobanana.delete(iid)
-        for row in list_nanobanana_key_rows_for_ui():
+        for index, row in enumerate(list_nanobanana_key_rows_for_ui(), start=1):
             self._tree_nanobanana.insert(
                 "",
                 tk.END,
                 iid=row["id"],
-                values=("★" if row["is_active"] else "", row["label"], row["preview"]),
+                values=(index, "★" if row["is_active"] else "", row["label"], row["preview"]),
             )
 
     def _selected_nanobanana_key_id(self) -> str | None:

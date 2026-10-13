@@ -8,8 +8,16 @@ Pure filter/sort helpers cho danh sách job ``schedule_posts.json``.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Iterable
+
+_PLACEHOLDER_ACCOUNT_NAMES = {
+    "tài khoản mới",
+    "tai khoan moi",
+    "new account",
+}
+_INTERNAL_ACCOUNT_ID = re.compile(r"(?:acc|uid)_[0-9a-z]+", re.IGNORECASE)
 
 
 RETRY_MODES: tuple[str, ...] = ("all", "retry_0", "retry_gt_0", "retry_ge_2")
@@ -44,12 +52,25 @@ def format_page_filter_label(page_id: str, page_name: str = "") -> str:
     return name or pid
 
 
-def format_account_filter_label(account_id: str, account_name: str = "") -> str:
-    """Nhãn combobox lọc account: ``Tên account (account_id)``."""
+def account_name_is_placeholder(name: str, account_id: str = "") -> bool:
+    """Tên chưa phải tên người dùng: trống, trùng mã nội bộ, hoặc nhãn mặc định."""
+    raw = " ".join(str(name or "").split())
     aid = str(account_id or "").strip()
-    name = str(account_name or "").strip()
-    if name and aid:
-        return f"{name} ({aid})"
+    if not raw:
+        return True
+    if aid and raw.casefold() == aid.casefold():
+        return True
+    if raw.casefold() in _PLACEHOLDER_ACCOUNT_NAMES:
+        return True
+    return bool(_INTERNAL_ACCOUNT_ID.fullmatch(raw))
+
+
+def format_account_filter_label(account_id: str, account_name: str = "") -> str:
+    """Nhãn combobox tài khoản: tên người dùng. Mã nội bộ chỉ hiện khi chưa có tên."""
+    aid = str(account_id or "").strip()
+    name = " ".join(str(account_name or "").split())
+    if name and name.casefold() != aid.casefold() and not _INTERNAL_ACCOUNT_ID.fullmatch(name):
+        return name
     return aid or name
 
 

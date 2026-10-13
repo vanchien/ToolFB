@@ -660,6 +660,50 @@ def test_live_check_reads_c_user_and_sorts_live_above_die() -> None:
     assert [live_result_rank(label) for label in ("Live", "Lỗi", "Die")] == [0, 2, 3]
 
 
+def test_profile_name_from_live_detail_and_cookie_uid() -> None:
+    from src.utils.account_proxy_mapper import (
+        facebook_uid_from_cookie_export,
+        profile_name_from_live_detail,
+    )
+
+    assert profile_name_from_live_detail("Còn hoạt động — Chung Chiến (Chung Văn Chiến)") == (
+        "Chung Chiến (Chung Văn Chiến)"
+    )
+    assert profile_name_from_live_detail("Còn hoạt động — hồ sơ công khai") == ""
+    from src.utils.account_proxy_mapper import name_from_profile_html
+
+    assert name_from_profile_html(
+        "<html><title>Chung Chiến (Chung Văn Chiến) | Facebook</title></html>"
+    ) == "Chung Chiến (Chung Văn Chiến)"
+    assert name_from_profile_html("<html><title>Đăng nhập | Facebook</title></html>") == ""
+    from src.utils.account_proxy_mapper import facebook_account_name_from_labels
+
+    assert facebook_account_name_from_labels(
+        ["Quản lý cài đặt thông báo của Đinh Bảo Trân"]
+    ) == "Đinh Bảo Trân"
+    assert facebook_account_name_from_labels(["Bạn đang nghĩ gì, Chung Chiến?"]) == "Chung Chiến"
+    assert facebook_account_name_from_labels(["Trang chủ", "Đoạn chat"]) == ""
+    from src.utils.account_proxy_mapper import facebook_display_name_from_page_bits
+
+    assert facebook_display_name_from_page_bits(
+        [],
+        ["Chung Chiến (Chung Văn Chiến)"],
+    ) == "Chung Chiến (Chung Văn Chiến)"
+    assert facebook_display_name_from_page_bits([], ["61581337018549", "Trang chủ"]) == ""
+    from src.utils.account_proxy_mapper import facebook_href_is_own_profile
+
+    uid = "61581337018549"
+    assert facebook_href_is_own_profile(f"https://www.facebook.com/profile.php?id={uid}", uid)
+    assert facebook_href_is_own_profile(f"/{uid}", uid)
+    assert not facebook_href_is_own_profile(
+        f"https://www.facebook.com/story.php?story_fbid=1&id=999&__user={uid}",
+        uid,
+    )
+    assert facebook_uid_from_cookie_export(
+        {"cookies": [{"name": "c_user", "value": "100012345678901"}, {"name": "xs", "value": "secret"}]}
+    ) == "100012345678901"
+
+
 def test_extract_uid_lines_keeps_only_numbers() -> None:
     from src.utils.account_proxy_mapper import extract_uid_lines
 

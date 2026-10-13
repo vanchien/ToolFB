@@ -438,23 +438,17 @@ def build_video_editor_tab(
         t = str(cl.get("type") or "").strip().lower()
         return (not t) or t == "text"
 
-    top = ttk.LabelFrame(parent, text="Luồng nhanh Video Editor", padding=6)
+    top = ttk.LabelFrame(parent, text="Dự án", padding=6)
     top.pack(fill=tk.X, padx=4, pady=(4, 2))
+    ttk.Label(
+        top,
+        text="Chọn dự án, nạp job tải, rồi đưa video vào thư viện.",
+    ).pack(anchor="w", pady=(0, 4))
     top_project = ttk.Frame(top)
     top_project.pack(fill=tk.X, pady=(0, 4))
     top_job = ttk.Frame(top)
     top_job.pack(fill=tk.X)
-    lbl_flow_hint = ttk.Label(
-        top,
-        text="1) Chọn dự án  →  2) Nạp job  →  3) Import video  →  chỉnh timeline  →  preview hoặc xuất.",
-        foreground="#555",
-        font=("Segoe UI", 8),
-        wraplength=480,
-        justify="left",
-    )
-    lbl_flow_hint.pack(anchor="w", pady=(4, 0))
-    _follow_wrap(lbl_flow_hint, top)
-    ttk.Label(top_project, text="B1 - Dự án:").pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Label(top_project, text="Dự án").pack(side=tk.LEFT, padx=(0, 6))
 
     project_ids = [p["id"] for p in pm.list_projects()]
     sync_p2_ui_ref: dict[str, Any] = {"fn": None}
@@ -661,16 +655,16 @@ def build_video_editor_tab(
         except Exception as e:
             messagebox.showerror("Video Editor", f"Không xóa được project: {e}", parent=root)
 
-    ttk.Button(top_project, text="1) Dự án mới", command=new_project).pack(side=tk.LEFT, padx=(0, 4))
-    ttk.Button(top_project, text="Lưu dự án", command=save_project_btn).pack(side=tk.LEFT, padx=(0, 4))
-    ttk.Button(top_project, text="Xóa dự án...", command=delete_current_project).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_project, text="Thêm", command=new_project).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_project, text="Lưu", command=save_project_btn).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_project, text="Xóa", command=delete_current_project).pack(side=tk.LEFT, padx=(0, 4))
 
     dl_job_map: dict[str, str] = {}
     var_show_empty_jobs = tk.BooleanVar(value=False)
     var_dl_job = tk.StringVar(value="")
     var_dl_job_meta = tk.StringVar(value="")
     _dl_combo_refresh = {"gen": 0, "after_id": ""}
-    ttk.Label(top_job, text="B2 - Job tải:").pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Label(top_job, text="Job tải").pack(side=tk.LEFT, padx=(0, 4))
     cb_dl_job = ttk.Combobox(top_job, textvariable=var_dl_job, width=50, state="readonly")
     cb_dl_job.pack(side=tk.LEFT, padx=(0, 4))
 
@@ -989,9 +983,9 @@ def build_video_editor_tab(
 
         threading.Thread(target=_worker, name="ve_import_dl_job", daemon=True).start()
 
-    ttk.Button(top_job, text="2) Nạp danh sách job", command=refresh_download_job_combo).pack(side=tk.LEFT, padx=(0, 4))
-    ttk.Button(top_job, text="3) Import video vào Media", command=import_from_download_job).pack(side=tk.LEFT, padx=(0, 4))
-    ttk.Button(top_job, text="Mở thư mục metadata", command=_open_downloader_metadata_folder).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_job, text="Nạp danh sách", command=refresh_download_job_combo).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_job, text="Đưa vào thư viện", command=import_from_download_job).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_job, text="Mở thư mục", command=_open_downloader_metadata_folder).pack(side=tk.LEFT, padx=(0, 4))
     top_job_opts = ttk.Frame(top)
     top_job_opts.pack(fill=tk.X, pady=(4, 0))
     ttk.Checkbutton(
@@ -1047,7 +1041,7 @@ def build_video_editor_tab(
     main.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
     # --- Media panel ---
-    media_fr = ttk.LabelFrame(main, text="Thư viện media — nhập file vào dự án", padding=4)
+    media_fr = ttk.LabelFrame(main, text="Thư viện", padding=4)
     main.add(media_fr, weight=2)
     mb = ttk.Frame(media_fr)
     mb.pack(fill=tk.X)
@@ -1102,7 +1096,7 @@ def build_video_editor_tab(
     ttk.Button(mb, text="Thêm file nhạc", command=lambda: import_kind("audio")).pack(side=tk.LEFT, padx=(0, 4))
 
     media_inner = _pack_scrollable_vertical(media_fr)
-    help_media = ttk.LabelFrame(media_inner, text="Logo & watermark — các bước", padding=6)
+    help_media = ttk.LabelFrame(media_inner, text="Logo", padding=6)
     help_media.pack(fill=tk.X, pady=(6, 4))
     ttk.Label(
         help_media,
@@ -1119,7 +1113,7 @@ def build_video_editor_tab(
         justify="left",
     ).pack(anchor="w")
 
-    cols_m = ("name", "type", "duration", "resolution")
+    cols_m = ("stt", "name", "type", "duration", "resolution")
     var_media_name_filter = tk.StringVar(value="")
     var_media_only_timeline = tk.BooleanVar(value=False)
     var_stock_topic = tk.StringVar(value=STOCK_TOPIC_FILTER_ALL)
@@ -1127,6 +1121,16 @@ def build_video_editor_tab(
     var_stock_count = tk.StringVar(value="0/0 file")
     var_stock_auto_fill_status = tk.StringVar(value="")
     stock_paths_mem: list[str] = []
+    _media_sort: dict[str, Any] = {"col": "name", "asc": True}
+
+    def _on_media_heading_click(col: str) -> None:
+        """Đổi cột sắp xếp thư viện media rồi vẽ lại các bảng."""
+        if _media_sort.get("col") == col:
+            _media_sort["asc"] = not bool(_media_sort.get("asc", True))
+        else:
+            _media_sort["col"] = col
+            _media_sort["asc"] = True
+        refresh_media_tree()
 
     mf_wrap = ttk.Frame(media_inner)
     mf_wrap.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
@@ -1158,7 +1162,7 @@ def build_video_editor_tab(
         var_media_name_filter.set("")
         refresh_media_tree()
 
-    btn_clear_media_filter = ttk.Button(media_filter_fr, text="Xóa lọc tên", command=_clear_media_name_filter)
+    btn_clear_media_filter = ttk.Button(media_filter_fr, text="Xóa lọc", command=_clear_media_name_filter)
     btn_clear_media_filter.grid(row=0, column=3, sticky="w", padx=(10, 0))
 
     media_nb = ttk.Notebook(mf_wrap)
@@ -1169,13 +1173,14 @@ def build_video_editor_tab(
         host.rowconfigure(0, weight=1)
         tr = ttk.Treeview(host, columns=cols_m, show="headings", height=10, selectmode="extended")
         for c, t, w in (
+            ("stt", "STT", 44),
             ("name", "Tên file", 140),
             ("type", "Loại", 56),
             ("duration", "Độ dài (s)", 72),
             ("resolution", "Kích thước", 88),
         ):
-            tr.heading(c, text=t)
-            tr.column(c, width=w)
+            tr.heading(c, text=t, command=lambda cc=c: _on_media_heading_click(cc))
+            tr.column(c, width=w, anchor="center" if c == "stt" else "w", stretch=c == "name")
         sy = ttk.Scrollbar(host, orient=tk.VERTICAL, command=tr.yview)
         tr.configure(yscrollcommand=sy.set)
         tr.grid(row=0, column=0, sticky="nsew")
@@ -1245,10 +1250,14 @@ def build_video_editor_tab(
             if needle and needle not in Path(fp).name.lower():
                 continue
             stock_paths_mem.append(fp)
+        col = str(_media_sort.get("col") or "name")
+        asc = bool(_media_sort.get("asc", True))
+        if col == "name":
+            stock_paths_mem.sort(key=lambda fp: Path(fp).name.lower(), reverse=not asc)
         tr = media_trees["stock"]
         tr.delete(*tr.get_children())
-        for i, fp in enumerate(stock_paths_mem):
-            tr.insert("", tk.END, iid=f"s{i}", values=(Path(fp).name, "stock", "—", "—"))
+        for i, fp in enumerate(stock_paths_mem, start=1):
+            tr.insert("", tk.END, iid=f"s{i}", values=(i, Path(fp).name, "stock", "—", "—"))
         var_stock_count.set(f"{len(stock_paths_mem)}/{len(stock_paths_all)} file")
 
     def _play_stock_audio_system_default(path: str) -> None:
@@ -1474,7 +1483,7 @@ def build_video_editor_tab(
     center = ttk.PanedWindow(main, orient=tk.VERTICAL)
     main.add(center, weight=5)
 
-    prev_fr = ttk.LabelFrame(center, text="Xem trước — kiểm tra trước khi xuất file", padding=6)
+    prev_fr = ttk.LabelFrame(center, text="Xem trước", padding=6)
     center.add(prev_fr, weight=1)
     lbl_preview = ttk.Label(
         prev_fr,
@@ -2351,7 +2360,7 @@ def build_video_editor_tab(
         width=12,
     ).pack(side=tk.LEFT)
 
-    tl_fr = ttk.LabelFrame(center, text="Timeline — thứ tự clip trên video (Ctrl/Shift: chọn nhiều)", padding=4)
+    tl_fr = ttk.LabelFrame(center, text="Timeline", padding=4)
     center.add(tl_fr, weight=2)
     try:
         center.paneconfigure(prev_fr, minsize=72)
@@ -2381,9 +2390,10 @@ def build_video_editor_tab(
     var_tl_name_filter = tk.StringVar(value="")
     var_tlg_name_filter = tk.StringVar(value="")
     var_edit_sum_name_filter = tk.StringVar(value="")
-    cols_tl = ("track", "clip_id", "start", "dur", "src0", "src1", "kind", "col_logo", "col_audio", "col_text")
+    cols_tl = ("stt", "track", "clip_id", "start", "dur", "src0", "src1", "kind", "col_logo", "col_audio", "col_text")
     tree_tl = ttk.Treeview(tl_tab_detail, columns=cols_tl, show="headings", height=10, selectmode="extended")
     heads = {
+        "stt": "STT",
         "track": "Lớp",
         "clip_id": "Mã clip",
         "start": "Bắt đầu TL (s)",
@@ -2396,6 +2406,7 @@ def build_video_editor_tab(
         "col_text": "Chữ",
     }
     widths_tl = {
+        "stt": 44,
         "track": 72,
         "clip_id": 96,
         "start": 56,
@@ -2420,15 +2431,15 @@ def build_video_editor_tab(
     filt_tl_fr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
     ttk.Label(filt_tl_fr, text="Lọc:").pack(side=tk.LEFT)
     ttk.Entry(filt_tl_fr, textvariable=var_tl_name_filter, width=22).pack(side=tk.LEFT, padx=(4, 2))
-    ttk.Label(filt_tl_fr, text="(mã clip, lớp, loại…)", font=("Segoe UI", 8), foreground="#666").pack(side=tk.LEFT)
-    btn_tl_filt_clear = ttk.Button(filt_tl_fr, text="Xóa", command=lambda: None)
+    ttk.Label(filt_tl_fr, text="mã clip, lớp, loại").pack(side=tk.LEFT)
+    btn_tl_filt_clear = ttk.Button(filt_tl_fr, text="Xóa lọc", command=lambda: None)
     btn_tl_filt_clear.pack(side=tk.LEFT, padx=(6, 0))
     tree_tl.grid(row=1, column=0, sticky="nsew")
     st.grid(row=1, column=1, sticky="ns")
     cols_tlg = ("idx", "video_name", "start", "dur", "audio", "logo", "text")
     tree_tl_grouped = ttk.Treeview(tl_tab_grouped, columns=cols_tlg, show="headings", height=10, selectmode="extended")
     heads_tlg = {
-        "idx": "#",
+        "idx": "STT",
         "video_name": "Video",
         "start": "Bắt đầu TL (s)",
         "dur": "Độ dài (s)",
@@ -2445,9 +2456,9 @@ def build_video_editor_tab(
     tree_tl_grouped.configure(yscrollcommand=stg.set)
     filt_tlg_fr = ttk.Frame(tl_tab_grouped)
     filt_tlg_fr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
-    ttk.Label(filt_tlg_fr, text="Lọc video:").pack(side=tk.LEFT)
+    ttk.Label(filt_tlg_fr, text="Lọc:").pack(side=tk.LEFT)
     ttk.Entry(filt_tlg_fr, textvariable=var_tlg_name_filter, width=26).pack(side=tk.LEFT, padx=(4, 2))
-    btn_tlg_filt_clear = ttk.Button(filt_tlg_fr, text="Xóa", command=lambda: None)
+    btn_tlg_filt_clear = ttk.Button(filt_tlg_fr, text="Xóa lọc", command=lambda: None)
     btn_tlg_filt_clear.pack(side=tk.LEFT, padx=(6, 0))
     tree_tl_grouped.grid(row=1, column=0, sticky="nsew")
     stg.grid(row=1, column=1, sticky="ns")
@@ -2494,7 +2505,7 @@ def build_video_editor_tab(
     cols_edit = ("idx", "video", "logo", "audio", "text", "status")
     tree_edit_sum = ttk.Treeview(edit_sum_fr, columns=cols_edit, show="headings", height=5, selectmode="extended")
     heads_edit = {
-        "idx": "#",
+        "idx": "STT",
         "video": "Video",
         "logo": "Logo",
         "audio": "Âm thanh",
@@ -2512,8 +2523,8 @@ def build_video_editor_tab(
     filt_sum_fr.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
     ttk.Label(filt_sum_fr, text="Lọc:").pack(side=tk.LEFT)
     ttk.Entry(filt_sum_fr, textvariable=var_edit_sum_name_filter, width=28).pack(side=tk.LEFT, padx=(4, 2))
-    ttk.Label(filt_sum_fr, text="(tên video, tình trạng…)", font=("Segoe UI", 8), foreground="#666").pack(side=tk.LEFT)
-    btn_edit_sum_filt_clear = ttk.Button(filt_sum_fr, text="Xóa", command=lambda: None)
+    ttk.Label(filt_sum_fr, text="tên video, tình trạng").pack(side=tk.LEFT)
+    btn_edit_sum_filt_clear = ttk.Button(filt_sum_fr, text="Xóa lọc", command=lambda: None)
     btn_edit_sum_filt_clear.pack(side=tk.LEFT, padx=(6, 0))
     tree_edit_sum.grid(row=2, column=0, sticky="nsew")
     sy_edit.grid(row=2, column=1, sticky="ns")
@@ -2822,11 +2833,15 @@ def build_video_editor_tab(
         needle = str(var_media_name_filter.get() or "").strip().lower()
         only_tl = bool(var_media_only_timeline.get())
         used_mids = _collect_timeline_and_bgm_media_ids() if only_tl else set()
+        buckets: dict[str, list[dict[str, Any]]] = {"video": [], "image": [], "audio": []}
+        order_n = 0
         for m in project.get("media") or []:
             if not isinstance(m, dict):
                 continue
             mid = str(m.get("id"))
             mt = str(m.get("type") or "")
+            if mt not in buckets:
+                continue
             if only_tl and mid not in used_mids:
                 continue
             display_name = str(m.get("original_name") or "")
@@ -2836,18 +2851,52 @@ def build_video_editor_tab(
                     continue
             w, h = int(m.get("width") or 0), int(m.get("height") or 0)
             res = f"{w}x{h}" if w and h else ""
-            vals = (
-                display_name,
-                mt,
-                f"{float(m.get('duration') or 0):.2f}",
-                res,
+            try:
+                duration_n = float(m.get("duration") or 0)
+            except (TypeError, ValueError):
+                duration_n = 0.0
+            buckets[mt].append(
+                {
+                    "ord": order_n,
+                    "mid": mid,
+                    "name": display_name,
+                    "type": mt,
+                    "duration": duration_n,
+                    "res": res,
+                }
             )
+            order_n += 1
+        sort_col = str(_media_sort.get("col") or "name")
+        sort_asc = bool(_media_sort.get("asc", True))
 
-            def _insert_to(tr: ttk.Treeview) -> None:
-                tr.insert("", tk.END, iid=mid, values=vals, tags=(mid,))
+        def _media_row_key(row: dict[str, Any]) -> Any:
+            if sort_col == "stt":
+                return int(row["ord"])
+            if sort_col == "duration":
+                return float(row["duration"])
+            if sort_col == "resolution":
+                return str(row["res"]).lower()
+            if sort_col == "type":
+                return str(row["type"]).lower()
+            return str(row["name"]).lower()
 
-            if mt in ("video", "image", "audio"):
-                _insert_to(media_trees[mt])
+        for mt, rows in buckets.items():
+            rows.sort(key=_media_row_key, reverse=not sort_asc)
+            tr = media_trees[mt]
+            for index, row in enumerate(rows, start=1):
+                tr.insert(
+                    "",
+                    tk.END,
+                    iid=str(row["mid"]),
+                    values=(
+                        index,
+                        row["name"],
+                        row["type"],
+                        f"{float(row['duration']):.2f}",
+                        row["res"],
+                    ),
+                    tags=(str(row["mid"]),),
+                )
         refresh_stock_audio_box()
 
     cb_media_timeline_only.configure(command=refresh_media_tree)
@@ -2941,6 +2990,7 @@ def build_video_editor_tab(
                     continue
             detail_specs.append(
                 {
+                    "ord": len(detail_specs),
                     "cid": cid,
                     "tname": tname,
                     "ts": ts,
@@ -2959,6 +3009,8 @@ def build_video_editor_tab(
         dasc = bool(_tl_sort.get("asc", True))
 
         def _detail_sort_key(d: dict[str, Any]) -> Any:
+            if dcol == "stt":
+                return int(d.get("ord") or 0)
             if dcol == "track":
                 return str(d["tname"]).lower()
             if dcol == "clip_id":
@@ -2992,12 +3044,13 @@ def build_video_editor_tab(
         tl_gen = _tl_tree_insert_gen["v"]
 
         detail_insert_specs: list[dict[str, Any]] = []
-        for d in detail_specs:
+        for index, d in enumerate(detail_specs, start=1):
             cid = str(d["cid"])
             detail_insert_specs.append(
                 {
                     "iid": cid,
                     "values": (
+                        index,
                         d["tname"],
                         cid[:12] + "…",
                         f"{float(d['ts']):.2f}",
@@ -9558,7 +9611,7 @@ def build_video_editor_tab(
     sync_p2_ui_ref["fn"] = sync_p2_ui
     schedule_on_main_thread(root, lambda: _set_p2_advanced_visible(False))
 
-    exp_fr = ttk.LabelFrame(right, text="Xuất video (Export)", padding=4)
+    exp_fr = ttk.LabelFrame(right, text="Xuất", padding=4)
     right.add(exp_fr, weight=1)
     try:
         right.paneconfigure(insp_fr, minsize=150)

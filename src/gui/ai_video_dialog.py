@@ -208,6 +208,13 @@ class AIVideoDialog:
         self._var_uv_job_name = tk.StringVar(value="")
         self._uv_last_saved_job_name: str = ""
         self._var_uv_lib_job_filter = tk.StringVar(value="Tất cả job")
+        self._var_uv_lib_query = tk.StringVar(value="")
+        self._uv_lib_sort: dict[str, Any] = {"col": "title", "asc": True}
+        self._uv_lib_last_rows: list[dict[str, Any]] = []
+        self._var_uv_fb_tree_filter = tk.StringVar(value="")
+        self._var_uv_yt_tree_filter = tk.StringVar(value="")
+        self._var_uv_tt_tree_filter = tk.StringVar(value="")
+        self._var_uv_ig_tree_filter = tk.StringVar(value="")
         self._var_uv_lib_total_ok = tk.StringVar(value="Tổng thành công: 0 video")
         self._cb_uv_lib_job_filter: ttk.Combobox | None = None
         self._uv_lib_job_ids_by_filter_label: dict[str, set[str]] = {}
@@ -267,8 +274,7 @@ class AIVideoDialog:
 
         ttk.Label(
             root,
-            text="AI Video Gemini/Veo (Tích hợp Tool ngoài)",
-            font=("Segoe UI", 14, "bold"),
+            text="AI Video",
         ).grid(row=0, column=0, sticky="w")
 
         tabs = ttk.Notebook(root)
@@ -277,8 +283,8 @@ class AIVideoDialog:
 
         bridge_tab = ttk.Frame(tabs, padding=10)
         reverse_tab_host = ttk.Frame(tabs)
-        tabs.add(bridge_tab, text="Bridge Launcher")
-        tabs.add(reverse_tab_host, text="Reverse Video Prompt")
+        tabs.add(bridge_tab, text="  Mở tool  ")
+        tabs.add(reverse_tab_host, text="  Tách prompt  ")
 
         self._build_bridge_tab(bridge_tab)
         reverse_inner, _ = self._make_scrollable_tab(reverse_tab_host)
@@ -646,19 +652,10 @@ class AIVideoDialog:
             default_dir = str(project_root() / "data" / "downloads")
         ttk.Label(
             host,
-            text=(
-                "Luồng: (1) nhập URL + thư mục lưu  (2) quét Reels / YouTube / TikTok / Instagram  "
-                "(3) «Chọn hết» nếu cần → «Tải … đã chọn»  (4) xem «Video đã tải».\n"
-                "Nhiều video đã chọn được tải trong một lần chạy yt-dlp (batch), nhanh hơn gọi tuần tự từng URL.\n"
-                "Mỗi khối Bước 2 (Facebook / YouTube / TikTok / Instagram) có nút ▼/▶ để thu gọn khi cần chỗ màn hình."
-            ),
-            wraplength=840,
-            justify=tk.LEFT,
-            foreground="#555",
-            font=("Segoe UI", 9),
+            text="Dán link, quét danh sách, chọn video rồi tải. Video đã tải nằm ở cuối trang.",
         ).grid(row=0, column=0, sticky="w")
 
-        st_fr = ttk.LabelFrame(host, text="yt-dlp — trạng thái (kiểm tra khi mở tab «Tải Video» lần đầu)", padding=8)
+        st_fr = ttk.LabelFrame(host, text="Công cụ tải", padding=8)
         st_fr.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(
             st_fr,
@@ -679,7 +676,7 @@ class AIVideoDialog:
             foreground="#555",
         ).pack(anchor="w", pady=(4, 0))
 
-        form = ttk.LabelFrame(host, text="Bước 1 — URL, thư mục lưu và tùy chọn", padding=8)
+        form = ttk.LabelFrame(host, text="Nguồn", padding=8)
         form.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         form.columnconfigure(1, weight=1)
         self._var_uv_url = tk.StringVar()
@@ -718,15 +715,7 @@ class AIVideoDialog:
         ttk.Label(form, textvariable=var_quick_guide, foreground="#666", font=("Segoe UI", 8)).grid(
             row=3, column=1, sticky="w", padx=(8, 0), pady=(1, 0)
         )
-        lbl_platform_badge = tk.Label(
-            form,
-            textvariable=var_platform_badge,
-            bg="#6b7280",
-            fg="#ffffff",
-            padx=8,
-            pady=2,
-            font=("Segoe UI", 8, "bold"),
-        )
+        lbl_platform_badge = ttk.Label(form, textvariable=var_platform_badge, foreground="#64748b")
         lbl_platform_badge.grid(row=3, column=0, sticky="w", pady=(1, 0))
 
         quick = ttk.Frame(form)
@@ -846,12 +835,12 @@ class AIVideoDialog:
 
         btn_adv.configure(command=_toggle_advanced)
 
-        fb_prep = ttk.LabelFrame(form, text="Chuẩn bị Facebook (nếu quét Reels)", padding=8)
+        fb_prep = ttk.LabelFrame(form, text="Tài khoản Facebook", padding=8)
         fb_prep.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         fb_prep.columnconfigure(0, weight=1)
         ttk.Label(
             fb_prep,
-            text="Chọn tài khoản trước khi bấm quét Reels ở Bước 1.",
+            text="Chọn tài khoản trước khi quét Reels.",
             foreground="#555",
             wraplength=860,
             justify=tk.LEFT,
@@ -882,7 +871,7 @@ class AIVideoDialog:
             row=0, column=5, sticky="w", padx=(8, 0)
         )
 
-        ig_prep = ttk.LabelFrame(form, text="Chuẩn bị Instagram (nếu quét profile/Reels)", padding=8)
+        ig_prep = ttk.LabelFrame(form, text="Tài khoản Instagram", padding=8)
         ig_prep.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ig_prep.columnconfigure(1, weight=1)
         ttk.Label(
@@ -909,7 +898,7 @@ class AIVideoDialog:
             variable=self._var_uv_ig_show_browser,
         ).grid(row=0, column=3, sticky="w", padx=(10, 0))
 
-        platform_ops = ttk.LabelFrame(form, text="Quét danh sách (theo URL / nền tảng ở trên)", padding=8)
+        platform_ops = ttk.LabelFrame(form, text="Quét", padding=8)
         platform_ops.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         var_platform_ops = tk.StringVar(value="Dán URL để hệ thống tự chọn đúng luồng thao tác.")
         ttk.Label(platform_ops, textvariable=var_platform_ops, wraplength=860, justify=tk.LEFT).pack(anchor="w")
@@ -955,10 +944,10 @@ class AIVideoDialog:
         platform_ops_btns = ttk.Frame(platform_ops)
         platform_ops_btns.pack(anchor="w", pady=(6, 0))
         btn_ops_generic_dl = ttk.Button(platform_ops_btns, text="Tải URL hiện tại", command=self._on_uv_download)
-        btn_ops_fb_scan = ttk.Button(platform_ops_btns, text="1) Quét Reels Facebook", command=self._on_uv_scan_fb_reels)
-        btn_ops_yt_scan = ttk.Button(platform_ops_btns, text="1) Quét danh sách YouTube", command=self._on_uv_scan_yt_channel)
-        btn_ops_tt_scan = ttk.Button(platform_ops_btns, text="1) Quét kênh TikTok", command=self._on_uv_scan_tt_channel)
-        btn_ops_ig_scan = ttk.Button(platform_ops_btns, text="1) Quét Instagram", command=self._on_uv_scan_ig_channel)
+        btn_ops_fb_scan = ttk.Button(platform_ops_btns, text="Quét Reels Facebook", command=self._on_uv_scan_fb_reels)
+        btn_ops_yt_scan = ttk.Button(platform_ops_btns, text="Quét YouTube", command=self._on_uv_scan_yt_channel)
+        btn_ops_tt_scan = ttk.Button(platform_ops_btns, text="Quét TikTok", command=self._on_uv_scan_tt_channel)
+        btn_ops_ig_scan = ttk.Button(platform_ops_btns, text="Quét Instagram", command=self._on_uv_scan_ig_channel)
         for b in (
             btn_ops_generic_dl,
             btn_ops_fb_scan,
@@ -1096,7 +1085,7 @@ class AIVideoDialog:
 
         fb_coll = _UvCollapsibleSection(
             host,
-            title="Bước 2 (Facebook) — Quét danh sách Reels bằng browser tài khoản đã chọn",
+            title="Facebook",
             start_open=True,
             on_toggle=_uv_step2_scroll_sync,
         )
@@ -1120,9 +1109,9 @@ class AIVideoDialog:
         )
         fb_act = ttk.Frame(fb_fr)
         fb_act.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        btn_fb_select = ttk.Button(fb_act, text="2) Chọn hết", command=self._on_uv_fb_select_all)
+        btn_fb_select = ttk.Button(fb_act, text="Chọn hết", command=self._on_uv_fb_select_all)
         btn_fb_select.pack(side=tk.LEFT, padx=(0, 8))
-        btn_fb_dl = ttk.Button(fb_act, text="3) Tải reel đã chọn", command=self._on_uv_download_fb_reels_selected)
+        btn_fb_dl = ttk.Button(fb_act, text="Tải đã chọn", command=self._on_uv_download_fb_reels_selected)
         btn_fb_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_fb_dl_all = ttk.Button(fb_act, text="Tải hết danh sách", command=self._on_uv_download_fb_reels_all)
         btn_fb_dl_all.pack(side=tk.LEFT, padx=(0, 8))
@@ -1130,6 +1119,11 @@ class AIVideoDialog:
         fb_tree_fr = ttk.Frame(fb_fr)
         fb_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         fb_tree_fr.columnconfigure(0, weight=1)
+        self._pack_uv_scan_filter(
+            fb_tree_fr,
+            self._var_uv_fb_tree_filter,
+            lambda: self._refresh_fb_reel_tree(list(self._uv_fb_reel_urls)),
+        )
         self._tree_fb_reels = ttk.Treeview(
             fb_tree_fr,
             columns=("idx", "url"),
@@ -1137,16 +1131,16 @@ class AIVideoDialog:
             height=8,
             selectmode="extended",
         )
-        self._tree_fb_reels.heading("idx", text="#")
+        self._tree_fb_reels.heading("idx", text="STT")
         self._tree_fb_reels.heading("url", text="URL reel")
         self._tree_fb_reels.column("idx", width=44, stretch=False)
         self._tree_fb_reels.column("url", width=900, stretch=True)
         syf = ttk.Scrollbar(fb_tree_fr, orient="vertical", command=self._tree_fb_reels.yview)
         sxf = ttk.Scrollbar(fb_tree_fr, orient="horizontal", command=self._tree_fb_reels.xview)
         self._tree_fb_reels.configure(yscrollcommand=syf.set, xscrollcommand=sxf.set)
-        self._tree_fb_reels.grid(row=0, column=0, sticky="ew")
-        syf.grid(row=0, column=1, sticky="ns")
-        sxf.grid(row=1, column=0, sticky="ew")
+        self._tree_fb_reels.grid(row=1, column=0, sticky="ew")
+        syf.grid(row=1, column=1, sticky="ns")
+        sxf.grid(row=2, column=0, sticky="ew")
         install_treeview_shortcuts(self._tree_fb_reels, owner=self._top, info_callback=self._set_uv_status)
 
         self._var_uv_yt_scan_status.set(
@@ -1154,7 +1148,7 @@ class AIVideoDialog:
         )
         yt_coll = _UvCollapsibleSection(
             host,
-            title="Bước 2 (YouTube) — Quét danh sách video để chọn tải",
+            title="YouTube",
             start_open=True,
             on_toggle=_uv_step2_scroll_sync,
         )
@@ -1178,9 +1172,9 @@ class AIVideoDialog:
         )
         yt_act = ttk.Frame(yt_fr)
         yt_act.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        btn_yt_select = ttk.Button(yt_act, text="2) Chọn hết", command=self._on_uv_yt_select_all)
+        btn_yt_select = ttk.Button(yt_act, text="Chọn hết", command=self._on_uv_yt_select_all)
         btn_yt_select.pack(side=tk.LEFT, padx=(0, 8))
-        btn_yt_dl = ttk.Button(yt_act, text="3) Tải video đã chọn", command=self._on_uv_download_yt_selected)
+        btn_yt_dl = ttk.Button(yt_act, text="Tải đã chọn", command=self._on_uv_download_yt_selected)
         btn_yt_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_yt_dl_all = ttk.Button(yt_act, text="Tải hết danh sách", command=self._on_uv_download_yt_all)
         btn_yt_dl_all.pack(side=tk.LEFT, padx=(0, 8))
@@ -1188,6 +1182,11 @@ class AIVideoDialog:
         yt_tree_fr = ttk.Frame(yt_fr)
         yt_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         yt_tree_fr.columnconfigure(0, weight=1)
+        self._pack_uv_scan_filter(
+            yt_tree_fr,
+            self._var_uv_yt_tree_filter,
+            lambda: self._refresh_yt_channel_tree(list(self._uv_yt_entry_rows)),
+        )
         self._tree_yt_channel = ttk.Treeview(
             yt_tree_fr,
             columns=("idx", "title", "url"),
@@ -1195,7 +1194,7 @@ class AIVideoDialog:
             height=8,
             selectmode="extended",
         )
-        self._tree_yt_channel.heading("idx", text="#")
+        self._tree_yt_channel.heading("idx", text="STT")
         self._tree_yt_channel.heading("title", text="Tiêu đề")
         self._tree_yt_channel.heading("url", text="URL")
         self._tree_yt_channel.column("idx", width=40, stretch=False)
@@ -1204,9 +1203,9 @@ class AIVideoDialog:
         sy_yt = ttk.Scrollbar(yt_tree_fr, orient="vertical", command=self._tree_yt_channel.yview)
         sx_yt = ttk.Scrollbar(yt_tree_fr, orient="horizontal", command=self._tree_yt_channel.xview)
         self._tree_yt_channel.configure(yscrollcommand=sy_yt.set, xscrollcommand=sx_yt.set)
-        self._tree_yt_channel.grid(row=0, column=0, sticky="ew")
-        sy_yt.grid(row=0, column=1, sticky="ns")
-        sx_yt.grid(row=1, column=0, sticky="ew")
+        self._tree_yt_channel.grid(row=1, column=0, sticky="ew")
+        sy_yt.grid(row=1, column=1, sticky="ns")
+        sx_yt.grid(row=2, column=0, sticky="ew")
         install_treeview_shortcuts(self._tree_yt_channel, owner=self._top, info_callback=self._set_uv_status)
 
         self._var_uv_tt_scan_status.set(
@@ -1214,7 +1213,7 @@ class AIVideoDialog:
         )
         tt_coll = _UvCollapsibleSection(
             host,
-            title="Bước 2 (TikTok) — Quét danh sách video kênh để chọn tải",
+            title="TikTok",
             start_open=True,
             on_toggle=_uv_step2_scroll_sync,
         )
@@ -1235,9 +1234,9 @@ class AIVideoDialog:
         )
         tt_act = ttk.Frame(tt_fr)
         tt_act.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        btn_tt_select = ttk.Button(tt_act, text="2) Chọn hết", command=self._on_uv_tt_select_all)
+        btn_tt_select = ttk.Button(tt_act, text="Chọn hết", command=self._on_uv_tt_select_all)
         btn_tt_select.pack(side=tk.LEFT, padx=(0, 8))
-        btn_tt_dl = ttk.Button(tt_act, text="3) Tải TikTok đã chọn", command=self._on_uv_download_tt_selected)
+        btn_tt_dl = ttk.Button(tt_act, text="Tải đã chọn", command=self._on_uv_download_tt_selected)
         btn_tt_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_tt_dl_all = ttk.Button(tt_act, text="Tải hết danh sách", command=self._on_uv_download_tt_all)
         btn_tt_dl_all.pack(side=tk.LEFT, padx=(0, 8))
@@ -1245,6 +1244,11 @@ class AIVideoDialog:
         tt_tree_fr = ttk.Frame(tt_fr)
         tt_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         tt_tree_fr.columnconfigure(0, weight=1)
+        self._pack_uv_scan_filter(
+            tt_tree_fr,
+            self._var_uv_tt_tree_filter,
+            lambda: self._refresh_tt_channel_tree(list(self._uv_tt_entry_rows)),
+        )
         self._tree_tt_channel = ttk.Treeview(
             tt_tree_fr,
             columns=("idx", "title", "url"),
@@ -1252,7 +1256,7 @@ class AIVideoDialog:
             height=8,
             selectmode="extended",
         )
-        self._tree_tt_channel.heading("idx", text="#")
+        self._tree_tt_channel.heading("idx", text="STT")
         self._tree_tt_channel.heading("title", text="Tiêu đề")
         self._tree_tt_channel.heading("url", text="URL")
         self._tree_tt_channel.column("idx", width=40, stretch=False)
@@ -1261,9 +1265,9 @@ class AIVideoDialog:
         sy_tt = ttk.Scrollbar(tt_tree_fr, orient="vertical", command=self._tree_tt_channel.yview)
         sx_tt = ttk.Scrollbar(tt_tree_fr, orient="horizontal", command=self._tree_tt_channel.xview)
         self._tree_tt_channel.configure(yscrollcommand=sy_tt.set, xscrollcommand=sx_tt.set)
-        self._tree_tt_channel.grid(row=0, column=0, sticky="ew")
-        sy_tt.grid(row=0, column=1, sticky="ns")
-        sx_tt.grid(row=1, column=0, sticky="ew")
+        self._tree_tt_channel.grid(row=1, column=0, sticky="ew")
+        sy_tt.grid(row=1, column=1, sticky="ns")
+        sx_tt.grid(row=2, column=0, sticky="ew")
         install_treeview_shortcuts(self._tree_tt_channel, owner=self._top, info_callback=self._set_uv_status)
 
         self._var_uv_ig_scan_status.set(
@@ -1271,7 +1275,7 @@ class AIVideoDialog:
         )
         ig_coll = _UvCollapsibleSection(
             host,
-            title="Bước 2 (Instagram) — Quét tab Reels profile để chọn tải",
+            title="Instagram",
             start_open=True,
             on_toggle=_uv_step2_scroll_sync,
         )
@@ -1295,9 +1299,9 @@ class AIVideoDialog:
         )
         ig_act = ttk.Frame(ig_fr)
         ig_act.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        btn_ig_select = ttk.Button(ig_act, text="2) Chọn hết", command=self._on_uv_ig_select_all)
+        btn_ig_select = ttk.Button(ig_act, text="Chọn hết", command=self._on_uv_ig_select_all)
         btn_ig_select.pack(side=tk.LEFT, padx=(0, 8))
-        btn_ig_dl = ttk.Button(ig_act, text="3) Tải Instagram đã chọn", command=self._on_uv_download_ig_selected)
+        btn_ig_dl = ttk.Button(ig_act, text="Tải đã chọn", command=self._on_uv_download_ig_selected)
         btn_ig_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_ig_dl_all = ttk.Button(ig_act, text="Tải hết danh sách", command=self._on_uv_download_ig_all)
         btn_ig_dl_all.pack(side=tk.LEFT, padx=(0, 8))
@@ -1305,6 +1309,11 @@ class AIVideoDialog:
         ig_tree_fr = ttk.Frame(ig_fr)
         ig_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ig_tree_fr.columnconfigure(0, weight=1)
+        self._pack_uv_scan_filter(
+            ig_tree_fr,
+            self._var_uv_ig_tree_filter,
+            lambda: self._refresh_ig_channel_tree(list(self._uv_ig_entry_rows)),
+        )
         self._tree_ig_channel = ttk.Treeview(
             ig_tree_fr,
             columns=("idx", "title", "url"),
@@ -1312,7 +1321,7 @@ class AIVideoDialog:
             height=8,
             selectmode="extended",
         )
-        self._tree_ig_channel.heading("idx", text="#")
+        self._tree_ig_channel.heading("idx", text="STT")
         self._tree_ig_channel.heading("title", text="Tiêu đề")
         self._tree_ig_channel.heading("url", text="URL")
         self._tree_ig_channel.column("idx", width=40, stretch=False)
@@ -1321,16 +1330,16 @@ class AIVideoDialog:
         sy_ig = ttk.Scrollbar(ig_tree_fr, orient="vertical", command=self._tree_ig_channel.yview)
         sx_ig = ttk.Scrollbar(ig_tree_fr, orient="horizontal", command=self._tree_ig_channel.xview)
         self._tree_ig_channel.configure(yscrollcommand=sy_ig.set, xscrollcommand=sx_ig.set)
-        self._tree_ig_channel.grid(row=0, column=0, sticky="ew")
-        sy_ig.grid(row=0, column=1, sticky="ns")
-        sx_ig.grid(row=1, column=0, sticky="ew")
+        self._tree_ig_channel.grid(row=1, column=0, sticky="ew")
+        sy_ig.grid(row=1, column=1, sticky="ns")
+        sx_ig.grid(row=2, column=0, sticky="ew")
         install_treeview_shortcuts(self._tree_ig_channel, owner=self._top, info_callback=self._set_uv_status)
         section_state["fb_fr"] = fb_coll.outer
         section_state["yt_fr"] = yt_coll.outer
         section_state["tt_fr"] = tt_coll.outer
         section_state["ig_fr"] = ig_coll.outer
 
-        prog_fr = ttk.LabelFrame(host, text="Bước 3 — Theo dõi tiến trình", padding=8)
+        prog_fr = ttk.LabelFrame(host, text="Tiến trình", padding=8)
         prog_fr.grid(row=7, column=0, sticky="ew", pady=(6, 0))
         prog_fr.columnconfigure(0, weight=1)
         self._var_uv_operation_status.set("Sẵn sàng — có thể thao tác.")
@@ -1388,7 +1397,7 @@ class AIVideoDialog:
             b.pack(side=tk.LEFT, padx=(0, 8))
             self._uv_busy_disable_widgets.append(b)
 
-        lib = ttk.LabelFrame(host, text="Bước 4 — Video đã tải", padding=8)
+        lib = ttk.LabelFrame(host, text="Video đã tải", padding=8)
         lib.grid(row=9, column=0, sticky="nsew", pady=(8, 0))
         lib.columnconfigure(0, weight=1)
         lib.rowconfigure(1, weight=1)
@@ -1405,12 +1414,16 @@ class AIVideoDialog:
         )
         self._cb_uv_lib_job_filter.grid(row=0, column=1, sticky="ew", padx=(8, 8))
         self._cb_uv_lib_job_filter.bind("<<ComboboxSelected>>", lambda _e: self._on_uv_library_job_filter_changed())
-        ttk.Button(lib_filter, text="Bỏ lọc", command=self._on_uv_library_clear_job_filter).grid(
+        ttk.Button(lib_filter, text="Xóa lọc", command=self._on_uv_library_clear_job_filter).grid(
             row=0, column=2, sticky="w"
         )
-        ttk.Button(lib_filter, text="Xóa job lọc", command=self._on_uv_delete_filtered_job).grid(
+        ttk.Button(lib_filter, text="Xóa job", command=self._on_uv_delete_filtered_job).grid(
             row=0, column=3, sticky="w", padx=(8, 0)
         )
+        ttk.Label(lib_filter, text="Tìm").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ent_uv_lib = ttk.Entry(lib_filter, textvariable=self._var_uv_lib_query)
+        ent_uv_lib.grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(6, 0))
+        self._var_uv_lib_query.trace_add("write", lambda *_a: self._reapply_uv_library_rows())
         lib_filter.columnconfigure(4, weight=1)
         ttk.Label(
             lib_filter,
@@ -1418,9 +1431,10 @@ class AIVideoDialog:
             foreground="#1f4d8f",
             font=("Segoe UI", 9, "bold"),
         ).grid(row=0, column=4, sticky="e", padx=(12, 0))
-        cols = ("job", "platform", "title", "hashtags", "duration", "uploader", "status", "path")
+        cols = ("stt", "job", "platform", "title", "hashtags", "duration", "uploader", "status", "path")
         self._tree_uv = ttk.Treeview(lib, columns=cols, show="headings", height=8, selectmode="extended")
         heads = {
+            "stt": "STT",
             "job": "Job",
             "platform": "Nền tảng",
             "title": "Tiêu đề",
@@ -1431,6 +1445,7 @@ class AIVideoDialog:
             "path": "Đường dẫn file",
         }
         widths = {
+            "stt": 44,
             "job": 140,
             "platform": 86,
             "title": 160,
@@ -1441,8 +1456,13 @@ class AIVideoDialog:
             "path": 320,
         }
         for c in cols:
-            self._tree_uv.heading(c, text=heads[c])
-            self._tree_uv.column(c, width=widths[c], stretch=True if c == "path" else False)
+            self._tree_uv.heading(c, text=heads[c], command=lambda cc=c: self._on_uv_library_heading(cc))
+            self._tree_uv.column(
+                c,
+                width=widths[c],
+                anchor="center" if c == "stt" else "w",
+                stretch=True if c == "path" else False,
+            )
         sy = ttk.Scrollbar(lib, orient="vertical", command=self._tree_uv.yview)
         sx = ttk.Scrollbar(lib, orient="horizontal", command=self._tree_uv.xview)
         self._tree_uv.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
@@ -1465,7 +1485,7 @@ class AIVideoDialog:
         ttk.Button(ab, text="Dùng cho AI Video", command=self._on_uv_use_ai_video).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(ab, text="Xóa mục chọn", command=self._on_uv_delete_selected).pack(side=tk.LEFT)
 
-        logf = ttk.LabelFrame(host, text="Log tải (chi tiết)", padding=6)
+        logf = ttk.LabelFrame(host, text="Nhật ký", padding=6)
         logf.grid(row=10, column=0, sticky="nsew", pady=(8, 0))
         logf.columnconfigure(0, weight=1)
         logf.rowconfigure(0, weight=1)
@@ -1507,6 +1527,7 @@ class AIVideoDialog:
                 self._tree_ig_channel.column("url", width=max(180, int(w * 0.60)), stretch=True)
             if self._tree_uv is not None:
                 w = max(260, int(self._tree_uv.winfo_width()))
+                self._tree_uv.column("stt", width=44, stretch=False, anchor="center")
                 self._tree_uv.column("job", width=max(100, int(w * 0.12)), stretch=True)
                 self._tree_uv.column("platform", width=max(84, int(w * 0.08)), stretch=False)
                 self._tree_uv.column("title", width=max(120, int(w * 0.16)), stretch=True)
@@ -1932,13 +1953,26 @@ class AIVideoDialog:
             chunk=DEFAULT_TREE_APPEND_CHUNK,
         )
 
+    def _pack_uv_scan_filter(self, parent: ttk.Frame, var: tk.StringVar, refresh: Callable[[], None]) -> None:
+        """Ô lọc chữ phía trên bảng kết quả quét."""
+        bar = ttk.Frame(parent)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(bar, text="Lọc:").pack(side=tk.LEFT)
+        ttk.Entry(bar, textvariable=var, width=36).pack(side=tk.LEFT, padx=(6, 6))
+        ttk.Button(bar, text="Xóa lọc", command=lambda: var.set("")).pack(side=tk.LEFT)
+        var.trace_add("write", lambda *_a: refresh())
+
+    def _uv_scan_needle(self, var: tk.StringVar) -> str:
+        return str(var.get() or "").strip().lower()
+
     def _refresh_fb_reel_tree(self, urls: list[str], *, append_from: int = 0) -> None:
         """Làm mới hoặc chỉ append dòng mới (``append_from`` > 0) để quét dài không block UI."""
         self._uv_fb_reel_urls = list(urls)
         tr = self._tree_fb_reels
         if tr is None:
             return
-        if append_from > 0 and append_from <= len(urls):
+        needle = self._uv_scan_needle(self._var_uv_fb_tree_filter)
+        if append_from > 0 and not needle and append_from <= len(urls):
             specs = [{"iid": str(i), "values": (str(i + 1), urls[i])} for i in range(append_from, len(urls))]
             if specs:
                 self._uv_tree_append_specs_chunked(tr, specs, gen_attr="_uv_fb_tree_gen")
@@ -1948,7 +1982,8 @@ class AIVideoDialog:
         if not urls:
             self._sync_uv_download_scrollregion(scroll_to_content=False)
             return
-        specs = [{"iid": str(i), "values": (str(i + 1), u)} for i, u in enumerate(urls)]
+        visible = [i for i, u in enumerate(urls) if not needle or needle in u.lower()]
+        specs = [{"iid": str(i), "values": (n, urls[i])} for n, i in enumerate(visible, start=1)]
 
         def _done() -> None:
             if self._uv_tree_gen_is_current("_uv_fb_tree_gen", gen):
@@ -2319,7 +2354,8 @@ class AIVideoDialog:
         tr = self._tree_yt_channel
         if tr is None:
             return
-        if append_from > 0 and append_from <= len(rows):
+        needle = self._uv_scan_needle(self._var_uv_yt_tree_filter)
+        if append_from > 0 and not needle and append_from <= len(rows):
             specs = [
                 {
                     "iid": str(i),
@@ -2335,12 +2371,17 @@ class AIVideoDialog:
         if not rows:
             self._sync_uv_download_scrollregion(scroll_to_content=False)
             return
+        visible = [
+            i
+            for i, r in enumerate(rows)
+            if not needle or needle in f"{r.get('title') or ''} {r.get('url') or ''}".lower()
+        ]
         specs = [
             {
                 "iid": str(i),
-                "values": (str(i + 1), str(r.get("title") or ""), str(r.get("url") or "")),
+                "values": (n, str(rows[i].get("title") or ""), str(rows[i].get("url") or "")),
             }
-            for i, r in enumerate(rows)
+            for n, i in enumerate(visible, start=1)
         ]
 
         def _done() -> None:
@@ -2661,7 +2702,8 @@ class AIVideoDialog:
         tr = self._tree_tt_channel
         if tr is None:
             return
-        if append_from > 0 and append_from <= len(rows):
+        needle = self._uv_scan_needle(self._var_uv_tt_tree_filter)
+        if append_from > 0 and not needle and append_from <= len(rows):
             specs = [
                 {
                     "iid": str(i),
@@ -2677,12 +2719,17 @@ class AIVideoDialog:
         if not rows:
             self._sync_uv_download_scrollregion(scroll_to_content=False)
             return
+        visible = [
+            i
+            for i, r in enumerate(rows)
+            if not needle or needle in f"{r.get('title') or ''} {r.get('url') or ''}".lower()
+        ]
         specs = [
             {
                 "iid": str(i),
-                "values": (str(i + 1), str(r.get("title") or ""), str(r.get("url") or "")),
+                "values": (n, str(rows[i].get("title") or ""), str(rows[i].get("url") or "")),
             }
-            for i, r in enumerate(rows)
+            for n, i in enumerate(visible, start=1)
         ]
 
         def _done() -> None:
@@ -2993,7 +3040,8 @@ class AIVideoDialog:
         tr = self._tree_ig_channel
         if tr is None:
             return
-        if append_from > 0 and append_from <= len(rows):
+        needle = self._uv_scan_needle(self._var_uv_ig_tree_filter)
+        if append_from > 0 and not needle and append_from <= len(rows):
             specs = [
                 {
                     "iid": str(i),
@@ -3009,12 +3057,17 @@ class AIVideoDialog:
         if not rows:
             self._sync_uv_download_scrollregion(scroll_to_content=False)
             return
+        visible = [
+            i
+            for i, r in enumerate(rows)
+            if not needle or needle in f"{r.get('title') or ''} {r.get('url') or ''}".lower()
+        ]
         specs = [
             {
                 "iid": str(i),
-                "values": (str(i + 1), str(r.get("title") or ""), str(r.get("url") or "")),
+                "values": (n, str(rows[i].get("title") or ""), str(rows[i].get("url") or "")),
             }
-            for i, r in enumerate(rows)
+            for n, i in enumerate(visible, start=1)
         ]
 
         def _done() -> None:
@@ -3821,42 +3874,96 @@ class AIVideoDialog:
 
         run_background_then_main(self._top, _worker, _apply)
 
+    def _reapply_uv_library_rows(self) -> None:
+        """Vẽ lại bảng thư viện từ dữ liệu đã nạp, không đọc đĩa lại."""
+        if self._uv_lib_last_rows:
+            self._apply_uv_library_rows(self._uv_lib_last_rows)
+
+    def _on_uv_library_heading(self, col: str) -> None:
+        """Bấm tiêu đề cột để sắp xếp bảng video đã tải."""
+        cur = self._uv_lib_sort
+        if str(cur.get("col") or "") == col:
+            cur["asc"] = not bool(cur.get("asc", True))
+        else:
+            cur["col"] = col
+            cur["asc"] = True
+        self._reapply_uv_library_rows()
+
     def _apply_uv_library_rows(self, rows: list[dict[str, Any]]) -> None:
         if self._tree_uv is None:
             return
+        self._uv_lib_last_rows = list(rows)
         tree_delete_all(self._tree_uv)
         total_ok = len([r for r in rows if str(r.get("video_path") or "").strip()])
         self._refresh_uv_library_job_filter(rows)
         selected_job_filter = str(self._var_uv_lib_job_filter.get() or "").strip()
+        needle = str(self._var_uv_lib_query.get() or "").strip().lower()
         shown_ok = 0
-        specs: list[dict[str, Any]] = []
-        for r in rows:
+        pending: list[dict[str, Any]] = []
+        for order_n, r in enumerate(rows):
             vid = str(r.get("id") or "")
             if not vid:
                 continue
             display_job = self._uv_display_job_label(r)
             if selected_job_filter and selected_job_filter != "Tất cả job" and display_job != selected_job_filter:
                 continue
-            shown_ok += 1
-            if len(specs) >= UV_LIBRARY_UI_MAX_ROWS:
+            title = str(r.get("title") or "")[:120]
+            platform = str(r.get("platform") or "")
+            hashtags = self._uv_format_library_hashtags_cell(r)
+            uploader = str(r.get("uploader") or "")[:40]
+            status = str(r.get("status") or "")
+            path = str(r.get("video_path") or "")
+            if needle and needle not in " ".join((display_job, platform, title, hashtags, uploader, status, path)).lower():
                 continue
             dur = r.get("duration") or 0
             try:
-                ds = f"{float(dur):.1f}s"
+                duration_n = float(dur)
+                ds = f"{duration_n:.1f}s"
             except (TypeError, ValueError):
+                duration_n = 0.0
                 ds = str(dur)
+            pending.append(
+                {
+                    "ord": order_n,
+                    "iid": vid,
+                    "job": display_job,
+                    "platform": platform,
+                    "title": title,
+                    "hashtags": hashtags,
+                    "duration_n": duration_n,
+                    "duration": ds,
+                    "uploader": uploader,
+                    "status": status,
+                    "path": path,
+                }
+            )
+        sort_col = str(self._uv_lib_sort.get("col") or "title")
+        sort_asc = bool(self._uv_lib_sort.get("asc", True))
+
+        def _lib_key(item: dict[str, Any]) -> Any:
+            if sort_col == "stt":
+                return int(item["ord"])
+            if sort_col == "duration":
+                return float(item["duration_n"])
+            return str(item.get(sort_col) or "").lower()
+
+        pending.sort(key=_lib_key, reverse=not sort_asc)
+        shown_ok = len(pending)
+        specs: list[dict[str, Any]] = []
+        for index, item in enumerate(pending[:UV_LIBRARY_UI_MAX_ROWS], start=1):
             specs.append(
                 {
-                    "iid": vid,
+                    "iid": item["iid"],
                     "values": (
-                        display_job,
-                        str(r.get("platform") or ""),
-                        str(r.get("title") or "")[:120],
-                        self._uv_format_library_hashtags_cell(r),
-                        ds,
-                        str(r.get("uploader") or "")[:40],
-                        str(r.get("status") or ""),
-                        str(r.get("video_path") or ""),
+                        index,
+                        item["job"],
+                        item["platform"],
+                        item["title"],
+                        item["hashtags"],
+                        item["duration"],
+                        item["uploader"],
+                        item["status"],
+                        item["path"],
                     ),
                 }
             )
@@ -3871,7 +3978,8 @@ class AIVideoDialog:
                 is_current=lambda g: self._uv_tree_gen_is_current("_uv_lib_tree_gen", g),
                 chunk=DEFAULT_TREE_CHUNK,
             )
-        if selected_job_filter and selected_job_filter != "Tất cả job":
+        filtered = bool(needle) or (selected_job_filter and selected_job_filter != "Tất cả job")
+        if filtered:
             tail = f", đang hiển thị: {inserted}" if shown_ok > inserted else ""
             self._var_uv_lib_total_ok.set(f"Tổng thành công: {total_ok} video (đang lọc: {shown_ok}{tail})")
         else:
@@ -3943,6 +4051,7 @@ class AIVideoDialog:
 
     def _on_uv_library_clear_job_filter(self) -> None:
         self._var_uv_lib_job_filter.set("Tất cả job")
+        self._var_uv_lib_query.set("")
         self._refresh_uv_library()
 
     def _on_uv_delete_filtered_job(self) -> None:
@@ -4129,7 +4238,7 @@ class AIVideoDialog:
             wraplength=840,
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        launcher = ttk.LabelFrame(host, text="Bridge Launcher", padding=10)
+        launcher = ttk.LabelFrame(host, text="Mở tool", padding=10)
         launcher.grid(row=1, column=0, sticky="ew")
         launcher.columnconfigure(1, weight=1)
         ttk.Label(launcher, text="Tool exe").grid(row=0, column=0, sticky="w")
@@ -4143,7 +4252,7 @@ class AIVideoDialog:
         ttk.Button(acts, text="Mở thư mục Tool", command=self._on_open_tool_folder).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(acts, text="Kiểm tra đường dẫn", command=self._on_validate_tool_path).pack(side=tk.LEFT)
 
-        box = ttk.LabelFrame(host, text="Thông tin phiên tích hợp", padding=10)
+        box = ttk.LabelFrame(host, text="Phiên làm việc", padding=10)
         box.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
         box.columnconfigure(0, weight=1)
         host.rowconfigure(2, weight=1)
@@ -4169,7 +4278,7 @@ class AIVideoDialog:
         host.columnconfigure(0, weight=1)
         host.rowconfigure(4, weight=1)
 
-        guide = ttk.LabelFrame(host, text="Huong dan nhanh", padding=10)
+        guide = ttk.LabelFrame(host, text="Gợi ý", padding=10)
         guide.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             guide,
@@ -4181,7 +4290,7 @@ class AIVideoDialog:
             wraplength=900,
         ).grid(row=0, column=0, sticky="w")
 
-        src_box = ttk.LabelFrame(host, text="B1 - Nguon video (chi file local)", padding=10)
+        src_box = ttk.LabelFrame(host, text="Video nguồn", padding=10)
         src_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         src_box.columnconfigure(1, weight=1)
         src_box.columnconfigure(3, weight=1)
@@ -4190,16 +4299,16 @@ class AIVideoDialog:
         self._var_local_video = tk.StringVar()
         self._var_source_type.trace_add("write", lambda *_: self._schedule_reverse_source_reset())
         self._var_local_video.trace_add("write", lambda *_: self._schedule_reverse_source_reset())
-        ttk.Label(src_box, text="Ma job").grid(row=0, column=0, sticky="w")
+        ttk.Label(src_box, text="Mã job").grid(row=0, column=0, sticky="w")
         self._ent_job_id = ttk.Entry(src_box, textvariable=self._var_job_id, width=28)
         self._ent_job_id.grid(row=0, column=1, sticky="ew", padx=(8, 12))
-        ttk.Label(src_box, text="Loai nguon").grid(row=0, column=2, sticky="w")
+        ttk.Label(src_box, text="Nguồn").grid(row=0, column=2, sticky="w")
         ttk.Combobox(src_box, textvariable=self._var_source_type, values=["local"], width=12, state="readonly").grid(
             row=0, column=3, sticky="w"
         )
-        ttk.Label(src_box, text="Duong dan video local").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(src_box, text="File video").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(src_box, textvariable=self._var_local_video).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0))
-        ttk.Button(src_box, text="Chon file", command=self._on_pick_local_video).grid(row=1, column=3, sticky="e", pady=(8, 0))
+        ttk.Button(src_box, text="Chọn file", command=self._on_pick_local_video).grid(row=1, column=3, sticky="e", pady=(8, 0))
         ttk.Label(
             src_box,
             text="Tip: Tab «Tải video» -> Tải xong -> «Phân tích Reverse» để đưa file vào đây.",
@@ -4207,7 +4316,7 @@ class AIVideoDialog:
             wraplength=820,
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-        cfg_box = ttk.LabelFrame(host, text="B2 - Cai dat keyframe va Gemini", padding=10)
+        cfg_box = ttk.LabelFrame(host, text="Khung hình", padding=10)
         cfg_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         for c in range(6):
             cfg_box.columnconfigure(c, weight=1 if c in {1, 3, 5} else 0)
@@ -4281,7 +4390,7 @@ class AIVideoDialog:
             row=4, column=1, columnspan=5, sticky="w", padx=(8, 0), pady=(8, 0)
         )
 
-        repl_box = ttk.LabelFrame(host, text="B3 - Thay nhan vat va prompt series", padding=10)
+        repl_box = ttk.LabelFrame(host, text="Nhân vật và prompt", padding=10)
         repl_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         for c in range(6):
             repl_box.columnconfigure(c, weight=1 if c in {1, 3, 5} else 0)
@@ -4315,27 +4424,27 @@ class AIVideoDialog:
             variable=self._var_export_separate_jobs,
         ).grid(row=2, column=3, columnspan=3, sticky="w", pady=(8, 0))
 
-        run_box = ttk.LabelFrame(host, text="B4 - Thuc thi", padding=10)
+        run_box = ttk.LabelFrame(host, text="Chạy", padding=10)
         run_box.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         run_box.columnconfigure(0, weight=1)
         run_box.rowconfigure(1, weight=1)
         act = ttk.Frame(run_box)
         act.grid(row=0, column=0, sticky="w")
-        self._btn_step1 = ttk.Button(act, text="1) Import + Tach keyframes", command=self._on_reverse_import_extract)
+        self._btn_step1 = ttk.Button(act, text="Tách khung hình", command=self._on_reverse_import_extract)
         self._btn_step1.pack(side=tk.LEFT, padx=(0, 8))
-        self._btn_step2 = ttk.Button(act, text="2) Phan tich Gemini + Build prompt", command=self._on_reverse_analyze_build)
+        self._btn_step2 = ttk.Button(act, text="Phân tích", command=self._on_reverse_analyze_build)
         self._btn_step2.pack(side=tk.LEFT, padx=(0, 8))
-        self._btn_full = ttk.Button(act, text="Chay full pipeline", command=self._on_reverse_full_pipeline)
+        self._btn_full = ttk.Button(act, text="Chạy hết", command=self._on_reverse_full_pipeline)
         self._btn_full.pack(side=tk.LEFT, padx=(0, 8))
         self._btn_step3 = ttk.Button(
-            act, text="3) Xuat sang Bridge Launcher + Mo Tool", command=self._on_push_to_ai_video_engine
+            act, text="Đưa sang tool", command=self._on_push_to_ai_video_engine
         )
         self._btn_step3.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(act, text="Mo thu muc reverse_video", command=self._on_open_reverse_folder).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(act, text="Nap checkpoint theo Ma job", command=self._on_load_checkpoint_for_current_job).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(act, text="Reset tien trinh", command=self._on_reset_reverse_wizard).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(act, text="Xoa log", command=self._on_clear_reverse_log).pack(side=tk.LEFT, padx=(0, 8))
-        prompt_box = ttk.LabelFrame(run_box, text="Prompt da tao - copy dua vao Tool / Bridge Launcher", padding=8)
+        ttk.Button(act, text="Mở thư mục", command=self._on_open_reverse_folder).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(act, text="Nạp lại", command=self._on_load_checkpoint_for_current_job).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(act, text="Đặt lại", command=self._on_reset_reverse_wizard).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(act, text="Xóa nhật ký", command=self._on_clear_reverse_log).pack(side=tk.LEFT, padx=(0, 4))
+        prompt_box = ttk.LabelFrame(run_box, text="Prompt đã tạo", padding=8)
         prompt_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
         prompt_box.columnconfigure(1, weight=1)
         prompt_box.rowconfigure(0, weight=1)
@@ -4348,10 +4457,10 @@ class AIVideoDialog:
         self._txt_reverse_prompt_preview.configure(state="disabled")
         prompt_btns = ttk.Frame(prompt_box)
         prompt_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Button(prompt_btns, text="Copy prompt dang chon", command=self._on_copy_selected_reverse_prompt).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(prompt_btns, text="Copy tat ca prompt", command=self._on_copy_all_reverse_prompts).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(prompt_btns, text="Mo file prompts.txt", command=self._on_open_bridge_prompts_file).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(prompt_btns, text="Nap prompt tu analysis", command=self._load_prompt_preview_for_current_job).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(prompt_btns, text="Copy dòng chọn", command=self._on_copy_selected_reverse_prompt).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(prompt_btns, text="Copy tất cả", command=self._on_copy_all_reverse_prompts).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(prompt_btns, text="Mở file", command=self._on_open_bridge_prompts_file).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(prompt_btns, text="Nạp prompt", command=self._load_prompt_preview_for_current_job).pack(side=tk.LEFT, padx=(0, 4))
         self._lst_reverse_prompts.bind("<<ListboxSelect>>", lambda _e: self._on_reverse_prompt_selected())
 
         log_frame = ttk.Frame(run_box)

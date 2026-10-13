@@ -263,7 +263,7 @@ class PageCreatorDialog(tk.Toplevel):
         cols = ("idx", "name", "details", "avatar", "status")
         self._pages = ttk.Treeview(listing, columns=cols, show="headings", height=5)
         for key, title, width in (
-            ("idx", "#", 40),
+            ("idx", "STT", 44),
             ("name", "Tên Page", 220),
             ("details", "Thông tin", 280),
             ("avatar", "Ảnh đại diện", 160),
@@ -321,7 +321,7 @@ class PageCreatorDialog(tk.Toplevel):
         jcols = ("idx", "name", "status", "retry", "uid", "link", "action")
         self._jobs = ttk.Treeview(jobs, columns=jcols, show="headings", height=5)
         for key, title, width in (
-            ("idx", "#", 36),
+            ("idx", "STT", 44),
             ("name", "Page", 200),
             ("status", "Trạng thái", 110),
             ("retry", "Thử lại", 64),

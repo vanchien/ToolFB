@@ -135,29 +135,10 @@ def _flat_btn(
     active_bg: str,
     fg: str = "white",
     state: str = tk.NORMAL,
-) -> tk.Button:
-    """Nút cùng cỡ với các tab khác: nền sáng, chữ đậm. Nút dừng giữ màu đỏ."""
-    danger = str(bg).lower() in _DANGER_BG
-    face = "#fee2e2" if danger else "#f8fafc"
-    ink = "#991b1b" if danger else "#0f172a"
-    hot = "#fecaca" if danger else "#e2e8f0"
-    return tk.Button(
-        master,
-        text=text,
-        command=command,
-        font=("Segoe UI", 9),
-        bg=face,
-        fg=ink,
-        activebackground=hot,
-        activeforeground=ink,
-        relief=tk.GROOVE,
-        padx=10,
-        pady=3,
-        cursor="hand2",
-        state=state,
-        highlightthickness=0,
-        bd=1,
-    )
+) -> ttk.Button:
+    """Nút ttk cùng kiểu với các tab Tài khoản, Page và Lịch đăng."""
+    del bg, active_bg, fg
+    return ttk.Button(master, text=text, command=command, state=state)
 
 
 class _FlowBar(ttk.Frame):
@@ -241,7 +222,7 @@ def _configure_tree_status_tags(tr: ttk.Treeview) -> None:
             continue
         seen.add(tag)
         try:
-            tr.tag_configure(tag, background=bg, foreground=fg)
+            tr.tag_configure(tag, foreground=fg)
         except tk.TclError:
             pass
 
@@ -362,28 +343,12 @@ def build_human_interaction_tab(
     var_comment_pct = tk.IntVar(value=_comment_pct_default)
     var_virtual_cursor = tk.BooleanVar(value=bool(persisted.get("virtual_cursor", True)))
     var_ai_comments = tk.BooleanVar(value=bool(persisted.get("ai_comments", True)))
-    var_summary = tk.StringVar(value="Chọn tab bên dưới: Đăng nhập hoặc Tương tác")
-    var_run_status = tk.StringVar(value="● Sẵn sàng — chưa có tiến trình")
+    var_summary = tk.StringVar(value="Chọn Đăng nhập hoặc Tương tác")
+    var_run_status = tk.StringVar(value="Sẵn sàng")
 
-    run_banner = tk.Frame(parent, bg=_C_IDLE_BG, padx=8, pady=4, highlightthickness=1, highlightbackground="#e2e8f0")
+    run_banner = ttk.Frame(parent)
     run_banner.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
-    lbl_run_led = tk.Label(
-        run_banner,
-        text="●",
-        font=("Segoe UI", 12),
-        bg=_C_IDLE_BG,
-        fg=_C_IDLE_LED,
-        width=2,
-    )
-    lbl_run_led.pack(side=tk.LEFT, padx=(0, 6))
-    lbl_run_status = tk.Label(
-        run_banner,
-        textvariable=var_run_status,
-        font=_FONT_STATUS,
-        bg=_C_IDLE_BG,
-        fg=_C_IDLE_FG,
-        anchor="w",
-    )
+    lbl_run_status = ttk.Label(run_banner, textvariable=var_run_status)
     lbl_run_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
     btn_stop_global = _flat_btn(
         run_banner,
@@ -396,13 +361,13 @@ def build_human_interaction_tab(
     btn_stop_global.pack(side=tk.RIGHT, padx=(8, 0))
 
     # --- Hai TRANG chính (không gộp chung một màn hình) ---
-    nb_main = ttk.Notebook(parent, padding=2, style="Human.TNotebook")
+    nb_main = ttk.Notebook(parent, padding=2)
     nb_main.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
 
     page_login = ttk.Frame(nb_main, padding=6)
     page_interaction = ttk.Frame(nb_main, padding=6)
-    nb_main.add(page_login, text="  🔐  ĐĂNG NHẬP  ")
-    nb_main.add(page_interaction, text="  👤  TƯƠNG TÁC  ")
+    nb_main.add(page_login, text="  Đăng nhập  ")
+    nb_main.add(page_interaction, text="  Tương tác  ")
     page_login.columnconfigure(0, weight=1)
     page_login.rowconfigure(0, weight=1)
     page_interaction.columnconfigure(0, weight=1)
@@ -426,40 +391,23 @@ def build_human_interaction_tab(
     interaction_bottom.columnconfigure(0, weight=1)
     interaction_bottom.rowconfigure(0, weight=1)
 
-    hint_login = tk.Frame(login_inner, bg=_C_LOGIN_HINT_BG, highlightthickness=0)
-    hint_login.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-    lbl_hint_login = tk.Label(
-        hint_login,
-        text="🔐  Bước 1 — Dán TK + Proxy → Ghép → Đăng nhập. Tài khoản OK ở lại tab này cho đến khi bạn mở tab «Tương tác».",
-        font=("Segoe UI", 9),
-        bg=_C_LOGIN_HINT_BG,
-        fg=_C_LOGIN_HINT_FG,
-        wraplength=640,
-        justify=tk.LEFT,
-        padx=10,
-        pady=8,
+    lbl_hint_login = ttk.Label(
+        login_inner,
+        text="Dán tài khoản và proxy, ghép, rồi đăng nhập. Tài khoản thành công chuyển sang tab Tương tác.",
+        wraplength=720,
     )
-    lbl_hint_login.pack(anchor="w", fill=tk.X)
+    lbl_hint_login.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-    hint_interaction = tk.Frame(interaction_inner, bg=_C_INTER_HINT_BG, highlightthickness=0)
-    hint_interaction.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-    lbl_hint_interaction = tk.Label(
-        hint_interaction,
-        text="👤  Bước 2 — Mở tab này để nhận tài khoản Đăng nhập OK. Chạy tương tác tại đây.",
-        font=("Segoe UI", 9),
-        bg=_C_INTER_HINT_BG,
-        fg=_C_INTER_HINT_FG,
-        wraplength=640,
-        justify=tk.LEFT,
-        padx=10,
-        pady=8,
+    lbl_hint_interaction = ttk.Label(
+        interaction_inner,
+        text="Chỉ hiện tài khoản đã đăng nhập. Chọn tài khoản rồi bấm Chạy.",
+        wraplength=720,
     )
-    lbl_hint_interaction.pack(anchor="w", fill=tk.X)
+    lbl_hint_interaction.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
     # --- Trang Đăng nhập: nguồn dữ liệu (gọn) ---
     step1 = ttk.LabelFrame(
-        login_inner, text="Nguồn dữ liệu — account ↔ proxy (dòng 1↔1)", padding=4, style="Human.TLabelframe"
-    )
+        login_inner, text="Nguồn dữ liệu — account ↔ proxy (dòng 1↔1)", padding=4    )
     step1.grid(row=1, column=0, sticky="ew", pady=(0, 6))
     step1.columnconfigure(0, weight=1)
     step1.rowconfigure(0, weight=0)
@@ -593,8 +541,7 @@ def build_human_interaction_tab(
 
     # Cấu hình lưới cửa sổ (chỉ đăng nhập đa luồng)
     cfg_login = ttk.LabelFrame(
-        login_inner, text="Cấu hình lưới trình duyệt (đăng nhập song song)", padding=4, style="Human.TLabelframe"
-    )
+        login_inner, text="Cấu hình lưới trình duyệt (đăng nhập song song)", padding=4    )
     cfg_login.grid(row=2, column=0, sticky="ew", pady=(0, 6))
     ttk.Label(cfg_login, text="Luồng", font=_FONT_UI).grid(row=0, column=0, sticky="w", padx=(0, 4))
     ttk.Spinbox(cfg_login, from_=1, to=24, textvariable=var_threads, width=5).grid(row=0, column=1, sticky="w")
@@ -605,7 +552,7 @@ def build_human_interaction_tab(
     lbl_grid_hint = ttk.Label(cfg_login, text="", font=_FONT_HINT, foreground="#555", wraplength=720)
     lbl_grid_hint.grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
-    login_toolbar = ttk.LabelFrame(login_inner, text="Thao tác đăng nhập", padding=6, style="Human.TLabelframe")
+    login_toolbar = ttk.LabelFrame(login_inner, text="Thao tác đăng nhập", padding=6)
     login_toolbar.grid(row=3, column=0, sticky="ew", pady=(0, 4))
     data_btns = _FlowBar(login_toolbar)
     data_btns.pack(fill=tk.X)
@@ -617,16 +564,14 @@ def build_human_interaction_tab(
     lbl_login_summary.pack(anchor="e", pady=(4, 0))
 
     login_table_fr = ttk.LabelFrame(
-        login_paned, text="Danh sách chờ đăng nhập", padding=4, style="Human.TLabelframe"
-    )
+        login_paned, text="Danh sách chờ đăng nhập", padding=4    )
     login_paned.add(login_table_fr, weight=4)
     login_table_fr.columnconfigure(0, weight=1)
     login_table_fr.rowconfigure(0, weight=1)
 
     # --- Trang Tương tác ---
     cfg_interaction = ttk.LabelFrame(
-        interaction_inner, text="Cấu hình tương tác", padding=4, style="Human.TLabelframe"
-    )
+        interaction_inner, text="Cấu hình tương tác", padding=4    )
     cfg_interaction.grid(row=1, column=0, sticky="ew", pady=(0, 6))
     ttk.Label(cfg_interaction, text="Profile", font=_FONT_UI).grid(row=0, column=0, sticky="w", padx=(0, 4))
     ttk.Combobox(
@@ -672,8 +617,7 @@ def build_human_interaction_tab(
         ).grid(row=2, column=0, columnspan=9, sticky="w", pady=(4, 0))
 
     interaction_toolbar = ttk.LabelFrame(
-        interaction_inner, text="Thao tác tương tác", padding=6, style="Human.TLabelframe"
-    )
+        interaction_inner, text="Thao tác tương tác", padding=6    )
     interaction_toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 4))
     run_btns = _FlowBar(interaction_toolbar)
     run_btns.pack(fill=tk.X)
@@ -690,21 +634,15 @@ def build_human_interaction_tab(
         interaction_bottom,
         text="Tài khoản đã đăng nhập — sẵn sàng tương tác",
         padding=4,
-        style="Human.TLabelframe",
     )
     interaction_table_fr.grid(row=0, column=0, sticky="nsew")
     interaction_table_fr.columnconfigure(0, weight=1)
     interaction_table_fr.rowconfigure(0, weight=1)
 
-    health_fr = tk.Frame(interaction_bottom, bg=_C_HEALTH_BG, padx=10, pady=6)
-    health_fr.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-    tk.Label(health_fr, text="📊 Pool", font=("Segoe UI", 8, "bold"), bg=_C_HEALTH_BG, fg=_C_HEALTH_FG).pack(
-        side=tk.LEFT
-    )
-    lbl_health = tk.Label(
-        health_fr, text="Health: idle", font=_FONT_MONO, bg=_C_HEALTH_BG, fg=_C_HEALTH_FG, anchor="e"
-    )
-    lbl_health.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+    health_fr = ttk.Frame(interaction_bottom)
+    health_fr.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+    lbl_health = ttk.Label(health_fr, text="Chưa chạy", foreground="#64748b")
+    lbl_health.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     cols = ("stt", "uid", "username", "password", "email", "twofa", "proxy", "status", "detail")
     table_toolbars: list[ttk.Frame] = []
@@ -716,7 +654,6 @@ def build_human_interaction_tab(
             show="headings",
             height=8,
             selectmode="extended",
-            style="Human.Treeview",
         )
         tr.heading("stt", text="STT")
         tr.heading("uid", text="UID")
@@ -729,7 +666,7 @@ def build_human_interaction_tab(
         tr.heading("detail", text="Chi tiết")
         tr.column("stt", width=52, minwidth=44, stretch=False, anchor="center")
         tr.column("uid", width=120, minwidth=90, stretch=False)
-        tr.column("username", width=140, minwidth=90, stretch=False)
+        tr.column("username", width=200, minwidth=120, stretch=False)
         tr.column("password", width=120, minwidth=80, stretch=False)
         tr.column("email", width=180, minwidth=100, stretch=False)
         tr.column("twofa", width=52, minwidth=44, stretch=False)
@@ -1305,12 +1242,19 @@ def build_human_interaction_tab(
         s = str(text or "").strip() or "—"
         return s if len(s) <= limit else s[: limit - 3] + "..."
 
-    def _display_username(ma: MappedAccount) -> str:
-        """Tên đăng nhập gốc — khác UID khi dòng import không phải số Facebook."""
+    def _login_username(ma: MappedAccount) -> str:
+        """UID hoặc tên đăng nhập gốc — dùng khi copy lại dòng nick."""
         raw = str(ma.auth.username or "").strip()
         if raw.upper().startswith("UID_"):
             raw = raw[4:]
-        return raw or "—"
+        return raw
+
+    def _display_username(ma: MappedAccount) -> str:
+        """Tên người dùng trên Facebook. Chưa đọc được thì hiện UID."""
+        shown = " ".join(str(getattr(ma, "display_name", "") or "").split())
+        if shown and not shown.isdigit():
+            return shown
+        return _login_username(ma) or "—"
 
     def _proxy_public_label(ma: MappedAccount) -> str:
         """Địa chỉ proxy trên bảng. Không hiện mật khẩu."""
@@ -1329,7 +1273,7 @@ def build_human_interaction_tab(
         return (
             f"{n:02d}" if n else "—",
             ma.display_uid(),
-            _short(_display_username(ma), 28),
+            _short(_display_username(ma), 42),
             ma.auth.password or "—",
             _short(ma.auth.email or "—", 28),
             twofa,
@@ -1354,9 +1298,7 @@ def build_human_interaction_tab(
 
     def _account_copy_line(ma: MappedAccount, *, full: bool) -> str:
         uid = ma.display_uid()
-        username = _display_username(ma)
-        if username == "—":
-            username = ""
+        username = _login_username(ma)
         pw = ma.auth.password or ""
         mail = ma.auth.email or ""
         proxy = _full_proxy_line(ma)
@@ -1629,24 +1571,16 @@ def build_human_interaction_tab(
         state["_pulse_after"] = None
 
     def _apply_banner_colors(*, bg: str, fg: str, led: str) -> None:
-        """Đổi màu thanh trạng thái — giữ nguyên chiều cao và cỡ chữ."""
-        run_banner.configure(bg=bg, highlightbackground="#e2e8f0")
-        lbl_run_status.configure(bg=bg, fg=fg)
-        lbl_run_led.configure(bg=bg, fg=led, text="●")
+        """Đổi màu chữ trạng thái, cùng kiểu nhãn với các tab khác."""
+        del bg, led
+        try:
+            lbl_run_status.configure(foreground=fg)
+        except tk.TclError:
+            pass
 
     def _tick_run_pulse() -> None:
-        """Chỉ nhấp chấm trạng thái — nền không đổi màu."""
-        if not state.get("pool") or state.get("pool_stopping"):
-            _stop_run_pulse()
-            return
-        phase = int(state.get("_pulse_phase") or 0)
-        try:
-            lbl_run_led.configure(text="●" if phase % 2 == 0 else "○")
-        except tk.TclError:
-            _stop_run_pulse()
-            return
-        state["_pulse_phase"] = phase + 1
-        state["_pulse_after"] = root.after(800, _tick_run_pulse)
+        """Không nhấp màu nền. Trạng thái chỉ là một dòng chữ."""
+        _stop_run_pulse()
 
     def _sync_run_banner() -> None:
         """Thanh trạng thái + nút Dừng toàn tab — luôn thấy dù đang ở trang Đăng nhập hay Tương tác."""
@@ -3080,6 +3014,39 @@ def build_human_interaction_tab(
             ma.status_detail = str(detail or "Đang lướt bảng tin — 60 giây")[:220]
             _refresh_trees()
 
+        def _remember_registry_name(name: str) -> None:
+            """Ghi tên Facebook vào accounts.json khi bản ghi còn là mã hoặc nhãn mặc định."""
+            from src.utils.account_proxy_mapper import _find_registry_row_for_mapped
+            from src.utils.schedule_posts_filters import account_name_is_placeholder
+
+            try:
+                rows = AccountsDatabaseManager().load_all()
+                hit = _find_registry_row_for_mapped(list(rows), ma)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human GUI] Chưa đối chiếu tên với accounts.json: {}", exc)
+                return
+            if not isinstance(hit, dict):
+                return
+            current = " ".join(str(hit.get("name") or "").split())
+            aid = str(hit.get("id") or "").strip()
+            uid = ma.display_uid()
+            if current and not current.isdigit() and current != uid and not account_name_is_placeholder(current, aid):
+                return
+            try:
+                AccountsDatabaseManager().update_account_fields(aid, {"name": name})
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Human GUI] Chưa ghi tên tài khoản: {}", exc)
+
+        def _on_account_name(name: str) -> None:
+            clean = " ".join(str(name or "").split())
+            if not clean or clean.isdigit() or clean == ma.display_uid():
+                return
+            ma.display_name = clean[:80]
+            _refresh_trees()
+            _save_settings()
+            _remember_registry_name(ma.display_name)
+            logger.info("[Human GUI] Tên người dùng {} → {}", ma.display_uid(), ma.display_name)
+
         def _on_browse_done(detail: str) -> None:
             if ma.status == "error":
                 return
@@ -3149,6 +3116,7 @@ def build_human_interaction_tab(
             on_block=_on_block,
             on_browse_note=_on_browse_note if browse_only else None,
             on_browse_done=_on_browse_done if browse_only else None,
+            on_account_name=_on_account_name,
         )
         if for_interaction:
             run_fb_profile_browser_dialog(
@@ -3946,15 +3914,9 @@ def build_human_interaction_tab(
         pool = state.get("pool")
         if not pool:
             if state.get("pool_stopping"):
-                health_fr.configure(bg=_C_STOPPING_BG)
-                lbl_health.configure(
-                    text="⏳ Đang dừng pool…",
-                    bg=_C_STOPPING_BG,
-                    fg=_C_STOPPING_FG,
-                )
+                lbl_health.configure(text="Đang dừng…", foreground="#92400e")
             else:
-                health_fr.configure(bg=_C_HEALTH_BG)
-                lbl_health.configure(text="💤 Idle — chưa chạy pool", bg=_C_HEALTH_BG, fg=_C_HEALTH_FG)
+                lbl_health.configure(text="Chưa chạy", foreground="#64748b")
             _sync_run_banner()
             _update_summary()
             return
@@ -3964,24 +3926,20 @@ def build_human_interaction_tab(
             except Exception:
                 alive = True
             if not alive:
-                health_fr.configure(bg=_C_HEALTH_BG)
-                lbl_health.configure(text="💤 Idle — các luồng đã dừng", bg=_C_HEALTH_BG, fg=_C_HEALTH_FG)
+                lbl_health.configure(text="Các luồng đã dừng", foreground="#64748b")
                 _sync_run_banner()
                 _update_summary()
                 root.after(1200, _schedule_health_refresh)
                 return
         snap = pool.health_snapshot()
-        health_fr.configure(bg="#d1fae5")
         lbl_health.configure(
             text=(
-                f"▶ {snap['running']}/{snap['dynamic_limit']} luồng (max {snap['configured_limit']})  ·  "
-                f"tiến độ {snap.get('completed_accounts', 0)}/{snap.get('total_accounts', 0)}  ·  "
-                f"còn {snap.get('pending_accounts', 0)} TK  ·  "
-                f"profile={snap.get('profile', 'normal')}{'*' if snap.get('auto_profile') else ''}  ·  "
-                f"ok={snap['recent_success']}  proxy_err={snap['recent_proxy_error']}  err={snap['recent_error']}"
+                f"{snap['running']}/{snap['dynamic_limit']} luồng  ·  "
+                f"{snap.get('completed_accounts', 0)}/{snap.get('total_accounts', 0)} xong  ·  "
+                f"còn {snap.get('pending_accounts', 0)}  ·  "
+                f"ok {snap['recent_success']}  ·  lỗi proxy {snap['recent_proxy_error']}  ·  lỗi {snap['recent_error']}"
             ),
-            bg="#d1fae5",
-            fg="#065f46",
+            foreground="#065f46",
         )
         _sync_run_banner()
         _update_summary()
@@ -4137,11 +4095,13 @@ def build_human_interaction_tab(
         cb_live_filter.pack(side=tk.LEFT)
         var_live_status = tk.StringVar(value="Sẵn sàng")
         ttk.Label(opts, textvariable=var_live_status).pack(side=tk.LEFT, padx=8)
-        cols = ("uid", "result", "detail")
+        cols = ("stt", "uid", "result", "detail")
         tree = ttk.Treeview(win, columns=cols, show="headings", height=8)
+        tree.heading("stt", text="STT")
         tree.heading("uid", text="UID")
         tree.heading("result", text="Kết quả")
         tree.heading("detail", text="Chi tiết")
+        tree.column("stt", width=44, anchor="center", stretch=False)
         tree.column("uid", width=140)
         tree.column("result", width=100)
         tree.column("detail", width=480)
@@ -4232,11 +4192,13 @@ def build_human_interaction_tab(
             checked[ma.account_id] = ma
             label = classify_account_live(ma.status, ma.status_detail)
             iid = ma.account_id
-            vals = (ma.display_uid(), label, (ma.status_detail or "")[:180])
+            vals = ("", ma.display_uid(), label, (ma.status_detail or "")[:180])
             tag = _row_tag(label)
             if not _row_visible(label):
                 if tree.exists(iid):
                     tree.delete(iid)
+                for number, child in enumerate(tree.get_children(), start=1):
+                    tree.set(child, "stt", str(number))
                 return
             index = _sorted_index(label, int(ma.grid_slot_index or 0), iid)
             if tree.exists(iid):
@@ -4244,6 +4206,8 @@ def build_human_interaction_tab(
                 tree.move(iid, "", index)
             else:
                 tree.insert("", index, iid=iid, values=vals, tags=(tag,) if tag else ())
+            for number, child in enumerate(tree.get_children(), start=1):
+                tree.set(child, "stt", str(number))
 
         def _apply_live_filter(_event: object = None) -> None:
             for item in tree.get_children():
@@ -4455,7 +4419,7 @@ def build_human_interaction_tab(
         ttk.Button(bar, text="Hiện trình duyệt", command=_reveal_browser).pack(side=tk.LEFT, padx=8)
         ttk.Button(bar, text="Ẩn trình duyệt", command=_conceal_browser).pack(side=tk.LEFT, padx=2)
 
-    def _btn(bar: _FlowBar, **kwargs: Any) -> tk.Button:
+    def _btn(bar: _FlowBar, **kwargs: Any) -> ttk.Button:
         """Gắn nút vào hàng chảy — cùng cỡ, cùng khoảng cách."""
         return bar.add(_flat_btn(bar, **kwargs))
 
@@ -4674,25 +4638,11 @@ def build_human_interaction_tab(
     _row_actions(login_row_btns, export=False)
     _row_actions(interaction_row_btns, export=True)
 
-    legend_fr = tk.Frame(interaction_inner, bg="#f8fafc", pady=2)
-    legend_fr.grid(row=3, column=0, sticky="ew")
-    tk.Label(legend_fr, text="Màu dòng:", font=("Segoe UI", 8), bg="#f8fafc", fg="#64748b").pack(side=tk.LEFT, padx=(0, 6))
-    for label, st_key in (
-        ("Chờ", "pending"),
-        ("Chạy", "running"),
-        ("OK", "login_ok"),
-        ("Lỗi", "error"),
-        ("Proxy", "proxy_error"),
-    ):
-        _tag, chip_bg, chip_fg = _TREE_STATUS_TAGS[st_key]
-        tk.Label(
-            legend_fr,
-            text=f" {label} ",
-            font=("Segoe UI", 8),
-            bg=chip_bg,
-            fg=chip_fg,
-            padx=4,
-        ).pack(side=tk.LEFT, padx=2)
+    ttk.Label(
+        interaction_inner,
+        text="Màu chữ: chờ xám, đang chạy xanh dương, thành công xanh lá, lỗi đỏ.",
+        foreground="#64748b",
+    ).grid(row=3, column=0, sticky="w", pady=(4, 0))
 
     def _on_grid_settings_changed(*_args: object) -> None:
         _refresh_grid_hint()
