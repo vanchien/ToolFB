@@ -444,6 +444,13 @@ def build_bundle(
         for row in collect_profile_rows(settings)
         if row["portable_path"] not in account_paths
     ]
+    if project_root is not None:
+        known = set(account_paths) | {row["portable_path"] for row in profile_rows}
+        for row in collect_logged_in_profile_rows(Path(project_root)):
+            if row["portable_path"] in known:
+                continue
+            profile_rows.append(row)
+            known.add(row["portable_path"])
     return {
         "bundle_type": BUNDLE_TYPE,
         "bundle_version": BUNDLE_VERSION,
@@ -803,6 +810,53 @@ _SKIP_PROFILE_DIRS = {
 _SKIP_PROFILE_FILES = {"parent.lock", "lock", ".parentlock"}
 
 
+def collect_logged_in_profile_rows(project_root: Path) -> list[dict[str, str]]:
+    """Mọi profile trong data/profiles đã có cookie Facebook, kể cả khi danh sách tài khoản chưa trỏ tới."""
+    root = Path(project_root)
+    base = root / "data" / "profiles"
+    if not base.is_dir():
+        return []
+    rows: list[dict[str, str]] = []
+    for browser_dir in base.iterdir():
+        if not browser_dir.is_dir():
+            continue
+        for profile in browser_dir.iterdir():
+            if not profile.is_dir() or not profile_has_login(profile):
+                continue
+            rel = profile.relative_to(root).as_posix()
+            if ".." in rel or not rel.startswith("data/profiles/"):
+                continue
+            rows.append({"id": profile.name, "name": profile.name, "portable_path": rel, "profile_path": rel})
+    return rows
+
+
+def _make_firefox_profile_portable(profile_dir: Path) -> None:
+    """Bản sao sang máy khác không còn file khóa và đường dẫn Firefox của máy chủ."""
+    if not profile_dir.is_dir():
+        return
+    for name in ("compatibility.ini", "parent.lock", "lock", ".parentlock", "sessionstore.jsonlz4"):
+        target = profile_dir / name
+        if target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+    user_js = profile_dir / "user.js"
+    if not user_js.is_file():
+        return
+    try:
+        lines = user_js.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    kept = [line for line in lines if "network.proxy." not in line.lower()]
+    if len(kept) == len(lines):
+        return
+    try:
+        user_js.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def profile_has_login(path: Path) -> bool:
     """Profile đã có cookie nên không cần đăng nhập lại."""
     if not path.is_dir():
@@ -903,6 +957,7 @@ def export_profiles(
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source, dest, dirs_exist_ok=True, ignore=_ignore_profile_junk)
+        _make_firefox_profile_portable(dest)
         copied += 1
     return copied, missing
 
@@ -1000,6 +1055,7 @@ def install_profiles(
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source, dest, dirs_exist_ok=True, ignore=_ignore_profile_junk)
+        _make_firefox_profile_portable(dest)
         copied += 1
     return copied, kept, missing
 

@@ -564,3 +564,22 @@ def test_existing_firefox_wal_is_not_replaced(tmp_path) -> None:
     assert kept == 1
     assert missing == 0
     assert (dest / "cookies.sqlite-wal").read_bytes() == b"dang-dang-nhap"
+
+
+def test_logged_in_firefox_is_packed_without_old_machine_lock(tmp_path) -> None:
+    profile = tmp_path / "data" / "profiles" / "firefox" / "UID_61580000000001"
+    profile.mkdir(parents=True)
+    (profile / "cookies.sqlite").write_bytes(b"facebook-session")
+    (profile / "compatibility.ini").write_text("LastPlatformDir=C:\\Users\\Old\\firefox", encoding="utf-8")
+    (profile / "user.js").write_text('user_pref("network.proxy.http", "10.0.0.1");\n', encoding="utf-8")
+    payload = build_bundle(accounts=[], pages=[], jobs=[], project_root=tmp_path)
+    rows = payload["data"]["profile_rows"]
+    assert rows[0]["portable_path"] == "data/profiles/firefox/UID_61580000000001"
+    package = tmp_path / "package"
+    copied, missing = export_profiles(tmp_path, rows, package)
+    assert copied == 1
+    assert missing == 0
+    packed = package / "data" / "profiles" / "firefox" / "UID_61580000000001"
+    assert (packed / "cookies.sqlite").is_file()
+    assert not (packed / "compatibility.ini").exists()
+    assert "network.proxy" not in (packed / "user.js").read_text(encoding="utf-8")
