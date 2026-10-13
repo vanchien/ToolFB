@@ -12,6 +12,7 @@ import pytest
 from src.services.app_updater import (
     ApplyUpdateResult,
     UpdateManifest,
+    _pin_release_download_url,
     _stage_deferred_full_apply_windows,
     apply_update_package,
     update_pending_deferred_apply,
@@ -42,6 +43,13 @@ def _minimal_release_zip(path: Path) -> None:
                 zf.write(f, f.relative_to(root).as_posix())
 
 
+def test_download_url_is_pinned_to_the_manifest_version() -> None:
+    floating = "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip"
+    pinned = _pin_release_download_url(floating, "1.0.105")
+    assert pinned == "https://github.com/vanchien/ToolFB/releases/download/v1.0.105/ToolFB_release_bundle.zip"
+    assert _pin_release_download_url("https://example.com/a.zip", "1.0.105") == "https://example.com/a.zip"
+
+
 def test_deferred_batch_excludes_internal_and_relaunch_portable(tmp_path: Path) -> None:
   payload = tmp_path / "payload"
   payload.mkdir()
@@ -65,7 +73,8 @@ def test_deferred_batch_excludes_internal_and_relaunch_portable(tmp_path: Path) 
   text = bat.read_text(encoding="utf-8")
   assert "/MIR /IS /IT" in text
   assert "/XD" in text and "_internal" in text
-  assert "/XF ToolFB_GUI.exe" in text
+  assert "/XF ToolFB_GUI.exe version.json" in text
+  assert text.index("/XF ToolFB_GUI.exe version.json") < text.index("portable_apply\\version.json")
   assert "main.py" in text or "python" in text.lower()
 
 

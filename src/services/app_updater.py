@@ -854,6 +854,17 @@ def is_newer_version(remote_version: str, local_version: str) -> bool:
     return remote_version.strip() != local_version.strip()
 
 
+def _pin_release_download_url(url: str, version: str) -> str:
+    """Tải đúng zip của phiên bản trong manifest, không theo release Latest lúc bấm cập nhật."""
+    raw = str(url or "").strip()
+    ver = str(version or "").strip()
+    marker = "/releases/latest/download/"
+    if not raw or not ver or marker not in raw:
+        return raw
+    tag = ver if ver.lower().startswith("v") else f"v{ver}"
+    return raw.replace(marker, f"/releases/download/{tag}/", 1)
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -1265,13 +1276,15 @@ def _stage_deferred_full_apply_windows(
         "ping -n 2 127.0.0.1 >nul",
         (
             f'robocopy "{st_s}\\portable_apply" "{pr_s}" /MIR /IS /IT /R:3 /W:2 /NP '
-            f"/XF ToolFB_GUI.exe /XD {robocopy_xd}"
+            f"/XF ToolFB_GUI.exe version.json /XD {robocopy_xd}"
         ),
         "if errorlevel 8 goto L",
         f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" copy /Y "{st_s}\\exe_gui\\ToolFB_GUI.exe" "{exe_dst}" >nul 2>&1',
         f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" if errorlevel 1 goto L',
-        f'if exist "{st_s}\\exe_gui\\_internal" robocopy "{st_s}\\exe_gui\\_internal" "{pr_s}\\_internal" /MIR /R:3 /W:2 /NP',
+        f'if exist "{st_s}\\exe_gui\\_internal" robocopy "{st_s}\\exe_gui\\_internal" "{pr_s}\\_internal" /MIR /IS /IT /R:3 /W:2 /NP',
         f'if exist "{st_s}\\exe_gui\\_internal" if errorlevel 8 goto L',
+        f'if exist "{st_s}\\portable_apply\\version.json" copy /Y "{st_s}\\portable_apply\\version.json" "{pr_s}\\version.json" >nul',
+        f'if exist "{st_s}\\exe_gui\\version.json" copy /Y "{st_s}\\exe_gui\\version.json" "{pr_s}\\version.json" >nul',
         *_deferred_batch_common_tail(
             staged_root=staged,
             updates_dir=updates_dir,
@@ -1308,8 +1321,9 @@ def apply_update_package(
     updates_dir = project_root / "data" / "updates"
     updates_dir.mkdir(parents=True, exist_ok=True)
     tmp_zip = updates_dir / f"update_{manifest.version}.zip"
-    logger.info("Updater: tải gói cập nhật từ {}", manifest.download_url)
-    req = urllib.request.Request(manifest.download_url, headers={"User-Agent": "ToolFB-Updater/1.0"})
+    download_url = _pin_release_download_url(manifest.download_url, manifest.version)
+    logger.info("Updater: tải gói cập nhật từ {}", download_url)
+    req = urllib.request.Request(download_url, headers={"User-Agent": "ToolFB-Updater/1.0"})
     final_url: str | None = None
     with urllib.request.urlopen(req, timeout=900) as resp, tmp_zip.open("wb") as fh:
         try:
@@ -1322,7 +1336,7 @@ def apply_update_package(
 
     _validate_downloaded_zip(
         tmp_zip,
-        declared_url=manifest.download_url,
+        declared_url=download_url,
         final_url=final_url,
     )
 

@@ -123,6 +123,9 @@ def _write_latest_manifest(*, root: Path, zip_path: Path, dist: Path) -> Path:
     sha256 = _sha256_file(zip_path)
     root_url = os.environ.get("TOOLFB_RELEASE_DOWNLOAD_URL", "").strip()
     download_url = root_url or str(Path(zip_path).name)
+    from github_release_urls import pin_release_download_url
+
+    download_url = pin_release_download_url(download_url, version)
     notes = os.environ.get("TOOLFB_RELEASE_NOTES", "").strip()
     patch_url = os.environ.get("TOOLFB_PATCH_DOWNLOAD_URL", "").strip()
     patch_sha = os.environ.get("TOOLFB_PATCH_SHA256", "").strip().lower()
