@@ -43,10 +43,81 @@ def _minimal_release_zip(path: Path) -> None:
                 zf.write(f, f.relative_to(root).as_posix())
 
 
+def test_apply_replaces_old_code_before_marking_version(tmp_path: Path) -> None:
+    """Máy đích còn file bản cũ: mã bị thay, version.json chỉ đổi sau khi chép xong."""
+    if sys.platform != "win32":
+        pytest.skip("Windows robocopy apply")
+    import subprocess
+
+    payload = tmp_path / "payload"
+    (payload / "src").mkdir(parents=True)
+    (payload / "src" / "app.py").write_text("new\n", encoding="utf-8")
+    (payload / "version.json").write_text('{"version": "9.9.9"}\n', encoding="utf-8")
+    project = tmp_path / "app"
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "app.py").write_text("old\n", encoding="utf-8")
+    (project / "src" / "stale.py").write_text("stale\n", encoding="utf-8")
+    (project / "version.json").write_text('{"version": "1.0.0"}\n', encoding="utf-8")
+    (project / "data").mkdir()
+    (project / "data" / "keep.txt").write_text("profile\n", encoding="utf-8")
+    updates = project / "data" / "updates"
+    updates.mkdir()
+    bat = updates / DEFERRED_GUI_BAT_NAME
+    _stage_deferred_full_apply_windows(
+        payload_root=payload,
+        exe_gui_root=None,
+        project_root=project,
+        updates_dir=updates,
+        version="9.9.9",
+        bat_out=bat,
+        preserve_on_apply_dirs=("data", "config"),
+    )
+    staged_root = next(updates.glob("staged_apply_*"))
+    staged = staged_root / "portable_apply"
+    subprocess.run(
+        [
+            "robocopy",
+            str(staged),
+            str(project),
+            "/MIR",
+            "/IS",
+            "/IT",
+            "/R:1",
+            "/W:1",
+            "/NP",
+            "/XF",
+            "ToolFB_GUI.exe",
+            "version.json",
+            "/XD",
+            "data",
+            "config",
+            "_internal",
+        ],
+        check=False,
+    )
+    assert (project / "src" / "app.py").read_text(encoding="utf-8") == "new\n"
+    assert not (project / "src" / "stale.py").exists()
+    assert (project / "data" / "keep.txt").read_text(encoding="utf-8") == "profile\n"
+    assert '"1.0.0"' in (project / "version.json").read_text(encoding="utf-8")
+    subprocess.run(
+        ["cmd", "/c", "copy", "/Y", str(staged / "version.json"), str(project / "version.json")],
+        check=True,
+    )
+    assert '"9.9.9"' in (project / "version.json").read_text(encoding="utf-8")
+
+
 def test_download_url_is_pinned_to_the_manifest_version() -> None:
     floating = "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip"
     pinned = _pin_release_download_url(floating, "1.0.105")
     assert pinned == "https://github.com/vanchien/ToolFB/releases/download/v1.0.105/ToolFB_release_bundle.zip"
+    import sys
+    from pathlib import Path as _Path
+
+    tools = _Path(__file__).resolve().parents[1] / "tools"
+    sys.path.insert(0, str(tools))
+    from github_release_urls import pin_release_download_url
+
+    assert pin_release_download_url(floating, "1.0.105") == pinned
     assert _pin_release_download_url("https://example.com/a.zip", "1.0.105") == "https://example.com/a.zip"
 
 

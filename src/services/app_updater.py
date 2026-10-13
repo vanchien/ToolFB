@@ -1284,7 +1284,9 @@ def _stage_deferred_full_apply_windows(
         f'if exist "{st_s}\\exe_gui\\_internal" robocopy "{st_s}\\exe_gui\\_internal" "{pr_s}\\_internal" /MIR /IS /IT /R:3 /W:2 /NP',
         f'if exist "{st_s}\\exe_gui\\_internal" if errorlevel 8 goto L',
         f'if exist "{st_s}\\portable_apply\\version.json" copy /Y "{st_s}\\portable_apply\\version.json" "{pr_s}\\version.json" >nul',
+        f'if exist "{st_s}\\portable_apply\\version.json" if errorlevel 1 goto L',
         f'if exist "{st_s}\\exe_gui\\version.json" copy /Y "{st_s}\\exe_gui\\version.json" "{pr_s}\\version.json" >nul',
+        f'if exist "{st_s}\\exe_gui\\version.json" if errorlevel 1 goto L',
         *_deferred_batch_common_tail(
             staged_root=staged,
             updates_dir=updates_dir,
