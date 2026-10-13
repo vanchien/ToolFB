@@ -8809,6 +8809,9 @@ class _ManagerWindow:
                     "credentials": data.get("credentials") if isinstance(data.get("credentials"), dict) else {"accounts": {}},
                     "cookies": data.get("cookies") if isinstance(data.get("cookies"), list) else [],
                     "settings": data.get("settings") if isinstance(data.get("settings"), dict) else {},
+                    "profile_rows": [
+                        row for row in (data.get("profile_rows") or []) if isinstance(row, dict)
+                    ],
                 },
             )
             from src.services.tool_bundle_sync import apply_settings
@@ -8953,6 +8956,7 @@ class _ManagerWindow:
             copied_cookies, kept_cookies = write_missing_cookies(
                 project_root(),
                 list(merged.get("cookies") or []),
+                replace=True,
             )
             from src.services.tool_bundle_sync import install_profiles
 
@@ -8983,7 +8987,7 @@ class _ManagerWindow:
                 self._accounts.save_all(normalized_accounts)  # type: ignore[arg-type]
             from src.services.tool_bundle_sync import install_ai_account_dirs
 
-            install_ai_account_dirs(Path(profile_root), project_root())
+            install_ai_account_dirs(Path(profile_root), project_root(), replace=True)
         except Exception as exc:  # noqa: BLE001
             detail = (
                 "Import thất bại khi ghi dữ liệu.\n"

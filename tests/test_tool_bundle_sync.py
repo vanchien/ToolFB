@@ -150,9 +150,17 @@ def test_write_missing_cookies_keeps_existing_file(tmp_path) -> None:
     assert kept == 1
     assert json.loads(existing.read_text(encoding="utf-8"))["keep"] is True
     assert (tmp_path / "data" / "cookies" / "b.json").is_file()
+    copied_again, kept_again = write_missing_cookies(
+        tmp_path,
+        [{"relative_path": "data/cookies/a.json", "text": '{"keep":false}'}],
+        replace=True,
+    )
+    assert copied_again == 1
+    assert kept_again == 0
+    assert json.loads(existing.read_text(encoding="utf-8"))["keep"] is False
 
 
-def test_export_and_install_profile_keeps_existing_login(tmp_path) -> None:
+def test_export_and_install_replaces_profile_folder(tmp_path) -> None:
     source_root = tmp_path / "source"
     profile = source_root / "data" / "profiles" / "firefox" / "acc"
     profile.mkdir(parents=True)
@@ -216,9 +224,9 @@ def test_export_and_install_profile_keeps_existing_login(tmp_path) -> None:
     (new_profile / "cookies.sqlite").write_bytes(b"moi")
     export_profiles(source_root, [{"portable_path": "data/profiles/firefox/new"}], package)
     installed, kept, _missing = install_profiles(package, dest_root, list(merged["profile_jobs"]))
-    assert kept == 1
-    assert (kept_profile / "cookies.sqlite").read_bytes() == b"may-nay"
-    assert installed == 1
+    assert kept == 0
+    assert (kept_profile / "cookies.sqlite").read_bytes() == b"session"
+    assert installed == 2
     assert (dest_root / "data" / "profiles" / "firefox" / "new" / "cookies.sqlite").read_bytes() == b"moi"
 
     empty = dest_root / "data" / "profiles" / "firefox" / "trong"
@@ -547,10 +555,13 @@ def test_bundle_rewrites_old_machine_profile_path(tmp_path) -> None:
     assert row["cookie_path"] == "data/cookies/acc.json"
 
 
-def test_existing_firefox_wal_is_not_replaced(tmp_path) -> None:
+def test_profile_folder_replaces_cookie_only_dest(tmp_path) -> None:
     source = tmp_path / "pkg" / "data" / "profiles" / "firefox" / "acc"
     source.mkdir(parents=True)
     (source / "cookies.sqlite").write_bytes(b"tu-may-kia")
+    (source / "prefs.js").write_text("user_pref('browser.startup.page', 1);\n", encoding="utf-8")
+    (source / "storage").mkdir()
+    (source / "storage" / "default").mkdir()
     dest = tmp_path / "app" / "data" / "profiles" / "firefox" / "acc"
     dest.mkdir(parents=True)
     (dest / "cookies.sqlite").write_bytes(b"")
@@ -560,10 +571,13 @@ def test_existing_firefox_wal_is_not_replaced(tmp_path) -> None:
         tmp_path / "app",
         [{"dest": "data/profiles/firefox/acc", "source": "data/profiles/firefox/acc"}],
     )
-    assert copied == 0
-    assert kept == 1
+    assert copied == 1
+    assert kept == 0
     assert missing == 0
-    assert (dest / "cookies.sqlite-wal").read_bytes() == b"dang-dang-nhap"
+    assert (dest / "cookies.sqlite").read_bytes() == b"tu-may-kia"
+    assert (dest / "prefs.js").is_file()
+    assert (dest / "storage" / "default").is_dir()
+    assert not (dest / "cookies.sqlite-wal").exists()
 
 
 def test_tiktok_profile_from_other_machine_path_is_packed(tmp_path) -> None:

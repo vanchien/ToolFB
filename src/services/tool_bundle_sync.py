@@ -76,7 +76,7 @@ class SyncReport:
             f"Cookie chép thêm: {self.cookies_copied}",
             f"Cookie máy này được giữ: {self.cookies_kept}",
             f"Thư mục profile được chép: {self.profiles_copied}",
-            f"Profile máy này đã đăng nhập, được giữ: {self.profiles_kept}",
+            f"Thư mục profile trùng chỗ, được giữ: {self.profiles_kept}",
             f"Profile không thấy trong gói: {self.profiles_missing}",
             f"File cài đặt được bổ sung: {self.settings_updated}",
             "Không xóa tài khoản, page hay cài đặt đang có trên máy này.",
@@ -851,7 +851,7 @@ def _make_firefox_profile_portable(profile_dir: Path) -> None:
     """Bản sao sang máy khác không còn file khóa và đường dẫn Firefox của máy chủ."""
     if not profile_dir.is_dir():
         return
-    for name in ("compatibility.ini", "parent.lock", "lock", ".parentlock", "sessionstore.jsonlz4"):
+    for name in ("compatibility.ini", "parent.lock", "lock", ".parentlock"):
         target = profile_dir / name
         if target.exists():
             try:
@@ -1004,8 +1004,10 @@ def install_ai_account_dirs(source_root: Path, dest_root: Path, *, replace: bool
             if not replace and profile_has_login(dest):
                 kept += 1
                 continue
+            if replace and dest.exists():
+                shutil.rmtree(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(account, dest, dirs_exist_ok=True, ignore=_ignore_profile_junk)
+            shutil.copytree(account, dest, ignore=_ignore_profile_junk)
             copied += 1
     return copied, kept
 
@@ -1021,9 +1023,16 @@ def profile_install_action(source_root: Path, dest_root: Path, job: dict[str, st
             return "kept"
     except OSError:
         return "missing"
-    if profile_has_login(dest):
-        return "kept"
     return "copied"
+
+
+def _replace_profile_dir(source: Path, dest: Path) -> None:
+    """Thay cả thư mục profile. File wal cũ không được giữ lại đè cookie vừa chép."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, dest, ignore=_ignore_profile_junk)
+    _make_firefox_profile_portable(dest)
 
 
 def preview_profile_install(
@@ -1050,7 +1059,7 @@ def install_profiles(
     jobs: list[dict[str, str]],
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[int, int, int]:
-    """Chép profile còn thiếu phiên đăng nhập. Profile máy này đã có cookie thì giữ nguyên."""
+    """Chép cả thư mục profile từ gói đè lên máy này. Chỉ giữ khi nguồn và đích là cùng một thư mục."""
     copied = 0
     kept = 0
     missing = 0
@@ -1070,15 +1079,18 @@ def install_profiles(
         if source is None or dest is None:
             missing += 1
             continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, dest, dirs_exist_ok=True, ignore=_ignore_profile_junk)
-        _make_firefox_profile_portable(dest)
+        _replace_profile_dir(source, dest)
         copied += 1
     return copied, kept, missing
 
 
-def write_missing_cookies(project_root: Path, cookies: list[dict[str, Any]]) -> tuple[int, int]:
-    """Chép cookie chưa có. File cookie máy này đang có thì giữ nguyên."""
+def write_missing_cookies(
+    project_root: Path,
+    cookies: list[dict[str, Any]],
+    *,
+    replace: bool = False,
+) -> tuple[int, int]:
+    """Chép file cookie JSON. ``replace`` ghi đè file máy này để khớp gói vừa nạp."""
     root = Path(project_root).resolve()
     copied = 0
     kept = 0
@@ -1094,7 +1106,7 @@ def write_missing_cookies(project_root: Path, cookies: list[dict[str, Any]]) -> 
             target.relative_to(root)
         except ValueError:
             continue
-        if target.is_file() and target.stat().st_size > 0:
+        if not replace and target.is_file() and target.stat().st_size > 0:
             kept += 1
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
