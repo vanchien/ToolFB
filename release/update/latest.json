@@ -1,7 +1,7 @@
 {
-  "version": "1.0.98",
+  "version": "1.0.99",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "7e35750d91fc72ed15a04f40b4beb3d869ea8e78b13920bc96041d769e976118",
-  "notes": "Sua loi xuat goi dong bo.",
-  "generated_at": "2026-10-12T17:41:09"
+  "sha256": "0ce7cfdc36dc566e3ac5b770659feea6c6c5501fd622081eecbe31d0af560cdc",
+  "notes": "Sua Firefox giu proxy cu sau khi dong bo sang may khac.",
+  "generated_at": "2026-10-13T03:44:24"
 }
