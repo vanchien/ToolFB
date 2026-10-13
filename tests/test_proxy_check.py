@@ -9,11 +9,22 @@ from src.utils.proxy_check import (
     build_playwright_proxy_settings,
     check_proxy,
     check_proxy_line,
+    firefox_prefs_for_account_proxy,
     format_proxy_line,
     parse_proxy_line,
     playwright_host_for_scheme,
     verify_browser_facebook_via_proxy,
 )
+
+
+def test_firefox_prefs_replace_proxy_left_by_the_old_machine() -> None:
+    prefs = firefox_prefs_for_account_proxy("http://127.0.0.1:43123")
+    assert prefs["network.proxy.autoconfig_url"] == ""
+    assert prefs["network.proxy.allow_hijacking_localhost"] is True
+    assert prefs["network.proxy.http"] == "127.0.0.1"
+    assert prefs["network.proxy.http_port"] == 43123
+    assert prefs["network.proxy.ssl"] == "127.0.0.1"
+    assert prefs["network.proxy.socks"] == ""
 
 
 def test_parse_proxy_line_four_parts() -> None:

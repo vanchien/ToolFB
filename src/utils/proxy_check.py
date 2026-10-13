@@ -462,6 +462,44 @@ def verify_browser_facebook_via_proxy(
     return True, "Proxy OK — đã tải Facebook"
 
 
+def firefox_prefs_for_account_proxy(server: str) -> dict[str, Any]:
+    """Ghi đè proxy cũ trong profile Firefox.
+
+    Profile chép từ máy khác còn proxy tay hoặc PAC. Firefox giữ địa chỉ đó và bị
+    ``The connection was reset`` dù tài khoản đã có proxy mới.
+    """
+    raw = str(server or "").strip()
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    host = str(parsed.hostname or "").strip()
+    port = int(parsed.port or 0)
+    scheme = (parsed.scheme or "http").lower()
+    prefs: dict[str, Any] = {
+        "network.proxy.type": 1,
+        "network.proxy.share_proxy_settings": True,
+        "network.proxy.autoconfig_url": "",
+        "network.proxy.allow_hijacking_localhost": True,
+        "network.proxy.no_proxies_on": "",
+        "network.proxy.socks": "",
+        "network.proxy.socks_port": 0,
+        "network.proxy.http": "",
+        "network.proxy.http_port": 0,
+        "network.proxy.ssl": "",
+        "network.proxy.ssl_port": 0,
+    }
+    if not host or port <= 0:
+        return prefs
+    if scheme.startswith("socks"):
+        prefs["network.proxy.socks"] = host
+        prefs["network.proxy.socks_port"] = port
+        prefs["network.proxy.socks_version"] = 4 if scheme.startswith("socks4") else 5
+        return prefs
+    prefs["network.proxy.http"] = host
+    prefs["network.proxy.http_port"] = port
+    prefs["network.proxy.ssl"] = host
+    prefs["network.proxy.ssl_port"] = port
+    return prefs
+
+
 def build_playwright_proxy_settings(proxy: dict[str, Any]) -> dict[str, Any]:
     """
     Cấu hình ``proxy`` cho ``launch_persistent_context``.

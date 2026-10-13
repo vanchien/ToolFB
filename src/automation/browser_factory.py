@@ -1085,6 +1085,12 @@ class BrowserFactory:
                 launch_kwargs["proxy"] = {"server": socks_relay.local_url}
             else:
                 launch_kwargs["proxy"] = playwright_proxy_settings(proxy_cfg)  # type: ignore[arg-type]
+            if browser_key == "firefox":
+                from src.utils.proxy_check import firefox_prefs_for_account_proxy
+
+                ff = dict(launch_kwargs.get("firefox_user_prefs") or {})
+                ff.update(firefox_prefs_for_account_proxy(str(launch_kwargs["proxy"]["server"])))
+                launch_kwargs["firefox_user_prefs"] = ff
         elif not _env_bool("FB_KEEP_SYSTEM_PROXY", False):
             clean = {k: v for k, v in os.environ.items()}
             for k in (
