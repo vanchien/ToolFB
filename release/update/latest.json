@@ -1,7 +1,7 @@
 {
-  "version": "1.0.101",
+  "version": "1.0.103",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "470b76bf82000b9dc17340e1ad8ecdec4d3bea2bef3f3635760633c3f89664bd",
-  "notes": "May khac dung Firefox cua may do va profile da dong bo. Khong giu duong dan hay proxy cua may chu.",
-  "generated_at": "2026-10-13T11:55:40"
+  "sha256": "59308e0ff04e6bd1a170ee35b5da5d7fe83a871e1526ecac9574937f20fa2eff",
+  "notes": "Hien ten Facebook that tren bang dang nhap, STT va bo loc cac bang.",
+  "generated_at": "2026-10-13T17:08:16"
 }
