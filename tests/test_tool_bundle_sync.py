@@ -566,6 +566,32 @@ def test_existing_firefox_wal_is_not_replaced(tmp_path) -> None:
     assert (dest / "cookies.sqlite-wal").read_bytes() == b"dang-dang-nhap"
 
 
+def test_tiktok_profile_from_other_machine_path_is_packed(tmp_path) -> None:
+    profile = tmp_path / "data" / "tiktok" / "profiles" / "tt_acc_1"
+    profile.mkdir(parents=True)
+    (profile / "cookies.sqlite").write_bytes(b"tiktok")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "human_interaction_settings.json").write_text("{}", encoding="utf-8")
+    accounts_file = tmp_path / "data" / "tiktok" / "accounts.json"
+    accounts_file.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "tt_acc_1",
+                    "profile_path": str(profile),
+                    "proxy": {"enabled": True, "server": "socks5://203.0.113.8:1080"},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    payload = build_bundle(accounts=[], pages=[], jobs=[], project_root=tmp_path)
+    paths = {row["portable_path"] for row in payload["data"]["profile_rows"]}
+    assert "data/tiktok/profiles/tt_acc_1" in paths
+    saved = payload["data"]["settings"]["data/tiktok/accounts.json"][0]["profile_path"]
+    assert saved == "data/tiktok/profiles/tt_acc_1"
+
+
 def test_logged_in_firefox_is_packed_without_old_machine_lock(tmp_path) -> None:
     profile = tmp_path / "data" / "profiles" / "firefox" / "UID_61580000000001"
     profile.mkdir(parents=True)

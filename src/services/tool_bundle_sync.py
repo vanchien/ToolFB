@@ -135,7 +135,7 @@ def relativize_storage_path(path: str) -> str:
     raw = str(path or "").strip()
     folded = raw.replace("\\", "/")
     lower = folded.casefold()
-    for marker in ("/data/profiles/", "/data/cookies/"):
+    for marker in ("/data/profiles/", "/data/cookies/", "/data/tiktok/", "/data/ai_accounts/"):
         index = lower.find(marker)
         if index >= 0:
             return folded[index + 1 :]
@@ -446,7 +446,7 @@ def build_bundle(
     ]
     if project_root is not None:
         known = set(account_paths) | {row["portable_path"] for row in profile_rows}
-        for row in collect_logged_in_profile_rows(Path(project_root)):
+        for row in collect_logged_in_profile_rows(Path(project_root)) + collect_tiktok_profile_rows(Path(project_root)):
             if row["portable_path"] in known:
                 continue
             profile_rows.append(row)
@@ -827,6 +827,23 @@ def collect_logged_in_profile_rows(project_root: Path) -> list[dict[str, str]]:
             if ".." in rel or not rel.startswith("data/profiles/"):
                 continue
             rows.append({"id": profile.name, "name": profile.name, "portable_path": rel, "profile_path": rel})
+    return rows
+
+
+def collect_tiktok_profile_rows(project_root: Path) -> list[dict[str, str]]:
+    """Thư mục Firefox/Chromium của từng tài khoản TikTok."""
+    root = Path(project_root)
+    base = root / "data" / "tiktok" / "profiles"
+    if not base.is_dir():
+        return []
+    rows: list[dict[str, str]] = []
+    for profile in base.iterdir():
+        if not profile.is_dir():
+            continue
+        rel = profile.relative_to(root).as_posix()
+        if ".." in rel or not rel.startswith("data/tiktok/profiles/"):
+            continue
+        rows.append({"id": profile.name, "name": profile.name, "portable_path": rel, "profile_path": rel})
     return rows
 
 
