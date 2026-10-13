@@ -1,7 +1,7 @@
 {
-  "version": "1.0.99",
+  "version": "1.0.100",
   "download_url": "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip",
-  "sha256": "0ce7cfdc36dc566e3ac5b770659feea6c6c5501fd622081eecbe31d0af560cdc",
-  "notes": "Sua Firefox giu proxy cu sau khi dong bo sang may khac.",
-  "generated_at": "2026-10-13T03:44:24"
+  "sha256": "2985443643493a8b6340a05d30768cffd4dd8c779d5450c630f3025ec57cd947",
+  "notes": "Proxy da bat phai con song moi cho tai khoan chay. Tai khoan khong dung proxy thi chay truc tiep. Nut tab Tuong tac dong bo voi cac tab khac.",
+  "generated_at": "2026-10-13T05:10:51"
 }
