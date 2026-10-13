@@ -362,6 +362,57 @@ def is_playwright_target_closed_error(exc: BaseException) -> bool:
     return _context_or_page_already_closed_msg(exc)
 
 
+def _firefox_launch_timed_out(exc: BaseException) -> bool:
+    """Playwright hết giờ ngay tại ``<launching> firefox.exe``."""
+    msg = str(exc).lower()
+    return "timeout" in msg and "launch" in msg
+
+
+def _release_stale_firefox_profile(user_data_dir: Path) -> None:
+    """Đóng Firefox còn giữ profile này. Profile đang mở làm lần launch sau treo quá 90 giây."""
+    if sys.platform != "win32":
+        return
+    try:
+        from src.utils.win_browser_window import terminate_firefox_for_profile
+
+        terminate_firefox_for_profile(user_data_dir, grace_ms=400)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Không đóng được Firefox cũ của profile: {}", exc)
+
+
+def _prepare_firefox_profile_for_this_machine(user_data_dir: Path) -> None:
+    """Bỏ dấu vết Firefox của máy cũ trước khi mở profile đã đồng bộ.
+
+    ``compatibility.ini`` nhớ thư mục Firefox của máy chủ. Máy khác mở profile đó thì
+    Firefox hiện hộp thoại và Playwright hết 90 giây. ``user.js`` còn proxy cũ cũng bị gỡ.
+    """
+    if not user_data_dir.is_dir():
+        return
+    for name in ("compatibility.ini", "parent.lock", "lock", ".parentlock", "sessionstore.jsonlz4"):
+        path = user_data_dir / name
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.debug("Không xóa được {} của profile: {}", name, exc)
+    user_js = user_data_dir / "user.js"
+    if not user_js.is_file():
+        return
+    try:
+        lines = user_js.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    kept = [line for line in lines if "network.proxy." not in line.lower()]
+    if len(kept) == len(lines):
+        return
+    try:
+        user_js.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        logger.info("Đã gỡ proxy cũ trong user.js của profile đã đồng bộ.")
+    except OSError as exc:
+        logger.debug("Không ghi lại user.js: {}", exc)
+
+
 def _cleanup_firefox_profile_lock_files(user_data_dir: Path) -> None:
     """
     Xóa lock file mồ côi của Firefox profile trước khi launch.
@@ -697,6 +748,21 @@ class BrowserFactory:
                 "Vui lòng cấu hình profile trong tab Tài khoản trước khi chạy."
             )
         path = Path(raw)
+        if path.is_absolute() and not path.is_dir():
+            folded = str(path).replace("\\", "/")
+            lower = folded.casefold()
+            for marker in ("/data/profiles/", "/data/tiktok/"):
+                index = lower.find(marker)
+                if index < 0:
+                    continue
+                mapped = (_project_root() / folded[index + 1 :]).resolve()
+                if mapped.is_dir():
+                    logger.info(
+                        "Đường dẫn profile máy cũ không có trên máy này — dùng {}",
+                        mapped,
+                    )
+                    path = mapped
+                    break
         if not path.is_absolute():
             path = _project_root() / path
         resolved = path.resolve()
@@ -933,6 +999,16 @@ class BrowserFactory:
             logger.info("Không dùng proxy (use_proxy=false) account={}.", account_id)
 
         use_headless = self._default_headless if headless is None else headless
+        # Firefox headless trên Windows hay treo lúc launch. Chạy ngầm = cửa sổ thật rồi ẩn.
+        background_firefox = bool(
+            use_headless and browser_key == "firefox" and sys.platform == "win32"
+        )
+        if background_firefox:
+            use_headless = False
+            logger.info(
+                "Firefox chạy ngầm bằng cửa sổ thật (ẩn sau khi mở) account={}",
+                account_id,
+            )
         browser_type = self._select_browser_type(browser_key)
         manual_open = launch_slot_timeout_sec is not None
         use_desktop_fb = manual_open or force_desktop_facebook
@@ -1157,6 +1233,8 @@ class BrowserFactory:
             )
 
         if browser_key == "firefox":
+            _release_stale_firefox_profile(user_data_dir)
+            _prepare_firefox_profile_for_this_machine(user_data_dir)
             _cleanup_firefox_profile_lock_files(user_data_dir)
 
         profile_lock = acquire_profile_browser_slot(
@@ -1182,7 +1260,25 @@ class BrowserFactory:
                     context = browser_type.launch_persistent_context(**launch_kwargs)
                 except Exception as exc:
                     msg = str(exc).lower()
-                    if "executable doesn't exist" in msg or "executable does not exist" in msg:
+                    if browser_key == "firefox" and _firefox_launch_timed_out(exc):
+                        logger.warning(
+                            "Firefox mở quá 90 giây (account={}) — đóng tiến trình cũ và thử lại 1 lần.",
+                            account_id,
+                        )
+                        _release_stale_firefox_profile(user_data_dir)
+                        _cleanup_firefox_profile_lock_files(user_data_dir)
+                        time.sleep(0.4)
+                        try:
+                            context = browser_type.launch_persistent_context(**launch_kwargs)
+                        except Exception as exc_retry:
+                            if not _firefox_launch_timed_out(exc_retry):
+                                raise
+                            raise RuntimeError(
+                                "Firefox không mở được (quá 90 giây, đã thử lại). "
+                                "Giảm số luồng rồi chạy lại tài khoản này."
+                            ) from exc_retry
+                        msg = ""
+                    if msg and ("executable doesn't exist" in msg or "executable does not exist" in msg):
                         from src.utils.playwright_browser_lock import browser_executable_missing_message
 
                         raise RuntimeError(
@@ -1231,7 +1327,7 @@ class BrowserFactory:
                             if ch_fb:
                                 fallback_kwargs["channel"] = ch_fb
                             context = self._playwright.chromium.launch_persistent_context(**fallback_kwargs)
-                    else:
+                    elif msg:
                         raise
             finally:
                 if acquired_launch_sem:
@@ -1282,6 +1378,13 @@ class BrowserFactory:
             except Exception as place_exc:  # noqa: BLE001
                 logger.warning("Không đặt được vị trí cửa sổ Firefox (grid): {}", place_exc)
 
+        if background_firefox:
+            try:
+                from src.utils.win_browser_window import hide_firefox_window_for_profile
+
+                hide_firefox_window_for_profile(user_data_dir, timeout_s=8.0)
+            except Exception as hide_exc:  # noqa: BLE001
+                logger.warning("Không ẩn được cửa sổ Firefox (chạy ngầm): {}", hide_exc)
         logger.info(
             "Đã mở Firefox/{} persistent | account={} | profile={} | pw_mode={} | proxy={} | grid_pos={}",
             browser_key,

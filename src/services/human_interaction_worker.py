@@ -957,7 +957,19 @@ def run_human_interaction_worker(
         return _finish("success")
 
     except Exception as exc:  # noqa: BLE001
-        if "proxy" in str(exc).lower():
+        low_exc = str(exc).lower()
+        launch_failed = "launch_persistent_context" in low_exc or "browsertype.launch" in low_exc
+        if launch_failed:
+            if "timeout" in low_exc:
+                detail = "Firefox không mở được (quá 90 giây). Giảm số luồng rồi chạy lại."
+            else:
+                detail = str(exc).split("Call log:", 1)[0].strip()
+                detail = detail.split(":", 1)[-1].strip() or "Không mở được Firefox"
+                detail = f"Không mở được Firefox: {detail[:160]}"
+            logger.warning("[Human] Không mở được Firefox account={}: {}", mapped.account_id, exc)
+            _status("error", detail[:220])
+            return _finish("error", notify_now=True)
+        if "proxy" in low_exc:
             logger.warning("[Human] Không chạy account={} vì proxy: {}", mapped.account_id, exc)
             _status("proxy_error", str(exc)[:220])
             return _finish("proxy_error", notify_now=True)

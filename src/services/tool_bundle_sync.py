@@ -108,6 +108,28 @@ def page_match_key(row: dict[str, Any]) -> str:
     return f"url:{aid}:{url}"
 
 
+def _drop_foreign_browser_exe(row: dict[str, Any]) -> None:
+    """Bỏ firefox.exe/chrome.exe gắn cứng ổ đĩa máy cũ."""
+    exe = str(row.get("browser_exe_path") or "").strip()
+    if len(exe) > 2 and exe[1] == ":":
+        row["browser_exe_path"] = ""
+
+
+def _rewrite_paths_for_this_app(payload: Any) -> None:
+    """Đổi profile tuyệt đối của máy cũ thành data/... và bỏ exe trình duyệt máy cũ."""
+    if isinstance(payload, dict):
+        _drop_foreign_browser_exe(payload)
+        for key in ("portable_path", "profile_path", "cookie_path"):
+            raw = payload.get(key)
+            if isinstance(raw, str) and raw.strip():
+                payload[key] = relativize_storage_path(raw)
+        for value in payload.values():
+            _rewrite_paths_for_this_app(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            _rewrite_paths_for_this_app(item)
+
+
 def relativize_storage_path(path: str) -> str:
     """Đổi đường dẫn máy cũ thành data/profiles hoặc data/cookies nếu nhận ra."""
     raw = str(path or "").strip()
@@ -202,6 +224,7 @@ def merge_accounts(
         if not isinstance(raw, dict):
             continue
         incoming = dict(raw)
+        _drop_foreign_browser_exe(incoming)
         incoming_id = str(incoming.get("id") or "").strip()
         for path_key in ("portable_path", "profile_path", "cookie_path"):
             if incoming.get(path_key):
@@ -400,11 +423,13 @@ def build_bundle(
                 item[path_key] = relativize_storage_path(str(item[path_key]))
         if item.get("portable_path") and not item.get("profile_path"):
             item["profile_path"] = item["portable_path"]
+        _drop_foreign_browser_exe(item)
         exported_accounts.append(item)
     cookies: list[dict[str, str]] = []
     if project_root is not None:
         cookies = _read_cookies(Path(project_root), accounts)
     settings = _read_settings(Path(project_root)) if project_root is not None else {}
+    _rewrite_paths_for_this_app(settings)
     interaction = settings.get("human_interaction_settings.json")
     if isinstance(interaction, dict):
         from src.utils.account_proxy_mapper import stamp_registry_rows_from_interaction
@@ -683,6 +708,7 @@ def apply_settings(project_root: Path, incoming: dict[str, Any], *, write: bool 
     """Gộp file cài đặt. Không ghi đè giá trị máy này đang có."""
     if not isinstance(incoming, dict):
         return 0
+    _rewrite_paths_for_this_app(incoming)
     root = Path(project_root).resolve()
     updated = 0
     allowed = {name: path for name, path in _settings_paths(root)}
