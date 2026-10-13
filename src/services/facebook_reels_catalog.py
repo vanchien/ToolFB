@@ -343,6 +343,15 @@ def scan_facebook_profile_reels_page(
                     }
                     if browser_exe and Path(browser_exe).is_file():
                         launch_kwargs["executable_path"] = str(Path(browser_exe).resolve())
+                    from src.automation.browser_factory import account_use_proxy_enabled
+                    from src.utils.account_proxy_mapper import require_account_proxy_live
+                    from src.utils.proxy_check import build_playwright_proxy_settings
+
+                    if account_use_proxy_enabled(acc):
+                        require_account_proxy_live(acc)
+                        launch_kwargs["proxy"] = build_playwright_proxy_settings(
+                            acc.get("proxy") if isinstance(acc.get("proxy"), dict) else {}
+                        )
                     if browser_type in ("firefox",):
                         context = pw.firefox.launch_persistent_context(**launch_kwargs)
                     else:

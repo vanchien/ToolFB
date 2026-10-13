@@ -123,6 +123,9 @@ _TREE_STATUS_TAGS: dict[str, tuple[str, str, str]] = {
 }
 
 
+_DANGER_BG = {"#dc2626", "#f87171", "#ef4444", "#b91c1c"}
+
+
 def _flat_btn(
     master: tk.Misc,
     *,
@@ -133,23 +136,27 @@ def _flat_btn(
     fg: str = "white",
     state: str = tk.NORMAL,
 ) -> tk.Button:
-    """Nút phẳng cùng cỡ — chiều cao và chữ giống nhau trên mọi hàng."""
+    """Nút cùng cỡ với các tab khác: nền sáng, chữ đậm. Nút dừng giữ màu đỏ."""
+    danger = str(bg).lower() in _DANGER_BG
+    face = "#fee2e2" if danger else "#f8fafc"
+    ink = "#991b1b" if danger else "#0f172a"
+    hot = "#fecaca" if danger else "#e2e8f0"
     return tk.Button(
         master,
         text=text,
         command=command,
         font=("Segoe UI", 9),
-        bg=bg,
-        fg=fg,
-        activebackground=active_bg,
-        activeforeground=fg,
-        relief=tk.FLAT,
+        bg=face,
+        fg=ink,
+        activebackground=hot,
+        activeforeground=ink,
+        relief=tk.GROOVE,
         padx=10,
         pady=3,
         cursor="hand2",
         state=state,
         highlightthickness=0,
-        bd=0,
+        bd=1,
     )
 
 
@@ -672,6 +679,8 @@ def build_human_interaction_tab(
     run_btns.pack(fill=tk.X)
     profile_btns = _FlowBar(interaction_toolbar)
     profile_btns.pack(fill=tk.X, pady=(4, 0))
+    proxy_btns = _FlowBar(interaction_toolbar)
+    proxy_btns.pack(fill=tk.X, pady=(4, 0))
     interaction_row_btns = _FlowBar(interaction_toolbar)
     interaction_row_btns.pack(fill=tk.X, pady=(4, 0))
     lbl_interaction_summary = ttk.Label(interaction_toolbar, textvariable=var_summary, font=_FONT_HINT)
@@ -1303,6 +1312,16 @@ def build_human_interaction_tab(
             raw = raw[4:]
         return raw or "—"
 
+    def _proxy_public_label(ma: MappedAccount) -> str:
+        """Địa chỉ proxy trên bảng. Không hiện mật khẩu."""
+        server = str(ma.network.proxy_server or "").strip()
+        if not server:
+            return "—"
+        if "://" in server and "@" in server:
+            scheme, _rest = server.split("://", 1)
+            server = f"{scheme}://{server.rsplit('@', 1)[-1]}"
+        return server
+
     def _tree_values(ma: MappedAccount, *, status: str | None = None, detail: str | None = None) -> tuple[str, ...]:
         st = _STATUS_VI.get(status or ma.status, status or ma.status)
         twofa = "Có" if ma.auth.two_fa_secret else "—"
@@ -1314,7 +1333,7 @@ def build_human_interaction_tab(
             ma.auth.password or "—",
             _short(ma.auth.email or "—", 28),
             twofa,
-            _short(ma.network.proxy_server or "—", 32),
+            _short(_proxy_public_label(ma), 36),
             st,
             detail if detail is not None else (ma.status_detail or ""),
         )
@@ -2374,6 +2393,33 @@ def build_human_interaction_tab(
         _mark_soft_login(blocked, enabled=True)
         return list(blocked)
 
+    def _accounts_with_working_proxy(account_ids: list[str]) -> tuple[list[str], list[str]]:
+        """Chỉ giữ tài khoản có đúng proxy đang gắn và proxy đó còn kết nối được."""
+        ready: list[str] = []
+        blocked: list[str] = []
+        for aid in account_ids:
+            ma = _mapped_by_id(aid)
+            if ma is None:
+                continue
+            label = ma.display_uid()
+            if not ma.use_proxy:
+                ready.append(aid)
+                continue
+            if not str(ma.network.proxy_server or "").strip():
+                ma.status = "proxy_error"
+                ma.status_detail = "Đã bật proxy nhưng chưa gắn địa chỉ — không chạy"
+                blocked.append(f"{label}: đã bật proxy nhưng chưa gắn địa chỉ")
+                continue
+            ok_px, px_msg = ensure_mapped_proxy_live(ma)
+            shown = _proxy_public_label(ma)
+            if ok_px:
+                ready.append(aid)
+                continue
+            ma.status = "proxy_error"
+            ma.status_detail = f"Proxy không kết nối được — {shown} — {str(px_msg)[:80]}"[:220]
+            blocked.append(f"{label}: {shown} — {str(px_msg)[:60]}")
+        return ready, blocked
+
     def _start_pool(
         accounts: list[MappedAccount],
         *,
@@ -2381,6 +2427,7 @@ def build_human_interaction_tab(
         on_pool_finished: Callable[[bool, list[MappedAccount]], None] | None = None,
         is_auto_continue: bool = False,
         relogin: bool = False,
+        proxy_checked: bool = False,
     ) -> None:
         if state.get("pool") or state.get("pool_stopping"):
             if is_auto_continue:
@@ -2404,6 +2451,42 @@ def build_human_interaction_tab(
         if not accounts:
             if not is_auto_continue:
                 messagebox.showwarning("Chưa chọn", "Chọn ít nhất một dòng trong bảng.", parent=parent)
+            return
+        if not proxy_checked and not is_auto_continue:
+            account_ids = [ma.account_id for ma in accounts]
+
+            def _check() -> tuple[list[str], list[str]]:
+                return _accounts_with_working_proxy(account_ids)
+
+            def _checked(result: tuple[list[str], list[str]]) -> None:
+                ready_ids, lines = result
+                _refresh_trees()
+                _save_settings()
+                if lines:
+                    extra = ""
+                    if len(lines) > 8:
+                        extra = f"\n… và {len(lines) - 8} tài khoản khác."
+                    messagebox.showwarning(
+                        "Proxy không cho chạy",
+                        "Các tài khoản sau không được chạy:\n" + "\n".join(lines[:8]) + extra,
+                        parent=parent,
+                    )
+                ready = [ma for ma in accounts if ma.account_id in set(ready_ids)]
+                if not ready:
+                    return
+                _start_pool(
+                    ready,
+                    login_only=login_only,
+                    on_pool_finished=on_pool_finished,
+                    relogin=relogin,
+                    proxy_checked=True,
+                )
+
+            def _check_err(exc: BaseException) -> None:
+                messagebox.showerror("Proxy", str(exc), parent=parent)
+
+            var_summary.set(f"Đang kiểm tra proxy {len(account_ids)} tài khoản…")
+            run_background_then_main(root, _check, _checked, on_error=_check_err)
             return
         _ensure_queue_numbers()
         _refresh_trees()
@@ -3142,7 +3225,10 @@ def build_human_interaction_tab(
             apply_mapped_secrets_to_vault(ma)
             ok_px, px_msg = ensure_mapped_proxy_live(ma)
             if not ok_px:
-                raise ValueError(f"proxy chưa LIVE — {px_msg}")
+                shown = _proxy_public_label(ma)
+                ma.status = "proxy_error"
+                ma.status_detail = f"Proxy không kết nối được — {shown} — {str(px_msg)[:80]}"[:220]
+                raise ValueError(f"{ma.display_uid()}: proxy không kết nối được — {px_msg}")
             acc = prepare_mapped_account_for_browser_run(ma)
             ck_rel = str(acc.get("cookie_path") or ma.cookie_path or "").strip()
             return ma, slot, acc, ck_rel
@@ -3275,7 +3361,11 @@ def build_human_interaction_tab(
                 apply_mapped_secrets_to_vault(ma)
                 ok_px, px_msg = ensure_mapped_proxy_live(ma)
                 if not ok_px:
-                    raise ValueError(f"{ma.display_uid()}: proxy chưa LIVE — {px_msg}")
+                    shown = _proxy_public_label(ma)
+                    ma.status = "proxy_error"
+                    ma.status_detail = f"Proxy không kết nối được — {shown} — {str(px_msg)[:80]}"[:220]
+                    logger.warning("[Human GUI] Bỏ {} vì proxy: {}", ma.account_id, px_msg)
+                    continue
                 acc = prepare_mapped_account_for_browser_run(ma)
                 ck_rel = str(acc.get("cookie_path") or ma.cookie_path or "").strip()
                 out.append((ma, slot, acc, ck_rel))
@@ -3283,6 +3373,17 @@ def build_human_interaction_tab(
 
         def ok(rows: list[tuple[MappedAccount, GridWindowSlot, dict[str, Any], str]]) -> None:
             _save_settings()
+            skipped = len(pairs) - len(rows)
+            if skipped:
+                messagebox.showwarning(
+                    "Proxy không cho chạy",
+                    f"{skipped} tài khoản không được mở vì proxy chưa gắn hoặc không kết nối được.\n"
+                    "Xem cột Chi tiết. Chỉ mở tài khoản có proxy đang hoạt động.",
+                    parent=parent,
+                )
+            if not rows:
+                _refresh_trees()
+                return
             for ma, slot, acc, ck_rel in rows:
                 ma.status = "running"
                 ma.status_detail = (
@@ -4452,9 +4553,101 @@ def build_human_interaction_tab(
     _btn(profile_btns, text="Mở profile", command=_on_open_profile_browser, bg="#6366f1", active_bg="#4f46e5")
     _btn(profile_btns, text="Lướt nhận thiết bị", command=_on_browse_for_device, bg="#0f766e", active_bg="#115e59")
     _btn(profile_btns, text="Đóng profile", command=_on_close_profile_browser, bg="#64748b", active_bg="#475569")
+    _btn(
+        proxy_btns,
+        text="Kiểm tra proxy đã chọn",
+        command=lambda: _on_check_mapped_proxies(selected_only=True),
+        bg=_C_BTN_PROXY,
+        active_bg=_C_BTN_PROXY_H,
+    )
+    _btn(
+        proxy_btns,
+        text="Kiểm tra proxy tất cả",
+        command=lambda: _on_check_mapped_proxies(selected_only=False),
+        bg=_C_BTN_PROXY,
+        active_bg=_C_BTN_PROXY_H,
+    )
 
     btn_stop_global.configure(text="Dừng", command=_on_stop)
     state["btn_stop_all"] = [btn_stop_global, btn_stop_login, btn_stop_interaction]
+
+    def _on_check_mapped_proxies(*, selected_only: bool) -> None:
+        """Kiểm tra proxy đã gắn trên tab Tương tác. Không xóa tài khoản."""
+        if selected_only:
+            rows = _selected_mapped()
+            if not rows:
+                messagebox.showinfo("Kiểm tra proxy", "Chọn một hoặc nhiều dòng trong bảng Tương tác.", parent=parent)
+                return
+        else:
+            rows = list(state.get("mapped_interaction") or [])
+            if not rows:
+                messagebox.showinfo("Kiểm tra proxy", "Tab Tương tác chưa có tài khoản.", parent=parent)
+                return
+        account_ids = [ma.account_id for ma in rows]
+        var_summary.set(f"Đang kiểm tra proxy {len(account_ids)} tài khoản…")
+
+        def work() -> list[tuple[str, str, str]]:
+            found: list[tuple[str, str, str]] = []
+            for aid in account_ids:
+                ma = _mapped_by_id(aid)
+                if ma is None:
+                    continue
+                if not ma.use_proxy:
+                    found.append((aid, "off", "Không dùng proxy — chạy trực tiếp"))
+                    continue
+                if not str(ma.network.proxy_server or "").strip():
+                    found.append((aid, "missing", "Đã bật proxy nhưng chưa gắn địa chỉ"))
+                    continue
+                ok_px, px_msg = ensure_mapped_proxy_live(ma)
+                label = _proxy_public_label(ma)
+                if ok_px:
+                    found.append((aid, "live", f"Proxy đang hoạt động — {label}"))
+                else:
+                    found.append((aid, "die", f"Proxy không kết nối được — {label} — {str(px_msg)[:80]}"))
+            return found
+
+        def ok(found: list[tuple[str, str, str]]) -> None:
+            live = skipped = missing = dead = 0
+            for aid, kind, detail in found:
+                ma = _mapped_by_id(aid)
+                if ma is None:
+                    continue
+                ma.status_detail = detail[:220]
+                if kind in ("live", "off"):
+                    if kind == "off":
+                        skipped += 1
+                    else:
+                        live += 1
+                    if ma.status == "proxy_error":
+                        ma.status = "pending"
+                else:
+                    ma.status = "proxy_error"
+                    if kind == "missing":
+                        missing += 1
+                    else:
+                        dead += 1
+            _refresh_trees()
+            _save_settings()
+            var_summary.set(f"Proxy: {live} hoạt động, {skipped} không dùng, {missing} thiếu, {dead} lỗi")
+            messagebox.showinfo(
+                "Kiểm tra proxy",
+                "\n".join(
+                    [
+                        f"Đã kiểm tra {len(found)} tài khoản trên tab Tương tác.",
+                        f"Proxy còn hoạt động: {live}",
+                        f"Không chọn proxy — chạy trực tiếp: {skipped}",
+                        f"Bật proxy nhưng chưa gắn địa chỉ: {missing}",
+                        f"Proxy không kết nối được: {dead}",
+                        "Chỉ tài khoản lỗi bị dừng. Tài khoản không dùng proxy vẫn chạy.",
+                    ]
+                ),
+                parent=parent,
+            )
+
+        def err(exc: BaseException) -> None:
+            messagebox.showerror("Kiểm tra proxy", str(exc), parent=parent)
+
+        run_background_then_main(root, work, ok, on_error=err)
 
     def _row_actions(bar: _FlowBar, *, export: bool) -> None:
         """Cùng một hàng phụ trên cả hai tab: copy, đặt lại, proxy, xóa."""

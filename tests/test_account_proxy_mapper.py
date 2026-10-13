@@ -328,6 +328,26 @@ def test_ensure_account_dict_proxy_live_normalizes_socks5() -> None:
     assert str(acc["proxy"]["host"]).startswith("socks5://")
 
 
+def test_require_account_proxy_live_blocks_dead_proxy() -> None:
+    acc = {
+        "id": "acc_gate",
+        "use_proxy": True,
+        "proxy": {"host": "1.2.3.4", "port": 1080, "user": "", "pass": ""},
+    }
+    with patch("src.utils.proxy_check.check_proxy", return_value=(False, "TIMEOUT", "none")):
+        with pytest.raises(ValueError, match="không chạy vì proxy"):
+            from src.utils.account_proxy_mapper import require_account_proxy_live
+
+            require_account_proxy_live(acc)
+
+
+def test_require_account_proxy_live_skips_when_proxy_off() -> None:
+    acc = {"id": "acc_direct", "use_proxy": False, "proxy": {"host": "", "port": 0}}
+    from src.utils.account_proxy_mapper import require_account_proxy_live
+
+    require_account_proxy_live(acc)
+
+
 def test_prepare_account_dict_for_browser_run_raises_on_dead_proxy() -> None:
     acc = {
         "id": "acc_test",

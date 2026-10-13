@@ -7,6 +7,7 @@ Một module dùng chung: parse dòng dán → check LIVE → gắn vào trình 
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Literal, TypedDict
 from urllib.parse import quote, unquote, urlparse
 
@@ -360,6 +361,15 @@ def check_socks4_proxy(
     return _check_via_requests("socks4", bare, port, user=user, password=password, timeout=timeout)
 
 
+_LIVE_OK_SECONDS = 120.0
+_live_ok_cache: dict[str, tuple[float, str, ProxyScheme]] = {}
+
+
+def _live_cache_key(host: str, port: int, user: str) -> str:
+    """Khóa cache theo đúng proxy (host, cổng, user). Không lưu mật khẩu."""
+    return f"{_strip_proxy_scheme(host).lower()}|{int(port)}|{str(user or '').strip()}"
+
+
 def check_proxy(
     host: str,
     port: int,
@@ -388,6 +398,11 @@ def check_proxy(
         if s not in order:
             order.append(s)
 
+    cache_key = _live_cache_key(host_s, port, user)
+    cached = _live_ok_cache.get(cache_key)
+    if cached is not None and (time.monotonic() - cached[0]) < _LIVE_OK_SECONDS:
+        return True, cached[1], cached[2]
+
     errors: list[str] = []
     for scheme in order:
         if scheme == "http":
@@ -399,6 +414,7 @@ def check_proxy(
         else:
             ok, msg = check_socks4_proxy(host_s, port, user=user, password=password, timeout=timeout)
         if ok:
+            _live_ok_cache[cache_key] = (time.monotonic(), msg, scheme)
             return True, msg, scheme
         errors.append(f"{scheme.upper()}: {msg.split(chr(10))[0][:120]}")
 
@@ -485,6 +501,9 @@ def firefox_prefs_for_account_proxy(server: str) -> dict[str, Any]:
         "network.proxy.http_port": 0,
         "network.proxy.ssl": "",
         "network.proxy.ssl_port": 0,
+        "browser.sessionstore.resume_from_crash": False,
+        "browser.startup.page": 1,
+        "browser.startup.homepage": "https://www.facebook.com/",
     }
     if not host or port <= 0:
         return prefs

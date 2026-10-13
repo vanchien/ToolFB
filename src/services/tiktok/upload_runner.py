@@ -61,6 +61,38 @@ def _playwright_proxy(account: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
+def _require_tiktok_proxy_if_enabled(account: dict[str, Any]) -> dict[str, Any] | None:
+    """Proxy TikTok bật thì phải còn kết nối. Tắt proxy thì trả None."""
+    raw = account.get("proxy")
+    enabled = isinstance(raw, dict) and bool(raw.get("enabled"))
+    proxy = _playwright_proxy(account)
+    if not enabled:
+        return None
+    if not proxy:
+        raise ValueError("Tài khoản TikTok bật proxy nhưng thiếu địa chỉ — không chạy.")
+    from urllib.parse import urlparse
+
+    from src.utils.proxy_check import check_proxy
+
+    server = str(proxy.get("server") or "")
+    parsed = urlparse(server if "://" in server else f"http://{server}")
+    host = str(parsed.hostname or "").strip()
+    port = int(parsed.port or 0)
+    scheme = str(parsed.scheme or "http").lower()
+    if scheme == "socks5h":
+        scheme = "socks5"
+    ok, msg, _found = check_proxy(
+        host,
+        port,
+        user=str(proxy.get("username") or ""),
+        password=str(proxy.get("password") or ""),
+        preferred_scheme=scheme if scheme in ("http", "https", "socks5", "socks4") else None,
+    )
+    if not ok:
+        raise ValueError(f"Proxy TikTok không kết nối được: {msg}")
+    return proxy
+
+
 def open_tiktok_browser(account: dict[str, Any], *, playwright: Any) -> BrowserContext:
     # Dùng profile nội bộ theo account_id (data/tiktok/profiles), tránh dùng profile OS người dùng.
     profile = resolve_tiktok_profile_dir(account)
@@ -76,7 +108,7 @@ def open_tiktok_browser(account: dict[str, Any], *, playwright: Any) -> BrowserC
     if exe is not None and exe.is_file():
         launch_kwargs["executable_path"] = str(exe.resolve())
 
-    proxy = _playwright_proxy(account)
+    proxy = _require_tiktok_proxy_if_enabled(account)
     if proxy:
         launch_kwargs["proxy"] = proxy
 

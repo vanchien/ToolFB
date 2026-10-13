@@ -1690,7 +1690,7 @@ def _hold_account_open(
         if row is None:
             raise RuntimeError("Không tìm thấy tài khoản.")
         prepare_playwright_sync_thread(label=f"page-open:{account_id}")
-        acc = prepare_account_dict_for_browser_run(dict(row), require_proxy_live=False)
+        acc = prepare_account_dict_for_browser_run(dict(row), require_proxy_live=True)
         factory = BrowserFactory(headless=False, playwright_shared=True)
         context = factory.launch_persistent_context_from_account_dict(
             acc,

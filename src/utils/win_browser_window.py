@@ -101,6 +101,22 @@ def place_firefox_window_for_profile(
     return False
 
 
+def _hidden_process_kwargs() -> dict[str, Any]:
+    """Không bật cửa sổ PowerShell/cmd khi xếp cửa sổ trình duyệt."""
+    import subprocess
+
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform != "win32":
+        return kwargs
+    flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if flags:
+        kwargs["creationflags"] = flags
+    return kwargs
+
+
 def _firefox_pids_for_profile(profile_key: str) -> list[int]:
     """Liệt kê PID firefox.exe có command line chứa đường dẫn profile."""
     try:
@@ -111,11 +127,12 @@ def _firefox_pids_for_profile(profile_key: str) -> list[int]:
             "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
         )
         raw = subprocess.check_output(
-            ["powershell", "-NoProfile", "-Command", ps],
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=8,
+            **_hidden_process_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("Liệt kê process Firefox: {}", exc)
@@ -168,11 +185,13 @@ def terminate_firefox_for_profile(
 
     for pid in pids:
         try:
+            hidden = _hidden_process_kwargs()
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/F", "/T"],
-                capture_output=True,
                 timeout=12,
                 check=False,
+                stdout=subprocess.DEVNULL,
+                **hidden,
             )
             killed += 1
         except Exception as exc:  # noqa: BLE001

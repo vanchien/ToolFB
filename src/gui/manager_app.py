@@ -2459,9 +2459,10 @@ class _ManagerWindow:
                         except Exception:
                             pass
 
-                    self._page_insights.touch_account_session(aid)
-                    ctx = factory.get_browser_context(aid, headless=True)
+                    ctx = None
                     try:
+                        self._page_insights.touch_account_session(aid)
+                        ctx = factory.get_browser_context(aid, headless=True)
                         batch = fetch_insights_for_pages(
                             ctx,
                             account=dict(acc),
@@ -2483,8 +2484,12 @@ class _ManagerWindow:
                             )
                             if snap.get("followers") is not None or snap.get("views") is not None:
                                 ok_count["n"] += 1
+                    except Exception as exc:  # noqa: BLE001
+                        err_holder.append(f"{aid}: {exc}")
+                        logger.warning("Bỏ tài khoản {} khi lấy thống kê: {}", aid, exc)
                     finally:
-                        sync_close_persistent_context(ctx, log_label=f"page_insights:{aid}")
+                        if ctx is not None:
+                            sync_close_persistent_context(ctx, log_label=f"page_insights:{aid}")
             except Exception as exc:  # noqa: BLE001
                 err_holder.append(str(exc))
                 logger.exception("Lấy thống kê Page lỗi")

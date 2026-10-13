@@ -1988,7 +1988,7 @@ class AccountFormDialog:
 
                 acc_run = prepare_account_dict_for_browser_run(
                     dict(preview),
-                    require_proxy_live=False,
+                    require_proxy_live=True,
                 )
                 factory = BrowserFactory(accounts=self._manager, headless=False)
                 ctx = factory.launch_persistent_context_from_account_dict(acc_run, headless=False)

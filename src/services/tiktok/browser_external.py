@@ -295,6 +295,9 @@ def _detect_firefox_exe_from_profile(profile_dir: Path) -> Path | None:
 
 
 def open_tiktok_profile_for_manual_login(account: dict[str, Any], *, show_browser: bool = True) -> None:
+    from src.services.tiktok.upload_runner import _require_tiktok_proxy_if_enabled
+
+    _require_tiktok_proxy_if_enabled(account)
     aid = str(account.get("id", "")).strip() or "default"
     close_tiktok_manual_profile_session(aid)
     exe = Path(str(account.get("browser_exe_path", "")).strip())

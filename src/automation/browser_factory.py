@@ -895,6 +895,19 @@ class BrowserFactory:
             user_data_dir,
         )
         socks_relay = None
+        if use_px and not apply_proxy:
+            raise ValueError(
+                f"Tài khoản {account_id} bật proxy nhưng thiếu host/port — không chạy."
+            )
+        if apply_proxy:
+            from src.utils.account_proxy_mapper import require_account_proxy_live
+
+            require_account_proxy_live(acc)
+            proxy_cfg = acc.get("proxy")
+            if not isinstance(proxy_cfg, dict) or not proxy_host_port_configured(proxy_cfg):
+                raise ValueError(
+                    f"Tài khoản {account_id} bật proxy nhưng thiếu host/port — không chạy."
+                )
         if apply_proxy:
             from src.utils.socks5_http_relay import Socks5HttpRelay, socks_proxy_needs_http_relay
 
@@ -916,11 +929,6 @@ class BrowserFactory:
                     bool(pw_proxy.get("username")),
                 )
             logger.debug("Proxy URL tương đương (log ẩn pass): {}", _redact_proxy_url(format_proxy_server_url(proxy_cfg)))
-        elif use_px:
-            logger.warning(
-                "use_proxy bật nhưng thiếu host/port hợp lệ — chạy không proxy (account={}).",
-                account_id,
-            )
         else:
             logger.info("Không dùng proxy (use_proxy=false) account={}.", account_id)
 

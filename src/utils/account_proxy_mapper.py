@@ -775,6 +775,24 @@ def ensure_account_dict_proxy_live(acc: dict[str, Any]) -> tuple[bool, str]:
     return ok, msg
 
 
+def require_account_proxy_live(acc: dict[str, Any]) -> None:
+    """
+    Tài khoản bật proxy chỉ được chạy khi đúng proxy đó còn kết nối.
+
+    Raises:
+        ValueError: Thiếu host/port hoặc proxy không kết nối được.
+    """
+    from src.automation.browser_factory import account_use_proxy_enabled
+
+    if not account_use_proxy_enabled(acc):
+        return
+    ok, msg = ensure_account_dict_proxy_live(acc)
+    if ok:
+        return
+    aid = str(acc.get("id") or "").strip() or "tài khoản"
+    raise ValueError(f"{aid} không chạy vì proxy không kết nối được: {msg}")
+
+
 def _mapped_matches_post_account(mapped: MappedAccount, acc: dict[str, Any]) -> bool:
     """Khớp dòng tab Đăng nhập / Tương tác với bản ghi dùng để đăng job."""
     aid = str(acc.get("id") or "").strip()
