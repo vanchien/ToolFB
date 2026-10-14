@@ -7,10 +7,12 @@ import random
 from src.services.device_browse import (
     BROWSE_LIMIT_S,
     browse_limit_reached,
+    browse_page_settled,
     describe_account_block,
     feed_can_scroll,
     nudge_feed,
     open_home_feed,
+    select_interaction_page,
 )
 
 
@@ -110,3 +112,35 @@ def test_open_home_feed_skips_when_already_on_facebook() -> None:
     locked = _Page("https://www.facebook.com/checkpoint/block/")
     open_home_feed(locked)
     assert locked.gotos == []
+    old = _Page("http://0.0.3.188/")
+    open_home_feed(old)
+    assert old.gotos == ["https://www.facebook.com/"]
+    assert old.url == "https://www.facebook.com/"
+    assert browse_page_settled(old.url) is True
+    assert browse_page_settled("http://0.0.3.188/") is False
+    assert browse_page_settled("https://www.facebook.com/login.php") is True
+
+
+class _Closeable(_Page):
+    def __init__(self, url: str) -> None:
+        super().__init__(url)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_select_interaction_page_closes_old_proxy_tab() -> None:
+    home = _Closeable("about:blank")
+    stale = _Closeable("http://0.0.3.188/")
+
+    class _Context:
+        pages = [home, stale]
+
+        def new_page(self) -> _Closeable:
+            raise AssertionError("đã có tab")
+
+    chosen = select_interaction_page(_Context())
+    assert chosen is home
+    assert stale.closed is True
+    assert home.closed is False

@@ -308,7 +308,9 @@ def run_fb_cookie_capture_dialog(
                 )
                 foreground_firefox_for_profile(prof, timeout_s=8.0)
             progress_q.put("Firefox đã mở — tải Facebook…")
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            from src.services.device_browse import select_interaction_page
+
+            page = select_interaction_page(ctx)
             try:
                 page.bring_to_front()
             except Exception:
@@ -373,8 +375,13 @@ def run_fb_cookie_capture_dialog(
                             browse_noted = True
                             progress_q.put("NOTE\tĐang lướt bảng tin — 60 giây")
                         if browse_only and not feed_ready:
+                            from src.services.device_browse import browse_page_settled
+
                             open_home_feed(page)
-                            feed_ready = True
+                            current = str(getattr(page, "url", "") or "")
+                            feed_ready = browse_page_settled(current)
+                            if not feed_ready and idle_ticks % 4 == 0:
+                                progress_q.put("NOTE\tĐang mở facebook.com — bỏ link cũ")
                         elif browse_only and idle_ticks % 4 == 0:
                             nudge_feed(page)
                         if not found_name and idle_ticks % 8 == 1:

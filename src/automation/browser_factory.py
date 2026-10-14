@@ -381,36 +381,18 @@ def _release_stale_firefox_profile(user_data_dir: Path) -> None:
 
 
 def _prepare_firefox_profile_for_this_machine(user_data_dir: Path) -> None:
-    """Bỏ dấu vết Firefox của máy cũ trước khi mở profile đã đồng bộ.
+    """Bỏ tab, trang chủ và proxy của máy cũ trước khi mở profile đã đồng bộ.
 
-    ``compatibility.ini`` nhớ thư mục Firefox của máy chủ. Máy khác mở profile đó thì
-    Firefox hiện hộp thoại và Playwright hết 90 giây. ``user.js`` còn proxy cũ cũng bị gỡ.
+    Firefox khôi phục ``sessionstore-backups`` dù file phiên chính đã mất, nên thanh địa chỉ
+    vẫn là link cũ (ví dụ ``http://0.0.3.188``) và không vào Facebook. Proxy của tài khoản
+    được ghi lại lúc launch, sau bước dọn này.
     """
     if not user_data_dir.is_dir():
         return
-    for name in ("compatibility.ini", "parent.lock", "lock", ".parentlock", "sessionstore.jsonlz4"):
-        path = user_data_dir / name
-        if not path.exists():
-            continue
-        try:
-            path.unlink()
-        except OSError as exc:
-            logger.debug("Không xóa được {} của profile: {}", name, exc)
-    user_js = user_data_dir / "user.js"
-    if not user_js.is_file():
-        return
-    try:
-        lines = user_js.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return
-    kept = [line for line in lines if "network.proxy." not in line.lower()]
-    if len(kept) == len(lines):
-        return
-    try:
-        user_js.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-        logger.info("Đã gỡ proxy cũ trong user.js của profile đã đồng bộ.")
-    except OSError as exc:
-        logger.debug("Không ghi lại user.js: {}", exc)
+    from src.services.tool_bundle_sync import _make_firefox_profile_portable
+
+    _make_firefox_profile_portable(user_data_dir)
+    logger.info("Đã gỡ tab và trang chủ cũ của profile trước khi mở Firefox.")
 
 
 def _cleanup_firefox_profile_lock_files(user_data_dir: Path) -> None:
@@ -1148,6 +1130,11 @@ class BrowserFactory:
             ff = merge_firefox_user_prefs(dict(launch_kwargs.get("firefox_user_prefs") or {}))
             if disable_notifications:
                 ff["dom.webnotifications.enabled"] = False
+            # Profile đồng bộ còn homepage/phiên máy cũ. Ép tab trắng rồi điều hướng Facebook.
+            ff["browser.sessionstore.resume_from_crash"] = False
+            ff["browser.sessionstore.max_resumed_crashes"] = 0
+            ff["browser.startup.page"] = 0
+            ff["browser.startup.homepage"] = "about:blank"
             if not apply_proxy:
                 # Ép kết nối trực tiếp: profile portable có thể còn PAC/manual proxy từ máy cũ → NS_ERROR_PROXY_*.
                 ff.update(

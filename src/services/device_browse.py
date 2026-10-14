@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 from typing import Any
 
+from loguru import logger
+
 BROWSE_LIMIT_S = 60
 
 
@@ -151,6 +153,43 @@ def feed_can_scroll(url: str) -> bool:
     return "facebook.com" in raw
 
 
+def browse_page_settled(url: str) -> bool:
+    """Đã tới Facebook, trang đăng nhập hoặc checkpoint — không còn link máy cũ."""
+    raw = str(url or "").casefold()
+    if "checkpoint" in raw or "/login" in raw or "login.php" in raw:
+        return "facebook.com" in raw
+    return feed_can_scroll(url)
+
+
+def select_interaction_page(context: Any) -> Any:
+    """Giữ một tab để vào Facebook và đóng tab khôi phục địa chỉ cũ.
+
+    Profile chép từ máy khác hay mở lại ``http://0.0.3.188``. Tab đó không phải Facebook
+    nên bị đóng. Tab đăng nhập hoặc checkpoint được giữ, không bấm xác nhận thiết bị.
+    """
+    pages = list(getattr(context, "pages", []) or [])
+    if not pages:
+        return context.new_page()
+    chosen = pages[0]
+    for page in pages:
+        if "facebook.com" in str(getattr(page, "url", "") or "").casefold():
+            chosen = page
+            break
+    for extra in list(pages):
+        if extra is chosen:
+            continue
+        if "facebook.com" in str(getattr(extra, "url", "") or "").casefold():
+            continue
+        close = getattr(extra, "close", None)
+        if close is None:
+            continue
+        try:
+            close()
+        except Exception:
+            logger.debug("Không đóng được tab địa chỉ cũ.")
+    return chosen
+
+
 def open_home_feed(page: Any) -> None:
     """Vào bảng tin nếu trình duyệt chưa ở Facebook.
 
@@ -162,6 +201,8 @@ def open_home_feed(page: Any) -> None:
         return
     if feed_can_scroll(url):
         return
+    if url and "facebook.com" not in raw and not url.startswith("about:"):
+        logger.warning("Tab đang ở {} — chuyển sang Facebook.", url[:120])
     page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
 
 

@@ -883,6 +883,9 @@ def _make_firefox_profile_portable(profile_dir: Path) -> None:
         "lock",
         ".parentlock",
         "sessionstore.jsonlz4",
+        "sessionstore.js",
+        "sessionstore.bak",
+        "sessionCheckpoints.json",
     ):
         target = profile_dir / name
         if target.exists():

@@ -23,6 +23,37 @@ from src.automation.browser_factory import (
 from src.utils.db_manager import AccountsDatabaseManager
 
 
+def test_launch_prep_drops_restored_proxy_tab(tmp_path: Path) -> None:
+    """Profile đồng bộ không còn tab http://0.0.3.188 khi mở Firefox trên máy khác."""
+    from src.automation.browser_factory import _prepare_firefox_profile_for_this_machine
+
+    profile = tmp_path / "firefox"
+    profile.mkdir()
+    (profile / "prefs.js").write_text(
+        'user_pref("network.proxy.http", "0.0.3.188");\n'
+        'user_pref("browser.startup.homepage", "http://0.0.3.188");\n'
+        'user_pref("browser.startup.page", 3);\n',
+        encoding="utf-8",
+    )
+    (profile / "user.js").write_text('user_pref("network.proxy.http", "0.0.3.188");\n', encoding="utf-8")
+    (profile / "sessionstore.jsonlz4").write_bytes(b"old")
+    backups = profile / "sessionstore-backups"
+    backups.mkdir()
+    (backups / "recovery.jsonlz4").write_bytes(b"restore-old-tab")
+    (profile / "sessionCheckpoints.json").write_text("{}", encoding="utf-8")
+
+    _prepare_firefox_profile_for_this_machine(profile)
+
+    prefs = (profile / "prefs.js").read_text(encoding="utf-8")
+    assert "0.0.3.188" not in prefs
+    assert 'user_pref("network.proxy.type", 0);' in prefs
+    assert 'user_pref("browser.startup.homepage", "about:blank");' in prefs
+    assert "network.proxy.http" not in (profile / "user.js").read_text(encoding="utf-8")
+    assert not (profile / "sessionstore.jsonlz4").exists()
+    assert not backups.exists()
+    assert not (profile / "sessionCheckpoints.json").exists()
+
+
 def test_format_proxy_server_url_http_basic() -> None:
     """Không user/pass: server chỉ là http://host:port."""
     url = format_proxy_server_url(
