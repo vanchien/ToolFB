@@ -1134,8 +1134,8 @@ class BrowserFactory:
             ff["browser.sessionstore.enabled"] = False
             ff["browser.sessionstore.resume_from_crash"] = False
             ff["browser.sessionstore.max_resumed_crashes"] = 0
-            ff["browser.startup.page"] = 0
-            ff["browser.startup.homepage"] = "about:blank"
+            ff["browser.startup.page"] = 1
+            ff["browser.startup.homepage"] = "https://www.facebook.com/"
             if not apply_proxy:
                 # Ép kết nối trực tiếp: profile portable có thể còn PAC/manual proxy từ máy cũ → NS_ERROR_PROXY_*.
                 ff.update(

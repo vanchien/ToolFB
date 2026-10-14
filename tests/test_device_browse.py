@@ -10,6 +10,7 @@ from src.services.device_browse import (
     browse_page_settled,
     describe_account_block,
     feed_can_scroll,
+    hold_facebook_tabs,
     nudge_feed,
     open_home_feed,
     select_interaction_page,
@@ -128,6 +129,19 @@ class _Closeable(_Page):
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_hold_facebook_tabs_opens_facebook_for_every_window() -> None:
+    page = _Closeable("http://0.0.1.222/")
+
+    class _Context:
+        pages = [page]
+
+        def new_page(self) -> _Closeable:
+            raise AssertionError("đã có tab")
+
+    got = hold_facebook_tabs(_Context(), attempts=2, pause_s=0)
+    assert got.url == "https://www.facebook.com/"
 
 
 def test_select_interaction_page_closes_old_proxy_tab() -> None:

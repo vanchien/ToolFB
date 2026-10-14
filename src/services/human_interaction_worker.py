@@ -337,9 +337,9 @@ def run_human_interaction_worker(
 
         )
 
-        from src.services.device_browse import show_facebook_only
+        from src.services.device_browse import hold_facebook_tabs
 
-        page: Page = show_facebook_only(context)
+        page: Page = hold_facebook_tabs(context)
         os.environ.pop("TOOLFB_NAV_MOBILE_FB", None)
         _show_queue_number_on_browser(context, page, mapped)
 
@@ -431,14 +431,16 @@ def run_human_interaction_worker(
         )
         from src.services.facebook_session_persist import profile_session_ready_for_interaction
 
-        # Mở facebook.com một lần. Màn Continue phải bấm trước cookie và trước khi coi là đã login.
-        _status("running", "Kiểm tra Facebook…")
+        # Mọi tài khoản, không chỉ tài khoản đầu: đóng tab proxy cũ rồi mới kiểm tra phiên.
+        _status("running", "Đóng tab cũ — mở Facebook…")
+        page = hold_facebook_tabs(context, attempts=12, pause_s=0.4)
         cur = (page.url or "").lower()
         if "facebook.com" not in cur:
             try:
                 prime_facebook_session_page(page)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Human] Không mở được facebook.com account={}: {}", mapped.account_id, exc)
+            page = hold_facebook_tabs(context, attempts=6, pause_s=0.35)
         else:
             _force_www_facebook_if_mobile_redirect(page)
             navigate_away_from_login_if_session_active(page)

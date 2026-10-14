@@ -306,9 +306,9 @@ def run_fb_cookie_capture_dialog(
                 )
                 foreground_firefox_for_profile(prof, timeout_s=8.0)
             progress_q.put("Firefox đã mở — tải Facebook…")
-            from src.services.device_browse import show_facebook_only
+            from src.services.device_browse import hold_facebook_tabs
 
-            page = show_facebook_only(ctx)
+            page = hold_facebook_tabs(ctx, attempts=12, pause_s=0.4)
             if prof and window_position and grid_viewport and len(grid_viewport) >= 2:
                 from src.utils.win_browser_window import place_firefox_window_for_profile
 

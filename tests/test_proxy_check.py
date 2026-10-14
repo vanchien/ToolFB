@@ -25,8 +25,9 @@ def test_firefox_prefs_replace_proxy_left_by_the_old_machine() -> None:
     assert prefs["network.proxy.http_port"] == 43123
     assert prefs["network.proxy.ssl"] == "127.0.0.1"
     assert prefs["network.proxy.socks"] == ""
-    assert prefs["browser.startup.page"] == 0
-    assert prefs["browser.startup.homepage"] == "about:blank"
+    assert prefs["browser.startup.page"] == 1
+    assert prefs["browser.startup.homepage"] == "https://www.facebook.com/"
+    assert prefs["browser.sessionstore.enabled"] is False
 
 
 def test_parse_proxy_line_four_parts() -> None:

@@ -503,8 +503,9 @@ def firefox_prefs_for_account_proxy(server: str) -> dict[str, Any]:
         "network.proxy.ssl_port": 0,
         "browser.sessionstore.resume_from_crash": False,
         "browser.sessionstore.max_resumed_crashes": 0,
-        "browser.startup.page": 0,
-        "browser.startup.homepage": "about:blank",
+        "browser.startup.page": 1,
+        "browser.startup.homepage": "https://www.facebook.com/",
+        "browser.sessionstore.enabled": False,
     }
     if not host or port <= 0:
         return prefs

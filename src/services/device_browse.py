@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from typing import Any
 
 from loguru import logger
@@ -229,6 +230,22 @@ def show_facebook_only(context: Any) -> Any:
         page.bring_to_front()
     except Exception:
         pass
+    return page
+
+
+def hold_facebook_tabs(context: Any, *, attempts: int = 20, pause_s: float = 0.45) -> Any:
+    """Đóng tab proxy cũ nhiều lần. Firefox hay mở lại tab đó vài giây sau khi cửa sổ hiện.
+
+    Dùng cho mọi tài khoản, không chỉ tài khoản mở đầu tiên. Dừng khi đang ở Facebook,
+    trang đăng nhập hoặc checkpoint.
+    """
+    page = show_facebook_only(context)
+    for _ in range(max(0, int(attempts) - 1)):
+        current = str(getattr(page, "url", "") or "")
+        if browse_page_settled(current) and not foreign_tab_open(context):
+            return page
+        time.sleep(max(0.05, float(pause_s)))
+        page = show_facebook_only(context)
     return page
 
 

@@ -48,7 +48,7 @@ def test_launch_prep_drops_restored_proxy_tab(tmp_path: Path) -> None:
     prefs = (profile / "prefs.js").read_text(encoding="utf-8")
     assert "0.0.3.188" not in prefs
     assert 'user_pref("network.proxy.type", 0);' in prefs
-    assert 'user_pref("browser.startup.homepage", "about:blank");' in prefs
+    assert 'user_pref("browser.startup.homepage", "https://www.facebook.com/");' in prefs
     assert "network.proxy.http" not in (profile / "user.js").read_text(encoding="utf-8")
     assert not (profile / "sessionstore.jsonlz4").exists()
     assert not backups.exists()
