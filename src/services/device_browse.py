@@ -202,6 +202,36 @@ def select_interaction_page(context: Any) -> Any:
     return chosen
 
 
+def foreign_tab_open(context: Any) -> bool:
+    """Còn tab không phải Facebook (link proxy cũ, trang lỗi)."""
+    for page in list(getattr(context, "pages", []) or []):
+        raw = str(getattr(page, "url", "") or "").casefold()
+        if browse_page_settled(raw):
+            continue
+        if not raw or raw.startswith("about:"):
+            continue
+        return True
+    return False
+
+
+def show_facebook_only(context: Any) -> Any:
+    """Đóng mọi tab link cũ rồi đưa tab còn lại tới facebook.com.
+
+    Firefox khôi phục tab proxy sau khi cửa sổ đã hiện. Gọi lại vài nhịp cho đến khi
+    không còn tab đó. Trang đăng nhập hoặc checkpoint không bị đóng và không bị bấm.
+    """
+    page = select_interaction_page(context)
+    try:
+        open_home_feed(page)
+    except Exception:
+        logger.debug("Chưa mở được facebook.com, sẽ thử lại.")
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    return page
+
+
 def open_home_feed(page: Any) -> None:
     """Vào bảng tin nếu trình duyệt chưa ở Facebook.
 

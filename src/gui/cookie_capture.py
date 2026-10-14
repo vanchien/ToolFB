@@ -306,16 +306,9 @@ def run_fb_cookie_capture_dialog(
                 )
                 foreground_firefox_for_profile(prof, timeout_s=8.0)
             progress_q.put("Firefox đã mở — tải Facebook…")
-            from src.services.device_browse import select_interaction_page
+            from src.services.device_browse import show_facebook_only
 
-            page = select_interaction_page(ctx)
-            if browse_only:
-                from src.services.device_browse import open_home_feed
-
-                try:
-                    open_home_feed(page)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Chưa vào được Facebook ngay sau khi mở: {}", exc)
+            page = show_facebook_only(ctx)
             if prof and window_position and grid_viewport and len(grid_viewport) >= 2:
                 from src.utils.win_browser_window import place_firefox_window_for_profile
 
@@ -382,22 +375,25 @@ def run_fb_cookie_capture_dialog(
                     from src.services.device_browse import (
                         describe_account_block,
                         nudge_feed,
-                        open_home_feed,
                         read_visible_text,
                     )
 
                     try:
-                        if browse_only and not browse_noted:
-                            browse_noted = True
-                            progress_q.put("NOTE\tĐang lướt bảng tin — 60 giây")
-                        if browse_only and not feed_ready:
-                            from src.services.device_browse import browse_page_settled
+                        from src.services.device_browse import (
+                            browse_page_settled,
+                            foreign_tab_open,
+                            show_facebook_only,
+                        )
 
-                            open_home_feed(page)
+                        if browse_only and (not feed_ready or foreign_tab_open(ctx)):
+                            page = show_facebook_only(ctx)
                             current = str(getattr(page, "url", "") or "")
-                            feed_ready = browse_page_settled(current)
-                            if not feed_ready and idle_ticks % 4 == 0:
-                                progress_q.put("NOTE\tĐang mở facebook.com — bỏ link cũ")
+                            feed_ready = browse_page_settled(current) and not foreign_tab_open(ctx)
+                            if feed_ready and not browse_noted:
+                                browse_noted = True
+                                progress_q.put("NOTE\tĐang lướt bảng tin — 60 giây")
+                            elif not feed_ready and idle_ticks % 4 == 0:
+                                progress_q.put("NOTE\tĐang đóng tab cũ — mở facebook.com")
                         elif browse_only and idle_ticks % 4 == 0:
                             nudge_feed(page)
                         if not found_name and idle_ticks % 8 == 1:

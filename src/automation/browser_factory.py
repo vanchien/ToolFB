@@ -1131,6 +1131,7 @@ class BrowserFactory:
             if disable_notifications:
                 ff["dom.webnotifications.enabled"] = False
             # Profile đồng bộ còn homepage/phiên máy cũ. Ép tab trắng rồi điều hướng Facebook.
+            ff["browser.sessionstore.enabled"] = False
             ff["browser.sessionstore.resume_from_crash"] = False
             ff["browser.sessionstore.max_resumed_crashes"] = 0
             ff["browser.startup.page"] = 0

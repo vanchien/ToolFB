@@ -337,9 +337,9 @@ def run_human_interaction_worker(
 
         )
 
-        from src.services.device_browse import select_interaction_page
+        from src.services.device_browse import show_facebook_only
 
-        page: Page = select_interaction_page(context)
+        page: Page = show_facebook_only(context)
         os.environ.pop("TOOLFB_NAV_MOBILE_FB", None)
         _show_queue_number_on_browser(context, page, mapped)
 

@@ -158,3 +158,25 @@ def test_select_interaction_page_closes_old_proxy_tab() -> None:
     assert chosen is blank
     assert stale_first.closed is True
     assert blank.closed is False
+
+    late = _Closeable("http://0.0.1.222/")
+
+    class _Later:
+        pages = [blank, late]
+
+        def new_page(self) -> _Closeable:
+            raise AssertionError("đã có tab")
+
+    again = select_interaction_page(_Later())
+    assert again is blank
+    assert late.closed is True
+    from src.services.device_browse import foreign_tab_open
+
+    class _Feed:
+        pages = [_Closeable("https://www.facebook.com/")]
+
+    class _Proxy:
+        pages = [_Closeable("http://0.0.1.222/")]
+
+    assert foreign_tab_open(_Feed()) is False
+    assert foreign_tab_open(_Proxy()) is True
