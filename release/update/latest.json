@@ -1,7 +1,7 @@
 {
-  "version": "1.0.107",
-  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.107/ToolFB_release_bundle.zip",
-  "sha256": "8f0253d7f25b1b255bbb005f0964316a4da127a517b135341bc8ea0448dbf900",
-  "notes": "Luot nhan thiet bi mo Facebook qua proxy dang chay, khong mo lai link may cu.",
-  "generated_at": "2026-10-14T08:26:11"
+  "version": "1.0.108",
+  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.108/ToolFB_release_bundle.zip",
+  "sha256": "5c89941ec572f7e7dbedbb43bd21fbab916192a264ce5234d64b26ab36fd8044",
+  "notes": "Bo tab proxy cu va xep cua so Firefox dung o luoi khi luot nhan thiet bi.",
+  "generated_at": "2026-10-14T10:36:36"
 }
