@@ -1,7 +1,7 @@
 {
-  "version": "1.0.108",
-  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.108/ToolFB_release_bundle.zip",
-  "sha256": "5c89941ec572f7e7dbedbb43bd21fbab916192a264ce5234d64b26ab36fd8044",
-  "notes": "Bo tab proxy cu va xep cua so Firefox dung o luoi khi luot nhan thiet bi.",
-  "generated_at": "2026-10-14T10:36:36"
+  "version": "1.0.109",
+  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.109/ToolFB_release_bundle.zip",
+  "sha256": "bf1534e045177ddf23a3e81a3286cf31392956357205f90126954a623242f407",
+  "notes": "Cap nhat thay ca thu muc code, khong giu file ban cu canh file exe.",
+  "generated_at": "2026-10-14T11:14:03"
 }
