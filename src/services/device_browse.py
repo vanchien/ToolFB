@@ -170,15 +170,27 @@ def select_interaction_page(context: Any) -> Any:
     pages = list(getattr(context, "pages", []) or [])
     if not pages:
         return context.new_page()
-    chosen = pages[0]
+
+    def _url(page: Any) -> str:
+        return str(getattr(page, "url", "") or "")
+
+    chosen = None
     for page in pages:
-        if "facebook.com" in str(getattr(page, "url", "") or "").casefold():
+        if "facebook.com" in _url(page).casefold():
             chosen = page
             break
+    if chosen is None:
+        for page in pages:
+            raw = _url(page).casefold()
+            if not raw or raw.startswith("about:"):
+                chosen = page
+                break
+    if chosen is None:
+        chosen = pages[0]
     for extra in list(pages):
         if extra is chosen:
             continue
-        if "facebook.com" in str(getattr(extra, "url", "") or "").casefold():
+        if "facebook.com" in _url(extra).casefold():
             continue
         close = getattr(extra, "close", None)
         if close is None:

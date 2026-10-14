@@ -59,13 +59,12 @@ def reposition_browser_to_grid_slot(
         ch = int(slot.height)
     except (AttributeError, TypeError, ValueError):
         return False
-    outer_w, outer_h = firefox_outer_window_size(cw, ch)
     return place_firefox_window_for_profile(
         profile_dir,
         x=x,
         y=y,
-        width=outer_w,
-        height=outer_h,
+        width=cw,
+        height=ch,
         timeout_s=timeout_s,
     )
 
@@ -211,6 +210,7 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
 
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     SWP_SHOWWINDOW = 0x0040
+    SW_RESTORE = 9
     placed = False
     target_pids = set(_firefox_pids_for_profile(profile_key))
 
@@ -234,6 +234,8 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
         h = rect.bottom - rect.top
         if w < 200 or h < 200:
             return True
+        # Profile đồng bộ thường đang maximized — SetWindowPos không thu được nếu chưa restore.
+        user32.ShowWindow(hwnd, SW_RESTORE)
         user32.SetWindowPos(
             hwnd,
             None,
@@ -243,12 +245,8 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
             max(400, int(height)),
             SWP_SHOWWINDOW,
         )
-        try:
-            user32.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
         placed = True
-        return False  # stop after first main window
+        return True
 
     user32.EnumWindows(_enum_cb, 0)
     if placed:

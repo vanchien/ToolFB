@@ -1349,18 +1349,14 @@ class BrowserFactory:
         context._toolfb_profile_account_id = account_id  # type: ignore[attr-defined]
         if place_window and browser_key == "firefox":
             try:
-                from src.utils.win_browser_window import (
-                    firefox_outer_window_size,
-                    place_firefox_window_for_profile,
-                )
+                from src.utils.win_browser_window import place_firefox_window_for_profile
 
-                outer_w, outer_h = firefox_outer_window_size(vp_w, vp_h)
                 place_firefox_window_for_profile(
                     user_data_dir,
                     x=win_x,
                     y=win_y,
-                    width=outer_w,
-                    height=outer_h,
+                    width=vp_w,
+                    height=vp_h,
                 )
             except Exception as place_exc:  # noqa: BLE001
                 logger.warning("Không đặt được vị trí cửa sổ Firefox (grid): {}", place_exc)

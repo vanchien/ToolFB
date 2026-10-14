@@ -144,3 +144,17 @@ def test_select_interaction_page_closes_old_proxy_tab() -> None:
     assert chosen is home
     assert stale.closed is True
     assert home.closed is False
+
+    stale_first = _Closeable("http://0.0.3.188/")
+    blank = _Closeable("about:blank")
+
+    class _Restored:
+        pages = [stale_first, blank]
+
+        def new_page(self) -> _Closeable:
+            raise AssertionError("đã có tab")
+
+    chosen = select_interaction_page(_Restored())
+    assert chosen is blank
+    assert stale_first.closed is True
+    assert blank.closed is False

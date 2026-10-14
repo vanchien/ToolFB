@@ -41,6 +41,7 @@ def test_launch_prep_drops_restored_proxy_tab(tmp_path: Path) -> None:
     backups.mkdir()
     (backups / "recovery.jsonlz4").write_bytes(b"restore-old-tab")
     (profile / "sessionCheckpoints.json").write_text("{}", encoding="utf-8")
+    (profile / "xulstore.json").write_text('{"sizemode":"maximized"}', encoding="utf-8")
 
     _prepare_firefox_profile_for_this_machine(profile)
 
@@ -52,6 +53,8 @@ def test_launch_prep_drops_restored_proxy_tab(tmp_path: Path) -> None:
     assert not (profile / "sessionstore.jsonlz4").exists()
     assert not backups.exists()
     assert not (profile / "sessionCheckpoints.json").exists()
+    assert not (profile / "xulstore.json").exists()
+    assert "browser.sessionstore.resume_from_crash" in prefs
 
 
 def test_format_proxy_server_url_http_basic() -> None:

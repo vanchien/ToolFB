@@ -291,7 +291,6 @@ def run_fb_cookie_capture_dialog(
             prof = str(acc_preview.get("portable_path") or acc_preview.get("profile_path") or "").strip()
             if prof:
                 from src.utils.win_browser_window import (
-                    firefox_outer_window_size,
                     foreground_firefox_for_profile,
                     place_firefox_window_for_profile,
                 )
@@ -302,15 +301,32 @@ def run_fb_cookie_capture_dialog(
                     wx, wy = int(window_position[0]), int(window_position[1])
                 if grid_viewport and len(grid_viewport) >= 2:
                     cw, ch = max(320, int(grid_viewport[0])), max(400, int(grid_viewport[1]))
-                outer_w, outer_h = firefox_outer_window_size(cw, ch)
                 place_firefox_window_for_profile(
-                    prof, x=wx, y=wy, width=outer_w, height=outer_h, timeout_s=15.0
+                    prof, x=wx, y=wy, width=cw, height=ch, timeout_s=15.0
                 )
                 foreground_firefox_for_profile(prof, timeout_s=8.0)
             progress_q.put("Firefox đã mở — tải Facebook…")
             from src.services.device_browse import select_interaction_page
 
             page = select_interaction_page(ctx)
+            if browse_only:
+                from src.services.device_browse import open_home_feed
+
+                try:
+                    open_home_feed(page)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Chưa vào được Facebook ngay sau khi mở: {}", exc)
+            if prof and window_position and grid_viewport and len(grid_viewport) >= 2:
+                from src.utils.win_browser_window import place_firefox_window_for_profile
+
+                place_firefox_window_for_profile(
+                    prof,
+                    x=int(window_position[0]),
+                    y=int(window_position[1]),
+                    width=max(320, int(grid_viewport[0])),
+                    height=max(400, int(grid_viewport[1])),
+                    timeout_s=6.0,
+                )
             try:
                 page.bring_to_front()
             except Exception:

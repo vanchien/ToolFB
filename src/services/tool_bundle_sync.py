@@ -858,13 +858,20 @@ def _strip_proxy_pref_lines(path: Path) -> None:
     kept: list[str] = []
     for line in lines:
         low = line.lower()
-        if "network.proxy." in low or "browser.startup.homepage" in low or "browser.startup.page" in low:
+        if (
+            "network.proxy." in low
+            or "browser.startup.homepage" in low
+            or "browser.startup.page" in low
+            or "browser.sessionstore." in low
+        ):
             continue
         kept.append(line)
+    kept.append('user_pref("browser.sessionstore.resume_from_crash", false);')
+    kept.append('user_pref("browser.sessionstore.max_resumed_crashes", 0);')
+    kept.append('user_pref("browser.startup.page", 0);')
+    kept.append('user_pref("browser.startup.homepage", "about:blank");')
     if path.name == "prefs.js":
         kept.append('user_pref("network.proxy.type", 0);')
-        kept.append('user_pref("browser.startup.page", 0);')
-        kept.append('user_pref("browser.startup.homepage", "about:blank");')
     if kept == lines:
         return
     try:
@@ -886,6 +893,7 @@ def _make_firefox_profile_portable(profile_dir: Path) -> None:
         "sessionstore.js",
         "sessionstore.bak",
         "sessionCheckpoints.json",
+        "xulstore.json",
     ):
         target = profile_dir / name
         if target.exists():
