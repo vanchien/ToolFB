@@ -1,7 +1,7 @@
 {
-  "version": "1.0.106",
-  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.106/ToolFB_release_bundle.zip",
-  "sha256": "dc46df6b689c1abdfc906e2cb32b8cd0b542b3db557ff83ab0d429f57da42b00",
-  "notes": "Cap nhat ghi de file cu, tai dung goi cua phien ban, roi moi danh dau da cap nhat.",
-  "generated_at": "2026-10-13T18:36:41"
+  "version": "1.0.107",
+  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.107/ToolFB_release_bundle.zip",
+  "sha256": "8f0253d7f25b1b255bbb005f0964316a4da127a517b135341bc8ea0448dbf900",
+  "notes": "Luot nhan thiet bi mo Facebook qua proxy dang chay, khong mo lai link may cu.",
+  "generated_at": "2026-10-14T08:26:11"
 }
