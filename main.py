@@ -33,6 +33,11 @@ import sys
 from pathlib import Path
 
 
+from frozen_shadow import drop_frozen_shadow_source
+
+drop_frozen_shadow_source()
+
+
 def _configure_frozen_runtime() -> None:
     """
     PyInstaller: trình duyệt Playwright nằm trong ``_internal/ms-playwright``;

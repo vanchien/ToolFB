@@ -1226,6 +1226,49 @@ def _stage_deferred_exe_gui_merge_windows(
     bat_out.write_text("\r\n".join(bat_lines), encoding="utf-8")
 
 
+def _release_marker_text(version: str) -> str:
+    """Một dòng phiên bản để máy đích đối chiếu sau khi ghi đè ``_internal``."""
+    safe = "".join(ch for ch in str(version or "").strip() if ch.isalnum() or ch in ".-_")
+    return safe or "unknown"
+
+
+def _internal_replace_commands(staged: str, project: str, version: str) -> list[str]:
+    """Đổi cả thư mục ``_internal``. Không chép đè từng file nên file bản cũ không sót.
+
+    Bản staged được chuyển sang chỗ mới, kiểm tra dấu phiên bản, rồi mới thế vào chỗ đang chạy.
+    Lỗi thì trả lại thư mục cũ. ``data`` và ``config`` không nằm trong ``_internal``.
+    """
+    marker = _release_marker_text(version)
+    new_dir = f"{project}\\_internal.new"
+    old_dir = f"{project}\\_internal.old"
+    live = f"{project}\\_internal"
+    src = f"{staged}\\exe_gui\\_internal"
+    return [
+        f'if not exist "{src}\\toolfb_release.txt" goto L',
+        f'if exist "{new_dir}" rd /s /q "{new_dir}"',
+        f'move "{src}" "{new_dir}" >nul',
+        "if errorlevel 1 goto L",
+        f'findstr /x /c:"{marker}" "{new_dir}\\toolfb_release.txt" >nul',
+        "if errorlevel 1 (",
+        f'  move "{new_dir}" "{src}" >nul',
+        "  goto L",
+        ")",
+        f'if exist "{old_dir}" rd /s /q "{old_dir}"',
+        f'if exist "{live}" ren "{live}" "_internal.old"',
+        f'if exist "{live}" (',
+        f'  move "{new_dir}" "{src}" >nul',
+        "  goto L",
+        ")",
+        f'ren "{new_dir}" "_internal"',
+        f'if exist "{new_dir}" (',
+        f'  if exist "{old_dir}" ren "{old_dir}" "_internal"',
+        f'  move "{new_dir}" "{src}" >nul',
+        "  goto L",
+        ")",
+        f'if exist "{old_dir}" rd /s /q "{old_dir}"',
+    ]
+
+
 def _stage_deferred_full_apply_windows(
     *,
     payload_root: Path,
@@ -1235,6 +1278,7 @@ def _stage_deferred_full_apply_windows(
     version: str,
     bat_out: Path,
     preserve_on_apply_dirs: tuple[str, ...],
+    frozen_install: bool = False,
 ) -> None:
     """
     Windows: stage toàn bộ update và apply sau khi process hiện tại thoát.
@@ -1257,12 +1301,37 @@ def _stage_deferred_full_apply_windows(
         staged_gui.mkdir(parents=True, exist_ok=True)
         shutil.copy2(exe_gui_root / "ToolFB_GUI.exe", staged_gui / "ToolFB_GUI.exe")
         _copytree_resilient(exe_gui_root / "_internal", staged_gui / "_internal")
+        (staged_gui / "_internal" / "toolfb_release.txt").write_text(
+            _release_marker_text(version) + "\n",
+            encoding="ascii",
+        )
 
     pr_s = str(project_root.resolve())
     st_s = str(staged.resolve())
     exe_dst = str((project_root / "ToolFB_GUI.exe").resolve())
     robocopy_xd = " ".join(dict.fromkeys((*preserve_on_apply_dirs, "_internal")))
     log_file = str((updates_dir / "last_deferred_apply.log").resolve())
+    has_exe = exe_gui_root is not None and _exe_gui_looks_valid(exe_gui_root)
+    # Bản đóng gói: không trộn portable_clean lên thư mục exe. Lần cập nhật trước để lại
+    # thư mục src cạnh ToolFB_GUI.exe và Python nạp file đó thay cho code trong _internal.
+    code_lines: list[str] = []
+    if not frozen_install:
+        code_lines = [
+            (
+                f'robocopy "{st_s}\\portable_apply" "{pr_s}" /MIR /IS /IT /R:3 /W:2 /NP '
+                f"/XF ToolFB_GUI.exe version.json /XD {robocopy_xd}"
+            ),
+            "set RC=%ERRORLEVEL%",
+            "if %RC% GEQ 8 goto L",
+            f'for /d /r "{pr_s}\\src" %%D in (__pycache__) do rd /s /q "%%D" 2>nul',
+        ]
+    swap_lines = _internal_replace_commands(st_s, pr_s, version) if has_exe else []
+    shadow_lines: list[str] = []
+    if frozen_install and has_exe:
+        shadow_lines = [
+            f'if exist "{pr_s}\\src" rd /s /q "{pr_s}\\src"',
+            f'echo [%date% %time%] removed shadow src >> "{log_file}"',
+        ]
     bat_lines = [
         "@echo off",
         "setlocal",
@@ -1274,19 +1343,16 @@ def _stage_deferred_full_apply_windows(
         "set /a tries+=1",
         "if %tries% gtr 120 goto FAIL",
         "ping -n 2 127.0.0.1 >nul",
-        (
-            f'robocopy "{st_s}\\portable_apply" "{pr_s}" /MIR /IS /IT /R:3 /W:2 /NP '
-            f"/XF ToolFB_GUI.exe version.json /XD {robocopy_xd}"
-        ),
-        "if errorlevel 8 goto L",
-        f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" copy /Y "{st_s}\\exe_gui\\ToolFB_GUI.exe" "{exe_dst}" >nul 2>&1',
+        *code_lines,
+        *swap_lines,
+        f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" copy /Y "{st_s}\\exe_gui\\ToolFB_GUI.exe" "{exe_dst}" >nul',
         f'if exist "{st_s}\\exe_gui\\ToolFB_GUI.exe" if errorlevel 1 goto L',
-        f'if exist "{st_s}\\exe_gui\\_internal" robocopy "{st_s}\\exe_gui\\_internal" "{pr_s}\\_internal" /MIR /IS /IT /R:3 /W:2 /NP',
-        f'if exist "{st_s}\\exe_gui\\_internal" if errorlevel 8 goto L',
+        *shadow_lines,
         f'if exist "{st_s}\\portable_apply\\version.json" copy /Y "{st_s}\\portable_apply\\version.json" "{pr_s}\\version.json" >nul',
         f'if exist "{st_s}\\portable_apply\\version.json" if errorlevel 1 goto L',
         f'if exist "{st_s}\\exe_gui\\version.json" copy /Y "{st_s}\\exe_gui\\version.json" "{pr_s}\\version.json" >nul',
         f'if exist "{st_s}\\exe_gui\\version.json" if errorlevel 1 goto L',
+        f'echo [%date% %time%] apply files replaced version={_release_marker_text(version)} >> "{log_file}"',
         *_deferred_batch_common_tail(
             staged_root=staged,
             updates_dir=updates_dir,
@@ -1376,6 +1442,7 @@ def apply_update_package(
                 version=str(manifest.version),
                 bat_out=defer_bat,
                 preserve_on_apply_dirs=preserve_on_apply_dirs,
+                frozen_install=bool(getattr(sys, "frozen", False)),
             )
             logger.info("Updater: staged deferred apply; sau relaunch chạy {}", defer_bat.name)
             logger.info("Updater: áp dụng update {} thành công (chờ relaunch).", manifest.version)

@@ -106,6 +106,28 @@ def test_apply_replaces_old_code_before_marking_version(tmp_path: Path) -> None:
     assert '"9.9.9"' in (project / "version.json").read_text(encoding="utf-8")
 
 
+def test_frozen_startup_removes_shadow_src(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from frozen_shadow import drop_frozen_shadow_source
+
+    shadow = tmp_path / "src"
+    shadow.mkdir()
+    (shadow / "old_mod.py").write_text("old\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "ToolFB_GUI.exe"))
+    drop_frozen_shadow_source()
+    assert not shadow.exists()
+
+
+def test_deferred_bat_runs_on_windows_even_for_source_install(tmp_path: Path) -> None:
+    from src.utils.app_restart import should_run_deferred_apply
+
+    missing = tmp_path / "no.bat"
+    assert should_run_deferred_apply(missing) is False
+    present = tmp_path / "toolfb_deferred_gui_apply.bat"
+    present.write_text("@echo off\r\n", encoding="utf-8")
+    assert should_run_deferred_apply(present) is (sys.platform == "win32")
+
+
 def test_download_url_is_pinned_to_the_manifest_version() -> None:
     floating = "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip"
     pinned = _pin_release_download_url(floating, "1.0.105")
@@ -119,6 +141,104 @@ def test_download_url_is_pinned_to_the_manifest_version() -> None:
 
     assert pin_release_download_url(floating, "1.0.105") == pinned
     assert _pin_release_download_url("https://example.com/a.zip", "1.0.105") == "https://example.com/a.zip"
+
+
+def test_frozen_apply_replaces_internal_and_drops_shadow_src(tmp_path: Path) -> None:
+    """Bản exe: đổi cả _internal và xóa src nằm cạnh exe để không còn nạp file cũ."""
+    if sys.platform != "win32":
+        pytest.skip("Windows move/ren apply")
+    import subprocess
+
+    payload = tmp_path / "payload"
+    (payload / "src").mkdir(parents=True)
+    (payload / "main.py").write_text("print(1)\n", encoding="utf-8")
+    (payload / "version.json").write_text('{"version": "9.9.9"}\n', encoding="utf-8")
+    exe = tmp_path / "exe_gui"
+    (exe / "_internal").mkdir(parents=True)
+    (exe / "ToolFB_GUI.exe").write_bytes(b"new-exe")
+    (exe / "_internal" / "fresh.py").write_text("new\n", encoding="utf-8")
+    project = tmp_path / "app"
+    (project / "_internal").mkdir(parents=True)
+    (project / "_internal" / "stale.py").write_text("old\n", encoding="utf-8")
+    (project / "src").mkdir()
+    (project / "src" / "old_mod.py").write_text("shadow\n", encoding="utf-8")
+    (project / "data").mkdir()
+    (project / "data" / "keep.txt").write_text("profile\n", encoding="utf-8")
+    (project / "version.json").write_text('{"version": "1.0.0"}\n', encoding="utf-8")
+    updates = project / "data" / "updates"
+    updates.mkdir(parents=True)
+    bat = updates / DEFERRED_GUI_BAT_NAME
+    _stage_deferred_full_apply_windows(
+        payload_root=payload,
+        exe_gui_root=exe,
+        project_root=project,
+        updates_dir=updates,
+        version="9.9.9",
+        bat_out=bat,
+        preserve_on_apply_dirs=("data", "config"),
+        frozen_install=True,
+    )
+    text = bat.read_text(encoding="utf-8")
+    assert 'robocopy "' not in text.split("portable_apply", 1)[0] or "/MIR" not in text.split("version.json", 1)[0]
+    assert "/MIR" not in text
+    assert "_internal.old" in text
+    assert "toolfb_release.txt" in text
+    assert f'rd /s /q "{project.resolve()}\\src"' in text
+    staged = next(updates.glob("staged_apply_*"))
+    assert (staged / "exe_gui" / "_internal" / "toolfb_release.txt").read_text(encoding="ascii").strip() == "9.9.9"
+    # Chạy đúng các lệnh đổi thư mục, không relaunch app.
+    from src.services.app_updater import _internal_replace_commands
+
+    swap = updates / "swap_only.bat"
+    swap.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                "setlocal",
+                *_internal_replace_commands(str(staged.resolve()), str(project.resolve()), "9.9.9"),
+                "exit /b 0",
+                ":L",
+                "exit /b 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ran = subprocess.run(["cmd", "/c", str(swap)], check=False)
+    assert ran.returncode == 0
+    assert (project / "_internal" / "fresh.py").read_text(encoding="utf-8") == "new\n"
+    assert not (project / "_internal" / "stale.py").exists()
+    assert not (project / "_internal.old").exists()
+    assert (project / "data" / "keep.txt").read_text(encoding="utf-8") == "profile\n"
+    subprocess.run(["cmd", "/c", "rd", "/s", "/q", str(project / "src")], check=False)
+    assert not (project / "src").exists()
+
+
+def test_source_install_still_mirrors_code_tree(tmp_path: Path) -> None:
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "main.py").write_text("x=1\n", encoding="utf-8")
+    (payload / "src").mkdir()
+    project = tmp_path / "app"
+    project.mkdir()
+    updates = project / "data" / "updates"
+    updates.mkdir(parents=True)
+    bat = updates / DEFERRED_GUI_BAT_NAME
+    _stage_deferred_full_apply_windows(
+        payload_root=payload,
+        exe_gui_root=None,
+        project_root=project,
+        updates_dir=updates,
+        version="1.2.3",
+        bat_out=bat,
+        preserve_on_apply_dirs=("data", "config"),
+        frozen_install=False,
+    )
+    text = bat.read_text(encoding="utf-8")
+    assert "/MIR /IS /IT" in text
+    assert "__pycache__" in text
+    assert "/XF ToolFB_GUI.exe version.json" in text
+    assert text.index("/XF ToolFB_GUI.exe version.json") < text.index("portable_apply\\version.json")
 
 
 def test_deferred_batch_excludes_internal_and_relaunch_portable(tmp_path: Path) -> None:

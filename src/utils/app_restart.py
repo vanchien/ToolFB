@@ -38,6 +38,11 @@ def build_restart_command() -> list[str]:
     return [sys.executable, *argv]
 
 
+def should_run_deferred_apply(bat: Path) -> bool:
+    """Windows chạy batch ghi đè sau khi app thoát, kể cả bản source lẫn bản đóng gói."""
+    return os.name == "nt" and bat.is_file()
+
+
 def relaunch_same_app_and_exit(*, cwd: Path | None = None, tk_root: Any | None = None) -> None:
     """
     Mở một process mới (cùng cwd) rồi thoát process hiện tại.
@@ -51,7 +56,7 @@ def relaunch_same_app_and_exit(*, cwd: Path | None = None, tk_root: Any | None =
     frozen = getattr(sys, "frozen", False)
     bat = deferred_gui_bat_path(root)
 
-    if frozen and os.name == "nt" and bat.is_file():
+    if should_run_deferred_apply(bat):
         # Script đợi file nhả khóa rồi copy staged exe/_internal rồi mở lại GUI.
         bat_s = str(bat.resolve())
         cmd = ["cmd.exe", "/c", "start", "/min", "", "cmd.exe", "/c", bat_s]
