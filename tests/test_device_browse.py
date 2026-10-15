@@ -131,7 +131,13 @@ class _Closeable(_Page):
         self.closed = True
 
 
-def test_hold_facebook_tabs_opens_facebook_for_every_window() -> None:
+def test_old_machine_url_is_not_facebook() -> None:
+    from src.services.device_browse import is_old_machine_url
+
+    assert is_old_machine_url("http://0.0.1.64/")
+    assert is_old_machine_url("http://0.0.3.188")
+    assert not is_old_machine_url("https://www.facebook.com/")
+    assert not is_old_machine_url("about:blank")
     page = _Closeable("http://0.0.1.222/")
 
     class _Context:

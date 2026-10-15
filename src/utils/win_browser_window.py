@@ -64,6 +64,24 @@ def reposition_browser_to_grid_slot(
         ch = int(slot.height)
     except (AttributeError, TypeError, ValueError):
         return False
+    try:
+        from src.utils.grid_layout_manager import fit_slot_to_work_area, win32_work_area
+
+        work = win32_work_area()
+        if work is not None:
+            x, y, cw, ch = fit_slot_to_work_area(slot, work)
+            logger.info(
+                "Màn hình máy này {}×{} — ô {} tại ({}, {}) {}×{}",
+                work[2],
+                work[3],
+                int(getattr(slot, "index", 0)) + 1,
+                x,
+                y,
+                cw,
+                ch,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Không đo lại màn hình, dùng ô đã tính: {}", exc)
     return place_firefox_window_for_profile(
         profile_dir,
         x=x,
@@ -162,16 +180,27 @@ def _query_firefox_processes() -> list[tuple[int, str]]:
                 rows.append((int(row["ProcessId"]), cmd))
             except (KeyError, TypeError, ValueError):
                 continue
-        _firefox_proc_cache = rows
-        _firefox_proc_cached_at = time.monotonic()
-        return list(rows)
+        if rows:
+            _firefox_proc_cache = rows
+            _firefox_proc_cached_at = time.monotonic()
+        return rows
 
 
 def _firefox_pids_for_profile(profile_key: str) -> list[int]:
     """Liệt kê PID firefox.exe có command line chứa đường dẫn profile."""
     if not profile_key:
         return []
-    return [pid for pid, cmd in _query_firefox_processes() if profile_key in cmd]
+    tails = [profile_key]
+    parts = [part for part in profile_key.split("\\") if part]
+    if len(parts) >= 3:
+        tails.append("\\".join(parts[-3:]))
+    if len(parts) >= 2:
+        tails.append("\\".join(parts[-2:]))
+    found: list[int] = []
+    for pid, cmd in _query_firefox_processes():
+        if any(tail and tail in cmd for tail in tails):
+            found.append(pid)
+    return found
 
 
 def terminate_firefox_for_profile(
@@ -257,8 +286,8 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
             None,
             int(x),
             int(y),
-            max(320, int(width)),
-            max(400, int(height)),
+            max(160, int(width)),
+            max(160, int(height)),
             SWP_SHOWWINDOW,
         )
         placed = True

@@ -5,7 +5,19 @@ from __future__ import annotations
 from src.utils.grid_layout_manager import GridWindowSlot, _grid_dimensions, compute_grid_layout
 
 
-def test_grid_dimensions_four_threads() -> None:
+def test_fit_slot_uses_client_work_area() -> None:
+    from src.utils.grid_layout_manager import fit_slot_to_work_area
+
+    slots = compute_grid_layout(4, screen_width=1920, screen_height=1080)
+    # Máy khách 1366×768, vùng làm việc trừ taskbar.
+    fitted = [fit_slot_to_work_area(slot, (0, 0, 1366, 728)) for slot in slots]
+    assert fitted[0] == (0, 0, 683, 364)
+    assert fitted[1][0] == 683
+    assert fitted[2][1] == 364
+    assert fitted[0][2] == fitted[1][2]
+    assert fitted[1][0] + fitted[1][2] <= 1366
+    assert fitted[2][1] + fitted[2][3] <= 728
+    assert slots[0].cols == 2 and slots[0].rows == 2
     cols, rows = _grid_dimensions(4)
     assert (cols, rows) == (2, 2)
 

@@ -146,6 +146,14 @@ def read_logged_in_display_name(page: Any) -> str:
     )
 
 
+def is_old_machine_url(url: str) -> bool:
+    """Tab khôi phục từ máy khác, dạng ``http://0.0.x.x``."""
+    raw = str(url or "").strip().casefold()
+    if not raw or raw.startswith("about:"):
+        return False
+    return "://0.0." in raw or raw.startswith("0.0.")
+
+
 def feed_can_scroll(url: str) -> bool:
     """Trang đăng nhập hoặc checkpoint thì không cuộn."""
     raw = str(url or "").casefold()
@@ -183,6 +191,8 @@ def select_interaction_page(context: Any) -> Any:
     if chosen is None:
         for page in pages:
             raw = _url(page).casefold()
+            if is_old_machine_url(raw):
+                continue
             if not raw or raw.startswith("about:"):
                 chosen = page
                 break

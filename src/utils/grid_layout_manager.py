@@ -22,15 +22,23 @@ class GridWindowSlot:
     height: int
     col: int
     row: int
+    cols: int = 0
+    rows: int = 0
 
 
 def get_screen_resolution(*, fallback_width: int = 1920, fallback_height: int = 1080) -> tuple[int, int]:
     """
-    Lấy độ phân giải màn hình chính (động trên Windows qua Tk, fallback cố định).
+    Lấy độ phân giải màn hình chính.
 
-    Returns:
-        ``(width, height)`` pixel.
+    Trên Windows dùng vùng làm việc Win32 (trừ taskbar), cùng hệ tọa độ với
+    ``SetWindowPos``, để máy khách 125%/150% không bị lệch ô.
     """
+    if os.name == "nt":
+        area = win32_work_area()
+        if area is not None:
+            _x, _y, w, h = area
+            if w > 0 and h > 0:
+                return w, h
     try:
         import tkinter as tk
 
@@ -44,6 +52,36 @@ def get_screen_resolution(*, fallback_width: int = 1920, fallback_height: int = 
     except Exception:
         pass
     return fallback_width, fallback_height
+
+
+def win32_work_area() -> tuple[int, int, int, int] | None:
+    """``(x, y, width, height)`` vùng làm việc màn hình chính, đã trừ taskbar."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        try:
+            # -4 = PER_MONITOR_AWARE_V2. Firefox nhận tọa độ vật lý; process phải cùng chế độ.
+            user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:
+                pass
+        rect = wintypes.RECT()
+        spi_getworkarea = 0x0030
+        if not user32.SystemParametersInfoW(spi_getworkarea, 0, ctypes.byref(rect), 0):
+            return None
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width < 320 or height < 240:
+            return None
+        return int(rect.left), int(rect.top), width, height
+    except Exception:
+        return None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -104,12 +142,27 @@ def grid_work_area(
 
 
 def _cell_height(wh: int, rows: int) -> int:
-    """Chiều cao mỗi ô. Nhiều hàng thì ô thấp hơn để vừa màn hình."""
-    per_row = max(1, int(wh) // max(1, rows))
-    cap = _env_int("FB_GRID_MAX_CELL_HEIGHT", 780)
-    if cap <= 0:
-        return per_row
-    return min(per_row, cap)
+    """Chiều cao mỗi ô. Chia hết chiều cao màn hình để các hàng không chồng."""
+    return max(1, int(wh) // max(1, rows))
+
+
+def fit_slot_to_work_area(
+    slot: GridWindowSlot,
+    work: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Tính lại ô theo vùng làm việc thật của máy khách.
+
+    ``cols``/``rows`` lấy từ lúc chia luồng. Mỗi máy có độ phân giải khác nhau
+    vẫn ra lưới kín, không chồng.
+    """
+    cols = max(0, int(getattr(slot, "cols", 0) or 0))
+    rows = max(0, int(getattr(slot, "rows", 0) or 0))
+    if cols < 1 or rows < 1:
+        return int(slot.x), int(slot.y), int(slot.width), int(slot.height)
+    ox, oy, ww, wh = (int(work[0]), int(work[1]), int(work[2]), int(work[3]))
+    cell_w = max(1, ww // cols)
+    cell_h = max(1, wh // rows)
+    return ox + int(slot.col) * cell_w, oy + int(slot.row) * cell_h, cell_w, cell_h
 
 
 def compute_grid_layout(
@@ -166,6 +219,8 @@ def compute_grid_layout(
                 height=cell_h,
                 col=col,
                 row=row,
+                cols=cols,
+                rows=row_count,
             )
         )
     return slots
