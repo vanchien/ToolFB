@@ -1134,7 +1134,11 @@ class BrowserFactory:
             # Profile đồng bộ còn homepage/phiên máy cũ. Ép tab trắng rồi điều hướng Facebook.
             ff["browser.sessionstore.enabled"] = False
             ff["browser.sessionstore.resume_from_crash"] = False
+            ff["browser.sessionstore.resume_session_once"] = False
             ff["browser.sessionstore.max_resumed_crashes"] = 0
+            ff["browser.sessionstore.max_windows_undo"] = 0
+            ff["browser.sessionstore.max_tabs_undo"] = 0
+            ff["browser.tabs.warnOnClose"] = False
             ff["browser.startup.page"] = 1
             ff["browser.startup.homepage"] = "https://www.facebook.com/"
             if not apply_proxy:

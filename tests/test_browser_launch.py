@@ -55,6 +55,7 @@ def test_launch_prep_drops_restored_proxy_tab(tmp_path: Path) -> None:
     assert not (profile / "sessionCheckpoints.json").exists()
     assert not (profile / "xulstore.json").exists()
     assert "browser.sessionstore.resume_from_crash" in prefs
+    assert 'user_pref("browser.sessionstore.max_windows_undo", 0);' in prefs
 
 
 def test_format_proxy_server_url_http_basic() -> None:

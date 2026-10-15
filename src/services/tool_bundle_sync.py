@@ -868,7 +868,10 @@ def _strip_proxy_pref_lines(path: Path) -> None:
         kept.append(line)
     kept.append('user_pref("browser.sessionstore.enabled", false);')
     kept.append('user_pref("browser.sessionstore.resume_from_crash", false);')
+    kept.append('user_pref("browser.sessionstore.resume_session_once", false);')
     kept.append('user_pref("browser.sessionstore.max_resumed_crashes", 0);')
+    kept.append('user_pref("browser.sessionstore.max_windows_undo", 0);')
+    kept.append('user_pref("browser.sessionstore.max_tabs_undo", 0);')
     kept.append('user_pref("browser.startup.page", 1);')
     kept.append('user_pref("browser.startup.homepage", "https://www.facebook.com/");')
     if path.name == "prefs.js":

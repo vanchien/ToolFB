@@ -8,9 +8,14 @@ Playwright persistent context không luôn tôn ``-left``/``-top`` trên Windows
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+_firefox_proc_lock = threading.Lock()
+_firefox_proc_cached_at = 0.0
+_firefox_proc_cache: list[tuple[int, str]] = []
 
 from loguru import logger
 
@@ -116,46 +121,57 @@ def _hidden_process_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+def _query_firefox_processes() -> list[tuple[int, str]]:
+    """Một lần liệt kê firefox.exe. Nhiều cửa sổ dùng chung kết quả để không lệch lưới."""
+    global _firefox_proc_cached_at, _firefox_proc_cache
+    now = time.monotonic()
+    with _firefox_proc_lock:
+        if _firefox_proc_cache and (now - _firefox_proc_cached_at) < 1.5:
+            return list(_firefox_proc_cache)
+        try:
+            import subprocess
+
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | "
+                "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+            )
+            raw = subprocess.check_output(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=12,
+                **_hidden_process_kwargs(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Liệt kê process Firefox: {}", exc)
+            return list(_firefox_proc_cache)
+        import json
+
+        rows: list[tuple[int, str]] = []
+        try:
+            data = json.loads(raw.strip() or "[]")
+        except json.JSONDecodeError:
+            return list(_firefox_proc_cache)
+        items = data if isinstance(data, list) else [data]
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            cmd = str(row.get("CommandLine") or "").lower().replace("/", "\\")
+            try:
+                rows.append((int(row["ProcessId"]), cmd))
+            except (KeyError, TypeError, ValueError):
+                continue
+        _firefox_proc_cache = rows
+        _firefox_proc_cached_at = time.monotonic()
+        return list(rows)
+
+
 def _firefox_pids_for_profile(profile_key: str) -> list[int]:
     """Liệt kê PID firefox.exe có command line chứa đường dẫn profile."""
-    try:
-        import subprocess
-
-        ps = (
-            "Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | "
-            "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-        )
-        raw = subprocess.check_output(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=8,
-            **_hidden_process_kwargs(),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Liệt kê process Firefox: {}", exc)
+    if not profile_key:
         return []
-
-    import json
-
-    pids: list[int] = []
-    try:
-        data = json.loads(raw.strip() or "[]")
-    except json.JSONDecodeError:
-        return []
-    rows = data if isinstance(data, list) else [data]
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        cmd = str(row.get("CommandLine") or "").lower().replace("/", "\\")
-        if profile_key not in cmd:
-            continue
-        try:
-            pids.append(int(row["ProcessId"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return pids
+    return [pid for pid, cmd in _query_firefox_processes() if profile_key in cmd]
 
 
 def terminate_firefox_for_profile(
@@ -261,6 +277,59 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
     return placed
 
 
+def close_extra_firefox_windows(profile_dir: str | Path) -> int:
+    """Đóng cửa sổ Firefox thừa của cùng profile.
+
+    Phiên cũ hay mở thêm một cửa sổ ``http://0.0.x.x`` lệch khỏi lưới. Giữ cửa sổ đang
+    được đưa lên trước, đóng các cửa sổ lớn còn lại.
+    """
+    if sys.platform != "win32":
+        return 0
+    prof_key = str(Path(profile_dir).resolve()).lower().replace("/", "\\")
+    if not prof_key:
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    wm_close = 0x0010
+    target_pids = set(_firefox_pids_for_profile(prof_key))
+    if not target_pids:
+        return 0
+    foreground = int(user32.GetForegroundWindow() or 0)
+    hwnds: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) not in target_pids:
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        if (rect.right - rect.left) < 200 or (rect.bottom - rect.top) < 200:
+            return True
+        hwnds.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    if len(hwnds) < 2 or foreground not in hwnds:
+        return 0
+    keep = foreground
+    closed = 0
+    for hwnd in hwnds:
+        if hwnd == keep:
+            continue
+        user32.PostMessageW(hwnd, wm_close, 0, 0)
+        closed += 1
+    if closed:
+        logger.info("Đã đóng {} cửa sổ Firefox thừa profile~{}", closed, prof_key[-40:])
+    return closed
+
+
 def set_firefox_window_title(profile_dir: str | Path, title: str, *, timeout_s: float = 8.0) -> bool:
     """Ghi số thứ tự lên thanh tiêu đề cửa sổ Firefox của profile."""
     if sys.platform != "win32":
@@ -287,11 +356,11 @@ def _try_set_window_title(profile_key: str, title: str) -> bool:
     target_pids = set(_firefox_pids_for_profile(profile_key))
     if not target_pids:
         return False
-    titled = False
+    foreground = int(user32.GetForegroundWindow() or 0)
+    hwnds: list[int] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def _enum_cb(hwnd: int, _lparam: int) -> bool:
-        nonlocal titled
         if not user32.IsWindowVisible(hwnd):
             return True
         pid = wintypes.DWORD()
@@ -303,11 +372,15 @@ def _try_set_window_title(profile_key: str, title: str) -> bool:
             return True
         if (rect.right - rect.left) < 200 or (rect.bottom - rect.top) < 200:
             return True
-        user32.SetWindowTextW(hwnd, title)
-        titled = True
-        return False
+        hwnds.append(int(hwnd))
+        return True
 
     user32.EnumWindows(_enum_cb, 0)
+    if not hwnds:
+        return False
+    # Cửa sổ đang ở trước là tab Facebook. Cửa sổ tab cũ không được gắn số thứ tự.
+    chosen = foreground if foreground in hwnds else hwnds[-1]
+    titled = bool(user32.SetWindowTextW(chosen, title))
     if titled:
         logger.info("Đã gắn tiêu đề cửa sổ «{}» profile~{}", title, profile_key[-40:])
     return titled

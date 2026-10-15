@@ -155,6 +155,26 @@ def _queue_window_label(mapped: MappedAccount) -> str:
     return format_account_window_label(int(getattr(mapped, "queue_no", 0) or 0), uid)
 
 
+def _snap_profile_to_grid(acc: dict[str, Any], page: Any, grid_slot: GridWindowSlot | None) -> None:
+    """Đóng cửa sổ tab cũ rồi đặt cửa sổ Facebook đúng ô lưới."""
+    if grid_slot is None:
+        return
+    prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+    if not prof:
+        return
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    try:
+        from src.utils.win_browser_window import close_extra_firefox_windows, reposition_browser_to_grid_slot
+
+        close_extra_firefox_windows(prof)
+        reposition_browser_to_grid_slot(prof, grid_slot, timeout_s=8.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Human] Chưa xếp được cửa sổ: {}", exc)
+
+
 def _show_queue_number_on_browser(context: Any, page: Page, mapped: MappedAccount) -> None:
     """Gắn «#01 · UID» lên tab Firefox và góc trang."""
     from src.utils.browser_identity import stamp_browser_account_label
@@ -340,6 +360,7 @@ def run_human_interaction_worker(
         from src.services.device_browse import hold_facebook_tabs
 
         page: Page = hold_facebook_tabs(context)
+        _snap_profile_to_grid(acc, page, grid_slot)
         os.environ.pop("TOOLFB_NAV_MOBILE_FB", None)
         _show_queue_number_on_browser(context, page, mapped)
 
@@ -588,9 +609,17 @@ def run_human_interaction_worker(
             prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
             if prof:
                 try:
-                    from src.utils.win_browser_window import reposition_browser_to_grid_slot
+                    from src.utils.win_browser_window import (
+                        close_extra_firefox_windows,
+                        reposition_browser_to_grid_slot,
+                    )
 
-                    if reposition_browser_to_grid_slot(prof, grid_slot, timeout_s=20.0):
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
+                    close_extra_firefox_windows(prof)
+                    if reposition_browser_to_grid_slot(prof, grid_slot, timeout_s=12.0):
                         title = _queue_window_label(mapped)
                         if title:
                             from src.utils.browser_identity import stamp_browser_account_label
