@@ -332,9 +332,11 @@ class _ManagerWindow:
         try:
             sw = int(self._root.winfo_screenwidth() or 1280)
             sh = int(self._root.winfo_screenheight() or 800)
-            ww = min(1280, max(860, sw - 48))
-            wh = min(900, max(560, sh - 72))
-            self._root.geometry(f"{ww}x{wh}+{(sw - ww) // 2}+{(sh - wh) // 2}")
+            # Chiếm ~90% màn hình của từng máy, chừa chỗ cho taskbar.
+            ww = max(860, min(int(sw * 0.9), sw - 40))
+            wh = max(560, min(int(sh * 0.88), sh - 80))
+            self._root.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2 - 20)}")
+            self._start_zoomed = sw <= 1440 or sh <= 820
         except tk.TclError:
             pass
         self._compact_ui = int(self._root.winfo_screenheight() or 900) <= 820
@@ -1339,6 +1341,8 @@ class _ManagerWindow:
         self._root.after(1200, self._maybe_start_fleet_scheduler)
         try:
             self._root.deiconify()
+            if getattr(self, "_start_zoomed", False):
+                self._root.state("zoomed")
             self._root.lift()
         except tk.TclError:
             pass

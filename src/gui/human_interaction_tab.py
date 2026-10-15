@@ -1625,9 +1625,31 @@ def build_human_interaction_tab(
                 _tick_run_pulse()
             return
         _stop_run_pulse()
+        if state.get("proxy_check_cancel") is not None:
+            _apply_banner_colors(bg=_C_RUN_BG, fg=_C_RUN_FG, led=_C_RUN_LED)
+            _configure_stop_buttons(enabled=True)
+            return
+        if _other_work_running():
+            _apply_banner_colors(bg=_C_RUN_BG, fg=_C_RUN_FG, led=_C_RUN_LED)
+            _configure_stop_buttons(enabled=True)
+            return
         var_run_status.set("Sẵn sàng")
         _apply_banner_colors(bg=_C_IDLE_BG, fg=_C_IDLE_FG, led=_C_IDLE_LED)
         _configure_stop_buttons(enabled=False)
+
+    def _other_work_running() -> bool:
+        """Đang lướt nhận thiết bị hoặc còn cửa sổ profile mở (không phải pool)."""
+        return bool(state.get("device_browse_active")) or bool(state.get("profile_browser_sessions"))
+
+    def _idle_stop_watch() -> None:
+        """Giữ nút «Dừng» bấm được khi đang lướt / mở profile — không cần pool."""
+        try:
+            if not state.get("pool") and not state.get("pool_stopping"):
+                busy = state.get("proxy_check_cancel") is not None or _other_work_running()
+                _configure_stop_buttons(enabled=busy)
+            root.after(1500, _idle_stop_watch)
+        except tk.TclError:
+            pass
 
     def _finish_pool_cleanup(
         *,
@@ -2327,31 +2349,53 @@ def build_human_interaction_tab(
         _mark_soft_login(blocked, enabled=True)
         return list(blocked)
 
-    def _accounts_with_working_proxy(account_ids: list[str]) -> tuple[list[str], list[str]]:
-        """Chỉ giữ tài khoản có đúng proxy đang gắn và proxy đó còn kết nối được."""
-        ready: list[str] = []
-        blocked: list[str] = []
-        for aid in account_ids:
+    def _accounts_with_working_proxy(
+        account_ids: list[str],
+        *,
+        progress: Callable[[int, int], None] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Chỉ giữ tài khoản có đúng proxy đang gắn và proxy đó còn kết nối được.
+
+        Kiểm tra song song nhiều proxy; dừng sớm khi ``cancel`` được bật.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _check_one(aid: str) -> tuple[str, bool, str]:
             ma = _mapped_by_id(aid)
-            if ma is None:
-                continue
+            if ma is None or (cancel is not None and cancel.is_set()):
+                return aid, False, ""
             label = ma.display_uid()
             if not ma.use_proxy:
-                ready.append(aid)
-                continue
+                return aid, True, ""
             if not str(ma.network.proxy_server or "").strip():
                 ma.status = "proxy_error"
                 ma.status_detail = "Đã bật proxy nhưng chưa gắn địa chỉ — không chạy"
-                blocked.append(f"{label}: đã bật proxy nhưng chưa gắn địa chỉ")
-                continue
+                return aid, False, f"{label}: đã bật proxy nhưng chưa gắn địa chỉ"
             ok_px, px_msg = ensure_mapped_proxy_live(ma)
-            shown = _proxy_public_label(ma)
             if ok_px:
-                ready.append(aid)
-                continue
+                return aid, True, ""
+            shown = _proxy_public_label(ma)
             ma.status = "proxy_error"
             ma.status_detail = f"Proxy không kết nối được — {shown} — {str(px_msg)[:80]}"[:220]
-            blocked.append(f"{label}: {shown} — {str(px_msg)[:60]}")
+            return aid, False, f"{label}: {shown} — {str(px_msg)[:60]}"
+
+        total = len(account_ids)
+        ok_ids: set[str] = set()
+        blocked: list[str] = []
+        done = 0
+        workers = max(1, min(16, total))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hi-proxy-check") as ex:
+            for aid, ok_px, line in ex.map(_check_one, account_ids):
+                done += 1
+                if ok_px:
+                    ok_ids.add(aid)
+                elif line:
+                    blocked.append(line)
+                if progress is not None:
+                    progress(done, total)
+        ready = [aid for aid in account_ids if aid in ok_ids]
         return ready, blocked
 
     def _start_pool(
@@ -2387,12 +2431,42 @@ def build_human_interaction_tab(
                 messagebox.showwarning("Chưa chọn", "Chọn ít nhất một dòng trong bảng.", parent=parent)
             return
         if not proxy_checked and not is_auto_continue:
+            if state.get("proxy_check_cancel") is not None:
+                messagebox.showinfo(
+                    "Đang kiểm tra proxy",
+                    "Đang kiểm tra proxy cho lượt chạy trước — chờ xong hoặc bấm «Dừng».",
+                    parent=parent,
+                )
+                return
             account_ids = [ma.account_id for ma in accounts]
+            cancel_ev = threading.Event()
+            state["proxy_check_cancel"] = cancel_ev
+
+            def _show_progress(done: int, total: int) -> None:
+                schedule_on_main_thread(
+                    root,
+                    lambda d=done, t=total: var_run_status.set(
+                        f"Đang kiểm tra proxy {d}/{t} tài khoản trước khi chạy…"
+                    ),
+                )
 
             def _check() -> tuple[list[str], list[str]]:
-                return _accounts_with_working_proxy(account_ids)
+                return _accounts_with_working_proxy(
+                    account_ids, progress=_show_progress, cancel=cancel_ev
+                )
+
+            def _end_check() -> bool:
+                state["proxy_check_cancel"] = None
+                _configure_stop_buttons(enabled=False)
+                if cancel_ev.is_set():
+                    var_run_status.set("Đã dừng — chưa chạy tài khoản nào")
+                    _refresh_trees()
+                    return True
+                return False
 
             def _checked(result: tuple[list[str], list[str]]) -> None:
+                if _end_check():
+                    return
                 ready_ids, lines = result
                 _refresh_trees()
                 _save_settings()
@@ -2417,9 +2491,13 @@ def build_human_interaction_tab(
                 )
 
             def _check_err(exc: BaseException) -> None:
+                if _end_check():
+                    return
                 messagebox.showerror("Proxy", str(exc), parent=parent)
 
-            var_summary.set(f"Đang kiểm tra proxy {len(account_ids)} tài khoản…")
+            var_run_status.set(f"Đang kiểm tra proxy 0/{len(account_ids)} tài khoản trước khi chạy…")
+            _configure_stop_buttons(enabled=True)
+            logger.info("[Human GUI] Kiểm tra proxy {} tài khoản trước khi chạy", len(account_ids))
             run_background_then_main(root, _check, _checked, on_error=_check_err)
             return
         _ensure_queue_numbers()
@@ -2707,16 +2785,48 @@ def build_human_interaction_tab(
         on_pool_finished: Callable[[bool, list[MappedAccount]], None] | None = None,
         relogin: bool = False,
     ) -> None:
-        action = "đăng nhập lại" if relogin else ("đăng nhập lượt mới" if login_only else "chạy lượt mới")
-        _ensure_pool_stopped_or_ask(
-            action,
-            lambda: _start_pool(
+        action = "đăng nhập lượt mới" if login_only else "chạy lượt mới"
+        if relogin:
+            action = "đăng nhập lại"
+
+        def _go() -> None:
+            _start_pool(
                 accounts,
                 login_only=login_only,
                 on_pool_finished=on_pool_finished,
                 relogin=relogin,
-            ),
-        )
+            )
+
+        if not _pool_busy() and _other_work_running():
+            n_open = len(state.get("profile_browser_sessions") or {})
+            if not messagebox.askyesno(
+                "Đang mở profile",
+                f"Đang lướt / mở {n_open} cửa sổ profile.\n\n"
+                f"• Có — Đóng các cửa sổ đó rồi {action}\n"
+                "• Không — Giữ nguyên",
+                parent=parent,
+            ):
+                return
+            if state.get("device_browse_active"):
+                _cancel_device_browse()
+            for sess in list((state.get("profile_browser_sessions") or {}).values()):
+                try:
+                    sess["cmd_q"].put("close")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[Human GUI] Đóng profile trước khi chạy: {}", exc)
+            var_run_status.set("Đang đóng cửa sổ profile trước khi chạy…")
+            _wait_profiles_closed_then(_go)
+            return
+        _ensure_pool_stopped_or_ask(action, _go)
+
+    def _wait_profiles_closed_then(on_ready: Callable[[], None], *, tries: int = 0) -> None:
+        """Chờ các cửa sổ profile đóng hẳn (tối đa ~30 giây) rồi mới chạy pool."""
+        if not state.get("profile_browser_sessions") or tries >= 120:
+            if tries >= 120:
+                logger.warning("[Human GUI] Cửa sổ profile chưa đóng hết sau 30 giây — vẫn chạy tiếp")
+            on_ready()
+            return
+        root.after(250, lambda: _wait_profiles_closed_then(on_ready, tries=tries + 1))
 
     def _on_save_cookie_only() -> None:
         """
@@ -3883,10 +3993,32 @@ def build_human_interaction_tab(
         _refresh_trees()
 
     def _on_stop() -> None:
+        cancel_ev = state.get("proxy_check_cancel")
+        if cancel_ev is not None:
+            cancel_ev.set()
+            var_run_status.set("Đang dừng kiểm tra proxy…")
+            logger.info("[Human GUI] Người dùng dừng lúc đang kiểm tra proxy")
+            if not state.get("pool"):
+                return
         if state.get("device_browse_active"):
             _cancel_device_browse()
             if not state.get("pool"):
                 return
+        if not state.get("pool") and state.get("profile_browser_sessions"):
+            n_open = len(state.get("profile_browser_sessions") or {})
+            if not messagebox.askyesno(
+                "Dừng",
+                f"Đóng {n_open} cửa sổ profile đang mở?",
+                parent=parent,
+            ):
+                return
+            for sess in list((state.get("profile_browser_sessions") or {}).values()):
+                try:
+                    sess["cmd_q"].put("close")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[Human GUI] Dừng — đóng profile: {}", exc)
+            var_run_status.set(f"Đang đóng {n_open} cửa sổ profile…")
+            return
         if not state.get("pool"):
             if state.get("pool_stopping"):
                 messagebox.showinfo(
@@ -4742,3 +4874,4 @@ def build_human_interaction_tab(
     setattr(root, "_toolfb_human_shutdown", shutdown_gracefully)
 
     _update_summary()
+    root.after(1500, _idle_stop_watch)

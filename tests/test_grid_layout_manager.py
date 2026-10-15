@@ -2,7 +2,29 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from src.utils.grid_layout_manager import GridWindowSlot, _grid_dimensions, compute_grid_layout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 DPI")
+def test_work_area_does_not_change_app_dpi_mode() -> None:
+    import ctypes
+
+    from src.utils.grid_layout_manager import win32_work_area
+
+    user32 = ctypes.windll.user32
+    user32.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    user32.GetAwarenessFromDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+
+    def awareness() -> int:
+        return int(user32.GetAwarenessFromDpiAwarenessContext(user32.GetThreadDpiAwarenessContext()))
+
+    before = awareness()
+    assert win32_work_area() is not None
+    assert awareness() == before
 
 
 def test_fit_slot_uses_client_work_area() -> None:

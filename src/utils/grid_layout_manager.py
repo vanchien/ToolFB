@@ -6,8 +6,10 @@ Tính viewport và tọa độ (X, Y) cho từng luồng trước khi khởi ch�
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 
@@ -54,6 +56,38 @@ def get_screen_resolution(*, fallback_width: int = 1920, fallback_height: int = 
     return fallback_width, fallback_height
 
 
+@contextlib.contextmanager
+def win32_dpi_aware_thread() -> Iterator[None]:
+    """
+    Tạm cho luồng hiện tại dùng tọa độ vật lý (PER_MONITOR_AWARE_V2) rồi trả lại như cũ.
+
+    Không đổi chế độ DPI của cả process: nếu đổi, Windows thôi phóng giao diện Tk
+    và cửa sổ ToolFB bị thu nhỏ trên màn hình 125%/150%/200%.
+    """
+    if os.name != "nt":
+        yield
+        return
+    previous = None
+    user32 = None
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        previous = user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        previous = None
+    try:
+        yield
+    finally:
+        if previous and user32 is not None:
+            try:
+                user32.SetThreadDpiAwarenessContext(previous)
+            except Exception:
+                pass
+
+
 def win32_work_area() -> tuple[int, int, int, int] | None:
     """``(x, y, width, height)`` vùng làm việc màn hình chính, đã trừ taskbar."""
     if os.name != "nt":
@@ -63,17 +97,11 @@ def win32_work_area() -> tuple[int, int, int, int] | None:
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-        try:
-            # -4 = PER_MONITOR_AWARE_V2. Firefox nhận tọa độ vật lý; process phải cùng chế độ.
-            user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        except Exception:
-            try:
-                user32.SetProcessDPIAware()
-            except Exception:
-                pass
         rect = wintypes.RECT()
         spi_getworkarea = 0x0030
-        if not user32.SystemParametersInfoW(spi_getworkarea, 0, ctypes.byref(rect), 0):
+        with win32_dpi_aware_thread():
+            ok = user32.SystemParametersInfoW(spi_getworkarea, 0, ctypes.byref(rect), 0)
+        if not ok:
             return None
         width = int(rect.right - rect.left)
         height = int(rect.bottom - rect.top)

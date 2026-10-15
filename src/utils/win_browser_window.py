@@ -285,23 +285,26 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
         found.append((int(hwnd), str(buf.value or "")))
         return True
 
-    user32.EnumWindows(_enum_cb, 0)
-    good = [hwnd for hwnd, title in found if not restored_error_window_title(title)]
-    # Cửa sổ trang lỗi không được đặt đè lên ô của cửa sổ Facebook.
-    targets = good or [hwnd for hwnd, _title in found]
-    for hwnd in targets:
-        # Profile đồng bộ thường đang maximized — SetWindowPos không thu được nếu chưa restore.
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetWindowPos(
-            hwnd,
-            None,
-            int(x),
-            int(y),
-            max(160, int(width)),
-            max(160, int(height)),
-            SWP_SHOWWINDOW,
-        )
-        placed = True
+    from src.utils.grid_layout_manager import win32_dpi_aware_thread
+
+    with win32_dpi_aware_thread():
+        user32.EnumWindows(_enum_cb, 0)
+        good = [hwnd for hwnd, title in found if not restored_error_window_title(title)]
+        # Cửa sổ trang lỗi không được đặt đè lên ô của cửa sổ Facebook.
+        targets = good or [hwnd for hwnd, _title in found]
+        for hwnd in targets:
+            # Profile đồng bộ thường đang maximized — SetWindowPos không thu được nếu chưa restore.
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.SetWindowPos(
+                hwnd,
+                None,
+                int(x),
+                int(y),
+                max(160, int(width)),
+                max(160, int(height)),
+                SWP_SHOWWINDOW,
+            )
+            placed = True
     if placed:
         logger.info(
             "Đã đặt cửa sổ Firefox profile~{} → ({}, {}) {}x{}",
