@@ -179,10 +179,15 @@ def _snap_profile_to_grid(acc: dict[str, Any], page: Any, grid_slot: GridWindowS
     except Exception:
         pass
     try:
-        from src.utils.win_browser_window import close_extra_firefox_windows, reposition_browser_to_grid_slot
+        from src.utils.win_browser_window import (
+            close_extra_firefox_windows,
+            guard_profile_against_error_windows,
+            reposition_browser_to_grid_slot,
+        )
 
         close_extra_firefox_windows(prof)
         reposition_browser_to_grid_slot(prof, grid_slot, timeout_s=8.0)
+        guard_profile_against_error_windows(prof, grid_slot)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Human] Chưa xếp được cửa sổ: {}", exc)
 

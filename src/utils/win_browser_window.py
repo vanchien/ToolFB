@@ -262,9 +262,12 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
     if not target_pids:
         return False
 
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    found: list[tuple[int, str]] = []
+
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def _enum_cb(hwnd: int, _lparam: int) -> bool:
-        nonlocal placed
         if not user32.IsWindowVisible(hwnd):
             return True
         pid = wintypes.DWORD()
@@ -275,10 +278,18 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
         rect = wintypes.RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return True
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        if w < 200 or h < 200:
+        if (rect.right - rect.left) < 200 or (rect.bottom - rect.top) < 200:
             return True
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        found.append((int(hwnd), str(buf.value or "")))
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    good = [hwnd for hwnd, title in found if not restored_error_window_title(title)]
+    # Cửa sổ trang lỗi không được đặt đè lên ô của cửa sổ Facebook.
+    targets = good or [hwnd for hwnd, _title in found]
+    for hwnd in targets:
         # Profile đồng bộ thường đang maximized — SetWindowPos không thu được nếu chưa restore.
         user32.ShowWindow(hwnd, SW_RESTORE)
         user32.SetWindowPos(
@@ -291,9 +302,6 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
             SWP_SHOWWINDOW,
         )
         placed = True
-        return True
-
-    user32.EnumWindows(_enum_cb, 0)
     if placed:
         logger.info(
             "Đã đặt cửa sổ Firefox profile~{} → ({}, {}) {}x{}",
@@ -318,6 +326,43 @@ def restored_error_window_title(title: str) -> bool:
         or "sự cố" in raw
         or "su co" in raw
     )
+
+
+def guard_profile_against_error_windows(
+    profile_dir: str | Path,
+    slot: Any = None,
+    *,
+    duration_s: float = 90.0,
+    interval_s: float = 1.5,
+    stop: threading.Event | None = None,
+) -> threading.Thread | None:
+    """Canh cửa sổ trang lỗi ``http://0.0.x.x`` mở muộn sau khi tab đã được dọn.
+
+    Chạy nền trong ``duration_s`` giây. Mỗi lần thấy cửa sổ lỗi thì đóng nó và đặt lại
+    cửa sổ còn lại vào ô lưới.
+    """
+    if sys.platform != "win32":
+        return None
+    prof = str(profile_dir or "").strip()
+    if not prof:
+        return None
+
+    def _run() -> None:
+        end = time.monotonic() + max(1.0, float(duration_s))
+        while time.monotonic() < end:
+            if stop is not None and stop.is_set():
+                return
+            try:
+                if close_extra_firefox_windows(prof) and slot is not None:
+                    time.sleep(0.4)
+                    reposition_browser_to_grid_slot(prof, slot, timeout_s=3.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Canh cửa sổ lỗi: {}", exc)
+            time.sleep(max(0.3, float(interval_s)))
+
+    t = threading.Thread(target=_run, name="ff_error_window_guard", daemon=True)
+    t.start()
+    return t
 
 
 def close_extra_firefox_windows(profile_dir: str | Path) -> int:
@@ -366,10 +411,9 @@ def close_extra_firefox_windows(profile_dir: str | Path) -> int:
     if len(hwnds) < 2:
         return 0
     error_hwnds = [hwnd for hwnd, title in hwnds if restored_error_window_title(title)]
+    # Chỉ đóng cửa sổ trang lỗi khi còn cửa sổ khác. Cửa sổ duy nhất là của Playwright.
     if error_hwnds and len(error_hwnds) < len(hwnds):
         victims = error_hwnds
-    elif foreground in {hwnd for hwnd, _title in hwnds}:
-        victims = [hwnd for hwnd, _title in hwnds if hwnd != foreground]
     else:
         return 0
     closed = 0

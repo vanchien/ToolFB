@@ -149,6 +149,20 @@ def test_persistent_context_uses_portable_profile_dir(monkeypatch: pytest.Monkey
         factory.close()
 
 
+def test_firefox_grid_launch_has_no_number_that_becomes_a_tab() -> None:
+    """Ô 320px từng thành tab http://0.0.1.64 vì Firefox mở số đi kèm -width như URL."""
+    factory = BrowserFactory.__new__(BrowserFactory)
+    args = factory._launch_args_for(
+        "firefox",
+        viewport_width=320,
+        viewport_height=400,
+        window_x=8,
+        window_y=8,
+        fit_outer_window=True,
+    )
+    assert args == []
+
+
 def test_restored_error_window_title_is_not_facebook() -> None:
     from src.utils.win_browser_window import restored_error_window_title
 

@@ -844,15 +844,10 @@ class BrowserFactory:
                 args.append(f"--window-position={int(window_x)},{int(window_y)}")
             return args
         if browser_key == "firefox":
-            args: list[str] = []
-            # Lưới đa cửa sổ: bật -width/-height; mặc định tắt để tránh lệch layout khi không chia lưới.
-            if (
-                fit_outer_window or _env_bool("FB_FIREFOX_OUTER_WINDOW_FIT", False)
-            ) and viewport_width and viewport_height:
-                args.extend(["-width", str(viewport_width), "-height", str(viewport_height)])
-            if window_x is not None and window_y is not None:
-                args.extend(["-left", str(int(window_x)), "-top", str(int(window_y))])
-            return args
+            # Không truyền -width/-height/-left/-top: Firefox không nhận các cờ này khi có cửa sổ,
+            # rồi mở con số kèm theo thành URL (320 → http://0.0.1.64). Cửa sổ được đặt bằng
+            # SetWindowPos sau khi mở.
+            return []
         return []
 
     def get_browser_context(

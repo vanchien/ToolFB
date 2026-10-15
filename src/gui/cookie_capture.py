@@ -309,17 +309,24 @@ def run_fb_cookie_capture_dialog(
             from src.services.device_browse import hold_facebook_tabs
 
             page = hold_facebook_tabs(ctx, attempts=12, pause_s=0.4)
-            if prof and window_position and grid_viewport and len(grid_viewport) >= 2:
-                from src.utils.win_browser_window import place_firefox_window_for_profile
-
-                place_firefox_window_for_profile(
-                    prof,
-                    x=int(window_position[0]),
-                    y=int(window_position[1]),
-                    width=max(320, int(grid_viewport[0])),
-                    height=max(400, int(grid_viewport[1])),
-                    timeout_s=6.0,
+            if prof:
+                from src.utils.win_browser_window import (
+                    close_extra_firefox_windows,
+                    guard_profile_against_error_windows,
+                    place_firefox_window_for_profile,
                 )
+
+                close_extra_firefox_windows(prof)
+                if window_position and grid_viewport and len(grid_viewport) >= 2:
+                    place_firefox_window_for_profile(
+                        prof,
+                        x=int(window_position[0]),
+                        y=int(window_position[1]),
+                        width=max(320, int(grid_viewport[0])),
+                        height=max(400, int(grid_viewport[1])),
+                        timeout_s=6.0,
+                    )
+                guard_profile_against_error_windows(prof, None)
             try:
                 page.bring_to_front()
             except Exception:
