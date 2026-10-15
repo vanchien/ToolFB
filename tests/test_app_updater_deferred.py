@@ -128,6 +128,17 @@ def test_deferred_bat_runs_on_windows_even_for_source_install(tmp_path: Path) ->
     assert should_run_deferred_apply(present) is (sys.platform == "win32")
 
 
+def test_disk_full_error_mentions_updates_folder() -> None:
+    from src.services.app_updater import _disk_full_error
+
+    err = OSError(28, "No space left on device")
+    err.winerror = 112  # type: ignore[attr-defined]
+    mapped = _disk_full_error(err, Path("C:/ToolFB/data/updates/staged"))
+    assert mapped is not None
+    assert "data\\updates" in str(mapped)
+    assert _disk_full_error(OSError(13, "denied"), Path("x")) is None
+
+
 def test_download_url_is_pinned_to_the_manifest_version() -> None:
     floating = "https://github.com/vanchien/ToolFB/releases/latest/download/ToolFB_release_bundle.zip"
     pinned = _pin_release_download_url(floating, "1.0.105")
@@ -185,6 +196,10 @@ def test_frozen_apply_replaces_internal_and_drops_shadow_src(tmp_path: Path) -> 
     assert "toolfb_release.txt" in text
     assert f'rd /s /q "{project.resolve()}\\src"' in text
     staged = next(updates.glob("staged_apply_*"))
+    assert not exe.exists()
+    assert (staged / "exe_gui" / "ToolFB_GUI.exe").is_file()
+    assert (staged / "portable_apply" / "version.json").is_file()
+    assert not (staged / "portable_apply" / "src").exists()
     assert (staged / "exe_gui" / "_internal" / "toolfb_release.txt").read_text(encoding="ascii").strip() == "9.9.9"
     # Chạy đúng các lệnh đổi thư mục, không relaunch app.
     from src.services.app_updater import _internal_replace_commands

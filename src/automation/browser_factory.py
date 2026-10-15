@@ -796,7 +796,8 @@ class BrowserFactory:
         if key == "firefox":
             return self._playwright.firefox
         if key == "webkit":
-            return self._playwright.webkit
+            # Gói cập nhật không kèm WebKit. Tài khoản chọn WebKit mở bằng Chromium.
+            return self._playwright.chromium
         raise ValueError(f"browser_type không hỗ trợ: {name}")
 
     def _launch_args_for(

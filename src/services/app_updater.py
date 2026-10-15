@@ -1292,26 +1292,43 @@ def _stage_deferred_full_apply_windows(
         shutil.rmtree(old, ignore_errors=True)
     safe_ver = "".join(c if c.isalnum() or c in "-_" else "_" for c in version.strip())[:64] or "bundle"
     staged = updates_dir / f"staged_apply_{safe_ver}"
-    staged_payload = staged / "portable_apply"
-    staged_payload.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(payload_root, staged_payload, dirs_exist_ok=True)
-
-    if exe_gui_root is not None and _exe_gui_looks_valid(exe_gui_root):
-        staged_gui = staged / "exe_gui"
-        staged_gui.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(exe_gui_root / "ToolFB_GUI.exe", staged_gui / "ToolFB_GUI.exe")
-        _copytree_resilient(exe_gui_root / "_internal", staged_gui / "_internal")
-        (staged_gui / "_internal" / "toolfb_release.txt").write_text(
-            _release_marker_text(version) + "\n",
-            encoding="ascii",
-        )
+    staged.mkdir(parents=True, exist_ok=True)
+    has_exe = exe_gui_root is not None and _exe_gui_looks_valid(exe_gui_root)
+    # Bản exe: chỉ chuyển exe_gui (đổi tên trên cùng ổ). Không chép thêm portable_clean
+    # vì batch không dùng cây source — lần chép đó từng làm đầy đĩa (WinError 112).
+    if frozen_install and has_exe:
+        assert exe_gui_root is not None
+        staged_payload = staged / "portable_apply"
+        staged_payload.mkdir(parents=True, exist_ok=True)
+        version_file = payload_root / "version.json"
+        if version_file.is_file():
+            shutil.copy2(version_file, staged_payload / "version.json")
+        _relocate_tree(exe_gui_root, staged / "exe_gui")
+        if payload_root.exists() and payload_root.resolve() != exe_gui_root.resolve():
+            shutil.rmtree(payload_root, ignore_errors=True)
+    else:
+        if has_exe and exe_gui_root is not None:
+            try:
+                exe_gui_root.resolve().relative_to(payload_root.resolve())
+                exe_inside = True
+            except ValueError:
+                exe_inside = False
+            if exe_inside:
+                _relocate_tree(exe_gui_root, staged / "exe_gui")
+        _relocate_tree(payload_root, staged / "portable_apply")
+        if has_exe and exe_gui_root is not None and not (staged / "exe_gui").exists():
+            _relocate_tree(exe_gui_root, staged / "exe_gui")
+    if has_exe:
+        marker_path = staged / "exe_gui" / "_internal" / "toolfb_release.txt"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(_release_marker_text(version) + "\n", encoding="ascii")
 
     pr_s = str(project_root.resolve())
     st_s = str(staged.resolve())
     exe_dst = str((project_root / "ToolFB_GUI.exe").resolve())
     robocopy_xd = " ".join(dict.fromkeys((*preserve_on_apply_dirs, "_internal")))
     log_file = str((updates_dir / "last_deferred_apply.log").resolve())
-    has_exe = exe_gui_root is not None and _exe_gui_looks_valid(exe_gui_root)
+    has_exe = (staged / "exe_gui" / "ToolFB_GUI.exe").is_file()
     # Bản đóng gói: không trộn portable_clean lên thư mục exe. Lần cập nhật trước để lại
     # thư mục src cạnh ToolFB_GUI.exe và Python nạp file đó thay cho code trong _internal.
     code_lines: list[str] = []
@@ -1387,6 +1404,7 @@ def apply_update_package(
         Backup + cờ ``deferred`` (cần relaunch để hoàn tất trên Windows).
     """
     updates_dir = project_root / "data" / "updates"
+    _purge_stale_update_files(project_root, updates_dir)
     updates_dir.mkdir(parents=True, exist_ok=True)
     tmp_zip = updates_dir / f"update_{manifest.version}.zip"
     download_url = _pin_release_download_url(manifest.download_url, manifest.version)
@@ -1417,6 +1435,10 @@ def apply_update_package(
     extract_root = _make_short_extract_root(project_root=project_root, updates_dir=updates_dir)
     try:
         _zip_extract_resilient(tmp_zip, extract_root)
+        try:
+            tmp_zip.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Updater: chưa xóa được zip sau khi giải nén: {}", exc)
         layout = _detect_update_payload_layout(extract_root)
         payload_root = layout.code_root
         defer_bat = updates_dir / DEFERRED_GUI_BAT_NAME
@@ -1496,6 +1518,87 @@ def apply_update_package(
         shutil.rmtree(extract_root, ignore_errors=True)
 
 
+def _same_volume(left: Path, right: Path) -> bool:
+    """True khi hai đường dẫn cùng ổ — đổi tên thư mục không cần thêm dung lượng."""
+    try:
+        a = left.resolve()
+        b = right.resolve()
+    except OSError:
+        return False
+    if os.name == "nt":
+        return a.drive.lower() == b.drive.lower()
+    return a.anchor == b.anchor
+
+
+def _disk_full_error(exc: BaseException, target: Path) -> RuntimeError | None:
+    """Đổi WinError 112 thành câu tiếng Việt, kèm chỗ cần xóa."""
+    win_e = int(getattr(exc, "winerror", 0) or 0)
+    en = int(getattr(exc, "errno", 0) or 0)
+    if win_e != 112 and en != 28:
+        return None
+    return RuntimeError(
+        "Ổ đĩa không đủ chỗ để cập nhật.\n"
+        "Đóng ToolFB, xóa thư mục data\\updates trong thư mục cài, xóa C:\\tfe nếu có, "
+        "dọn Thùng rác, rồi bấm cập nhật lại.\n"
+        f"Không ghi được: {target}"
+    )
+
+
+def _relocate_tree(src: Path, dst: Path) -> None:
+    """
+    Đưa cả cây thư mục sang chỗ stage.
+
+    Cùng ổ thì đổi tên (không chép thêm một bản ~1GB trình duyệt). Khác ổ thì chép rồi xóa nguồn.
+    """
+    if not src.is_dir():
+        raise RuntimeError(f"Thiếu thư mục cập nhật: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    try:
+        if _same_volume(src, dst.parent):
+            shutil.move(str(src), str(dst))
+            return
+        _copytree_resilient(src, dst)
+        shutil.rmtree(src, ignore_errors=True)
+    except OSError as exc:
+        mapped = _disk_full_error(exc, dst)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+
+
+def _purge_stale_update_files(project_root: Path, updates_dir: Path) -> None:
+    """Xóa zip, bản stage dở và thư mục giải nén cũ trước khi tải gói mới."""
+    if updates_dir.is_dir():
+        for pattern in ("update_*.zip", "staged_apply_*", "staged_gui_*", "backup_before_*"):
+            for old in updates_dir.glob(pattern):
+                try:
+                    if old.is_dir():
+                        shutil.rmtree(old, ignore_errors=True)
+                    else:
+                        old.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Updater: không xóa được {}: {}", old, exc)
+    for name in ("_internal.old", "_internal.new"):
+        stale = project_root / name
+        if stale.exists():
+            shutil.rmtree(stale, ignore_errors=True)
+    if os.name != "nt":
+        return
+    drv = (os.environ.get("SystemDrive") or "C:").rstrip("\\/") + "\\"
+    tfe = Path(drv) / "tfe"
+    if not tfe.is_dir():
+        return
+    try:
+        children = list(tfe.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if child.is_dir() and (child.name.startswith("e") or child.name == "stage"):
+            shutil.rmtree(child, ignore_errors=True)
+
+
 def _copytree_resilient(src: Path, dst: Path) -> None:
     """
     Merge tree an toàn cho thư mục tools:
@@ -1508,7 +1611,13 @@ def _copytree_resilient(src: Path, dst: Path) -> None:
         root_p = Path(root)
         rel = root_p.relative_to(src)
         out_dir = dst / rel
-        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            mapped = _disk_full_error(exc, out_dir)
+            if mapped is not None:
+                raise mapped from exc
+            raise
         for d in dirs:
             try:
                 (out_dir / d).mkdir(parents=True, exist_ok=True)
@@ -1522,6 +1631,11 @@ def _copytree_resilient(src: Path, dst: Path) -> None:
                 shutil.copy2(s, t)
             except FileNotFoundError:
                 logger.warning("Updater tools: file nguồn không còn, bỏ qua {}", s)
+            except OSError as exc:
+                mapped = _disk_full_error(exc, t)
+                if mapped is not None:
+                    raise mapped from exc
+                logger.warning("Updater tools: không copy được {} -> {}: {}", s, t, exc)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Updater tools: không copy được {} -> {}: {}", s, t, exc)
 

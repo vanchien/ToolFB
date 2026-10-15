@@ -53,6 +53,14 @@ def _bundle_playwright_browsers(*, project_root: Path, dist_dir: Path) -> None:
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     shutil.copytree(src, dest)
+    # Headless shell và WebKit không dùng cho lướt Facebook. Bỏ khỏi gói để máy khách
+    # còn chỗ khi cập nhật (WinError 112). Headless Chromium dùng chrome thường.
+    for child in list(dest.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.name.startswith("chromium_headless_shell-") or child.name.startswith("webkit-"):
+            shutil.rmtree(child, ignore_errors=True)
+            print(f"PLAYWRIGHT_BROWSER_OMITTED={child.name}", file=sys.stderr)
     print(f"PLAYWRIGHT_BROWSERS_BUNDLED={dest}", file=sys.stderr)
     _write_manifest = project_root / "tools" / "write_browser_bundle_manifest.py"
     if _write_manifest.is_file():

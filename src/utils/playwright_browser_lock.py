@@ -18,6 +18,9 @@ from typing import Any
 from loguru import logger
 
 _MANIFEST_NAME = "browser_bundle_manifest.json"
+# Playwright 1.49+ mặc định dùng chrome-headless-shell. Gói cài không kèm shell đó;
+# headless chạy bằng Chromium thường cho nhẹ file cập nhật.
+os.environ.setdefault("PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL", "0")
 _BROWSER_DIR_RE = re.compile(
     r"^(chromium_headless_shell|chromium|firefox|webkit|ffmpeg|winldd)-\d+$"
 )
