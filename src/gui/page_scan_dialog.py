@@ -46,6 +46,7 @@ class PageScanDialog:
         self._done_evt = threading.Event()
         self._err_holder: list[str] = []
         self._selected_account_id: str = ""
+        self._selected_account_label: str = ""
         self._saved_count: int = 0
         self._scan_running: bool = False
 
@@ -72,10 +73,22 @@ class PageScanDialog:
         top.columnconfigure(1, weight=1)
 
         ttk.Label(top, text="Tài khoản:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        account_ids = [str(a.get("id", "")).strip() for a in self._accounts.load_all() if a.get("id")]
-        self._cb_account = ttk.Combobox(top, values=account_ids, state="readonly")
-        if account_ids:
-            self._cb_account.set(account_ids[0])
+        from src.services.page_creation.naming import account_display_label
+
+        # Hiện tên người dùng thay cho mã acc_…; mã id vẫn giữ để quét đúng tài khoản.
+        self._account_id_by_label: dict[str, str] = {}
+        for acc in self._accounts.load_all():
+            aid = str(acc.get("id") or "").strip()
+            if not aid:
+                continue
+            label = account_display_label(acc)
+            if label in self._account_id_by_label:
+                label = f"{label} · {aid}"
+            self._account_id_by_label[label] = aid
+        labels = list(self._account_id_by_label)
+        self._cb_account = ttk.Combobox(top, values=labels, state="readonly")
+        if labels:
+            self._cb_account.set(labels[0])
         self._cb_account.grid(row=0, column=1, sticky="ew")
 
         btnf = ttk.Frame(top)
@@ -217,7 +230,8 @@ class PageScanDialog:
         self._log_var.set(msg)
 
     def _on_start_scan(self) -> None:
-        aid = self._cb_account.get().strip()
+        label = self._cb_account.get().strip()
+        aid = self._account_id_by_label.get(label, label)
         if not aid:
             messagebox.showwarning("Chưa chọn", "Chọn một tài khoản để quét.", parent=self._top)
             return
@@ -225,6 +239,7 @@ class PageScanDialog:
             messagebox.showinfo("Đang chạy", "Đang có tiến trình quét, vui lòng chờ.", parent=self._top)
             return
         self._selected_account_id = aid
+        self._selected_account_label = label
         self._results = []
         for i in self._tree.get_children():
             self._tree.delete(i)
@@ -404,7 +419,7 @@ class PageScanDialog:
             return
         if not messagebox.askyesno(
             "Xác nhận",
-            f"Sẽ thêm/cập nhật {len(to_save)} Page cho account {self._selected_account_id!r} "
+            f"Sẽ thêm/cập nhật {len(to_save)} Page cho tài khoản «{self._selected_account_label or self._selected_account_id}» "
             f"vào pages.json. Tiếp tục?",
             parent=self._top,
         ):
