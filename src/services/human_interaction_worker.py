@@ -155,11 +155,23 @@ def _queue_window_label(mapped: MappedAccount) -> str:
     return format_account_window_label(int(getattr(mapped, "queue_no", 0) or 0), uid)
 
 
+def _profile_dir_for_window(acc: dict[str, Any]) -> str:
+    """Đường dẫn profile tuyệt đối, cùng cách Firefox ghi trên dòng lệnh."""
+    raw = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+    if not raw:
+        return ""
+    from src.utils.account_browser_profile import resolve_account_path
+    from src.utils.paths import project_root
+
+    resolved = resolve_account_path(project_root(), raw)
+    return str(resolved or raw)
+
+
 def _snap_profile_to_grid(acc: dict[str, Any], page: Any, grid_slot: GridWindowSlot | None) -> None:
     """Đóng cửa sổ tab cũ rồi đặt cửa sổ Facebook đúng ô lưới."""
     if grid_slot is None:
         return
-    prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+    prof = _profile_dir_for_window(acc)
     if not prof:
         return
     try:
@@ -606,7 +618,7 @@ def run_human_interaction_worker(
             _persist_session_immediately(log_label=f"prep_{prep_mode}", require_confirm=False)
 
         if grid_slot is not None:
-            prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+            prof = _profile_dir_for_window(acc)
             if prof:
                 try:
                     from src.utils.win_browser_window import (

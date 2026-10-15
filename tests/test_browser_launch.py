@@ -149,6 +149,15 @@ def test_persistent_context_uses_portable_profile_dir(monkeypatch: pytest.Monkey
         factory.close()
 
 
+def test_restored_error_window_title_is_not_facebook() -> None:
+    from src.utils.win_browser_window import restored_error_window_title
+
+    assert restored_error_window_title("Problem loading page — Nightly")
+    assert restored_error_window_title("http://0.0.1.64")
+    assert not restored_error_window_title("Facebook")
+    assert not restored_error_window_title("#02 · 61580525175532 — Facebook")
+
+
 @pytest.mark.integration
 def test_ipify_shows_ip_through_configured_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     """

@@ -277,11 +277,25 @@ def _try_set_window(profile_key: str, *, x: int, y: int, width: int, height: int
     return placed
 
 
+def restored_error_window_title(title: str) -> bool:
+    """Cửa sổ tab máy cũ (``http://0.0.x.x`` / Problem loading page), không phải Facebook."""
+    raw = str(title or "").casefold()
+    if "facebook" in raw:
+        return False
+    return (
+        "problem loading" in raw
+        or "0.0." in raw
+        or "connection was reset" in raw
+        or "sự cố" in raw
+        or "su co" in raw
+    )
+
+
 def close_extra_firefox_windows(profile_dir: str | Path) -> int:
     """Đóng cửa sổ Firefox thừa của cùng profile.
 
-    Phiên cũ hay mở thêm một cửa sổ ``http://0.0.x.x`` lệch khỏi lưới. Giữ cửa sổ đang
-    được đưa lên trước, đóng các cửa sổ lớn còn lại.
+    Phiên cũ hay mở thêm một cửa sổ ``http://0.0.x.x`` lệch khỏi lưới. Đóng cửa sổ
+    trang lỗi đó. Nếu không đọc được tiêu đề thì giữ cửa sổ đang ở trước.
     """
     if sys.platform != "win32":
         return 0
@@ -292,12 +306,14 @@ def close_extra_firefox_windows(profile_dir: str | Path) -> int:
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
     wm_close = 0x0010
     target_pids = set(_firefox_pids_for_profile(prof_key))
     if not target_pids:
         return 0
     foreground = int(user32.GetForegroundWindow() or 0)
-    hwnds: list[int] = []
+    hwnds: list[tuple[int, str]] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def _enum_cb(hwnd: int, _lparam: int) -> bool:
@@ -312,17 +328,23 @@ def close_extra_firefox_windows(profile_dir: str | Path) -> int:
             return True
         if (rect.right - rect.left) < 200 or (rect.bottom - rect.top) < 200:
             return True
-        hwnds.append(int(hwnd))
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        hwnds.append((int(hwnd), str(buf.value or "")))
         return True
 
     user32.EnumWindows(_enum_cb, 0)
-    if len(hwnds) < 2 or foreground not in hwnds:
+    if len(hwnds) < 2:
         return 0
-    keep = foreground
+    error_hwnds = [hwnd for hwnd, title in hwnds if restored_error_window_title(title)]
+    if error_hwnds and len(error_hwnds) < len(hwnds):
+        victims = error_hwnds
+    elif foreground in {hwnd for hwnd, _title in hwnds}:
+        victims = [hwnd for hwnd, _title in hwnds if hwnd != foreground]
+    else:
+        return 0
     closed = 0
-    for hwnd in hwnds:
-        if hwnd == keep:
-            continue
+    for hwnd in victims:
         user32.PostMessageW(hwnd, wm_close, 0, 0)
         closed += 1
     if closed:
