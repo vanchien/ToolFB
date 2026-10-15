@@ -1,7 +1,7 @@
 {
-  "version": "1.0.113",
-  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.113/ToolFB_release_bundle.zip",
-  "sha256": "ce5dd1a30ca5eae8eadf04ac330bb1a7406e04970c7f1ebd7741daada8bb6a00",
-  "notes": "Dong cua so tab proxy cu va xep lai dung luoi.",
-  "generated_at": "2026-10-15T03:50:22"
+  "version": "1.0.114",
+  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.114/ToolFB_release_bundle.zip",
+  "sha256": "040fa00231326de3f547faee28edff529343076f5febf7bfb2fbdf1bf1c12db4",
+  "notes": "May khac dong cua so tab proxy cu va xep dung luoi.",
+  "generated_at": "2026-10-15T05:29:27"
 }
