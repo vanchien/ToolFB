@@ -13,6 +13,10 @@ from src.services.facebook_session_recovery import (
     _login_form_wait_ms,
     _normalize_facebook_uid,
     facebook_auth_flow_was_active,
+    facebook_checkpoint_blocks_retries,
+    facebook_checkpoint_body_is_hard,
+    facebook_checkpoint_id_from_url,
+    facebook_checkpoint_may_skip_url,
     facebook_page_blocks_recovery_email,
     facebook_page_has_visible_password_prompt,
     facebook_page_is_full_login_form,
@@ -37,6 +41,37 @@ def test_hard_checkpoint_detects_captcha_and_checkpoint() -> None:
     assert facebook_page_is_hard_checkpoint("https://www.facebook.com/?captcha=1")
     assert not facebook_page_is_hard_checkpoint("https://www.facebook.com/login")
     assert not facebook_page_is_hard_checkpoint("https://example.com/checkpoint/")
+
+
+def test_soft_checkpoint_url_can_be_skipped() -> None:
+    assert facebook_checkpoint_may_skip_url(
+        "https://www.facebook.com/checkpoint/828281030927956/?next=https%3A%2F%2Fwww.facebook.com%2F"
+    )
+    assert facebook_checkpoint_may_skip_url(
+        "https://www.facebook.com/checkpoint/1501092823525282/"
+    )
+    assert facebook_checkpoint_may_skip_url("https://www.facebook.com/checkpoint/?next")
+    assert facebook_checkpoint_id_from_url(
+        "https://www.facebook.com/checkpoint/828281030927956/?next=x"
+    ) == "828281030927956"
+    assert not facebook_checkpoint_may_skip_url("https://www.facebook.com/accountquality")
+    assert not facebook_checkpoint_may_skip_url("https://www.facebook.com/confirm_identity")
+    assert not facebook_checkpoint_may_skip_url("https://www.facebook.com/recover/initiate")
+    assert not facebook_checkpoint_may_skip_url("https://www.facebook.com/login")
+
+
+def test_hard_checkpoint_body_is_not_skippable() -> None:
+    assert facebook_checkpoint_body_is_hard("Please upload an ID to confirm your identity")
+    assert facebook_checkpoint_body_is_hard("Your account has been disabled")
+    assert facebook_checkpoint_body_is_hard("We've locked your account")
+    assert not facebook_checkpoint_body_is_hard("Continue to Facebook")
+    assert facebook_checkpoint_blocks_retries(
+        "Checkpoint cứng — bỏ qua TK, chạy TK tiếp",
+        "https://www.facebook.com/checkpoint/1",
+    )
+    assert facebook_checkpoint_blocks_retries(
+        "Vẫn ở checkpoint (https://www.facebook.com/checkpoint/828281030927956/)",
+    )
 
 
 def test_recovery_email_blocked_on_captcha_not_plain_checkpoint() -> None:

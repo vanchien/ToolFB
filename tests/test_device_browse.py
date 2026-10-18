@@ -71,6 +71,38 @@ def test_locked_account_reports_the_facebook_sentence() -> None:
     assert describe_account_block("https://www.facebook.com/login.php", "Log in", expect_session=False) == ""
 
 
+def test_interaction_name_reads_profile_header_then_returns(monkeypatch: object) -> None:
+    from src.services import device_browse as mod
+
+    class _Feed:
+        def __init__(self) -> None:
+            self.url = "https://www.facebook.com/"
+            self.gotos: list[str] = []
+
+        def goto(self, url: str, **_kwargs: object) -> None:
+            self.gotos.append(url)
+            self.url = url
+
+        def wait_for_timeout(self, _ms: int) -> None:
+            return None
+
+    page = _Feed()
+
+    def _header(current: object) -> str:
+        if "profile.php?id=100" in str(getattr(current, "url", "")):
+            return "Andy Garcia"
+        return "Chats"
+
+    monkeypatch.setattr(mod, "read_profile_header_name", _header)  # type: ignore[attr-defined]
+    monkeypatch.setattr(mod, "read_logged_in_display_name", lambda _page: "")  # type: ignore[attr-defined]
+    monkeypatch.setattr(mod, "facebook_uid_on_page", lambda _page: "100")  # type: ignore[attr-defined]
+    assert mod.read_account_display_name(page, visit_profile=False) == ""
+    assert mod.read_account_display_name(page, visit_profile=True) == "Andy Garcia"
+    assert page.url == "https://www.facebook.com/"
+    assert page.gotos[0].endswith("profile.php?id=100")
+    assert page.gotos[-1] == "https://www.facebook.com/"
+
+
 def test_browse_stops_at_60_seconds() -> None:
     assert BROWSE_LIMIT_S == 60
     assert browse_limit_reached(0, 59.9) is False
@@ -101,6 +133,29 @@ def test_read_logged_in_display_name_uses_session_label() -> None:
 
     assert read_logged_in_display_name(_NamedPage()) == "Anna"
     assert read_logged_in_display_name(_Page("https://www.facebook.com/")) == ""
+
+    class _MenuPage(_NamedPage):
+        def evaluate(self, _script: str, uid: str) -> dict[str, object]:
+            return {
+                "labels": [],
+                "links": [],
+                "headings": ["Chats"],
+                "title": "Chats | Facebook",
+                "url": "https://www.facebook.com/messages/",
+            }
+
+    class _ProfilePage(_NamedPage):
+        def evaluate(self, _script: str, uid: str) -> dict[str, object]:
+            return {
+                "labels": [],
+                "links": [],
+                "headings": ["Đinh Bảo Trân"],
+                "title": "Đinh Bảo Trân | Facebook",
+                "url": f"https://www.facebook.com/profile.php?id={uid}",
+            }
+
+    assert read_logged_in_display_name(_MenuPage()) == ""
+    assert read_logged_in_display_name(_ProfilePage()) == "Đinh Bảo Trân"
 
 
 def test_open_home_feed_skips_when_already_on_facebook() -> None:

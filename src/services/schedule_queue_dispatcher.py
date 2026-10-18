@@ -193,7 +193,7 @@ def select_dispatch_batch(
     per_account_limit: int = 1,
 ) -> list[SchedulePostJob]:
     """
-    Chọn batch job dispatch: account rảnh chạy ngay; account busy chờ; trùng giờ → queue FIFO sort.
+    Chọn batch job dispatch: mỗi tài khoản một Page. Account đang đăng thì job tới giờ ở lại ready_queue, chạy sau khi Page hiện tại xong — không bỏ.
     """
     selected: list[SchedulePostJob] = []
     selected_ids: set[str] = set()
@@ -313,6 +313,111 @@ def ensure_schedule_queue_recovery(sp: SchedulePostsManager) -> None:
         return
     _recovery_done = True
     recover_stale_running_jobs(sp, force_all_running=True)
+
+
+_ARCHIVE_STATUSES = frozenset({"success", "cancelled"})
+
+
+def schedule_archive_path(*, root: Path | None = None) -> Path:
+    """File lưu bài đã đăng xong lâu ngày (mỗi dòng một job JSON)."""
+    d = (root or project_root()) / "data" / "runtime"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "schedule_posts_archive.jsonl"
+
+
+def archive_finished_jobs(
+    sp: SchedulePostsManager,
+    *,
+    older_than_days: int = 7,
+    now: datetime | None = None,
+    archive_path: Path | None = None,
+) -> int:
+    """
+    Chuyển job ``success``/``cancelled`` cũ hơn ``older_than_days`` ngày ra file archive.
+
+    Giữ ``schedule_posts.json`` gọn để mỗi lần đọc/ghi khi chạy nhiều Page 24/7 vẫn nhanh.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.timestamp() - max(1, int(older_than_days)) * 86400
+    jobs = sp.load_all()
+    keep: list[SchedulePostJob] = []
+    old: list[dict[str, Any]] = []
+    for job in jobs:
+        st = str(job.get("status", "")).strip().lower()
+        if st in _ARCHIVE_STATUSES:
+            raw = job.get("posted_at") or job.get("updated_at") or job.get("scheduled_at")
+            if str(raw or "").strip() and parse_job_schedule_time(raw).timestamp() < cutoff:
+                old.append(dict(job))
+                continue
+        keep.append(job)
+    if not old:
+        return 0
+    path = archive_path or schedule_archive_path()
+    with path.open("a", encoding="utf-8") as fh:
+        for row in old:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    sp.save_all(keep)
+    logger.info("[Schedule queue] Đã chuyển {} job xong lâu ngày sang {}.", len(old), path)
+    return len(old)
+
+
+_archived_ids_cache: tuple[float, frozenset[str]] = (0.0, frozenset())
+
+
+def archived_job_ids(*, archive_path: Path | None = None) -> frozenset[str]:
+    """Id job đã chuyển sang archive (cache theo mtime) — để tab Chờ đăng không coi là mất lịch."""
+    global _archived_ids_cache
+    path = archive_path or schedule_archive_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return frozenset()
+    if archive_path is None and _archived_ids_cache[0] == mtime:
+        return _archived_ids_cache[1]
+    ids: set[str] = set()
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                jid = str(json.loads(line).get("id") or "").strip()
+            except (ValueError, AttributeError):
+                continue
+            if jid:
+                ids.add(jid)
+    out = frozenset(ids)
+    if archive_path is None:
+        _archived_ids_cache = (mtime, out)
+    return out
+
+
+def find_orphan_running_jobs(
+    jobs: list[SchedulePostJob],
+    *,
+    tracked_ids: set[str],
+    now: datetime | None = None,
+    grace_minutes: float = 5.0,
+) -> list[str]:
+    """
+    Job ``running`` trong file nhưng không còn worker nào chạy (worker chết giữa chừng).
+
+    Chỉ tính job có ``running_started_at`` quá ``grace_minutes`` phút.
+    """
+    now = now or datetime.now(timezone.utc)
+    out: list[str] = []
+    for job in jobs:
+        if str(job.get("status", "")).strip().lower() != "running":
+            continue
+        jid = str(job.get("id", "")).strip()
+        if not jid or jid in tracked_ids:
+            continue
+        raw = str(job.get("running_started_at") or "").strip()
+        if not raw:
+            continue
+        if (now - parse_job_schedule_time(raw)).total_seconds() >= grace_minutes * 60:
+            out.append(jid)
+    return out
 
 
 def count_pending_due(jobs: list[SchedulePostJob], *, now: datetime | None = None) -> int:

@@ -690,6 +690,19 @@ def test_profile_name_from_live_detail_and_cookie_uid() -> None:
         ["Chung Chiến (Chung Văn Chiến)"],
     ) == "Chung Chiến (Chung Văn Chiến)"
     assert facebook_display_name_from_page_bits([], ["61581337018549", "Trang chủ"]) == ""
+    assert facebook_display_name_from_page_bits([], ["Edit"]) == ""
+    assert facebook_display_name_from_page_bits([], ["Edit"], ["Đinh Bảo Trân"]) == "Đinh Bảo Trân"
+    assert facebook_display_name_from_page_bits([], ["Chats"], ["Chats"]) == ""
+    from src.utils.account_proxy_mapper import name_from_facebook_window_title
+
+    assert name_from_facebook_window_title("(3) Đinh Bảo Trân | Facebook") == "Đinh Bảo Trân"
+    assert name_from_facebook_window_title("Chats | Facebook") == ""
+    from src.utils.account_proxy_mapper import pick_profile_header_name
+
+    assert pick_profile_header_name(["Andy Garcia", "265 followers • 42 following"]) == "Andy Garcia"
+    assert pick_profile_header_name(["Chats", "Public figure"], "Chats | Facebook") == ""
+    assert pick_profile_header_name([], "Andy Garcia | Facebook") == "Andy Garcia"
+    assert name_from_profile_html("<html><title>Edit | Facebook</title></html>") == ""
     from src.utils.account_proxy_mapper import facebook_href_is_own_profile
 
     uid = "61581337018549"

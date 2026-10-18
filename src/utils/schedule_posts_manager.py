@@ -17,6 +17,12 @@ from typing import Any, Iterable, Optional, TypedDict
 
 from loguru import logger
 
+from src.utils.json_list_cache import (
+    forget_json_list,
+    peek_json_list_fresh,
+    peek_json_list_stale,
+    remember_json_list,
+)
 from src.utils.json_store_lock import json_file_lock
 from src.utils.paths import project_root
 
@@ -130,6 +136,15 @@ class SchedulePostsManager:
         self._rows_cache = None
         self._rows_mtime = None
         self._id_index = {}
+        forget_json_list(self.file_path)
+
+    def _remember_rows(self, rows: list[SchedulePostJob], mtime: Optional[float]) -> None:
+        """Đồng bộ cache instance, index id và cache process-wide."""
+        self._rows_cache = rows
+        self._rows_mtime = mtime
+        self._rebuild_id_index(rows)
+        if mtime is not None:
+            remember_json_list(self.file_path, mtime, rows)
 
     def _rebuild_id_index(self, rows: list[SchedulePostJob]) -> None:
         self._id_index = {
@@ -187,13 +202,36 @@ class SchedulePostsManager:
         self._validate_row(d)
 
     def load_all(self) -> list[SchedulePostJob]:
-        with json_file_lock(self.file_path):
+        hit = peek_json_list_fresh(self.file_path)
+        if hit is not None:
+            try:
+                mtime = self.file_path.stat().st_mtime
+            except OSError:
+                mtime = None
+            self._remember_rows(hit, mtime)  # type: ignore[arg-type]
+            return list(hit)
+        with json_file_lock(self.file_path, timeout=0.2) as got:
+            if not got:
+                stale = peek_json_list_stale(self.file_path)
+                if stale is not None:
+                    logger.debug("schedule_posts load_all: cache cũ vì file đang ghi")
+                    return list(stale)
+                with json_file_lock(self.file_path):
+                    return self._load_all_unlocked()
             return self._load_all_unlocked()
 
     def _load_all_unlocked(self) -> list[SchedulePostJob]:
         if not self.file_path.is_file():
             self._invalidate_cache()
             raise FileNotFoundError(str(self.file_path))
+        shared = peek_json_list_fresh(self.file_path)
+        if shared is not None:
+            try:
+                mtime = self.file_path.stat().st_mtime
+            except OSError:
+                mtime = None
+            self._remember_rows(shared, mtime)  # type: ignore[arg-type]
+            return list(shared)
         mtime = self.file_path.stat().st_mtime
         if self._rows_cache is not None and self._rows_mtime == mtime:
             return list(self._rows_cache)
@@ -207,9 +245,7 @@ class SchedulePostsManager:
                 raise ValueError(f"Phần tử {i} không phải object.")
             self._validate_row(item)
             out.append(item)  # type: ignore[arg-type]
-        self._rows_cache = out
-        self._rows_mtime = mtime
-        self._rebuild_id_index(out)
+        self._remember_rows(out, mtime)
         logger.debug("schedule_posts load_all: {} job", len(out))
         return list(out)
 
@@ -222,9 +258,7 @@ class SchedulePostsManager:
                 if enforce_fleet_gate:
                     self._reject_unapproved_fleet_job(dict(r))
             self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
-            self._rows_cache = list(lst)
-            self._rows_mtime = self.file_path.stat().st_mtime
-            self._rebuild_id_index(self._rows_cache)
+            self._remember_rows(list(lst), self.file_path.stat().st_mtime)
             logger.info("Đã ghi {} job schedule_posts vào {}", len(lst), self.file_path)
 
     def _reject_unapproved_fleet_job(self, row: dict[str, Any]) -> None:
@@ -262,9 +296,7 @@ class SchedulePostsManager:
             if not replaced:
                 new_list.append(d)  # type: ignore[arg-type]
             self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
-            self._rows_cache = new_list
-            self._rows_mtime = self.file_path.stat().st_mtime
-            self._rebuild_id_index(new_list)
+            self._remember_rows(new_list, self.file_path.stat().st_mtime)
 
     def upsert_many(self, rows: Iterable[SchedulePostJob]) -> int:
         """Upsert nhiều job trong một lần đọc/ghi file (tránh O(n²) khi nạp hàng loạt)."""
@@ -299,10 +331,27 @@ class SchedulePostsManager:
                 if jid not in applied:
                     out.append(d)  # type: ignore[arg-type]
             self._atomic_write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
-            self._rows_cache = out
-            self._rows_mtime = self.file_path.stat().st_mtime
-            self._rebuild_id_index(out)
+            self._remember_rows(out, self.file_path.stat().st_mtime)
             return len(incoming)
+
+    def mutate(self, fn: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        """
+        Đọc – sửa – ghi trong cùng một lần khóa file.
+
+        ``fn`` nhận bản sao toàn bộ job, sửa tại chỗ và trả về các dòng đã đổi; không đổi gì thì không ghi.
+        Dùng khi trạng thái job có thể vừa bị scheduler đổi (vd. dời giờ job quá hạn).
+        """
+        with json_file_lock(self.file_path):
+            self._invalidate_cache()
+            rows = [dict(x) for x in self._load_all_unlocked()]
+            changed = fn(rows)
+            if not changed:
+                return []
+            for r in rows:
+                self._validate_row(r)
+            self._atomic_write(json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
+            self._remember_rows(rows, self.file_path.stat().st_mtime)  # type: ignore[arg-type]
+            return changed
 
     def delete_by_id(self, job_id: str) -> bool:
         jid = str(job_id).strip()
@@ -440,9 +489,7 @@ class SchedulePostsManager:
             if updated <= 0:
                 return 0
             self._atomic_write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
-            self._rows_cache = out
-            self._rows_mtime = self.file_path.stat().st_mtime
-            self._rebuild_id_index(out)
+            self._remember_rows(out, self.file_path.stat().st_mtime)
             return updated
 
 

@@ -30,6 +30,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -88,7 +89,7 @@ from src.utils.app_secrets import (
     apply_saved_nanobanana_key_to_environ,
 )
 from src.scheduler import run_forever
-from src.utils.db_manager import AccountsDatabaseManager, _default_accounts_path
+from src.utils.db_manager import AccountsDatabaseManager, get_default_accounts_manager, _default_accounts_path
 from src.utils.profile_cleanup import cleanup_orphan_profile_directories
 from src.utils.runtime_cleanup import cleanup_runtime_junk
 
@@ -114,7 +115,7 @@ def _preflight_or_exit() -> AccountsDatabaseManager:
     if not path.is_file():
         logger.error("Thiếu file cấu hình: {} — hãy tạo trước khi chạy (hoặc chạy lại bản app đã có bước bootstrap).", path)
         raise SystemExit(1)
-    mgr = AccountsDatabaseManager()
+    mgr = get_default_accounts_manager()
     rows = mgr.load_all()
     try:
         cleanup_orphan_profile_directories(rows)
@@ -166,6 +167,28 @@ def _configure_logging() -> None:
         level="INFO",
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level:<8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
     )
+    try:
+        # Log ra file theo ngày để xem lại job đăng lỗi/chậm sau khi đã đóng app (giữ 7 ngày).
+        logs_dir = project_root() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_file = str(logs_dir / "toolfb_{time:YYYY-MM-DD}.log")
+        log_kwargs = dict(
+            level="INFO",
+            rotation="00:00",
+            retention="7 days",
+            encoding="utf-8",
+            enqueue=True,
+            delay=True,
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {thread.name} | {name}:{function} - {message}",
+        )
+        try:
+            logger.add(log_file, **log_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không mở được file log, thử lại: {}", exc)
+            time.sleep(0.4)
+            logger.add(log_file, **log_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không mở được file log: {}", exc)
 
 
 def _cleanup_previous_background_instances() -> None:

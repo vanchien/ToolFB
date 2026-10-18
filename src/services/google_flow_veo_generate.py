@@ -173,7 +173,14 @@ def open_or_create_flow_project(page: Page) -> None:
                 # Một số build Flow render text trong div non-clickable -> click vị trí trung tâm.
                 box = loc.bounding_box()
                 if box:
-                    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    from src.utils.dom_input import click_locator_dom, click_point_dom
+
+                    if not click_locator_dom(loc):
+                        click_point_dom(
+                            page,
+                            box["x"] + box["width"] / 2,
+                            box["y"] + box["height"] / 2,
+                        )
                 else:
                     raise
             page.wait_for_timeout(3200)

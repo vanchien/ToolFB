@@ -375,6 +375,7 @@ def run_fb_cookie_capture_dialog(
             browse_started = time.monotonic()
             browse_noted = False
             found_name = ""
+            tried_profile_name = False
             from src.services.device_browse import browse_limit_reached
 
             while not cmd:
@@ -403,10 +404,11 @@ def run_fb_cookie_capture_dialog(
                                 progress_q.put("NOTE\tĐang đóng tab cũ — mở facebook.com")
                         elif browse_only and idle_ticks % 4 == 0:
                             nudge_feed(page)
-                        if not found_name and idle_ticks % 8 == 1:
-                            from src.services.device_browse import read_logged_in_display_name
+                        if not found_name and idle_ticks % 8 == 1 and "facebook.com" in str(getattr(page, "url", "") or "").casefold():
+                            from src.services.device_browse import read_account_display_name
 
-                            found_name = read_logged_in_display_name(page)
+                            found_name = read_account_display_name(page, visit_profile=not tried_profile_name)
+                            tried_profile_name = True
                             if found_name:
                                 progress_q.put("NAME\t" + found_name)
                         if idle_ticks % 3 == 0:
@@ -425,9 +427,12 @@ def run_fb_cookie_capture_dialog(
                 ):
                     if not last_block:
                         if not found_name and _page_usable(page):
-                            from src.services.device_browse import read_logged_in_display_name
+                            from src.services.device_browse import read_account_display_name
 
-                            found_name = read_logged_in_display_name(page)
+                            found_name = read_account_display_name(
+                                page,
+                                visit_profile=not tried_profile_name,
+                            )
                         if found_name:
                             progress_q.put("NAME\t" + found_name)
                         progress_q.put("FINISH\tĐã lướt 60 giây")

@@ -1,6 +1,43 @@
 """Kết quả chia sẻ theo từng page."""
 
-from src.gui.share_tab import describe_page_jobs
+from src.gui.share_tab import dedupe_receiving_pages, describe_page_jobs, receiving_page_key
+
+
+def test_same_page_id_across_accounts_keeps_one() -> None:
+    rows = [
+        {
+            "iid": "a1",
+            "account_id": "acc1",
+            "page_id": "111",
+            "page_name": "Happy Stories Time",
+            "target_url": "https://www.facebook.com/111",
+        },
+        {
+            "iid": "a2",
+            "account_id": "acc2",
+            "page_id": "111",
+            "page_name": "Happy Stories Time",
+            "target_url": "https://www.facebook.com/111",
+        },
+        {
+            "iid": "b1",
+            "account_id": "acc1",
+            "page_id": "222",
+            "page_name": "Other",
+            "target_url": "https://www.facebook.com/222",
+        },
+    ]
+    unique = dedupe_receiving_pages(rows)
+    assert [row["iid"] for row in unique] == ["a1", "b1"]
+    assert receiving_page_key(rows[0]) == receiving_page_key(rows[1])
+
+
+def test_same_url_without_page_id_keeps_one() -> None:
+    rows = [
+        {"iid": "x", "page_id": "", "target_url": "https://facebook.com/foo/"},
+        {"iid": "y", "page_id": "", "target_url": "https://facebook.com/foo"},
+    ]
+    assert [row["iid"] for row in dedupe_receiving_pages(rows)] == ["x"]
 
 
 def test_page_success_and_error_are_named() -> None:
@@ -24,6 +61,16 @@ def test_watch_error_shows_on_pages_still_waiting() -> None:
     assert label == "Lỗi"
     assert "bình luận" in detail
     assert tag == "fail"
+
+
+def test_live_step_shows_which_page_is_running() -> None:
+    label, detail, tag = describe_page_jobs(
+        [{"status": "PENDING", "error_message": ""}],
+        live_step="Đang bấm Like",
+    )
+    assert label == "Đang chạy"
+    assert detail == "Đang bấm Like"
+    assert tag == "run"
 
 
 def test_partial_page_keeps_the_error_text() -> None:

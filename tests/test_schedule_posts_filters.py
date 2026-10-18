@@ -173,6 +173,35 @@ def test_empty_search_returns_all(sample_jobs: list[dict]) -> None:
     assert len(apply_job_filters(sample_jobs)) == len(sample_jobs)
 
 
+def test_name_refresh_targets_placeholders_unless_ticked() -> None:
+    from src.utils.schedule_posts_filters import account_ids_for_name_refresh
+
+    rows = [
+        {"id": "acc_1", "name": "facebok1"},
+        {"id": "acc_2", "name": "Edit"},
+        {"id": "acc_3", "name": "Đinh Bảo Trân"},
+    ]
+    ids, forced = account_ids_for_name_refresh(rows, [])
+    assert ids == ["acc_1", "acc_2"] and forced is False
+    ids, forced = account_ids_for_name_refresh(rows, ["acc_3"])
+    assert ids == ["acc_3"] and forced is True
+
+
+def test_placeholder_name_takes_facebook_display_name() -> None:
+    from src.utils.schedule_posts_filters import account_name_should_take_facebook_name
+
+    assert account_name_should_take_facebook_name("Tài khoản mới", "Đinh Bảo Toàn", "acc_1")
+    assert account_name_should_take_facebook_name("facebok1", "Nguyễn Văn A", "acc_1")
+    assert account_name_should_take_facebook_name("Edit", "Nguyễn Văn A", "acc_1")
+    assert account_name_should_take_facebook_name("Chats", "Nguyễn Văn A", "acc_1")
+    assert not account_name_should_take_facebook_name("Tài khoản mới", "Chats", "acc_1")
+    assert not account_name_should_take_facebook_name("Tài khoản mới", "Edit", "acc_1")
+    assert account_name_should_take_facebook_name("", "Anna", "acc_1")
+    assert not account_name_should_take_facebook_name("Đinh Bảo Toàn", "Người khác", "acc_1")
+    assert not account_name_should_take_facebook_name("facebook1", "facebook1", "acc_1")
+    assert not account_name_should_take_facebook_name("Tài khoản mới", "", "acc_1")
+
+
 def test_format_filter_labels() -> None:
     assert "Minh Tuyết" in format_page_filter_label("538b89cc73f2", "Minh Tuyết")
     assert "538b89cc73f2" in format_page_filter_label("538b89cc73f2", "Minh Tuyết")

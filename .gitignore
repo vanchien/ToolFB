@@ -50,6 +50,7 @@ config/app_secrets.json.corrupt.bak
 data/video_editor/remote_audio_config.json
 
 # Cấu hình theo máy / tài khoản (giữ bản *.example.json nếu có)
+config/app_runtime.json
 config/accounts.json
 config/account_credentials.json
 config/pages.json

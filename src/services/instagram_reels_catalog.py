@@ -227,7 +227,9 @@ def scan_instagram_profile_reels_page(
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=hl)
+            from src.utils.dom_input import chromium_background_launch_kwargs
+
+            browser = pw.chromium.launch(**chromium_background_launch_kwargs(headless=hl))
             try:
                 ctx_kwargs: dict[str, Any] = {
                     "viewport": {"width": 1280, "height": 900},
@@ -279,7 +281,6 @@ def scan_instagram_profile_reels_page(
                             "() => { const e=document.scrollingElement||document.documentElement;"
                             " e.scrollBy(0, Math.floor((window.innerHeight||800)*0.92)); }"
                         )
-                        page.mouse.wheel(0, 2400)
                     except Exception:
                         pass
                     time.sleep(scroll_pause_sec)

@@ -22,6 +22,7 @@ from src.automation.facebook_page_scanner import ScannedPage
 from src.automation.meta_business_scanner import scan_meta_business_pages_for_account
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.utils.db_manager import AccountsDatabaseManager
+from src.utils.page_categories import PAGE_CATEGORY_CHOICES, UNCATEGORIZED_LABEL, normalize_page_category
 from src.utils.pages_manager import PagesManager
 
 
@@ -223,6 +224,15 @@ class PageScanDialog:
         self._btn_save = ttk.Button(f, text="Lưu Page đã tick vào pages.json", command=self._on_save_selected)
         self._btn_save.pack(side=tk.RIGHT, padx=(0, 8))
         self._btn_save.configure(state=tk.DISABLED)
+        self._save_category_var = tk.StringVar(value=UNCATEGORIZED_LABEL)
+        ttk.Combobox(
+            f,
+            textvariable=self._save_category_var,
+            values=[UNCATEGORIZED_LABEL] + [label for _key, label in PAGE_CATEGORY_CHOICES],
+            state="readonly",
+            width=16,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Label(f, text="Phân loại khi lưu").pack(side=tk.RIGHT, padx=(0, 4))
 
     # --- Scan ---
 
@@ -425,6 +435,7 @@ class PageScanDialog:
         ):
             return
         existing = {(str(r.get("page_url", "")).strip().lower()): r for r in self._pages.load_all()}
+        save_category = normalize_page_category(self._save_category_var.get())
         count_new = 0
         count_update = 0
         batch_rows: list[dict[str, Any]] = []
@@ -457,10 +468,15 @@ class PageScanDialog:
                     {k: v for k, v in row_dict.items() if v not in (None, "")}
                 )
                 cur["id"] = cur.get("id") or uuid.uuid4().hex[:12]
+                # Không ghi đè phân loại người dùng đã gán trước đó.
+                if save_category and not normalize_page_category(cur.get("page_category")):
+                    cur["page_category"] = save_category
                 batch_rows.append(cur)
                 count_update += 1
             else:
                 row_dict["id"] = uuid.uuid4().hex[:12]
+                if save_category:
+                    row_dict["page_category"] = save_category
                 batch_rows.append(row_dict)
                 count_new += 1
             existing[key] = batch_rows[-1]

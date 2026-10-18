@@ -1585,6 +1585,13 @@ _PROFILE_TITLE_SKIP: frozenset[str] = frozenset(
         "lỗi",
         "something went wrong",
         "page not found",
+        "edit",
+        "edit profile",
+        "chỉnh sửa",
+        "sửa hồ sơ",
+        "chats",
+        "chat",
+        "messenger",
     }
 )
 
@@ -1934,6 +1941,47 @@ _FACEBOOK_UI_NAMES = frozenset(
         "doan chat",
         "trang cá nhân của bạn",
         "your profile",
+        "edit",
+        "edit profile",
+        "chỉnh sửa",
+        "chinh sua",
+        "sửa",
+        "sua",
+        "sửa hồ sơ",
+        "save",
+        "lưu",
+        "luu",
+        "chats",
+        "chat",
+        "watch",
+        "reels",
+        "marketplace",
+        "groups",
+        "nhóm",
+        "nhom",
+        "gaming",
+        "feeds",
+        "bảng tin",
+        "bang tin",
+        "friends",
+        "bạn bè",
+        "ban be",
+        "menu",
+        "search",
+        "tìm kiếm",
+        "tim kiem",
+        "meta",
+        "video",
+        "ảnh",
+        "about",
+        "giới thiệu",
+        "gioi thieu",
+        "posts",
+        "bài viết",
+        "bai viet",
+        "notifications",
+        "tin nhắn",
+        "tin nhan",
     }
 )
 
@@ -1982,15 +2030,49 @@ def facebook_href_is_own_profile(href: str, uid: str) -> bool:
     return len(parts) == 1 and parts[0] == target
 
 
+def pick_profile_header_name(candidates: list[str], title: str = "") -> str:
+    """Tên trên đầu trang cá nhân. Bỏ dòng follower và mục menu như Chats."""
+    ordered = [str(item or "") for item in candidates]
+    from_title = name_from_facebook_window_title(title)
+    if from_title:
+        ordered.append(from_title)
+    skip = _FACEBOOK_UI_NAMES | {
+        "public figure",
+        "digital creator",
+        "người của công chúng",
+        "nhân vật công chúng",
+    }
+    for raw in ordered:
+        text = " ".join(str(raw or "").replace("\xa0", " ").split())
+        if not text or text.casefold() in skip or text.isdigit():
+            continue
+        if re.search(r"followers|following|người theo dõi|đang theo dõi", text, flags=re.I):
+            continue
+        if _profile_name_is_usable(text):
+            return text[:80]
+    return ""
+
+
+def name_from_facebook_window_title(title: str) -> str:
+    """Tên trong tiêu đề cửa sổ «Tên | Facebook». Bỏ chuông thông báo và mục menu."""
+    raw = " ".join(str(title or "").split())
+    raw = re.sub(r"^\(\d+\)\s*", "", raw)
+    raw = re.sub(r"\s*[|\-]\s*facebook\s*$", "", raw, flags=re.I).strip()
+    if not raw or raw.casefold() in _FACEBOOK_UI_NAMES or not _profile_name_is_usable(raw):
+        return ""
+    return raw[:80]
+
+
 def facebook_display_name_from_page_bits(
     labels: list[str],
     own_link_texts: list[str] | None = None,
+    headings: list[str] | None = None,
 ) -> str:
-    """Tên người dùng: nhãn phiên đăng nhập, rồi chữ trên link hồ sơ của đúng UID."""
+    """Tên người dùng: nhãn phiên, tiêu đề hồ sơ, rồi chữ trên link của đúng UID."""
     named = facebook_account_name_from_labels(labels)
     if named:
         return named
-    for raw in own_link_texts or []:
+    for raw in list(headings or []) + list(own_link_texts or []):
         text = " ".join(str(raw or "").split())
         if not text or text.isdigit() or text.casefold() in _FACEBOOK_UI_NAMES:
             continue

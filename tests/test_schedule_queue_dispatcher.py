@@ -114,6 +114,41 @@ def test_recover_stale_running_on_startup(tmp_path: Path) -> None:
     assert sp.get_by_id("r1")["status"] == "ready_queue"
 
 
+def test_same_account_due_job_waits_instead_of_skip(tmp_path: Path) -> None:
+    """Page tới giờ trong lúc Page trước chưa đăng xong thì ở lại hàng, không bị bỏ."""
+    ready = [
+        _job("now", account_id="a1", scheduled_at="2026-05-19T10:00:00+00:00", status="ready_queue"),
+        _job("next", account_id="a1", scheduled_at="2026-05-19T10:02:00+00:00", status="ready_queue"),
+    ]
+    batch = sqd.select_dispatch_batch(ready, account_inflight=lambda _a: 1, per_account_limit=1)  # type: ignore[arg-type]
+    assert batch == []
+    assert [j["id"] for j in ready] == ["now", "next"]
+
+
+def test_failed_post_is_not_requeued(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "schedule_posts.json"
+    sp = SchedulePostsManager(json_path=cfg)
+    sp.upsert(
+        {
+            "id": "j1",
+            "account_id": "a1",
+            "page_id": "p1",
+            "post_type": "video",
+            "status": "running",
+            "scheduled_at": "2026-05-19T10:00:00+00:00",
+            "retry_count": 0,
+        }
+    )
+    monkeypatch.setattr("src.scheduler.get_default_schedule_posts_manager", lambda: sp)
+    from src.scheduler import _finalize_schedule_post_job_record, _per_account_parallel_limit
+
+    assert _per_account_parallel_limit() == 1
+    _finalize_schedule_post_job_record("j1", False, "Không switch được sang vai trò Page")
+    saved = sp.get_by_id("j1")
+    assert saved["status"] == "failed"
+    assert saved["scheduled_at"] == "2026-05-19T10:00:00+00:00"
+
+
 def test_compute_smart_delay_scales_with_depth() -> None:
     assert sqd.compute_smart_delay_ms(ready_count=1, running_count=0) >= sqd.compute_smart_delay_ms(
         ready_count=20, running_count=5

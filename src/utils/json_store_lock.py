@@ -26,11 +26,25 @@ def _lock_for(path: Path | str) -> threading.RLock:
 
 
 @contextmanager
-def json_file_lock(path: Path | str) -> Generator[None, None, None]:
-    """Giữ khóa trong suốt load → sửa → save một file JSON."""
+def json_file_lock(
+    path: Path | str,
+    *,
+    timeout: float | None = None,
+) -> Generator[bool, None, None]:
+    """
+    Giữ khóa trong suốt load → sửa → save một file JSON.
+
+    ``timeout`` giây: nếu không lấy được khóa thì ``yield False`` (không ghi).
+    Đọc GUI dùng timeout ngắn rồi fallback cache cũ — tránh Not Responding khi worker đang ghi.
+    """
     lk = _lock_for(path)
-    lk.acquire()
+    if timeout is None:
+        lk.acquire()
+        acquired = True
+    else:
+        acquired = bool(lk.acquire(timeout=float(timeout)))
     try:
-        yield
+        yield acquired
     finally:
-        lk.release()
+        if acquired:
+            lk.release()

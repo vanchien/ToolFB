@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import date
+import random
+from datetime import date, datetime
 from pathlib import Path
 
 from src.utils.schedule_batch_preview import (
+    build_random_window_schedules_per_group,
     build_schedule_by_daily_slots,
     compute_scheduled_at_series,
+    parse_daily_time_windows,
     post_type_for_kind,
     preview_row_to_schedule_job,
     scan_video_files,
@@ -106,3 +109,57 @@ def test_build_schedule_by_daily_slots_validate_delay_range() -> None:
         assert False, "Expected ValueError"
     except ValueError:
         assert True
+
+
+def test_random_window_is_independent_per_page() -> None:
+    keys = ["fb:p1", "fb:p2", "fb:p1", "fb:p2", "fb:p1"]
+    plans = build_random_window_schedules_per_group(
+        keys,
+        start_date=date(2026, 10, 16),
+        end_date=date(2026, 10, 20),
+        window_start=(8, 0),
+        window_end=(22, 0),
+        gap_min_minutes=30,
+        gap_max_minutes=40,
+        timezone_name="Asia/Ho_Chi_Minh",
+        start_jitter_max_min=10,
+        rng=random.Random(7),
+    )
+    assert len(plans) == 5
+    walls = [datetime.strptime(p["wall"], "%Y-%m-%d %H:%M") for p in plans]
+    p1 = [walls[i] for i, k in enumerate(keys) if k == "fb:p1"]
+    p2 = [walls[i] for i, k in enumerate(keys) if k == "fb:p2"]
+    assert p1 == sorted(p1)
+    assert p2 == sorted(p2)
+    assert p1[1] > p1[0]
+    assert all(8 <= w.hour < 22 or (w.hour == 22 and w.minute == 0) for w in walls)
+
+
+def test_parse_daily_time_windows_ranges_and_points() -> None:
+    windows = parse_daily_time_windows("20:00-22:00, 08:00-10:00, 14:00")
+    assert windows[0] == ((8, 0), (10, 0))
+    assert windows[1] == ((14, 0), (14, 0))
+    assert windows[2] == ((20, 0), (22, 0))
+
+
+def test_multi_windows_repeat_next_day() -> None:
+    keys = ["fb:p1"] * 4
+    plans = build_random_window_schedules_per_group(
+        keys,
+        start_date=date(2026, 10, 16),
+        end_date=date(2026, 10, 20),
+        windows=[((8, 0), (8, 20)), ((20, 0), (20, 20))],
+        gap_min_minutes=25,
+        gap_max_minutes=25,
+        timezone_name="Asia/Ho_Chi_Minh",
+        start_jitter_max_min=0,
+        rng=random.Random(3),
+    )
+    walls = [datetime.strptime(p["wall"], "%Y-%m-%d %H:%M") for p in plans]
+    assert walls == sorted(walls)
+    hours = [w.hour for w in walls]
+    assert hours[0] == 8
+    assert hours[1] == 20
+    assert walls[2].date() == date(2026, 10, 17)
+    assert hours[2] == 8
+    assert hours[3] == 20

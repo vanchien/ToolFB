@@ -165,3 +165,107 @@ def test_join_waits_after_stop_until_workers_finish() -> None:
         release.set()
         assert pool.join(timeout=20.0) is True
         assert pool._join_workers_alive is False
+
+
+def test_enter_slot_rereads_dynamic_limit_while_waiting() -> None:
+    """Health nâng limit khi đang chờ — worker phải vào slot, không kẹt số cũ."""
+    pool = HumanInteractionPool([_fake_mapped("a1")], max_concurrent=4, login_only=False)
+    pool._running = 2
+    pool._dynamic_limit = 2
+    got: list[bool] = []
+
+    def waiter() -> None:
+        got.append(pool._enter_slot())
+
+    t = threading.Thread(target=waiter, daemon=True)
+    t.start()
+    time.sleep(0.35)
+    assert not got
+    with pool._state_cv:
+        pool._dynamic_limit = 4
+        pool._state_cv.notify_all()
+    t.join(timeout=2.0)
+    assert got == [True]
+    assert pool._running == 3
+
+
+def test_interrupted_rotates_to_waiting_account_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Hết thời gian lượt: nhả slot, chạy TK đang chờ ngay — không đợi cả lượt 14 luồng.
+    """
+    monkeypatch.setenv("FB_POOL_WORKER_WARMUP_MS", "0")
+    monkeypatch.setenv("FB_HUMAN_ACCOUNT_ROTATE_MAX", "2")
+    accounts = [_fake_mapped(f"a{i}", proxy=f"127.0.0.1:81{i:02d}") for i in range(4)]
+    order: list[str] = []
+    visits: dict[str, int] = {}
+    a1_hold = threading.Event()
+    a2_started = threading.Event()
+
+    def fake_worker(mapped, **kwargs):  # noqa: ANN001
+        aid = mapped.account_id
+        visits[aid] = visits.get(aid, 0) + 1
+        order.append(aid)
+        if aid == "a0" and visits[aid] == 1:
+            mapped.status = "pending"
+            mapped.status_detail = "Hết thời gian lượt"
+            return "interrupted"
+        if aid == "a1" and visits[aid] == 1:
+            assert a2_started.wait(timeout=5.0), "TK chờ phải chạy khi luồng kia xong, không đợi cả lượt"
+            a1_hold.set()
+            return "success"
+        if aid == "a2":
+            a2_started.set()
+            assert a1_hold.wait(timeout=5.0)
+            return "success"
+        return "success"
+
+    with patch(
+        "src.services.human_interaction_pool.run_human_interaction_worker",
+        side_effect=fake_worker,
+    ):
+        pool = HumanInteractionPool(accounts, max_concurrent=2, login_only=True)
+        pool.start()
+        assert pool.join(timeout=20.0) is True
+
+    assert "a2" in order
+    assert visits.get("a0", 0) >= 2
+    assert pool._completed_accounts == 4
+    assert pool._running == 0
+    assert set(order) >= {"a0", "a1", "a2", "a3"}
+
+
+def test_pool_start_does_not_prepare_accounts_on_caller() -> None:
+    """start() chỉ xếp hàng — không chuẩn bị profile trên luồng gọi (GUI)."""
+    accounts = [_fake_mapped(f"a{i}", proxy=f"127.0.0.1:70{i:02d}") for i in range(5)]
+    prep_ids: list[str] = []
+
+    def track_prep(mapped, **kwargs):  # noqa: ANN001
+        del kwargs
+        prep_ids.append(mapped.account_id)
+        return {}
+
+    def fake_worker(mapped, **kwargs):  # noqa: ANN001
+        del mapped, kwargs
+        return "login_ok"
+
+    with patch(
+        "src.utils.account_proxy_mapper.prepare_mapped_account_for_browser_run",
+        side_effect=track_prep,
+    ), patch(
+        "src.services.human_interaction_pool.run_human_interaction_worker",
+        side_effect=fake_worker,
+    ):
+        pool = HumanInteractionPool(accounts, max_concurrent=2, login_only=True)
+        pool.start()
+        pool.join(timeout=15.0)
+    assert prep_ids == []
+    assert pool._completed_accounts == 5
+
+
+def test_health_floor_does_not_collapse_concurrency() -> None:
+    pool = HumanInteractionPool(
+        [_fake_mapped(f"a{i}") for i in range(4)],
+        max_concurrent=14,
+        login_only=False,
+    )
+    assert pool._health_floor() == 7

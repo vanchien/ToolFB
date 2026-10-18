@@ -44,6 +44,9 @@ from src.services.video_editor.timeline_manager import (
     effective_source_span,
     timeline_duration_from_source,
 )
+from src.services.universal_video_downloader import downloaded_file_empty_reason
+from src.services.video_editor.ffmpeg_builder import clip_export_skip_reason, exported_mp4_reject_reason
+from src.services.video_editor.overlay_utils import resolve_media_file_path
 from src.services.video_editor import (
     AudioExtractor,
     AudioMixManager,
@@ -87,7 +90,12 @@ from src.services.universal_video_downloader import (
     DownloadMetadataStore,
     TOOLFB_PENDING_DOWNLOAD_JOB_ATTR,
     _extract_hashtags_from_text,
+    ALL_DOWNLOADED_VIDEOS_JOB_ID,
+    annotate_downloaded_library_row,
     build_download_job_combo_options,
+    downloaded_row_identity,
+    unique_playable_download_rows,
+    prune_unused_download_jobs,
     clear_root_pending_download_job,
     consume_auto_import_download_job,
     downloader_metadata_summary,
@@ -655,9 +663,64 @@ def build_video_editor_tab(
         except Exception as e:
             messagebox.showerror("Video Editor", f"Không xóa được project: {e}", parent=root)
 
+    def delete_all_projects() -> None:
+        """Xóa mọi dự án trong tab Video."""
+        nonlocal project, selected_clip_id
+        rows = list(pm.list_projects() or [])
+        if not rows:
+            messagebox.showinfo("Video Editor", "Không có dự án để xóa.", parent=root)
+            return
+        if not messagebox.askyesno(
+            "Video Editor",
+            f"Xóa toàn bộ {len(rows)} dự án?",
+            parent=root,
+        ):
+            return
+        remove_files = messagebox.askyesnocancel(
+            "Video Editor",
+            "Bạn muốn xóa luôn file media local của các dự án không?\n\n"
+            "Có = xóa mọi dự án + xóa file local trong thư viện Video Editor\n"
+            "Không = chỉ xóa file dự án\n"
+            "Hủy = không thực hiện",
+            parent=root,
+        )
+        if remove_files is None:
+            return
+        local_paths: list[Path] = []
+        if remove_files:
+            for row in rows:
+                pid = str(row.get("id") or "").strip()
+                if not pid:
+                    continue
+                try:
+                    local_paths.extend(_collect_media_local_paths(pm.load_project(pid)))
+                except Exception:
+                    continue
+        deleted = 0
+        try:
+            for row in rows:
+                pid = str(row.get("id") or "").strip()
+                if not pid:
+                    continue
+                pm.delete_project(pid)
+                deleted += 1
+            deleted_files = _delete_local_media_files_if_safe(local_paths, skip_paths=set()) if remove_files else 0
+            project = None
+            selected_clip_id = None
+            var_project.set("")
+            refresh_project_combo()
+            refresh_all()
+            notify(
+                f"Đã xóa {deleted} dự án"
+                + (f" và {deleted_files} file media local." if remove_files else ".")
+            )
+        except Exception as e:
+            messagebox.showerror("Video Editor", f"Không xóa hết dự án được: {e}", parent=root)
+
     ttk.Button(top_project, text="Thêm", command=new_project).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(top_project, text="Lưu", command=save_project_btn).pack(side=tk.LEFT, padx=(0, 4))
     ttk.Button(top_project, text="Xóa", command=delete_current_project).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(top_project, text="Xóa hết", command=delete_all_projects).pack(side=tk.LEFT, padx=(0, 4))
 
     dl_job_map: dict[str, str] = {}
     var_show_empty_jobs = tk.BooleanVar(value=False)
@@ -779,6 +842,9 @@ def build_video_editor_tab(
             try:
                 dl_paths = ensure_downloader_layout()
                 store = DownloadMetadataStore(paths=dl_paths)
+                removed = prune_unused_download_jobs(store)
+                if removed:
+                    logger.info("[VE] Đã xóa {} job tải không dùng.", len(removed))
                 vals, new_map = build_download_job_combo_options(
                     store.list_jobs(),
                     store.list_downloaded_videos(),
@@ -878,8 +944,17 @@ def build_video_editor_tab(
         def _worker() -> None:
             dl_paths = ensure_downloader_layout()
             store = DownloadMetadataStore(paths=dl_paths)
-            job_row = store.get_job(jid)
-            rows = list_videos_for_download_job(jid, job=job_row, store=store)
+            load_all = jid == ALL_DOWNLOADED_VIDEOS_JOB_ID
+            if load_all:
+                raw_rows = [
+                    annotate_downloaded_library_row(r)
+                    for r in store.list_downloaded_videos()
+                    if isinstance(r, dict)
+                ]
+            else:
+                job_row = store.get_job(jid)
+                raw_rows = list_videos_for_download_job(jid, job=job_row, store=store)
+            rows, n_dup = unique_playable_download_rows(raw_rows)
             if not rows:
                 def _no_rows() -> None:
                     _import_dl_busy["v"] = False
@@ -892,8 +967,26 @@ def build_video_editor_tab(
                 _schedule_on_main_thread(_no_rows)
                 return
             existing = {str(m.get("path") or "") for m in (proj_snapshot.get("media") or []) if isinstance(m, dict)}
+            existing_keys: set[str] = set()
+            on_timeline: set[str] = set()
+            for m in proj_snapshot.get("media") or []:
+                if not isinstance(m, dict):
+                    continue
+                key = str(m.get("source_video_key") or "").strip() or downloaded_row_identity(
+                    {"video_path": m.get("path") or m.get("local_path") or ""}
+                )
+                if key:
+                    existing_keys.add(key)
+            for tr in proj_snapshot.get("tracks") or []:
+                if not isinstance(tr, dict) or str(tr.get("type") or "") != "video":
+                    continue
+                for cl in tr.get("clips") or []:
+                    if isinstance(cl, dict):
+                        on_timeline.add(str(cl.get("media_id") or ""))
             added = 0
+            placed = 0
             failed = 0
+            skipped_empty = max(0, len(raw_rows) - len(rows) - n_dup)
             source_video_ids: list[str] = []
             source_video_meta_by_id: dict[str, dict[str, Any]] = {}
             total = len(rows)
@@ -902,6 +995,10 @@ def build_video_editor_tab(
                 src_vid = str(r.get("id") or "").strip()
                 vp = Path(str(r.get("video_path") or "")).expanduser().resolve()
                 if not vp.is_file():
+                    continue
+                empty_why = downloaded_file_empty_reason(vp)
+                if empty_why:
+                    skipped_empty += 1
                     continue
                 raw_t = str(r.get("title") or "").strip()
                 raw_d = str(r.get("description") or "").strip()
@@ -912,7 +1009,30 @@ def build_video_editor_tab(
                 }
                 if src_vid:
                     source_video_meta_by_id[src_vid] = src_meta
-                if str(vp) in existing:
+                row_key = downloaded_row_identity(r)
+                if str(vp) in existing or (row_key and row_key in existing_keys):
+                    for m in proj_snapshot.get("media") or []:
+                        if not isinstance(m, dict):
+                            continue
+                        same_path = str(m.get("path") or "") == str(vp)
+                        same_key = bool(row_key) and str(m.get("source_video_key") or "") == row_key
+                        if not same_path and not same_key:
+                            continue
+                        mid_old = str(m.get("id") or "")
+                        if mid_old and mid_old not in on_timeline:
+                            try:
+                                tm.add_clip(
+                                    proj_snapshot,
+                                    mid_old,
+                                    "video",
+                                    persist=False,
+                                    recompute_duration=False,
+                                )
+                                on_timeline.add(mid_old)
+                                placed += 1
+                            except Exception:
+                                logger.exception("Không đưa video đã có lên timeline")
+                        break
                     if src_vid:
                         source_video_ids.append(src_vid)
                     continue
@@ -934,12 +1054,29 @@ def build_video_editor_tab(
                         "created_at": datetime.now().replace(microsecond=0).isoformat(),
                     }
                 rec["source_download_video_id"] = src_vid
-                rec["source_download_job_id"] = jid
+                rec["source_video_key"] = row_key
+                rec["source_download_job_id"] = str(r.get("download_job_id") or jid)
                 rec["source_title"] = src_meta["title"]
                 rec["source_description"] = src_meta["description"]
                 rec["source_hashtags"] = list(src_meta["hashtags"])
                 proj_snapshot.setdefault("media", []).append(rec)
                 existing.add(str(vp))
+                if row_key:
+                    existing_keys.add(row_key)
+                mid = str(rec.get("id") or "")
+                if mid and mid not in on_timeline:
+                    try:
+                        tm.add_clip(
+                            proj_snapshot,
+                            mid,
+                            "video",
+                            persist=False,
+                            recompute_duration=False,
+                        )
+                        on_timeline.add(mid)
+                        placed += 1
+                    except Exception:
+                        logger.exception("Không đưa video lên timeline")
                 if src_vid:
                     source_video_ids.append(src_vid)
                 added += 1
@@ -947,6 +1084,8 @@ def build_video_editor_tab(
                     _schedule_on_main_thread(
                         lambda i=idx, t=total: notify(f"Nạp job tải: {i}/{t} video…")
                     )
+            if placed:
+                tm.refresh_project_duration(proj_snapshot)
             pipe = dict(proj_snapshot.get("pipeline") or {})
             pipe["source_download_job_id"] = jid
             job_label = next((k for k, v in dl_job_map.items() if v == jid), "")
@@ -966,9 +1105,13 @@ def build_video_editor_tab(
                 _schedule_on_main_thread(_import_fail)
                 return
             tail = f" | fallback nhanh: {failed}" if failed else ""
+            skip_note = f" | bỏ qua {skipped_empty} video hỏng" if skipped_empty else ""
+            dup_note = f" | bỏ {n_dup} bản trùng, giữ 1 bản" if n_dup else ""
+            src_name = "tất cả job" if load_all else f"job {jid}"
             msg = (
-                f"Đã nạp {added} video từ job tải {jid} "
-                f"(tổng liên kết: {len(source_video_ids)}){tail}."
+                f"Đã nạp {added} video từ {src_name}, đưa {placed} clip lên timeline "
+                f"(chỉnh nhanh một lần rồi xuất job chờ đăng)"
+                f"{dup_note}{tail}{skip_note}."
             )
 
             def _done() -> None:
@@ -1012,6 +1155,17 @@ def build_video_editor_tab(
     lbl_status.pack(side=tk.LEFT, anchor="w", fill=tk.X, expand=True)
     _follow_wrap(lbl_status, status_fr)
 
+    _quick_edit_ref: dict[str, Any] = {"apply": None, "apply_export": None}
+    var_qe_use = tk.BooleanVar(value=True)
+    var_qe_flip_h = tk.BooleanVar(value=False)
+    var_qe_flip_v = tk.BooleanVar(value=False)
+    var_qe_rot = tk.StringVar(value="0")
+    var_qe_canvas = tk.StringVar(value="fit")
+    var_qe_head = tk.StringVar(value="1")
+    var_qe_tail = tk.StringVar(value="1")
+    var_qe_all = tk.BooleanVar(value=True)
+    var_qe_export = tk.BooleanVar(value=False)
+
     def notify(msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -1051,15 +1205,29 @@ def build_video_editor_tab(
         if not project:
             messagebox.showinfo("Video Editor", "Tạo hoặc chọn project trước.")
             return
-        ft = [("Media", "*.mp4 *.mov *.mkv *.webm *.png *.jpg *.jpeg *.webp *.mp3 *.wav *.m4a")]
-        paths = filedialog.askopenfilenames(parent=root, title="Chọn file", filetypes=ft)
+        # Chỉ gắn đường dẫn gốc — không copy vào thư viện (tránh nhân đôi dung lượng ổ đĩa).
+        from src.gui.file_dialog_defaults import pick_video_media_files
+
+        if kind == "video":
+            paths = pick_video_media_files(
+                root,
+                title="Chọn video từ thư mục (không copy vào ToolFB)",
+                multiple=True,
+            )
+        else:
+            ft = [("Media", "*.png;*.jpg;*.jpeg;*.webp;*.mp3;*.wav;*.m4a;*.*")]
+            paths = filedialog.askopenfilenames(
+                parent=root,
+                title="Chọn file từ thư mục (không copy vào ToolFB)",
+                filetypes=ft,
+            )
         if not paths:
             return
         n_ok = 0
         last_image_rec: dict[str, Any] | None = None
         for fp in paths:
             try:
-                rec = mm.import_media(fp, kind, copy_to_library=True)
+                rec = mm.import_media(fp, kind, copy_to_library=False)
                 project.setdefault("media", []).append(rec)
                 pm.save_project(project)
                 n_ok += 1
@@ -2162,8 +2330,8 @@ def build_video_editor_tab(
                     ffmpeg_bin=ffmpeg_bin,
                     ass_path=ass_path,
                     output_duration_limit_sec=20.0,
-                    encoding_overrides={"preset": "ultrafast", "crf": crf, "threads": threads},
-                    lightweight_mode_override=True,
+                    encoding_overrides={"preset": "veryfast", "crf": crf, "threads": threads},
+                    lightweight_mode_override=False,
                 )
             except Exception as e:
                 preview_busy_ref["busy"] = False
@@ -2216,7 +2384,7 @@ def build_video_editor_tab(
                                 pass
                             return
                         notify("Preview lỗi lần 1, đang thử lại cấu hình an toàn hơn…")
-                        _start_preview_render(max_side=640, crf=36, threads=1)
+                        _start_preview_render(max_side=1080, crf=20, threads=1)
                         return
                     preview_busy_ref["busy"] = False
                     preview_open_after_done_ref["v"] = False
@@ -2250,8 +2418,8 @@ def build_video_editor_tab(
             )
             _arm_preview_watchdog()
 
-        # Mặc định ưu tiên tốc độ phản hồi khi preview nháp.
-        _start_preview_render(max_side=960, crf=33, threads=1)
+        # Preview nháp giữ Full HD (cạnh dài 1080) và CRF thấp — không thu nhỏ / làm mờ.
+        _start_preview_render(max_side=1080, crf=18, threads=0)
 
     _auto_preview_schedule_ref: dict[str, Any] = {"after_id": None}
 
@@ -2390,7 +2558,7 @@ def build_video_editor_tab(
     var_tl_name_filter = tk.StringVar(value="")
     var_tlg_name_filter = tk.StringVar(value="")
     var_edit_sum_name_filter = tk.StringVar(value="")
-    cols_tl = ("stt", "track", "clip_id", "start", "dur", "src0", "src1", "kind", "col_logo", "col_audio", "col_text")
+    cols_tl = ("stt", "track", "clip_id", "start", "dur", "src0", "src1", "kind", "edited", "col_logo", "col_audio", "col_text")
     tree_tl = ttk.Treeview(tl_tab_detail, columns=cols_tl, show="headings", height=10, selectmode="extended")
     heads = {
         "stt": "STT",
@@ -2401,6 +2569,7 @@ def build_video_editor_tab(
         "src0": "Điểm nguồn đầu",
         "src1": "Điểm nguồn cuối",
         "kind": "Loại clip",
+        "edited": "Đã chỉnh",
         "col_logo": "Logo",
         "col_audio": "Âm thanh",
         "col_text": "Chữ",
@@ -2414,17 +2583,19 @@ def build_video_editor_tab(
         "src0": 72,
         "src1": 72,
         "kind": 52,
+        "edited": 168,
         "col_logo": 52,
         "col_audio": 64,
         "col_text": 44,
     }
     heads_tl_base = dict(heads)
     for c in cols_tl:
-        tree_tl.column(c, width=widths_tl[c], stretch=c in ("clip_id", "kind"))
+        tree_tl.column(c, width=widths_tl[c], stretch=c in ("clip_id", "kind", "edited"))
         tree_tl.heading(c, text=heads_tl_base[c])
     tree_tl.tag_configure("all_done", foreground="#0b4f2f", background="#d8f3dc")
     tree_tl.tag_configure("partial_done", foreground="#7a4b00", background="#fff3cd")
     tree_tl.tag_configure("not_done", foreground="#495057", background="#f1f3f5")
+    tree_tl.tag_configure("quick_edited", foreground="#0b4f2f", background="#d8f3dc")
     st = ttk.Scrollbar(tl_tab_detail, orient=tk.VERTICAL, command=tree_tl.yview)
     tree_tl.configure(yscrollcommand=st.set)
     filt_tl_fr = ttk.Frame(tl_tab_detail)
@@ -2906,6 +3077,37 @@ def build_video_editor_tab(
 
     ent_media_filter.bind("<KeyRelease>", _on_media_filter_key)
 
+    def _timeline_clip_edit_label(cl: dict[str, Any]) -> str:
+        """Nhãn cột «Đã chỉnh» — ưu tiên lần bấm Áp dụng tất cả vừa ghi."""
+        saved = str(cl.get("edit_status") or "").strip()
+        if saved:
+            return saved
+        bits: list[str] = []
+        try:
+            rot = int(cl.get("rotation") or 0) % 360
+        except (TypeError, ValueError):
+            rot = 0
+        if cl.get("flip_horizontal"):
+            bits.append("lật ngang")
+        if cl.get("flip_vertical"):
+            bits.append("lật dọc")
+        if rot:
+            bits.append(f"xoay {rot}°")
+        cm = str(cl.get("canvas_mode") or "fit").strip().lower()
+        if cm in ("fill", "stretch"):
+            bits.append(f"khung {cm}")
+        if cl.get("reverse"):
+            bits.append("đảo đầu đuôi")
+        try:
+            ss = float(cl.get("source_start") or 0)
+        except (TypeError, ValueError):
+            ss = 0.0
+        if ss > 0.05:
+            bits.append(f"cắt đầu {ss:g}s")
+        if not bits:
+            return "Chưa chỉnh"
+        return "Đã chỉnh: " + " · ".join(bits)
+
     def refresh_timeline() -> None:
         # Giữ selection qua lần rebuild; nếu mất selection thì inspector tưởng user bỏ chọn
         # và mọi thao tác «tự áp dụng» trông như «không chạy».
@@ -2945,7 +3147,8 @@ def build_video_editor_tab(
                 ss = float(cl.get("source_start") or 0) if "source_start" in cl else ""
                 se = float(cl.get("source_end") or 0) if "source_end" in cl else ""
                 kind = str(cl.get("type") or "")
-                tl_rows.append((cid, tname, ts, du, ss, se, kind))
+                edit_note = _timeline_clip_edit_label(cl)
+                tl_rows.append((cid, tname, ts, du, ss, se, kind, edit_note))
                 if tname == "video" and kind == "video":
                     mid = str(cl.get("media_id") or "").strip()
                     media = media_by_id.get(mid) or {}
@@ -2966,7 +3169,7 @@ def build_video_editor_tab(
         video_only = bool(var_tl_video_only.get())
         needle_tl = str(var_tl_name_filter.get() or "").strip().lower()
         detail_specs: list[dict[str, Any]] = []
-        for cid, tname, ts, du, ss, se, kind in tl_rows:
+        for cid, tname, ts, du, ss, se, kind, edit_note in tl_rows:
             show_row = (not video_only) or (tname == "video" and kind == "video")
             if not show_row:
                 continue
@@ -2979,7 +3182,10 @@ def build_video_editor_tab(
                 av = "Có" if has_audio else "Chưa"
                 tv = "Có" if has_text else "Chưa"
                 done_count = int(has_logo) + int(has_audio) + int(has_text)
-                row_tag = "all_done" if done_count == 3 else "partial_done" if done_count > 0 else "not_done"
+                if str(edit_note).startswith("Đã chỉnh"):
+                    row_tag = "quick_edited"
+                else:
+                    row_tag = "all_done" if done_count == 3 else "partial_done" if done_count > 0 else "not_done"
                 row_tags = (row_tag,)
             else:
                 lv, av, tv = "—", "—", "—"
@@ -2998,6 +3204,7 @@ def build_video_editor_tab(
                     "ss": ss,
                     "se": se,
                     "kind": kind,
+                    "edited": edit_note,
                     "lv": lv,
                     "av": av,
                     "tv": tv,
@@ -3029,6 +3236,8 @@ def build_video_editor_tab(
                 return float(d["se"])
             if dcol == "kind":
                 return str(d["kind"]).lower()
+            if dcol == "edited":
+                return str(d.get("edited") or "").lower()
             if dcol == "col_logo":
                 return str(d["lv"]).lower()
             if dcol == "col_audio":
@@ -3058,6 +3267,7 @@ def build_video_editor_tab(
                         f"{float(d['ss']):.2f}" if d["ss"] != "" else "",
                         f"{float(d['se']):.2f}" if d["se"] != "" else "",
                         d["kind"],
+                        d.get("edited") or "Chưa chỉnh",
                         d["lv"],
                         d["av"],
                         d["tv"],
@@ -6399,6 +6609,150 @@ def build_video_editor_tab(
                 out.append((str(cid), cl))
         return out
 
+    def _all_video_timeline_rows() -> list[tuple[str, dict[str, Any]]]:
+        """Mọi clip video trong dự án, theo thứ tự track."""
+        out: list[tuple[str, dict[str, Any]]] = []
+        if not project:
+            return out
+        for tr in project.get("tracks") or []:
+            if not isinstance(tr, dict) or str(tr.get("type") or "") != "video":
+                continue
+            for cl in tr.get("clips") or []:
+                if not isinstance(cl, dict) or str(cl.get("type") or "") != "video":
+                    continue
+                cid = str(cl.get("id") or "").strip()
+                if cid:
+                    out.append((cid, cl))
+        return out
+
+    def apply_quick_edit(*, then_export: bool = False) -> None:
+        """Lật ngang/dọc và xoay 0/90/180/270 như Transform & canvas, rồi cắt đầu/đuôi."""
+        from src.services.video_editor.timeline_manager import _update_project_duration
+
+        if not project:
+            messagebox.showinfo("Chỉnh nhanh", "Chọn hoặc tạo dự án trước.", parent=root)
+            return
+        rows = _all_video_timeline_rows() if bool(var_qe_all.get()) or bool(var_qe_use.get()) else _selected_video_timeline_rows()
+        if not rows:
+            messagebox.showinfo(
+                "Chỉnh nhanh",
+                "Chưa có clip video. Bật «Mọi video» hoặc chọn clip trên timeline.",
+                parent=root,
+            )
+            return
+        try:
+            head = max(0.0, float(str(var_qe_head.get() or "0").strip() or "0"))
+            tail = max(0.0, float(str(var_qe_tail.get() or "0").strip() or "0"))
+        except ValueError:
+            messagebox.showerror("Chỉnh nhanh", "Số giây cắt đầu / cắt đuôi không hợp lệ.", parent=root)
+            return
+        try:
+            rot = int(str(var_qe_rot.get() or "0").strip() or "0")
+        except ValueError:
+            messagebox.showerror("Chỉnh nhanh", "Xoay chỉ nhận 0 / 90 / 180 / 270.", parent=root)
+            return
+        if rot not in (0, 90, 180, 270):
+            messagebox.showerror("Chỉnh nhanh", "Xoay chỉ nhận 0 / 90 / 180 / 270.", parent=root)
+            return
+        canvas = str(var_qe_canvas.get() or "fit").strip().lower()
+        if canvas not in ("fit", "fill", "stretch"):
+            canvas = "fit"
+        flip_h = bool(var_qe_flip_h.get())
+        flip_v = bool(var_qe_flip_v.get())
+        if not flip_h and not flip_v and rot == 0 and canvas == "fit" and head <= 0 and tail <= 0:
+            messagebox.showinfo(
+                "Chỉnh nhanh",
+                "Chọn Lật ngang, Lật dọc, Xoay (90/180/270), Vào khung, hoặc số giây cắt.",
+                parent=root,
+            )
+            return
+        n = len(rows)
+        patch = {
+            "flip_horizontal": flip_h,
+            "flip_vertical": flip_v,
+            "rotation": rot,
+            "canvas_mode": canvas,
+            "reverse": False,
+        }
+        for index, (cid, _cl) in enumerate(rows, start=1):
+            tm.update_clip(
+                project,
+                cid,
+                patch,
+                persist=False,
+                recompute_duration=False,
+            )
+            if index == n or index % max(1, n // 20) == 0:
+                _ve_batch_status_progress(index, n, "lật / xoay")
+        edit_bits: list[str] = []
+        if flip_h:
+            edit_bits.append("lật ngang")
+        if flip_v:
+            edit_bits.append("lật dọc")
+        if rot:
+            edit_bits.append(f"xoay {rot}°")
+        if canvas != "fit":
+            edit_bits.append(f"khung {canvas}")
+        if head > 0 or tail > 0:
+            edit_bits.append(f"cắt đầu {head:g}s / đuôi {tail:g}s")
+        if not edit_bits:
+            edit_bits.append("không lật")
+        edit_note = "Đã chỉnh: " + " · ".join(edit_bits)
+        for cid, _cl in rows:
+            found = None
+            for tr in project.get("tracks") or []:
+                if not isinstance(tr, dict):
+                    continue
+                for cl in tr.get("clips") or []:
+                    if isinstance(cl, dict) and str(cl.get("id") or "") == cid:
+                        found = cl
+                        break
+            if found is not None:
+                found["edit_status"] = edit_note
+        updated = skipped = 0
+        if head > 0 or tail > 0:
+            updated, skipped = _trim_video_rows_source(rows, head, tail, sync_audio=True)
+            if updated <= 0:
+                messagebox.showwarning(
+                    "Chỉnh nhanh",
+                    "Không clip nào cắt được (quá ngắn so với số giây đã nhập).",
+                    parent=root,
+                )
+                return
+        _update_project_duration(project)
+        try:
+            pm.save_project(project)
+        except Exception as exc:
+            messagebox.showerror("Chỉnh nhanh", f"Không lưu được dự án: {exc}", parent=root)
+            return
+        refresh_all()
+        parts = [f"Đã chỉnh {n} video"]
+        if flip_h:
+            parts.append("lật ngang")
+        if flip_v:
+            parts.append("lật dọc")
+        if rot:
+            parts.append(f"xoay {rot}°")
+        if canvas != "fit":
+            parts.append(f"khung {canvas}")
+        if head > 0 or tail > 0:
+            parts.append(f"cắt đầu {head:g}s / đuôi {tail:g}s")
+            if skipped:
+                parts.append(f"bỏ qua {skipped} clip quá ngắn")
+        notify(". ".join(parts) + ".")
+        if then_export:
+            fn = _quick_edit_ref.get("export")
+            if callable(fn):
+                fn()
+            else:
+                messagebox.showinfo("Chỉnh nhanh", "Đã áp dụng. Bấm «Xuất MP4» ở khung xuất.", parent=root)
+
+    def apply_quick_edit_then_export() -> None:
+        apply_quick_edit(then_export=True)
+
+    _quick_edit_ref["apply"] = apply_quick_edit
+    _quick_edit_ref["apply_export"] = apply_quick_edit_then_export
+
     def _ve_iv_overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
         return min(a1, b1) > max(a0, b0)
 
@@ -7490,7 +7844,7 @@ def build_video_editor_tab(
     clip_tab_scroll_host = ttk.Frame(tab_insp_clip)
     tab_insp_clip.columnconfigure(0, weight=1)
     tab_insp_clip.rowconfigure(0, weight=1, minsize=160)
-    tab_insp_clip.rowconfigure(1, weight=0, minsize=52)
+    tab_insp_clip.rowconfigure(1, weight=0, minsize=150)
     clip_tab_scroll_host.grid(row=0, column=0, sticky="nsew")
     clip_tab_bottom.grid(row=1, column=0, sticky="ew")
     clip_tab_scroll_inner = _pack_scrollable_vertical(clip_tab_scroll_host)
@@ -7814,6 +8168,13 @@ def build_video_editor_tab(
     ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
     def _apply_all_from_bottom() -> None:
+        if bool(var_qe_use.get()):
+            fn_q = _quick_edit_ref.get("apply")
+            if callable(fn_q):
+                fn_q(then_export=bool(var_qe_export.get()))
+                return
+            messagebox.showinfo("Chỉnh nhanh", "Chưa sẵn sàng. Chọn dự án rồi thử lại.", parent=root)
+            return
         fn = _apply_batch_video_ref.get("fn")
         if callable(fn):
             fn()
@@ -7876,7 +8237,7 @@ def build_video_editor_tab(
     sec_logo_outer, sec_logo_inner, _var_sec_logo_open = _section_collapsible(
         fr_quick_edit_host,
         "Logo — độ mờ, kích, vị trí, chuyển động",
-        start_open=True,
+        start_open=False,
     )
     sec_logo_outer.pack(fill=tk.X, pady=(0, 4))
     lf_q_logo = ttk.LabelFrame(sec_logo_inner, text="Thông số logo", padding=(8, 6))
@@ -8413,6 +8774,47 @@ def build_video_editor_tab(
     _bind_label_wrap_to_frame(lbl_clip_quick_hint, sec_hint_inner, inset=8)
     sec_hint_outer.pack(fill=tk.X, pady=(0, 6))
     ttk.Separator(clip_footer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 6))
+    qe_box = ttk.LabelFrame(clip_footer, text="Chỉnh nhanh", padding=(6, 4))
+    qe_box.pack(fill=tk.X, pady=(0, 6))
+    qe_r1 = ttk.Frame(qe_box)
+    qe_r1.pack(fill=tk.X)
+    ttk.Checkbutton(qe_r1, text="Dùng chỉnh nhanh", variable=var_qe_use).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Checkbutton(qe_r1, text="Lật ngang", variable=var_qe_flip_h).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Checkbutton(qe_r1, text="Lật dọc", variable=var_qe_flip_v).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Label(qe_r1, text="Xoay").pack(side=tk.LEFT)
+    ttk.Combobox(
+        qe_r1,
+        textvariable=var_qe_rot,
+        values=["0", "90", "180", "270"],
+        width=5,
+        state="readonly",
+    ).pack(side=tk.LEFT, padx=(4, 0))
+    qe_r2 = ttk.Frame(qe_box)
+    qe_r2.pack(fill=tk.X, pady=(4, 0))
+    ttk.Label(qe_r2, text="Vào khung").pack(side=tk.LEFT)
+    ttk.Combobox(
+        qe_r2,
+        textvariable=var_qe_canvas,
+        values=["fit", "fill", "stretch"],
+        width=8,
+        state="readonly",
+    ).pack(side=tk.LEFT, padx=(4, 8))
+    ttk.Label(qe_r2, text="Cắt đầu").pack(side=tk.LEFT)
+    ttk.Entry(qe_r2, textvariable=var_qe_head, width=5).pack(side=tk.LEFT, padx=(4, 8))
+    ttk.Label(qe_r2, text="Cắt đuôi").pack(side=tk.LEFT)
+    ttk.Entry(qe_r2, textvariable=var_qe_tail, width=5).pack(side=tk.LEFT, padx=(4, 8))
+    qe_r3 = ttk.Frame(qe_box)
+    qe_r3.pack(fill=tk.X, pady=(4, 0))
+    ttk.Checkbutton(qe_r3, text="Mọi video", variable=var_qe_all).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Checkbutton(qe_r3, text="Rồi xuất MP4", variable=var_qe_export).pack(side=tk.LEFT)
+    ttk.Label(
+        qe_box,
+        text="Cùng chế độ Transform & canvas: Lật ngang, Lật dọc, Xoay 0/90/180/270, Vào khung. Bấm Áp dụng tất cả để ghi lên mọi video.",
+        foreground="#555",
+        font=("Segoe UI", 8),
+        wraplength=280,
+        justify=tk.LEFT,
+    ).pack(anchor="w", pady=(4, 0))
     btn_apply_all_bottom.pack(fill=tk.X, pady=(0, 2), ipady=6)
 
     for _vq in (
@@ -9896,7 +10298,7 @@ def build_video_editor_tab(
     ).grid(row=1, column=0, columnspan=2, sticky="w")
     ttk.Label(
         fr_export_post,
-        text="Đích đăng (Facebook / TikTok / Page): cấu hình trong popup «Nạp job chờ đăng từ Export» (mở từ tab «7.Job chờ đăng từ Video Editor») — có «Chờ chọn» và «Lưu gợi ý đích».",
+        text="Sau khi xuất: tab Chờ đăng → «Chia đều Page» (đặt số video/page, chọn nhiều Page) → «Nạp vào lịch».",
         foreground="#555",
         font=("Segoe UI", 9),
         wraplength=620,
@@ -10362,6 +10764,28 @@ def build_video_editor_tab(
                             failures.append(f"{cid}: không dựng được clip.")
                             _queue_export_status(f"Clip {idx}/{n} lỗi dựng project ({cid}).", log=True)
                             continue
+                        try:
+                            src_du = float(_cl.get("duration") or 0)
+                        except (TypeError, ValueError):
+                            src_du = 0.0
+                        src_media = next(
+                            (
+                                m
+                                for m in (project or {}).get("media") or []
+                                if isinstance(m, dict) and str(m.get("id") or "") == str(_cl.get("media_id") or "")
+                            ),
+                            None,
+                        )
+                        src_path = resolve_media_file_path(src_media) if isinstance(src_media, dict) else None
+                        skip_why = (
+                            clip_export_skip_reason(src_media, src_path, src_du)
+                            if isinstance(src_media, dict) and src_path is not None
+                            else "không thấy file nguồn — bỏ qua, không xuất"
+                        )
+                        if skip_why:
+                            failures.append(f"{cid}: {skip_why}")
+                            _queue_export_status(f"Clip {idx}/{n} bỏ qua, không xuất: {skip_why}", log=True)
+                            continue
                         bproj["width"] = w
                         bproj["height"] = h
                         bproj["fps"] = fps
@@ -10426,12 +10850,17 @@ def build_video_editor_tab(
                         # Mặc định chất lượng theo project (chuẩn, không ép «light export»).
                         # Nếu lỗi/timeout: fallback ultrafast như preview nháp.
                         enc_plans: list[dict[str, Any]] = [
-                            {"tag": "chuẩn (chất lượng)", "mp4_faststart": False, "enc": None, "light": False},
                             {
-                                "tag": "fallback nhanh",
+                                "tag": "Full HD nét",
                                 "mp4_faststart": False,
-                                "enc": {"preset": "ultrafast", "crf": 34, "threads": 1},
-                                "light": True,
+                                "enc": {"preset": "veryfast", "crf": 18},
+                                "light": False,
+                            },
+                            {
+                                "tag": "fallback vẫn nét",
+                                "mp4_faststart": False,
+                                "enc": {"preset": "veryfast", "crf": 20},
+                                "light": False,
                             },
                         ]
                         res: dict[str, Any] = {"ok": False, "error_message": ""}
@@ -10465,10 +10894,11 @@ def build_video_editor_tab(
                                 )
                             except Exception as ex:
                                 res = {"ok": False, "error_message": str(ex)}
-                                if plan_i == len(enc_plans) - 1:
-                                    failures.append(f"{logical_name}: {ex}")
-                                    _queue_export_status(f"Clip {idx}/{n} lỗi build command: {logical_name}", log=True)
-                                continue
+                                _queue_export_status(
+                                    f"Clip {idx}/{n} bỏ qua, không xuất: {logical_name}",
+                                    log=True,
+                                )
+                                break
 
                             _queue_export_status(
                                 f"Clip {idx}/{n} — FFmpeg ({plan['tag']}) → {out_file.name}…",
@@ -10489,6 +10919,24 @@ def build_video_editor_tab(
                                 wait_heartbeat_callback=_hb_clip,
                             )
                             if res.get("ok"):
+                                bad = exported_mp4_reject_reason(
+                                    out_file,
+                                    expect_w=w,
+                                    expect_h=h,
+                                    expect_dur=max(0.1, float(bproj.get("duration") or 0.1)),
+                                )
+                                if bad:
+                                    res = {"ok": False, "error_message": bad}
+                                    try:
+                                        if out_file.exists():
+                                            out_file.unlink()
+                                    except Exception:
+                                        pass
+                                    _queue_export_status(
+                                        f"Clip {idx}/{n} bỏ qua, không giữ file: {bad}",
+                                        log=True,
+                                    )
+                                    break
                                 break
 
                         if not res.get("ok"):
@@ -10568,12 +11016,17 @@ def build_video_editor_tab(
                             _schedule_on_main_thread(_ui)
 
                         full_plans: list[dict[str, Any]] = [
-                            {"tag": "chuẩn (chất lượng)", "mp4_faststart": True, "enc": None, "light": False},
                             {
-                                "tag": "fallback nhanh",
+                                "tag": "Full HD nét",
+                                "mp4_faststart": True,
+                                "enc": {"preset": "veryfast", "crf": 18},
+                                "light": False,
+                            },
+                            {
+                                "tag": "fallback vẫn nét",
                                 "mp4_faststart": False,
-                                "enc": {"preset": "ultrafast", "crf": 34, "threads": 1},
-                                "light": True,
+                                "enc": {"preset": "veryfast", "crf": 20},
+                                "light": False,
                             },
                         ]
                         res_full: dict[str, Any] = {"ok": False, "error_message": ""}
@@ -10622,6 +11075,20 @@ def build_video_editor_tab(
                                 wait_heartbeat_callback=_hb_full,
                             )
                             if res_full.get("ok"):
+                                bad_full = exported_mp4_reject_reason(
+                                    out_file,
+                                    expect_w=w,
+                                    expect_h=h,
+                                    expect_dur=max(0.1, float(export_project.get("duration") or 0.1)),
+                                )
+                                if bad_full:
+                                    res_full = {"ok": False, "error_message": bad_full}
+                                    try:
+                                        if out_file.exists():
+                                            out_file.unlink()
+                                    except Exception:
+                                        pass
+                                    _queue_export_status(f"Full timeline bỏ qua, không giữ file: {bad_full}", log=True)
                                 break
 
                         try:
@@ -10757,7 +11224,7 @@ def build_video_editor_tab(
                             if fail_snap:
                                 messagebox.showwarning(
                                     "Export",
-                                    "Có file lỗi:\n"
+                                    "Đã bỏ qua, không xuất các file lỗi:\n"
                                     + "\n".join(fail_snap[:8])
                                     + (
                                         f"\n… (+{len(fail_snap) - 8})"
@@ -10789,6 +11256,7 @@ def build_video_editor_tab(
 
     btn_export_run = ttk.Button(btns_fr, text="Xuất MP4", command=_run_export_with_custom_settings)
     btn_export_run.pack(side=tk.LEFT)
+    _quick_edit_ref["export"] = _run_export_with_custom_settings
     btn_exp_refs["run"] = btn_export_run
     btn_export_stop = ttk.Button(btns_fr, text="Dừng export", command=_stop_export_now)
     btn_export_stop.pack(side=tk.LEFT, padx=(8, 0))

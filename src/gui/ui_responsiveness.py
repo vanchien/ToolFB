@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 from weakref import WeakKeyDictionary
@@ -23,20 +24,35 @@ from loguru import logger
 DEFAULT_TREE_CHUNK = 45
 DEFAULT_TREE_APPEND_CHUNK = 60
 _DEFAULT_MAIN_PUMP_MS = 25
-_MAIN_DRAIN_PER_TICK = 48
+_MAIN_DRAIN_PER_TICK = 24
+_MAIN_DRAIN_BUDGET_SEC = 0.008
+_PUMP_BUSY_MS = 1
 
 _ROOT_QUEUES: WeakKeyDictionary[tk.Misc, queue.Queue[Callable[[], None]]] = WeakKeyDictionary()
 _PUMP_REGISTERED: WeakKeyDictionary[tk.Misc, bool] = WeakKeyDictionary()
 
 
-def flush_main_thread_queue(root: tk.Misc, *, max_items: int = _MAIN_DRAIN_PER_TICK) -> int:
-    """Xử lý callback đang chờ — **chỉ gọi trên main thread** (test / pump)."""
+def flush_main_thread_queue(
+    root: tk.Misc,
+    *,
+    max_items: int = _MAIN_DRAIN_PER_TICK,
+    budget_sec: float = _MAIN_DRAIN_BUDGET_SEC,
+) -> int:
+    """
+    Xử lý callback đang chờ — **chỉ gọi trên main thread** (test / pump).
+
+    Giới hạn theo số lượng **và** thời gian để Windows không gắn Not Responding
+    khi hàng đợi UI phình (nhiều Page / nhiều luồng Firefox).
+    """
     q = _ROOT_QUEUES.get(root)
     if q is None:
         return 0
     n = 0
+    deadline = time.perf_counter() + max(0.001, float(budget_sec))
     try:
         while n < max_items:
+            if n > 0 and time.perf_counter() >= deadline:
+                break
             fn = q.get_nowait()
             n += 1
             try:
@@ -62,8 +78,11 @@ def register_main_thread_dispatcher(root: tk.Misc, *, interval_ms: int = _DEFAUL
 
     def _pump() -> None:
         flush_main_thread_queue(root)
+        q = _ROOT_QUEUES.get(root)
+        busy = q is not None and q.qsize() > 0
+        delay = _PUMP_BUSY_MS if busy else max(8, int(interval_ms))
         try:
-            root.after(max(8, int(interval_ms)), _pump)
+            root.after(delay, _pump)
         except (tk.TclError, RuntimeError):
             _PUMP_REGISTERED.pop(root, None)
 
@@ -75,12 +94,6 @@ def register_main_thread_dispatcher(root: tk.Misc, *, interval_ms: int = _DEFAUL
 
 def schedule_on_main_thread(root: tk.Misc, fn: Callable[[], None]) -> None:
     """Đưa callback về main thread — an toàn khi gọi từ worker (Python 3.14+)."""
-    if threading.current_thread() is threading.main_thread():
-        try:
-            fn()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[UI] callback main thread lỗi: {}", exc)
-        return
     if root not in _ROOT_QUEUES:
         register_main_thread_dispatcher(root)
     q = _ROOT_QUEUES.get(root)
@@ -88,6 +101,8 @@ def schedule_on_main_thread(root: tk.Misc, fn: Callable[[], None]) -> None:
         logger.warning("[UI] Không có queue dispatcher cho root — bỏ qua callback")
         return
     q.put(fn)
+    if threading.current_thread() is threading.main_thread():
+        flush_main_thread_queue(root)
 
 
 DEFAULT_TREE_SELECT_CHUNK = 120
@@ -217,6 +232,8 @@ def install_adaptive_wrap(root: tk.Misc) -> None:
         except tk.TclError:
             return
         for child in children:
+            if isinstance(child, (ttk.Treeview, tk.Text, tk.Canvas, tk.Listbox, ttk.Scrollbar, tk.Scrollbar)):
+                continue
             if isinstance(child, (ttk.Label, tk.Label)):
                 try:
                     current = int(float(child.cget("wraplength") or 0))
@@ -247,7 +264,8 @@ def install_adaptive_wrap(root: tk.Misc) -> None:
 
     def _on_configure(event: tk.Event) -> None:
         widget = event.widget
-        if not isinstance(widget, (tk.Tk, tk.Toplevel, tk.Frame, ttk.Frame, ttk.LabelFrame, ttk.Panedwindow)):
+        # Chỉ cửa sổ — không bắt Frame/Treeview (insert hàng nghìn dòng sẽ đơ UI).
+        if not isinstance(widget, (tk.Tk, tk.Toplevel)):
             return
         try:
             top = widget.winfo_toplevel()
@@ -260,8 +278,8 @@ def install_adaptive_wrap(root: tk.Misc) -> None:
             except tk.TclError:
                 pass
         try:
-            _WRAP_AFTER[top] = top.after(90, lambda t=top: _run(t))
+            _WRAP_AFTER[top] = top.after(160, lambda t=top: _run(t))
         except tk.TclError:
             pass
 
-    root.bind_all("<Configure>", _on_configure, add="+")
+    root.bind("<Configure>", _on_configure, add="+")

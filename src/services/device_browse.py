@@ -84,10 +84,12 @@ def read_visible_text(page: Any) -> str:
 
 _READ_DISPLAY_NAME_JS = """(uid) => {
   const labels = [];
+  const matcher = /nghĩ gì|on your mind|thông báo của |notification settings for /i;
   for (const el of document.querySelectorAll("[aria-label]")) {
     const value = (el.getAttribute("aria-label") || "").trim();
-    if (value && value.length <= 180) labels.push(value);
-    if (labels.length >= 300) break;
+    if (!value || value.length > 180 || !matcher.test(value)) continue;
+    labels.push(value);
+    if (labels.length >= 20) break;
   }
   const links = [];
   if (uid) {
@@ -99,8 +101,122 @@ _READ_DISPLAY_NAME_JS = """(uid) => {
       if (links.length >= 40) break;
     }
   }
-  return {labels, links};
+  const headings = [];
+  const root = document.querySelector('[role="main"]') || document.body;
+  for (const el of root.querySelectorAll("h1")) {
+    const text = (el.innerText || "").trim().split("\\n")[0].trim();
+    if (text && text.length <= 80) headings.push(text);
+    if (headings.length >= 8) break;
+  }
+  return {labels, links, headings, title: document.title || "", url: location.href || ""};
 }"""
+
+
+def facebook_uid_on_page(page: Any) -> str:
+    """UID đang đăng nhập trong trình duyệt. Rỗng nếu chưa có cookie phiên."""
+    try:
+        cookies = page.context.cookies("https://www.facebook.com")
+    except Exception:
+        return ""
+    for item in cookies or []:
+        if str(item.get("name") or "").strip().lower() != "c_user":
+            continue
+        return "".join(ch for ch in str(item.get("value") or "") if ch.isdigit())
+    return ""
+
+
+_READ_PROFILE_HEADER_JS = """() => {
+  const clean = (value) => (value || "").replace(/\\u00a0/g, " ").replace(/\\s+/g, " ").trim();
+  const followerRe = /followers|following|người theo dõi|đang theo dõi/i;
+  const names = [];
+  const push = (value) => {
+    const name = clean(value).split("\\n")[0].trim();
+    if (!name || name.length < 2 || name.length > 80 || followerRe.test(name)) return;
+    if (!names.includes(name)) names.push(name);
+  };
+  const root = document.body;
+  for (const el of root.querySelectorAll("h1, [role='heading']")) push(el.innerText);
+  for (const el of root.querySelectorAll("span, div, a, h1")) {
+    const text = clean(el.innerText);
+    if (!text || text.length > 180 || !followerRe.test(text)) continue;
+    let parent = el;
+    for (let depth = 0; depth < 10 && parent; depth += 1) {
+      parent = parent.parentElement;
+      if (!parent) break;
+      for (const span of parent.querySelectorAll("h1, [role='heading'], div[role='button'] > span, a[role='link'] > span")) {
+        push(span.innerText);
+      }
+      if (names.length) break;
+    }
+    if (names.length) break;
+  }
+  return {title: document.title || "", names};
+}"""
+
+
+def _usable_account_name(name: str) -> str:
+    """Tên người dùng đã lọc nút menu và nhãn mặc định."""
+    from src.utils.schedule_posts_filters import account_name_is_placeholder
+
+    clean = " ".join(str(name or "").replace("\xa0", " ").split())[:80]
+    if not clean or clean.isdigit() or account_name_is_placeholder(clean):
+        return ""
+    return clean
+
+
+def read_account_display_name(page: Any, *, visit_profile: bool = False) -> str:
+    """Tên tài khoản đang đăng nhập.
+
+    Trang bảng tin thường không có tên. Khi ``visit_profile`` bật, mở trang cá nhân
+    để đọc tên trên nút cạnh dòng follower, rồi quay lại trang trước.
+    """
+    from src.utils.account_proxy_mapper import facebook_href_is_own_profile
+
+    found = _usable_account_name(read_profile_header_name(page)) or _usable_account_name(
+        read_logged_in_display_name(page)
+    )
+    if found or not visit_profile:
+        return found
+    uid = facebook_uid_on_page(page)
+    current = str(getattr(page, "url", "") or "")
+    if not uid or facebook_href_is_own_profile(current, uid):
+        return ""
+    try:
+        page.goto(
+            f"https://www.facebook.com/profile.php?id={uid}",
+            wait_until="domcontentloaded",
+            timeout=45_000,
+        )
+        for _ in range(6):
+            found = _usable_account_name(read_profile_header_name(page)) or _usable_account_name(
+                read_logged_in_display_name(page)
+            )
+            if found:
+                break
+            page.wait_for_timeout(1000)
+    except Exception:
+        found = found or ""
+    finally:
+        if "facebook.com" in current.casefold() and not facebook_href_is_own_profile(current, uid):
+            try:
+                page.goto(current, wait_until="domcontentloaded", timeout=45_000)
+            except Exception:
+                pass
+    return found
+
+
+def read_profile_header_name(page: Any) -> str:
+    """Tên trên đầu trang cá nhân, kể cả khi Facebook để tên trong nút chứ không phải h1."""
+    from src.utils.account_proxy_mapper import pick_profile_header_name
+
+    try:
+        payload = page.evaluate(_READ_PROFILE_HEADER_JS)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    names = payload.get("names") if isinstance(payload.get("names"), list) else []
+    return pick_profile_header_name([str(item) for item in names], str(payload.get("title") or ""))
 
 
 def read_logged_in_display_name(page: Any) -> str:
@@ -108,18 +224,10 @@ def read_logged_in_display_name(page: Any) -> str:
     from src.utils.account_proxy_mapper import (
         facebook_display_name_from_page_bits,
         facebook_href_is_own_profile,
+        name_from_facebook_window_title,
     )
 
-    uid = ""
-    try:
-        cookies = page.context.cookies("https://www.facebook.com")
-    except Exception:
-        cookies = []
-    for item in cookies or []:
-        if str(item.get("name") or "").strip().lower() != "c_user":
-            continue
-        uid = "".join(ch for ch in str(item.get("value") or "") if ch.isdigit())
-        break
+    uid = facebook_uid_on_page(page)
     try:
         payload = page.evaluate(_READ_DISPLAY_NAME_JS, uid)
     except Exception:
@@ -128,6 +236,9 @@ def read_logged_in_display_name(page: Any) -> str:
         return ""
     labels = payload.get("labels") if isinstance(payload.get("labels"), list) else []
     raw_links = payload.get("links") if isinstance(payload.get("links"), list) else []
+    headings = payload.get("headings") if isinstance(payload.get("headings"), list) else []
+    url = str(payload.get("url") or "")
+    on_profile = bool(uid) and facebook_href_is_own_profile(url, uid)
     own_texts: list[str] = []
     for item in raw_links:
         if isinstance(item, dict):
@@ -138,12 +249,20 @@ def read_logged_in_display_name(page: Any) -> str:
             text = str(item or "")
         if uid and not facebook_href_is_own_profile(href, uid):
             continue
+        if "edit" in href.casefold():
+            continue
         if text:
             own_texts.append(text)
-    return facebook_display_name_from_page_bits(
+    named = facebook_display_name_from_page_bits(
         [str(item) for item in labels],
         own_texts,
+        [str(item) for item in headings] if on_profile else [],
     )
+    if named:
+        return named
+    if on_profile:
+        return name_from_facebook_window_title(str(payload.get("title") or ""))
+    return ""
 
 
 def is_old_machine_url(url: str) -> bool:

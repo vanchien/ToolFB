@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _kept_int(value: Any, default: int) -> int:
+    """Giữ số 0. Chỉ dùng mặc định khi trường không được gửi."""
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
 def default_store_path() -> Path:
     return project_root() / "config" / "facebook_groups.json"
 
@@ -36,6 +45,7 @@ def _empty() -> dict[str, Any]:
         "join_jobs": [],
         "share_batches": [],
         "share_jobs": [],
+        "share_settings": {},
     }
 
 
@@ -45,14 +55,32 @@ class GroupStore:
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path else default_store_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._cache_lock = threading.Lock()
+        self._doc_cache: dict[str, Any] | None = None
+        self._doc_mtime: float | None = None
         if not self.path.is_file():
             self._write(_empty())
 
     def _read(self) -> dict[str, Any]:
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            raw = {}
+        raw: Any = {}
+        if self.path.is_file():
+            last_exc: Exception | None = None
+            for attempt in range(4):
+                try:
+                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    time.sleep(0.05 * (attempt + 1))
+            if last_exc is not None:
+                from loguru import logger
+
+                logger.warning(
+                    "Không đọc được facebook_groups.json — dùng bản trống tạm: {}",
+                    last_exc,
+                )
+                raw = {}
         if not isinstance(raw, dict):
             raw = {}
         base = _empty()
@@ -60,6 +88,29 @@ class GroupStore:
             if key not in raw or not isinstance(raw.get(key), type(value)):
                 raw[key] = value
         return raw
+
+    def _snapshot(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Bản sao nông: list/dict cấp 1 tách riêng, tránh caller làm bẩn cache."""
+        out: dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(value, list):
+                out[key] = list(value)
+            elif isinstance(value, dict):
+                out[key] = dict(value)
+            else:
+                out[key] = value
+        return out
+
+    def _file_mtime(self) -> float | None:
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _remember(self, data: dict[str, Any], mtime: float | None = None) -> None:
+        with self._cache_lock:
+            self._doc_cache = data
+            self._doc_mtime = self._file_mtime() if mtime is None else mtime
 
     def _write(self, data: dict[str, Any]) -> None:
         text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
@@ -76,10 +127,20 @@ class GroupStore:
             except OSError:
                 pass
             raise
+        self._remember(data)
 
     def load(self) -> dict[str, Any]:
+        """Đọc store — dùng cache theo mtime khi file không đổi (tối ưu wave lớn)."""
         with json_file_lock(self.path):
-            return self._read()
+            mtime = self._file_mtime()
+            with self._cache_lock:
+                cached = self._doc_cache
+                cached_mtime = self._doc_mtime
+            if cached is not None and mtime is not None and cached_mtime == mtime:
+                return self._snapshot(cached)
+            doc = self._read()
+            self._remember(doc, mtime)
+            return self._snapshot(doc)
 
     def _mutate(self, fn) -> Any:
         with json_file_lock(self.path):
@@ -354,16 +415,18 @@ class GroupStore:
                 "pending_jobs": len(jobs),
                 "failed_jobs": 0,
                 "cooldown_mode": str(row.get("cooldown_mode") or "fixed"),
-                "cooldown_fixed": int(row.get("cooldown_fixed") or 30),
-                "cooldown_min": int(row.get("cooldown_min") or 30),
-                "cooldown_max": int(row.get("cooldown_max") or 90),
+                "cooldown_fixed": _kept_int(row.get("cooldown_fixed"), 30),
+                "cooldown_min": _kept_int(row.get("cooldown_min"), 30),
+                "cooldown_max": _kept_int(row.get("cooldown_max"), 90),
                 "watch_seconds": int(row.get("watch_seconds") or 0),
                 "watch_min_seconds": int(row.get("watch_min_seconds") or row.get("watch_seconds") or 0),
                 "watch_max_seconds": int(row.get("watch_max_seconds") or row.get("watch_seconds") or 0),
                 "reel_seconds": int(row.get("reel_seconds") or 0),
                 "reels_browsed": False,
                 "watched_page_ids": [],
+                "commented_page_ids": [],
                 "comment": str(row.get("comment") or ""),
+                "like_video": bool(row.get("like_video")),
                 "source_watched": False,
                 "source_commented": False,
                 "source_prepared": False,
@@ -414,6 +477,24 @@ class GroupStore:
 
         self._mutate(_apply)
 
+    def completed_share_fingerprints(self) -> set[str]:
+        """Một lần đọc: tập fingerprint đã chia sẻ thành công (tránh O(n) mỗi Page)."""
+        found: set[str] = set()
+        for job in self.share_jobs():
+            if str(job.get("status")) not in {SHARE_COMPLETED, SHARE_DUPLICATE}:
+                continue
+            target = str(job.get("page_id") or job.get("account_id") or "")
+            found.add(
+                share_fingerprint(
+                    target,
+                    str(job.get("group_id") or ""),
+                    str(job.get("source_url") or ""),
+                    str(job.get("text") or ""),
+                    list(job.get("image_paths") or []),
+                )
+            )
+        return found
+
     def completed_share_fingerprint(
         self,
         target_id: str,
@@ -423,20 +504,7 @@ class GroupStore:
         images: list[str] | None = None,
     ) -> bool:
         wanted = share_fingerprint(target_id, group_id, source_url, text, images)
-        for job in self.share_jobs():
-            if str(job.get("status")) not in {SHARE_COMPLETED, SHARE_DUPLICATE}:
-                continue
-            target = str(job.get("page_id") or job.get("account_id") or "")
-            current = share_fingerprint(
-                target,
-                str(job.get("group_id") or ""),
-                str(job.get("source_url") or ""),
-                str(job.get("text") or ""),
-                list(job.get("image_paths") or []),
-            )
-            if current == wanted:
-                return True
-        return False
+        return wanted in self.completed_share_fingerprints()
 
     def refresh_batch_counts(self, batch_id: str) -> dict[str, Any] | None:
         def _apply(doc: dict[str, Any]) -> dict[str, Any] | None:
@@ -472,3 +540,32 @@ class GroupStore:
             return dict(batch)
 
         return self._mutate(_apply)
+
+    def share_settings(self) -> dict[str, Any]:
+        """Cài đặt tab Chia sẻ: bình luận, thời lượng, lần chạy gần nhất."""
+        raw = self.load().get("share_settings")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def save_share_settings(self, settings: dict[str, Any]) -> None:
+        """Ghi cài đặt tab Chia sẻ, giữ lại kết quả lần chạy để mở lại còn xem được."""
+
+        def _apply(doc: dict[str, Any]) -> None:
+            current = doc.get("share_settings") if isinstance(doc.get("share_settings"), dict) else {}
+            merged = dict(current)
+            merged.update(settings if isinstance(settings, dict) else {})
+            doc["share_settings"] = merged
+
+        self._mutate(_apply)
+
+    def recent_share_batch_ids(self, limit: int = 20) -> list[str]:
+        """Mã batch mới nhất, để bảng kết quả còn hiện sau khi đóng app."""
+        rows = list(self.share_batches())
+        rows.sort(key=lambda row: str(row.get("started_at") or row.get("created_at") or ""), reverse=True)
+        found: list[str] = []
+        for row in rows:
+            token = str(row.get("id") or "").strip()
+            if token and token not in found:
+                found.append(token)
+            if len(found) >= max(1, int(limit)):
+                break
+        return found

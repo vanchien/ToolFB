@@ -136,6 +136,7 @@ class HumanInteractionPool:
         self._completed_accounts = 0
         self._join_workers_alive = False
         self._retry_counts: dict[str, int] = {}
+        self._rotate_counts: dict[str, int] = {}
         self._graceful_shutdown = False
         # Đăng nhập: luôn chạy đủ N luồng, không tự hạ concurrency.
         if self._login_only:
@@ -230,6 +231,7 @@ class HumanInteractionPool:
         self._user_cancel.clear()
         self._stop.clear()
         self._retry_counts.clear()
+        self._rotate_counts.clear()
         self._dynamic_limit = self._max_concurrent
         try:
             from src.utils.concurrency_runtime import KIND_BROWSER_POST, workload_begin
@@ -238,18 +240,10 @@ class HumanInteractionPool:
             self._workload_registered = True
         except Exception as exc:  # noqa: BLE001
             logger.debug("[Human pool] workload_begin: {}", exc)
+        # Chỉ xếp hàng — chuẩn bị profile/cookie trên worker khi nhận việc
+        # (không làm trên luồng GUI, tránh cửa sổ Not Responding).
         for acc in self._accounts:
             acc.status = "pending"
-            try:
-                from src.utils.account_proxy_mapper import prepare_mapped_account_for_browser_run
-
-                prepare_mapped_account_for_browser_run(acc)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[Human pool] Chuẩn bị profile/cookie account={}: {}",
-                    acc.account_id,
-                    exc,
-                )
             self._work_q.put(acc)
 
         for wi in range(self._max_concurrent):
@@ -566,15 +560,28 @@ class HumanInteractionPool:
             self._running = max(0, self._running - 1)
             self._state_cv.notify_all()
 
+    def _health_floor(self) -> int:
+        """Không hạ dưới ~50% số luồng cấu hình — tránh 14 luồng còn 2 ô trống."""
+        if self._max_concurrent >= 4:
+            return max(2, (self._max_concurrent + 1) // 2)
+        return 1
+
+    def _slot_limit(self) -> int:
+        """Giới hạn luồng hiện tại — đọc lại mỗi lần chờ, không giữ số cũ."""
+        if self._login_only:
+            return max(1, int(self._max_concurrent))
+        return max(1, int(self._dynamic_limit))
+
     def _enter_slot(self) -> bool:
         """
         Chờ slot concurrency; trả False nếu pool đã dừng trước khi vào slot.
 
         Chế độ ``login_only``: luôn dùng ``max_concurrent`` (không bị health monitor hạ).
+        Đọc ``_dynamic_limit`` trong vòng chờ — nếu health nâng lại limit, luồng
+        đang chờ phải vào ngay, không kẹt mãi ở số cũ (ví dụ 2/7).
         """
-        limit = self._max_concurrent if self._login_only else self._dynamic_limit
         with self._state_cv:
-            while not self._stop.is_set() and self._running >= limit:
+            while not self._stop.is_set() and self._running >= self._slot_limit():
                 self._state_cv.wait(timeout=0.5)
             if self._stop.is_set():
                 return False
@@ -600,7 +607,7 @@ class HumanInteractionPool:
                 # Tự hạ tốc khi lỗi cao; tự nâng nhẹ khi ổn định.
                 new_limit = self._dynamic_limit
                 if proxy_ratio >= 0.30 or err_ratio >= 0.40:
-                    new_limit = max(1, self._dynamic_limit - 1)
+                    new_limit = max(self._health_floor(), self._dynamic_limit - 1)
                 elif successes >= max(8, int(n * 0.7)) and proxy_errors == 0 and err_ratio < 0.15:
                     new_limit = min(self._max_concurrent, self._dynamic_limit + 1)
                 if new_limit != self._dynamic_limit:
@@ -645,8 +652,44 @@ class HumanInteractionPool:
         return max(0, int(os.environ.get("FB_HUMAN_INTERACTION_MAX_RETRIES", "2")))
 
     @staticmethod
+    def _max_account_rotations() -> int:
+        """Số lần đưa TK hết thời gian lượt lại cuối hàng (không chiếm slot)."""
+        return max(0, int(os.environ.get("FB_HUMAN_ACCOUNT_ROTATE_MAX", "2")))
+
+    @staticmethod
     def _retryable_result(result: str) -> bool:
-        return str(result or "") in {"browser_closed", "error", "interrupted"}
+        """Lỗi tạm trên cùng TK — không gồm hết thời gian lượt (xoay sang TK khác)."""
+        return str(result or "") in {"browser_closed", "error"}
+
+    def _should_rotate_account(self, mapped: MappedAccount, result: str) -> bool:
+        """
+        Hết thời gian / dừng giữa module: nhả slot, chạy TK đang chờ ngay.
+
+        TK chưa xong được đưa lại cuối hàng đợi trong cùng pool — không đợi
+        cả 14 luồng kết thúc rồi mới auto-continue lượt mới.
+        """
+        if self._user_cancel.is_set() or self._stop.is_set():
+            return False
+        if str(result or "") != "interrupted":
+            return False
+        st = str(mapped.status or "").strip()
+        if st in {"cancelled", "success", "login_ok", "proxy_error", "login_failed"}:
+            return False
+        aid = str(mapped.account_id or "")
+        max_rot = self._max_account_rotations()
+        if max_rot <= 0 or not aid:
+            return False
+        used = int(self._rotate_counts.get(aid, 0))
+        if used >= max_rot:
+            logger.info(
+                "[Human pool] {} đã xoay {}/{} lần — giữ pending cho lượt sau",
+                aid,
+                used,
+                max_rot,
+            )
+            return False
+        self._rotate_counts[aid] = used + 1
+        return True
 
     def _worker_loop(self, worker_index: int) -> None:
         """Mỗi worker giữ một ô lưới cố định — cửa sổ không nhảy vị trí giữa các tài khoản."""
@@ -682,15 +725,17 @@ class HumanInteractionPool:
                 continue
 
             counted_done = False
+            rotate = False
 
-            def _account_work_done(result: str) -> None:
+            def _account_work_done(result: str, *, complete: bool = True) -> None:
                 nonlocal counted_done
                 if counted_done:
                     return
                 counted_done = True
                 self._on_worker_done(result)
-                with self._state_lock:
-                    self._completed_accounts += 1
+                if complete:
+                    with self._state_lock:
+                        self._completed_accounts += 1
 
             try:
                 if not self._acquire_proxy(mapped):
@@ -776,8 +821,27 @@ class HumanInteractionPool:
                         is_user_cancelled=self.is_stopped,
                         skip_launch_stagger=True,
                     )
+                rotate = self._should_rotate_account(mapped, result)
+                if rotate:
+                    self._emit_status(
+                        mapped,
+                        "waiting",
+                        (
+                            f"Hết thời gian lượt — chuyển TK tiếp theo "
+                            f"(xoay {self._rotate_counts.get(aid, 0)}/{self._max_account_rotations()})"
+                        ),
+                    )
+                    logger.info(
+                        "[Human pool] Luồng {} xong {} ({}) — nhận TK đang chờ ngay",
+                        worker_index + 1,
+                        aid,
+                        result,
+                    )
                 if not counted_done:
-                    _account_work_done(result)
+                    _account_work_done(result, complete=not rotate)
+                elif not rotate:
+                    with self._state_lock:
+                        self._completed_accounts += 1
             except Exception as exc:  # noqa: BLE001
                 terminal = str(mapped.status or "").strip()
                 if terminal in ("success", "login_ok"):
@@ -799,6 +863,8 @@ class HumanInteractionPool:
                 self._release_account(mapped)
                 self._release_proxy(mapped)
                 self._work_q.task_done()
+                if rotate and not self._user_cancel.is_set() and not self._stop.is_set():
+                    self._work_q.put(mapped)
 
 
 def validate_pool_start(

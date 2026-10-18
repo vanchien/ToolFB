@@ -27,6 +27,17 @@ _PAUSE_TEXT = {
 }
 
 
+def _share_page_url(page_id: str, page_url: str) -> str:
+    """Link Page đã lưu. Không đổi sang dạng khác kẻo Facebook báo không xem được."""
+    dest = str(page_url or "").strip()
+    if dest:
+        return dest
+    token = str(page_id or "").strip()
+    if token:
+        return f"https://www.facebook.com/{token}"
+    return ""
+
+
 class FacebookGroupProvider:
     """Tìm nhóm và chia sẻ link qua một profile. Không mở trình duyệt mới cho từng từ khóa."""
 
@@ -36,6 +47,10 @@ class FacebookGroupProvider:
         self._factory: Any = None
         self._context: Any = None
         self._page: Any = None
+
+    def spawn(self) -> FacebookGroupProvider:
+        """Một profile riêng. Nhiều tài khoản chia sẻ cùng lúc thì mỗi tài khoản một cửa sổ."""
+        return FacebookGroupProvider(self._fetch_html)
 
     def check_session(self, account_id: str) -> str:
         """Rỗng nếu account còn trong kho. Hết phiên xử lý khi mở Facebook."""
@@ -119,6 +134,77 @@ class FacebookGroupProvider:
     def verify_membership(self, *, account_id: str, page_id: str, group_id: str) -> dict[str, Any]:
         return self.check_membership(account_id=account_id, page_id=page_id, group_id=group_id)
 
+    def switch_to_page(
+        self,
+        *,
+        account_id: str,
+        page_id: str,
+        page_name: str = "",
+        page_url: str = "",
+    ) -> dict[str, Any]:
+        """Chuyển vai trò sang đúng Page trước khi lướt Reel, xem, like, bình luận và chia sẻ.
+
+        Mở trang Page đích trước (nút «Switch now» chỉ hiện ở đó), rồi mới switch. Lỗi thì
+        về trang chủ cá nhân và thử lại lần 2. Vẫn lỗi thì để trình duyệt ở trang chủ sạch
+        để Page sau không bị kẹt theo.
+        """
+        if self._fetch_html is not None:
+            return {"error_code": "", "switched": True}
+        if self._page is None:
+            self.begin_account(account_id)
+        if self._page is None:
+            return {"error_code": "TIMEOUT", "error_message": "Không mở được trình duyệt"}
+        from src.automation.facebook_actions import (
+            _disable_view_only_guard,
+            _dismiss_open_profile_menu,
+            _enable_view_only_guard,
+            _go_facebook_personal_home,
+            _robust_switch_to_target_page,
+            _target_page_role_satisfied,
+            navigate_to_url,
+        )
+
+        page = self._page
+        dest = _share_page_url(page_id, page_url)
+        name = str(page_name or "").strip()
+        label = name or page_id
+        if not dest:
+            return {"error_code": "TEMPORARY_ERROR", "error_message": f"Thiếu link Page {label}"}
+
+        ok = False
+        _disable_view_only_guard(page)
+        try:
+            for attempt in (1, 2):
+                try:
+                    if attempt == 2:
+                        logger.info("Chuyển Page {} lần 1 chưa được — về trang chủ rồi thử lần 2.", label)
+                        _dismiss_open_profile_menu(page)
+                        _go_facebook_personal_home(page)
+                    navigate_to_url(page, dest)
+                    page.wait_for_timeout(1_500)
+                    if _robust_switch_to_target_page(page, page_display_name=name, page_url=dest):
+                        _dismiss_open_profile_menu(page)
+                        ok = _target_page_role_satisfied(
+                            page, dest, timeout_ms=4_000, page_display_name=name
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Chuyển Page {} lần {} lỗi: {}", label, attempt, exc)
+                    ok = False
+                if ok:
+                    break
+            if not ok:
+                try:
+                    _dismiss_open_profile_menu(page)
+                    _go_facebook_personal_home(page)
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            _enable_view_only_guard(page, force=True)
+        if not ok:
+            return {"error_code": "TEMPORARY_ERROR", "error_message": f"Chưa chuyển được sang Page {label} (đã thử 2 lần)"}
+        logger.info("Đã chuyển sang Page {}.", label)
+        return {"error_code": "", "switched": True}
+
     def browse_reels(
         self,
         *,
@@ -142,6 +228,23 @@ class FacebookGroupProvider:
             return {"error_code": code, "browsed_seconds": 0}
         return browse_reels_feed(self._page, seconds=seconds, should_stop=should_stop)
 
+    def like_source_video(self, *, account_id: str, source_url: str) -> dict[str, Any]:
+        """Bấm Like trên video đang mở. Không bấm React."""
+        from src.services.facebook_groups.video_engage import like_open_video
+
+        if self._fetch_html is not None:
+            return {"error_code": "", "liked": True}
+        if not source_url:
+            return {"error_code": "TEMPORARY_ERROR", "liked": False}
+        if self._page is None or source_url not in str(getattr(self._page, "url", "") or ""):
+            self._load_html(account_id, source_url)
+        if self._page is None:
+            return {"error_code": "TIMEOUT", "liked": False}
+        code = self._pause_code(str(getattr(self._page, "url", "") or ""), self._visible_text(self._page))
+        if code:
+            return {"error_code": code, "liked": False}
+        return {"error_code": "", "liked": bool(like_open_video(self._page))}
+
     def prepare_source_video(
         self,
         *,
@@ -149,9 +252,10 @@ class FacebookGroupProvider:
         source_url: str,
         watch_seconds: int = 0,
         comment: str = "",
+        like: bool = False,
         should_stop: Any = None,
     ) -> dict[str, Any]:
-        """Mở link video, xem đủ số giây, rồi bình luận. Không tải file."""
+        """Mở link video, xem đủ số giây; trong lúc xem thì Like và bình luận lần lượt. Không tải file."""
         from src.services.facebook_groups.video_engage import engage_source_video
 
         if not source_url:
@@ -161,17 +265,19 @@ class FacebookGroupProvider:
                 "error_code": "",
                 "watched_seconds": int(watch_seconds or 0),
                 "commented": bool(str(comment or "").strip()),
+                "liked": bool(like),
             }
         self._load_html(account_id, source_url)
         if self._page is None:
-            return {"error_code": "TIMEOUT", "watched_seconds": 0, "commented": False}
+            return {"error_code": "TIMEOUT", "watched_seconds": 0, "commented": False, "liked": False}
         code = self._pause_code(str(getattr(self._page, "url", "") or ""), self._visible_text(self._page))
         if code:
-            return {"error_code": code, "watched_seconds": 0, "commented": False}
+            return {"error_code": code, "watched_seconds": 0, "commented": False, "liked": False}
         return engage_source_video(
             self._page,
             watch_seconds=int(watch_seconds or 0),
             comment=str(comment or ""),
+            like=bool(like),
             should_stop=should_stop,
         )
 
@@ -187,6 +293,7 @@ class FacebookGroupProvider:
         target_url: str = "",
         page_name: str = "",
         group_name: str = "",
+        like_video: bool = False,
     ) -> dict[str, Any]:
         """Bấm nút chia sẻ trên video nguồn, rồi gửi lên Page hoặc nhóm trong list."""
         if not source_url:
@@ -199,13 +306,23 @@ class FacebookGroupProvider:
             code = self._pause_code(str(getattr(self._page, "url", "") or ""), self._visible_text(self._page))
             if code:
                 return {"error_code": code}
-            shared = share_open_video(
-                self._page,
-                kind="group" if group_id else "page",
-                target_id=group_id or page_id,
-                target_name=group_name if group_id else page_name,
-                caption=text,
-            )
+            share_args = {
+                "kind": "group" if group_id else "page",
+                "target_id": group_id or page_id,
+                "target_name": group_name if group_id else page_name,
+                "caption": text,
+                "like": bool(like_video),
+            }
+            shared = share_open_video(self._page, **share_args)
+            if shared.get("error_code") == "TIMEOUT" and "nút chia sẻ" in str(shared.get("error_message") or ""):
+                logger.info("Chưa thấy nút chia sẻ — tải lại video rồi thử lại một lần.")
+                try:
+                    self._page.goto(source_url, wait_until="domcontentloaded", timeout=60_000)
+                    self._page.wait_for_timeout(2_000)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Không tải lại được video: {}", exc)
+                else:
+                    shared = share_open_video(self._page, **{**share_args, "like": False})
             if shared.get("error_code"):
                 return shared
             return {"post_id": str(shared.get("post_id") or ""), "post_url": source_url}
@@ -421,8 +538,15 @@ class FacebookGroupProvider:
         if page is None:
             return ""
         try:
+            current = str(getattr(page, "url", "") or "")
+            from src.services.facebook_groups.video_engage import _lock_user
+
+            if url and (current == url or url in current):
+                _lock_user(page)
+                return page.content() or ""
             page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(800)
+            _lock_user(page)
             return page.content() or ""
         except Exception as exc:  # noqa: BLE001
             logger.warning("Không mở được {}: {}", url, exc)
@@ -449,6 +573,9 @@ class FacebookGroupProvider:
         self._context = context
         self._page = context.pages[0] if context.pages else context.new_page()
         self._account_id = account_id
+        from src.services.facebook_groups.video_engage import _lock_user
+
+        _lock_user(self._page)
 
     def _click_join(self, page: Any) -> str:
         try:

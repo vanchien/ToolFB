@@ -267,9 +267,9 @@ def run_human_interaction_worker(
         if _user_stopped():
             return "cancelled", "Đã hủy — người dùng bấm Dừng"
         if _pool_abort():
-            return "pending", "Dừng giữa module — tự động chạy tiếp lượt sau"
+            return "pending", "Dừng giữa module — chuyển TK tiếp theo, sẽ chạy lại sau"
         if _deadline_reached():
-            return "pending", "Hết thời gian lượt — tự động chạy tiếp lượt sau"
+            return "pending", "Hết thời gian lượt — chuyển TK tiếp theo, sẽ chạy lại sau"
         return "", ""
 
     def _finish_if_aborted(*, notify_now: bool = True, allow_deadline_continue: bool = False) -> str | None:
@@ -294,7 +294,13 @@ def run_human_interaction_worker(
             logger.debug("[Human] on_work_finished: {}", exc)
 
     def _finish(result: str, *, notify_now: bool = False) -> str:
-        """``notify_now=True``: không mở browser — báo pool ngay; mặc định báo sau khi đóng browser."""
+        """
+        Báo pool khi biết kết quả.
+
+        ``notify_now=True``: báo ngay (chưa mở browser / lỗi sớm).
+        Mặc định hoãn tới sau khi đóng Firefox — pool có thể nhận TK tiếp theo
+        ngay khi worker trả về (cùng luồng đóng xong rồi lấy việc mới).
+        """
         if notify_now:
             _notify_pool_done(result)
         else:
@@ -870,6 +876,12 @@ def run_human_interaction_worker(
                     )
                     if ok_sess:
                         break
+                    from src.services.facebook_session_recovery import (
+                        facebook_checkpoint_blocks_retries,
+                    )
+
+                    if facebook_checkpoint_blocks_retries(sess_detail, page.url or ""):
+                        break
         else:
             from src.services.facebook_session_recovery import reload_facebook_page_f5
 
@@ -894,11 +906,21 @@ def run_human_interaction_worker(
                 )
                 if ok_sess:
                     break
+                from src.services.facebook_session_recovery import (
+                    facebook_checkpoint_blocks_retries,
+                )
+
+                if facebook_checkpoint_blocks_retries(sess_detail, page.url or ""):
+                    break
 
         if not ok_sess:
             if aborted := _finish_if_aborted(notify_now=False):
                 return aborted
-            if cookie_only:
+            from src.services.facebook_session_recovery import facebook_checkpoint_blocks_retries
+
+            if facebook_checkpoint_blocks_retries(sess_detail, page.url or ""):
+                hint = " — bỏ qua, chạy TK tiếp"
+            elif cookie_only:
                 hint = " — cookie không vào được, không mở form mật khẩu"
             elif has_cookie_file and not has_password:
                 hint = " — thử «Lưu cookie» hoặc bổ sung pass để đăng nhập form"
@@ -964,6 +986,26 @@ def run_human_interaction_worker(
             on_status=on_status,
             should_stop=_stopped,
         )
+
+        from src.services.facebook_session_recovery import (
+            facebook_checkpoint_is_blocking,
+            facebook_page_is_hard_checkpoint,
+            try_skip_soft_facebook_checkpoint,
+        )
+
+        if facebook_page_is_hard_checkpoint(page.url or ""):
+            if try_skip_soft_facebook_checkpoint(page) and not facebook_page_is_hard_checkpoint(
+                page.url or ""
+            ):
+                logger.info("[Human] Đã bỏ qua checkpoint nhẹ sau tương tác")
+            elif facebook_checkpoint_is_blocking(page) or facebook_page_is_hard_checkpoint(
+                page.url or ""
+            ):
+                _status(
+                    "login_failed",
+                    "Checkpoint cứng sau tương tác — bỏ qua, chạy TK tiếp",
+                )
+                return _finish("login_failed")
 
         if _deadline_reached() and not _user_stopped():
             logger.info(

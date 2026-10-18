@@ -33,12 +33,21 @@ from src.services.universal_video_downloader import (
     _extract_hashtags_from_text,
     arm_auto_import_download_job,
     classify_url_type,
+    annotate_downloaded_library_row,
     detect_platform,
     ensure_downloader_layout,
+    parse_video_url_list,
+    merge_scan_entry_rows,
+    merge_scan_url_list,
     extract_failed_download_pairs,
+    extract_job_pending_urls,
+    load_scan_lists,
     load_universal_video_downloader_config,
     persist_facebook_reels_settings,
     persist_instagram_reels_settings,
+    remaining_scan_entry_rows,
+    remaining_urls_after_success,
+    save_scan_lists,
     set_root_pending_download_job,
     write_failed_download_urls_log,
     write_pending_video_editor_job,
@@ -242,9 +251,16 @@ class AIVideoDialog:
         self._uv_yt_logical_select_all = False
         self._uv_ig_logical_select_all = False
         self._uv_tt_logical_select_all = False
+        self._uv_fb_scan_sources: list[str] = []
+        self._uv_yt_scan_sources: list[str] = []
+        self._uv_tt_scan_sources: list[str] = []
+        self._uv_ig_scan_sources: list[str] = []
         self._uv_lib_tree_gen = 0
         self._uv_lib_refresh_gen = 0
         self._uv_embedded_warm_done: bool = False
+        self._uv_scan_persist_after_id: str | None = None
+        self._uv_scan_persist_suppress: bool = False
+        self._uv_scan_lists_restored: bool = False
         self._start_tab = str(start_tab or "reverse").strip().lower()
         try:
             self._uv_downloader = UniversalVideoDownloader(log=self._append_uv_log)
@@ -706,6 +722,17 @@ class AIVideoDialog:
         ent_uv_job.bind("<FocusOut>", lambda _e: self._persist_uv_last_job_name(interactive=False))
         ent_uv_job.bind("<Return>", lambda _e: self._persist_uv_last_job_name(interactive=False))
         ttk.Button(job_row, text="Lưu tên job", command=self._on_uv_save_job_name).grid(row=0, column=2, sticky="w")
+        ttk.Button(job_row, text="Tải nhiều link", command=self._on_uv_open_multi_link_dialog).grid(
+            row=0, column=3, sticky="w", padx=(8, 0)
+        )
+        ttk.Label(
+            job_row,
+            text="Một tên job dùng chung. «Tải nhiều link» dán hàng nghìn URL vào cùng job → Video Editor → Chia đều Page → lịch random.",
+            foreground="#555",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Label(form, text="URL:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ent_url = ttk.Entry(form, textvariable=self._var_uv_url)
         ent_url.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
@@ -1043,7 +1070,9 @@ class AIVideoDialog:
                 return
             if p == "tiktok":
                 _set_badge("♪ TikTok", "#111111")
-                var_platform_ops.set("TikTok: quét kênh (Bước 1). Chọn dòng → «Tải TikTok đã chọn» (một lần yt-dlp nếu nhiều).")
+                var_platform_ops.set(
+                    "TikTok: quét kênh (Bước 1). yt-dlp lỗi kênh thì tự mở trình duyệt lấy list, rồi tải từng video."
+                )
                 _show_platform_buttons([btn_ops_tt_scan])
                 _show_sections(show_fb=False, show_yt=False, show_tt=True, show_ig=False, view_key="tiktok")
                 return
@@ -1098,7 +1127,8 @@ class AIVideoDialog:
             fb_fr,
             text=(
                 "Có thể chọn tài khoản Facebook sẵn có để nạp URL nhanh. "
-                "Bật «Hiện browser khi quét» nếu cần theo dõi Playwright trực tiếp."
+                "Quét xong dán trang khác rồi quét tiếp để cộng vào list. "
+                "Bật «Hiện browser khi quét» nếu cần theo dõi Playwright."
             ),
             wraplength=820,
             justify=tk.LEFT,
@@ -1115,7 +1145,9 @@ class AIVideoDialog:
         btn_fb_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_fb_dl_all = ttk.Button(fb_act, text="Tải hết danh sách", command=self._on_uv_download_fb_reels_all)
         btn_fb_dl_all.pack(side=tk.LEFT, padx=(0, 8))
-        self._uv_busy_disable_widgets.extend((btn_fb_select, btn_fb_dl, btn_fb_dl_all))
+        btn_fb_clear = ttk.Button(fb_act, text="Xóa danh sách", command=self._on_uv_fb_clear_list)
+        btn_fb_clear.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_fb_select, btn_fb_dl, btn_fb_dl_all, btn_fb_clear))
         fb_tree_fr = ttk.Frame(fb_fr)
         fb_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         fb_tree_fr.columnconfigure(0, weight=1)
@@ -1160,8 +1192,8 @@ class AIVideoDialog:
         ttk.Label(
             yt_fr,
             text=(
-                "Dùng cùng ô URL với Bước 1. Chỉ áp dụng khi Tự nhận diện là youtube + channel hoặc playlist "
-                "(ví dụ /@kênh/shorts, playlist ?list=…)."
+                "Dùng cùng ô URL với Bước 1 (kênh / Shorts / playlist). "
+                "Quét xong có thể dán URL khác rồi quét tiếp — video mới được cộng vào danh sách (bỏ trùng)."
             ),
             wraplength=820,
             justify=tk.LEFT,
@@ -1178,7 +1210,9 @@ class AIVideoDialog:
         btn_yt_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_yt_dl_all = ttk.Button(yt_act, text="Tải hết danh sách", command=self._on_uv_download_yt_all)
         btn_yt_dl_all.pack(side=tk.LEFT, padx=(0, 8))
-        self._uv_busy_disable_widgets.extend((btn_yt_select, btn_yt_dl, btn_yt_dl_all))
+        btn_yt_clear = ttk.Button(yt_act, text="Xóa danh sách", command=self._on_uv_yt_clear_list)
+        btn_yt_clear.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_yt_select, btn_yt_dl, btn_yt_dl_all, btn_yt_clear))
         yt_tree_fr = ttk.Frame(yt_fr)
         yt_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         yt_tree_fr.columnconfigure(0, weight=1)
@@ -1209,7 +1243,7 @@ class AIVideoDialog:
         install_treeview_shortcuts(self._tree_yt_channel, owner=self._top, info_callback=self._set_uv_status)
 
         self._var_uv_tt_scan_status.set(
-            "Chưa quét. Dán URL profile TikTok ở ô URL phía trên, rồi dùng nút ở Bước 1."
+            "Chưa quét. Dán URL profile TikTok, bấm «Quét TikTok». Có thể quét thêm kênh khác để cộng vào list."
         )
         tt_coll = _UvCollapsibleSection(
             host,
@@ -1224,7 +1258,11 @@ class AIVideoDialog:
         tt_fr.columnconfigure(1, weight=1)
         ttk.Label(
             tt_fr,
-            text="Nhập URL dạng https://www.tiktok.com/@username để lấy danh sách video trong kênh.",
+            text=(
+                "Nhập URL https://www.tiktok.com/@username rồi «Quét TikTok». "
+                "Xong có thể dán kênh khác và quét tiếp — video mới cộng vào list bên dưới (bỏ trùng). "
+                "«Tải hết danh sách» = 1 job. «Xóa danh sách» nếu muốn làm lại."
+            ),
             wraplength=820,
             justify=tk.LEFT,
             foreground="#555",
@@ -1240,7 +1278,9 @@ class AIVideoDialog:
         btn_tt_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_tt_dl_all = ttk.Button(tt_act, text="Tải hết danh sách", command=self._on_uv_download_tt_all)
         btn_tt_dl_all.pack(side=tk.LEFT, padx=(0, 8))
-        self._uv_busy_disable_widgets.extend((btn_tt_select, btn_tt_dl, btn_tt_dl_all))
+        btn_tt_clear = ttk.Button(tt_act, text="Xóa danh sách", command=self._on_uv_tt_clear_list)
+        btn_tt_clear.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_tt_select, btn_tt_dl, btn_tt_dl_all, btn_tt_clear))
         tt_tree_fr = ttk.Frame(tt_fr)
         tt_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         tt_tree_fr.columnconfigure(0, weight=1)
@@ -1288,7 +1328,7 @@ class AIVideoDialog:
             ig_fr,
             text=(
                 "URL profile: https://www.instagram.com/username/ hoặc tab Reels …/username/reels/. "
-                "Reel/post đơn: dùng «Tải URL hiện tại» ở Bước 1."
+                "Quét xong có thể dán profile khác rồi quét tiếp để cộng vào list. Reel đơn: «Tải URL hiện tại»."
             ),
             wraplength=820,
             justify=tk.LEFT,
@@ -1305,7 +1345,9 @@ class AIVideoDialog:
         btn_ig_dl.pack(side=tk.LEFT, padx=(0, 8))
         btn_ig_dl_all = ttk.Button(ig_act, text="Tải hết danh sách", command=self._on_uv_download_ig_all)
         btn_ig_dl_all.pack(side=tk.LEFT, padx=(0, 8))
-        self._uv_busy_disable_widgets.extend((btn_ig_select, btn_ig_dl, btn_ig_dl_all))
+        btn_ig_clear = ttk.Button(ig_act, text="Xóa danh sách", command=self._on_uv_ig_clear_list)
+        btn_ig_clear.pack(side=tk.LEFT, padx=(0, 8))
+        self._uv_busy_disable_widgets.extend((btn_ig_select, btn_ig_dl, btn_ig_dl_all, btn_ig_clear))
         ig_tree_fr = ttk.Frame(ig_fr)
         ig_tree_fr.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ig_tree_fr.columnconfigure(0, weight=1)
@@ -1419,6 +1461,9 @@ class AIVideoDialog:
         )
         ttk.Button(lib_filter, text="Xóa job", command=self._on_uv_delete_filtered_job).grid(
             row=0, column=3, sticky="w", padx=(8, 0)
+        )
+        ttk.Button(lib_filter, text="Xóa hết job", command=self._on_uv_delete_all_jobs).grid(
+            row=0, column=5, sticky="w", padx=(8, 0)
         )
         ttk.Label(lib_filter, text="Tìm").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ent_uv_lib = ttk.Entry(lib_filter, textvariable=self._var_uv_lib_query)
@@ -1577,9 +1622,11 @@ class AIVideoDialog:
         host.bind("<Configure>", _schedule_reflow, add="+")
         if self._embedded_download_host is None:
             self._top.after(100, self._refresh_uv_library)
+            self._top.after(110, self._uv_restore_scan_lists)
             self._top.after(150, lambda: self._sync_uv_download_scrollregion(scroll_to_content=False))
             self._top.after(220, _reflow_download_tab)
         else:
+            self._top.after(90, self._uv_restore_scan_lists)
             self._top.after(120, _reflow_download_tab)
         _refresh_detect_hint()
 
@@ -1674,6 +1721,171 @@ class AIVideoDialog:
             seen.add(key)
             out.append(u)
         return out
+
+    def _on_uv_open_multi_link_dialog(self) -> None:
+        """Dán nhiều URL vào một job tải — dùng cho list lớn rồi chia Page."""
+        top = tk.Toplevel(self._top)
+        top.title("Tải nhiều link vào 1 job")
+        top.transient(self._top)
+        top.geometry("760x520")
+        top.minsize(560, 400)
+        frm = ttk.Frame(top, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+        ttk.Label(
+            frm,
+            text="Dán URL (mỗi dòng một link, hoặc lẫn dấu phẩy). Tất cả vào đúng tên job phía trên tab Tải video.",
+            wraplength=720,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        txt = tk.Text(frm, height=16, wrap="none", undo=True)
+        sy = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sy.set)
+        txt.grid(row=1, column=0, sticky="nsew")
+        sy.grid(row=1, column=1, sticky="ns")
+        var_count = tk.StringVar(value="0 link")
+        ttk.Label(frm, textvariable=var_count, foreground="#1a4480").grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        def _recount(*_a: Any) -> None:
+            n = len(parse_video_url_list(txt.get("1.0", "end")))
+            var_count.set(f"{n} link sẽ vào job «{self._var_uv_job_name.get().strip() or 'chưa đặt tên'}».")
+
+        txt.bind("<KeyRelease>", _recount)
+        txt.bind("<<Paste>>", lambda _e: top.after(30, _recount))
+
+        def _go() -> None:
+            urls = parse_video_url_list(txt.get("1.0", "end"))
+            if not urls:
+                messagebox.showwarning("Tải nhiều link", "Chưa thấy URL http(s) trong ô dán.", parent=top)
+                return
+            top.destroy()
+            self._run_uv_url_list_download(urls)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Hủy", command=top.destroy).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="Tải list vào 1 job", command=_go).pack(side=tk.LEFT)
+        _recount()
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+        txt.focus_set()
+
+    def _run_uv_url_list_download(self, urls: list[str]) -> None:
+        """Tải list URL lẫn nền tảng vào đúng một download job."""
+        down = self._uv_require_downloader(fail_title="Tải nhiều link")
+        if down is None:
+            return
+        urls = self._uv_unique_nonempty_urls(urls)
+        if not urls:
+            messagebox.showwarning("Tải nhiều link", "Danh sách URL rỗng.", parent=self._top)
+            return
+        self._persist_uv_last_job_name(interactive=False)
+        try:
+            opts = self._uv_options_dict()
+        except (ValueError, tk.TclError, TypeError) as exc:  # noqa: BLE001
+            messagebox.showerror("Tải nhiều link", f"Tùy chọn không hợp lệ: {exc}", parent=self._top)
+            return
+        opts["url_type"] = "single_video"
+        opts["max_videos"] = 1
+        if str(opts.get("platform") or "").strip().lower() in {"", "auto", "unknown"}:
+            opts["platform"] = detect_platform(urls[0])
+        n = len(urls)
+        self._uv_set_busy(True, f"Chuẩn bị tải {n} link vào 1 job…")
+
+        def _batch() -> None:
+            jid = ""
+            try:
+                st = down.get_ytdlp_status()
+                if not st.get("ok"):
+
+                    def _bad() -> None:
+                        self._uv_set_busy(False)
+                        self._apply_ytdlp_status_to_var(st)
+                        messagebox.showerror(
+                            "Tải nhiều link",
+                            f"yt-dlp chưa chạy được: {st.get('message', '')}",
+                            parent=self._top,
+                        )
+
+                    self._schedule_ui(_bad)
+                    return
+                down.clear_cancel()
+                root = str(self._var_uv_url.get() or "").strip() or urls[0]
+                self._schedule_ui(lambda u=root: self._var_uv_url.set(u) if not self._var_uv_url.get().strip() else None)
+                opts["queued_urls"] = list(urls)
+                job = down.create_download_job(root, opts)
+                jid = str(job.get("id") or "")
+                self._schedule_ui(lambda j=jid: self._uv_remember_job_id(j))
+                cancelled = False
+                failed_n = 0
+                if down.is_cancel_requested():
+                    cancelled = True
+                else:
+                    use_seq = n > UV_DOWNLOAD_SEQUENTIAL_THRESHOLD
+
+                    def _pulse() -> None:
+                        mode = "tuần tự" if use_seq else "batch"
+                        self._var_uv_operation_status.set(f"Đang tải {mode} {n} link (1 job)…")
+                        self._append_uv_log(f"[INFO] Tải {n} URL vào job {jid} ({mode}).")
+
+                    self._schedule_ui(_pulse)
+                    ph = self._uv_download_progress_hook()
+
+                    def _item_done(idx: int, total: int, _url: str) -> None:
+                        if idx == 1 or idx % 10 == 0 or idx == total:
+                            self._top.after(
+                                0,
+                                lambda i=idx, t=total: self._var_uv_operation_status.set(
+                                    f"Đang tải list {i}/{t}…"
+                                ),
+                            )
+
+                    if use_seq:
+                        jcur = down.run_download_urls_sequential_for_job(
+                            jid, urls, on_progress=ph, on_item_done=_item_done
+                        ) or {}
+                    else:
+                        jcur = down.run_download_urls_batch_for_job(jid, urls, on_progress=ph) or {}
+                    failed_n = len(jcur.get("failed_items") or [])
+                    for it in jcur.get("failed_items") or []:
+                        uu = str(it.get("url") or "").strip()
+                        ee = str(it.get("error") or "")
+                        if uu:
+                            self._schedule_ui(lambda a=uu, b=ee: self._append_uv_log(f"[FAILED] {a} | {b}"))
+                jdone = down.finalize_batch_download_job(jid) if jid else {}
+                n_ok = len(jdone.get("downloaded_files") or [])
+                n_fail = len(jdone.get("failed_items") or []) or failed_n
+
+                def _done() -> None:
+                    self._uv_set_busy(False)
+                    self._refresh_uv_library()
+                    self._show_uv_list_download_done(
+                        title="Tải nhiều link",
+                        platform_key=str(opts.get("platform") or "mixed"),
+                        job_id=jid,
+                        total=n,
+                        ok_count=n_ok,
+                        fail_count=n_fail,
+                        jdone=jdone,
+                        cancelled=cancelled,
+                        item_label="video",
+                    )
+
+                self._schedule_ui(_done)
+            except Exception as exc:  # noqa: BLE001
+                if jid:
+                    try:
+                        down.finalize_batch_download_job(jid)
+                    except Exception:
+                        pass
+                self._schedule_ui(lambda: self._uv_set_busy(False))
+                self._schedule_ui(self._refresh_uv_library)
+                self._schedule_ui(lambda e=exc: messagebox.showerror("Tải nhiều link", str(e), parent=self._top))
+
+        threading.Thread(target=_batch, daemon=True, name="uv_multi_link_job").start()
 
     def _on_uv_pick_folder(self) -> None:
         d = filedialog.askdirectory(parent=self._top, title="Chọn thư mục lưu video")
@@ -1924,8 +2136,263 @@ class AIVideoDialog:
                 sync_backing(rows_or_urls)
             status_setter(status_text)
             return
+        if current_n > 0 and len(rows_or_urls) > current_n:
+            refresh_fn(rows_or_urls, append_from=current_n)
+            status_setter(status_text)
+            return
         refresh_fn(rows_or_urls)
         status_setter(status_text)
+
+    def _uv_note_scan_source(self, attr: str, url: str) -> int:
+        """Ghi URL nguồn đã quét (để hiện «từ N nguồn»). Trả số nguồn."""
+        raw = str(url or "").strip()
+        lst = [str(x).strip() for x in (getattr(self, attr, None) or []) if str(x).strip()]
+        if raw:
+            key = raw.lower()
+            if key not in {x.lower() for x in lst}:
+                lst.append(raw)
+        setattr(self, attr, lst)
+        return len(lst)
+
+    def _uv_scan_merge_status(
+        self,
+        *,
+        added: int,
+        total: int,
+        dup: int,
+        item_label: str,
+        n_sources: int = 0,
+    ) -> str:
+        src = f" từ {n_sources} nguồn" if n_sources > 1 else ""
+        return (
+            f"Đã thêm {added} {item_label} (tổng {total}{src}, trùng {dup}). "
+            "Dán URL khác rồi quét tiếp để cộng dồn — «Tải hết danh sách» = 1 job."
+        )
+
+    def _uv_confirm_clear_scan_list(self, title: str, n: int, item_label: str) -> bool:
+        if n <= 0:
+            return True
+        return bool(
+            messagebox.askyesno(
+                title,
+                f"Xóa {n} {item_label} đang có trong danh sách?\n"
+                "Quét kênh khác sẽ bắt đầu list mới.",
+                parent=self._top,
+            )
+        )
+
+    def _uv_scan_lists_payload(self) -> dict[str, Any]:
+        """Gói list quét hiện tại (kể cả video chưa tải) để ghi đĩa."""
+        return {
+            "saved_at": datetime.now().replace(microsecond=0).isoformat(),
+            "last_job_id": str(self._last_download_job_id or "").strip(),
+            "tiktok": {
+                "rows": list(self._uv_tt_entry_rows),
+                "sources": list(self._uv_tt_scan_sources),
+            },
+            "youtube": {
+                "rows": list(self._uv_yt_entry_rows),
+                "sources": list(self._uv_yt_scan_sources),
+            },
+            "instagram": {
+                "rows": list(self._uv_ig_entry_rows),
+                "sources": list(self._uv_ig_scan_sources),
+            },
+            "facebook": {
+                "urls": list(self._uv_fb_reel_urls),
+                "sources": list(self._uv_fb_scan_sources),
+            },
+        }
+
+    def _uv_persist_scan_lists_now(self) -> None:
+        """Ghi ngay danh sách quét / URL chưa tải."""
+        if self._uv_scan_persist_suppress:
+            return
+        try:
+            save_scan_lists(self._uv_scan_lists_payload())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không lưu được danh sách quét: {}", exc)
+
+    def _uv_schedule_persist_scan_lists(self, *, immediate: bool = False) -> None:
+        """Ghi list quét — debounce khi đang quét dài, ghi ngay khi tải xong/xóa."""
+        if self._uv_scan_persist_suppress:
+            return
+        if immediate:
+            prev = self._uv_scan_persist_after_id
+            if prev:
+                try:
+                    self._top.after_cancel(prev)
+                except Exception:
+                    pass
+                self._uv_scan_persist_after_id = None
+            self._uv_persist_scan_lists_now()
+            return
+        prev = self._uv_scan_persist_after_id
+        if prev:
+            try:
+                self._top.after_cancel(prev)
+            except Exception:
+                pass
+        self._uv_scan_persist_after_id = self._top.after(700, self._uv_persist_scan_lists_now)
+
+    def _uv_restore_scan_lists(self) -> None:
+        """Nạp lại list quét chưa tải khi mở tab / khởi động lại."""
+        if self._uv_scan_lists_restored:
+            return
+        self._uv_scan_lists_restored = True
+        try:
+            data = load_scan_lists()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không đọc được danh sách quét đã lưu: {}", exc)
+            return
+        self._uv_scan_persist_suppress = True
+        try:
+            last_jid = str(data.get("last_job_id") or "").strip()
+            if last_jid and not self._last_download_job_id:
+                self._last_download_job_id = last_jid
+            tt = data.get("tiktok") if isinstance(data.get("tiktok"), dict) else {}
+            yt = data.get("youtube") if isinstance(data.get("youtube"), dict) else {}
+            ig = data.get("instagram") if isinstance(data.get("instagram"), dict) else {}
+            fb = data.get("facebook") if isinstance(data.get("facebook"), dict) else {}
+            self._uv_tt_scan_sources = list((tt or {}).get("sources") or [])
+            self._uv_yt_scan_sources = list((yt or {}).get("sources") or [])
+            self._uv_ig_scan_sources = list((ig or {}).get("sources") or [])
+            self._uv_fb_scan_sources = list((fb or {}).get("sources") or [])
+            tt_rows = list((tt or {}).get("rows") or [])
+            yt_rows = list((yt or {}).get("rows") or [])
+            ig_rows = list((ig or {}).get("rows") or [])
+            fb_urls = list((fb or {}).get("urls") or [])
+            if tt_rows:
+                self._refresh_tt_channel_tree(tt_rows)
+                self._var_uv_tt_scan_status.set(
+                    f"Đã nạp {len(tt_rows)} video TikTok chưa tải từ lần trước — «Tải hết danh sách» để tiếp."
+                )
+            if yt_rows:
+                self._refresh_yt_channel_tree(yt_rows)
+                self._var_uv_yt_scan_status.set(
+                    f"Đã nạp {len(yt_rows)} video YouTube chưa tải từ lần trước."
+                )
+            if ig_rows:
+                self._refresh_ig_channel_tree(ig_rows)
+                self._var_uv_ig_scan_status.set(
+                    f"Đã nạp {len(ig_rows)} video Instagram chưa tải từ lần trước."
+                )
+            if fb_urls:
+                self._refresh_fb_reel_tree(fb_urls)
+                self._var_uv_fb_scan_status.set(
+                    f"Đã nạp {len(fb_urls)} reel Facebook chưa tải từ lần trước."
+                )
+        finally:
+            self._uv_scan_persist_suppress = False
+
+    def _uv_remember_job_id(self, job_id: str) -> None:
+        jid = str(job_id or "").strip()
+        if not jid:
+            return
+        self._last_download_job_id = jid
+        self._uv_schedule_persist_scan_lists(immediate=True)
+
+    def _uv_keep_undownloaded_after_job(
+        self,
+        *,
+        platform_key: str,
+        attempted_urls: list[str],
+        job_done: dict[str, Any] | None,
+        cancelled: bool = False,
+    ) -> int:
+        """
+        Bỏ URL đã tải khỏi list quét, giữ video chưa tải và ghi đĩa.
+
+        Trả số URL còn lại trên list nền tảng đó.
+        """
+        job = job_done if isinstance(job_done, dict) else {}
+        pending = extract_job_pending_urls(job)
+        failed = [u for u, _ in extract_failed_download_pairs(job)]
+        keep_from_job = pending or failed
+        # URL thành công = batch trừ pending/failed (cũng đúng khi tạm dừng).
+        success_urls = (
+            remaining_urls_after_success(attempted_urls, keep_from_job)
+            if keep_from_job
+            else list(attempted_urls)
+        )
+        tt_kept = remaining_scan_entry_rows(list(self._uv_tt_entry_rows), success_urls)
+        yt_kept = remaining_scan_entry_rows(list(self._uv_yt_entry_rows), success_urls)
+        ig_kept = remaining_scan_entry_rows(list(self._uv_ig_entry_rows), success_urls)
+        fb_kept = remaining_urls_after_success(list(self._uv_fb_reel_urls), success_urls)
+        if len(tt_kept) != len(self._uv_tt_entry_rows):
+            self._refresh_tt_channel_tree(tt_kept)
+        if len(yt_kept) != len(self._uv_yt_entry_rows):
+            self._refresh_yt_channel_tree(yt_kept)
+        if len(ig_kept) != len(self._uv_ig_entry_rows):
+            self._refresh_ig_channel_tree(ig_kept)
+        if len(fb_kept) != len(self._uv_fb_reel_urls):
+            self._refresh_fb_reel_tree(fb_kept)
+        key = str(platform_key or "").strip().lower()
+        remaining_n = 0
+        if key in {"tiktok"}:
+            remaining_n = len(tt_kept)
+            self._var_uv_tt_scan_status.set(
+                f"Còn {remaining_n} video TikTok chưa tải — đã lưu. «Tải hết danh sách» hoặc «Tiếp tục job cuối»."
+                if remaining_n
+                else "Đã tải hết danh sách TikTok."
+            )
+        elif key in {"youtube"}:
+            remaining_n = len(yt_kept)
+            if remaining_n:
+                self._var_uv_yt_scan_status.set(f"Còn {remaining_n} video YouTube chưa tải — đã lưu.")
+        elif key in {"instagram"}:
+            remaining_n = len(ig_kept)
+            if remaining_n:
+                self._var_uv_ig_scan_status.set(f"Còn {remaining_n} video Instagram chưa tải — đã lưu.")
+        elif key in {"facebook", "facebook_reels"}:
+            remaining_n = len(fb_kept)
+            if remaining_n:
+                self._var_uv_fb_scan_status.set(f"Còn {remaining_n} reel chưa tải — đã lưu.")
+        else:
+            remaining_n = len(tt_kept) + len(yt_kept) + len(ig_kept) + len(fb_kept)
+        self._uv_schedule_persist_scan_lists(immediate=True)
+        return remaining_n
+
+    def _uv_schedule_merged_partial(
+        self,
+        *,
+        base: list[Any],
+        incoming: list[Any],
+        last_ui_count: dict[str, int],
+        refresh_fn: Callable[..., None],
+        status_var: tk.StringVar,
+        item_label: str,
+        as_urls: bool = False,
+        min_grow: int = 3,
+        throttle_sec: float = 0.55,
+    ) -> None:
+        """Partial quét: cộng dồn vào list đang có, chỉ append dòng mới."""
+        if as_urls:
+            merged, added, _dup = merge_scan_url_list(
+                [str(x) for x in base],
+                [str(x) for x in incoming],
+            )
+        else:
+            merged, added, _dup = merge_scan_entry_rows(
+                [x for x in base if isinstance(x, dict)],
+                [x for x in incoming if isinstance(x, dict)],
+            )
+        now = time.monotonic()
+        prev = int(last_ui_count.get("n") or 0)
+        grow = len(merged) - prev
+        if grow < min_grow and now - self._uv_last_partial_ui_ts < throttle_sec:
+            return
+        self._uv_last_partial_ui_ts = now
+        last_ui_count["n"] = len(merged)
+
+        def _apply() -> None:
+            if prev <= 0:
+                refresh_fn(merged)
+            elif len(merged) > prev:
+                refresh_fn(merged, append_from=prev)
+            status_var.set(f"Đang quét… thêm {added} {item_label} (tổng {len(merged)}).")
+
+        self._schedule_ui(_apply)
 
     def _uv_tree_append_specs_chunked(
         self,
@@ -1968,6 +2435,7 @@ class AIVideoDialog:
     def _refresh_fb_reel_tree(self, urls: list[str], *, append_from: int = 0) -> None:
         """Làm mới hoặc chỉ append dòng mới (``append_from`` > 0) để quét dài không block UI."""
         self._uv_fb_reel_urls = list(urls)
+        self._uv_schedule_persist_scan_lists()
         tr = self._tree_fb_reels
         if tr is None:
             return
@@ -2070,33 +2538,28 @@ class AIVideoDialog:
             f"Đang mở Playwright và quét tab Reels ({mode_txt}, tối đa {max_minutes} phút)…",
         )
         self._uv_fb_logical_select_all = False
-        self._refresh_fb_reel_tree([])
-        self._var_uv_fb_scan_status.set("Đang quét — bảng «URL reel» sẽ hiện dần…")
+        keep_fb = list(self._uv_fb_reel_urls)
+        self._var_uv_fb_scan_status.set(
+            f"Đang quét — cộng vào {len(keep_fb)} reel đang có…" if keep_fb else "Đang quét — bảng «URL reel» sẽ hiện dần…"
+        )
 
         def _status(msg: str) -> None:
             self._schedule_ui(lambda m=msg: self._var_uv_fb_scan_status.set(m))
 
-        last_fb_count = {"n": 0}
+        last_fb_count = {"n": len(keep_fb)}
 
         def _partial(urls: list[str]) -> None:
-            snap = list(urls)
-            now = time.monotonic()
-            grow = len(snap) - int(last_fb_count["n"])
-            if grow < 2 and now - self._uv_last_partial_ui_ts < 0.35:
-                return
-            self._uv_last_partial_ui_ts = now
-            prev = int(last_fb_count["n"])
-            last_fb_count["n"] = len(snap)
-
-            def _apply() -> None:
-                if prev <= 0:
-                    self._refresh_fb_reel_tree(snap)
-                else:
-                    self._refresh_fb_reel_tree(snap, append_from=prev)
-                if snap:
-                    self._var_uv_fb_scan_status.set(f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng).")
-
-            self._schedule_ui(_apply)
+            self._uv_schedule_merged_partial(
+                base=keep_fb,
+                incoming=list(urls),
+                last_ui_count=last_fb_count,
+                refresh_fn=self._refresh_fb_reel_tree,
+                status_var=self._var_uv_fb_scan_status,
+                item_label="reel",
+                as_urls=True,
+                min_grow=2,
+                throttle_sec=0.35,
+            )
 
         def _work() -> None:
             show_browser = bool(self._var_uv_fb_show_browser.get())
@@ -2137,17 +2600,26 @@ class AIVideoDialog:
                 if res.get("ok"):
                     items = res.get("items") or []
                     urls = [str(x.get("url") or "") for x in items if isinstance(x, dict)]
+                    merged, added, dup = merge_scan_url_list(keep_fb, urls)
+                    n_src = self._uv_note_scan_source("_uv_fb_scan_sources", page_url)
+                    status = self._uv_scan_merge_status(
+                        added=added, total=len(merged), dup=dup, item_label="reel", n_sources=n_src
+                    )
                     self._uv_finish_scan_tree_refresh(
-                        rows_or_urls=urls,
+                        rows_or_urls=merged,
                         refresh_fn=self._refresh_fb_reel_tree,
                         backing_count=lambda: len(self._uv_fb_reel_urls),
                         status_setter=self._var_uv_fb_scan_status.set,
-                        status_text=res.get("message") or f"{len(urls)} reel.",
+                        status_text=status,
                         sync_backing=lambda u: setattr(self, "_uv_fb_reel_urls", list(u)),
                     )
                     messagebox.showinfo(
                         "Quét Reels",
-                        f"{res.get('message', '')}\n\n«Tải hết danh sách» hoặc chọn dòng → «Tải reel đã chọn».",
+                        (
+                            f"Thêm {added} reel (tổng {len(merged)}, trùng {dup}).\n"
+                            "Dán URL trang khác rồi «Quét Reels Facebook» để cộng dồn.\n"
+                            "«Tải hết danh sách» để tải tất cả trong 1 job."
+                        ),
                         parent=self._top,
                     )
                 else:
@@ -2157,6 +2629,15 @@ class AIVideoDialog:
             self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_fb_reels").start()
+
+    def _on_uv_fb_clear_list(self) -> None:
+        n = len(self._uv_fb_reel_urls)
+        if not self._uv_confirm_clear_scan_list("Xóa danh sách Reels", n, "reel"):
+            return
+        self._uv_fb_logical_select_all = False
+        self._uv_fb_scan_sources = []
+        self._refresh_fb_reel_tree([])
+        self._var_uv_fb_scan_status.set("Đã xóa danh sách. Dán URL rồi «Quét Reels Facebook» để bắt đầu lại.")
 
     def _on_uv_download_fb_reels_all(self) -> None:
         n = len(self._uv_fb_reel_urls)
@@ -2248,9 +2729,10 @@ class AIVideoDialog:
 
                     self._schedule_ui(_no_root)
                     return
+                opts["queued_urls"] = list(urls)
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: self._uv_remember_job_id(j))
                 failed_urls: list[str] = []
                 cancelled = False
                 if down.is_cancel_requested():
@@ -2351,6 +2833,7 @@ class AIVideoDialog:
 
     def _refresh_yt_channel_tree(self, rows: list[dict[str, str]], *, append_from: int = 0) -> None:
         self._uv_yt_entry_rows = list(rows)
+        self._uv_schedule_persist_scan_lists()
         tr = self._tree_yt_channel
         if tr is None:
             return
@@ -2442,6 +2925,23 @@ class AIVideoDialog:
             elif picked == "profile":
                 picked = "channel"
             ut = picked
+        if ut == "single_video":
+            title = raw.rsplit("/", 1)[-1][:80] or "YouTube"
+            merged, added, dup = merge_scan_entry_rows(
+                list(self._uv_yt_entry_rows),
+                [{"title": title, "url": raw}],
+            )
+            n_src = self._uv_note_scan_source("_uv_yt_scan_sources", raw)
+            status = self._uv_scan_merge_status(
+                added=added, total=len(merged), dup=dup, item_label="video", n_sources=n_src
+            )
+            prev = len(self._uv_yt_entry_rows)
+            if prev > 0 and len(merged) > prev:
+                self._refresh_yt_channel_tree(merged, append_from=prev)
+            else:
+                self._refresh_yt_channel_tree(merged)
+            self._var_uv_yt_scan_status.set(status)
+            return
         if ut not in ("channel", "playlist"):
             messagebox.showwarning(
                 "Quét YouTube",
@@ -2456,29 +2956,24 @@ class AIVideoDialog:
         if down is None:
             return
         self._uv_yt_logical_select_all = False
+        keep_yt = list(self._uv_yt_entry_rows)
         self._uv_set_busy(True, f"Đang quét danh sách YouTube (tối đa {lim} video, yt-dlp)…")
-        self._refresh_yt_channel_tree([])
-        self._var_uv_yt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
-        last_ui_count = {"n": 0}
+        self._var_uv_yt_scan_status.set(
+            f"Đang gọi yt-dlp — cộng vào {len(keep_yt)} video đang có…"
+            if keep_yt
+            else "Đang gọi yt-dlp --flat-playlist…"
+        )
+        last_ui_count = {"n": len(keep_yt)}
 
         def _partial(rows: list[dict[str, str]]) -> None:
-            snap = list(rows)
-            now = time.monotonic()
-            grow = len(snap) - int(last_ui_count["n"])
-            if grow < 3 and now - self._uv_last_partial_ui_ts < 0.55:
-                return
-            self._uv_last_partial_ui_ts = now
-            prev = int(last_ui_count["n"])
-            last_ui_count["n"] = len(snap)
-
-            def _apply() -> None:
-                if prev <= 0:
-                    self._refresh_yt_channel_tree(snap)
-                else:
-                    self._refresh_yt_channel_tree(snap, append_from=prev)
-                self._var_uv_yt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video.")
-
-            self._schedule_ui(_apply)
+            self._uv_schedule_merged_partial(
+                base=keep_yt,
+                incoming=list(rows),
+                last_ui_count=last_ui_count,
+                refresh_fn=self._refresh_yt_channel_tree,
+                status_var=self._var_uv_yt_scan_status,
+                item_label="video",
+            )
 
         def _work() -> None:
             res = down.list_flat_playlist_entries(raw, max_entries=lim, on_partial=_partial)
@@ -2491,11 +2986,17 @@ class AIVideoDialog:
                     ptitle = str(res.get("playlist_title") or "").strip()
                     warn = str(res.get("warning") or "").strip()
                     partial = bool(res.get("partial"))
-                    status = f"Đã quét {len(rows)} video." + (f" — {ptitle}" if ptitle else "")
+                    merged, added, dup = merge_scan_entry_rows(keep_yt, rows)
+                    n_src = self._uv_note_scan_source("_uv_yt_scan_sources", raw)
+                    status = self._uv_scan_merge_status(
+                        added=added, total=len(merged), dup=dup, item_label="video", n_sources=n_src
+                    )
+                    if ptitle:
+                        status = f"{status} — {ptitle}"
                     if partial and warn:
                         status += f" ({warn})"
                     self._uv_finish_scan_tree_refresh(
-                        rows_or_urls=rows,
+                        rows_or_urls=merged,
                         refresh_fn=self._refresh_yt_channel_tree,
                         backing_count=lambda: len(self._uv_yt_entry_rows),
                         status_setter=self._var_uv_yt_scan_status.set,
@@ -2505,9 +3006,10 @@ class AIVideoDialog:
                     messagebox.showinfo(
                         "Quét YouTube",
                         (
-                            f"{len(rows)} video trong danh sách.\n"
+                            f"Thêm {added} video (tổng {len(merged)}, trùng {dup}).\n"
                             + ("(Quét một phần do mạng chậm, bạn vẫn có thể tải các video đã hiện.)\n" if partial else "")
-                            + "«Tải hết danh sách» hoặc chọn dòng → «Tải video đã chọn»."
+                            + "Dán URL kênh/playlist khác rồi «Quét YouTube» để cộng dồn.\n"
+                            + "«Tải hết danh sách» để tải tất cả trong 1 job."
                         ),
                         parent=self._top,
                     )
@@ -2518,6 +3020,15 @@ class AIVideoDialog:
             self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_yt_channel").start()
+
+    def _on_uv_yt_clear_list(self) -> None:
+        n = len(self._uv_yt_entry_rows)
+        if not self._uv_confirm_clear_scan_list("Xóa danh sách YouTube", n, "video"):
+            return
+        self._uv_yt_logical_select_all = False
+        self._uv_yt_scan_sources = []
+        self._refresh_yt_channel_tree([])
+        self._var_uv_yt_scan_status.set("Đã xóa danh sách. Dán URL rồi «Quét YouTube» để bắt đầu lại.")
 
     def _on_uv_download_yt_all(self) -> None:
         n = len(self._uv_yt_entry_rows)
@@ -2600,9 +3111,10 @@ class AIVideoDialog:
 
                     self._schedule_ui(_no_root)
                     return
+                opts["queued_urls"] = list(urls)
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: self._uv_remember_job_id(j))
                 failed_urls: list[str] = []
                 cancelled = False
                 if down.is_cancel_requested():
@@ -2699,6 +3211,7 @@ class AIVideoDialog:
 
     def _refresh_tt_channel_tree(self, rows: list[dict[str, str]], *, append_from: int = 0) -> None:
         self._uv_tt_entry_rows = list(rows)
+        self._uv_schedule_persist_scan_lists()
         tr = self._tree_tt_channel
         if tr is None:
             return
@@ -2783,6 +3296,26 @@ class AIVideoDialog:
             )
             return
         ut = classify_url_type(raw)
+        from src.services.tiktok_video_download import is_tiktok_video_url, parse_tiktok_video_ref
+
+        if ut == "single_video" or is_tiktok_video_url(raw):
+            user, vid = parse_tiktok_video_ref(raw)
+            title = f"TikTok @{user}" if user else (vid or "TikTok")
+            merged, added, dup = merge_scan_entry_rows(
+                list(self._uv_tt_entry_rows),
+                [{"title": title, "url": raw}],
+            )
+            n_src = self._uv_note_scan_source("_uv_tt_scan_sources", raw)
+            status = self._uv_scan_merge_status(
+                added=added, total=len(merged), dup=dup, item_label="video TikTok", n_sources=n_src
+            )
+            prev = len(self._uv_tt_entry_rows)
+            if prev > 0 and len(merged) > prev:
+                self._refresh_tt_channel_tree(merged, append_from=prev)
+            else:
+                self._refresh_tt_channel_tree(merged)
+            self._var_uv_tt_scan_status.set(status)
+            return
         if ut != "profile":
             messagebox.showwarning(
                 "Quét TikTok",
@@ -2796,32 +3329,35 @@ class AIVideoDialog:
         if down is None:
             return
         self._uv_tt_logical_select_all = False
-        self._uv_set_busy(True, f"Đang quét danh sách TikTok (tối đa {lim} video, yt-dlp)…")
-        self._refresh_tt_channel_tree([])
-        self._var_uv_tt_scan_status.set("Đang gọi yt-dlp --flat-playlist…")
-        last_ui_count = {"n": 0}
+        keep_tt = list(self._uv_tt_entry_rows)
+        self._uv_set_busy(True, f"Đang quét danh sách TikTok (tối đa {lim} video)…")
+        self._var_uv_tt_scan_status.set(
+            f"Đang quét — cộng vào {len(keep_tt)} video đang có…"
+            if keep_tt
+            else "Đang gọi yt-dlp — nếu lỗi kênh sẽ tự quét bằng trình duyệt…"
+        )
+        last_ui_count = {"n": len(keep_tt)}
 
         def _partial(rows: list[dict[str, str]]) -> None:
-            snap = list(rows)
-            now = time.monotonic()
-            grow = len(snap) - int(last_ui_count["n"])
-            if grow < 3 and now - self._uv_last_partial_ui_ts < 0.55:
-                return
-            self._uv_last_partial_ui_ts = now
-            prev = int(last_ui_count["n"])
-            last_ui_count["n"] = len(snap)
-
-            def _apply() -> None:
-                if prev <= 0:
-                    self._refresh_tt_channel_tree(snap)
-                else:
-                    self._refresh_tt_channel_tree(snap, append_from=prev)
-                self._var_uv_tt_scan_status.set(f"Đang quét… đã thấy {len(snap)} video TikTok.")
-
-            self._schedule_ui(_apply)
+            self._uv_schedule_merged_partial(
+                base=keep_tt,
+                incoming=list(rows),
+                last_ui_count=last_ui_count,
+                refresh_fn=self._refresh_tt_channel_tree,
+                status_var=self._var_uv_tt_scan_status,
+                item_label="video TikTok",
+            )
 
         def _work() -> None:
-            res = down.list_flat_playlist_entries(raw, max_entries=lim, on_partial=_partial)
+            def _status(msg: str) -> None:
+                self._schedule_ui(lambda m=msg: self._var_uv_tt_scan_status.set(m))
+
+            res = down.list_flat_playlist_entries(
+                raw,
+                max_entries=lim,
+                on_partial=_partial,
+                on_status=_status,
+            )
 
             def _ui() -> None:
                 self._uv_set_busy(False)
@@ -2830,11 +3366,19 @@ class AIVideoDialog:
                     rows = [e for e in entries if isinstance(e, dict) and str(e.get("url") or "").strip()]
                     warn = str(res.get("warning") or "").strip()
                     partial = bool(res.get("partial"))
-                    status = f"Đã quét {len(rows)} video TikTok."
+                    merged, added, dup = merge_scan_entry_rows(keep_tt, rows)
+                    n_src = self._uv_note_scan_source("_uv_tt_scan_sources", raw)
+                    status = self._uv_scan_merge_status(
+                        added=added,
+                        total=len(merged),
+                        dup=dup,
+                        item_label="video TikTok",
+                        n_sources=n_src,
+                    )
                     if partial and warn:
                         status += f" ({warn})"
                     self._uv_finish_scan_tree_refresh(
-                        rows_or_urls=rows,
+                        rows_or_urls=merged,
                         refresh_fn=self._refresh_tt_channel_tree,
                         backing_count=lambda: len(self._uv_tt_entry_rows),
                         status_setter=self._var_uv_tt_scan_status.set,
@@ -2844,9 +3388,10 @@ class AIVideoDialog:
                     messagebox.showinfo(
                         "Quét TikTok",
                         (
-                            f"{len(rows)} video trong profile.\n"
+                            f"Thêm {added} video (tổng {len(merged)}, trùng {dup}).\n"
                             + ("(Quét một phần do mạng chậm, bạn vẫn có thể tải các video đã hiện.)\n" if partial else "")
-                            + "«Tải hết danh sách» hoặc chọn dòng → «Tải TikTok đã chọn»."
+                            + "Dán URL kênh khác rồi «Quét TikTok» để cộng dồn.\n"
+                            + "«Tải hết danh sách» để tải tất cả trong 1 job."
                         ),
                         parent=self._top,
                     )
@@ -2857,6 +3402,15 @@ class AIVideoDialog:
             self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_tt_channel").start()
+
+    def _on_uv_tt_clear_list(self) -> None:
+        n = len(self._uv_tt_entry_rows)
+        if not self._uv_confirm_clear_scan_list("Xóa danh sách TikTok", n, "video"):
+            return
+        self._uv_tt_logical_select_all = False
+        self._uv_tt_scan_sources = []
+        self._refresh_tt_channel_tree([])
+        self._var_uv_tt_scan_status.set("Đã xóa danh sách. Dán URL rồi «Quét TikTok» để bắt đầu lại.")
 
     def _on_uv_download_tt_all(self) -> None:
         n = len(self._uv_tt_entry_rows)
@@ -2909,7 +3463,7 @@ class AIVideoDialog:
         opts["url_type"] = "single_video"
         opts["max_videos"] = 1
         n = len(urls)
-        self._uv_set_busy(True, f"Chuẩn bị tải {n} video TikTok bằng yt-dlp…")
+        self._uv_set_busy(True, f"Chuẩn bị tải {n} video TikTok (yt-dlp, fallback trình duyệt nếu lỗi)…")
 
         def _batch() -> None:
             jid = ""
@@ -2938,9 +3492,10 @@ class AIVideoDialog:
 
                     self._schedule_ui(_no_root)
                     return
+                opts["queued_urls"] = list(urls)
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: self._uv_remember_job_id(j))
                 failed_urls: list[str] = []
                 cancelled = False
                 if down.is_cancel_requested():
@@ -2952,7 +3507,10 @@ class AIVideoDialog:
                     def _pulse_tt() -> None:
                         if use_seq:
                             self._var_uv_operation_status.set(f"Đang tải tuần tự {n} video TikTok (1/{n})…")
-                            self._append_uv_log(f"[INFO] Bắt đầu tải tuần tự {n} URL TikTok…")
+                            self._append_uv_log(
+                                f"[INFO] Bắt đầu tải tuần tự {n} URL TikTok "
+                                "(lỗi yt-dlp sẽ tự tải bằng trình duyệt)…"
+                            )
                         else:
                             self._var_uv_operation_status.set(f"Đang tải batch {n} video TikTok (yt-dlp -a)…")
                             self._append_uv_log(f"[INFO] Bắt đầu batch {n} URL TikTok (1× yt-dlp -a …)")
@@ -3037,6 +3595,7 @@ class AIVideoDialog:
 
     def _refresh_ig_channel_tree(self, rows: list[dict[str, str]], *, append_from: int = 0) -> None:
         self._uv_ig_entry_rows = list(rows)
+        self._uv_schedule_persist_scan_lists()
         tr = self._tree_ig_channel
         if tr is None:
             return
@@ -3145,38 +3704,30 @@ class AIVideoDialog:
             pass
         mode_txt = "cuộn tới hết trang" if till_end else "dừng theo vòng cuộn"
         self._uv_ig_logical_select_all = False
+        keep_ig = list(self._uv_ig_entry_rows)
         self._uv_set_busy(
             True,
             f"Đang mở Playwright quét tab Reels Instagram ({mode_txt}, tối đa {max_minutes} phút)…",
         )
-        self._refresh_ig_channel_tree([])
-        self._var_uv_ig_scan_status.set("Đang quét — bảng «URL reel» sẽ hiện dần…")
-        last_ui_count = {"n": 0}
+        self._var_uv_ig_scan_status.set(
+            f"Đang quét — cộng vào {len(keep_ig)} reel đang có…" if keep_ig else "Đang quét — bảng «URL reel» sẽ hiện dần…"
+        )
+        last_ui_count = {"n": len(keep_ig)}
 
         def _status(msg: str) -> None:
             self._schedule_ui(lambda m=msg: self._var_uv_ig_scan_status.set(m))
 
         def _partial(urls: list[str]) -> None:
-            snap = self._ig_urls_to_rows(urls)
-            now = time.monotonic()
-            grow = len(snap) - int(last_ui_count["n"])
-            if grow < 2 and now - self._uv_last_partial_ui_ts < 0.35:
-                return
-            self._uv_last_partial_ui_ts = now
-            prev = int(last_ui_count["n"])
-            last_ui_count["n"] = len(snap)
-
-            def _apply() -> None:
-                if prev <= 0:
-                    self._refresh_ig_channel_tree(snap)
-                else:
-                    self._refresh_ig_channel_tree(snap, append_from=prev)
-                if snap:
-                    self._var_uv_ig_scan_status.set(
-                        f"Đang quét… đã thấy {len(snap)} reel (cập nhật trực tiếp trong bảng)."
-                    )
-
-            self._schedule_ui(_apply)
+            self._uv_schedule_merged_partial(
+                base=keep_ig,
+                incoming=self._ig_urls_to_rows(urls),
+                last_ui_count=last_ui_count,
+                refresh_fn=self._refresh_ig_channel_tree,
+                status_var=self._var_uv_ig_scan_status,
+                item_label="reel",
+                min_grow=2,
+                throttle_sec=0.35,
+            )
 
         def _work() -> None:
             show_browser = bool(self._var_uv_ig_show_browser.get())
@@ -3199,17 +3750,26 @@ class AIVideoDialog:
                     items = res.get("items") or []
                     urls = [str(x.get("url") or "") for x in items if isinstance(x, dict)]
                     rows = self._ig_urls_to_rows(urls)
+                    merged, added, dup = merge_scan_entry_rows(keep_ig, rows)
+                    n_src = self._uv_note_scan_source("_uv_ig_scan_sources", page_url)
+                    status = self._uv_scan_merge_status(
+                        added=added, total=len(merged), dup=dup, item_label="reel", n_sources=n_src
+                    )
                     self._uv_finish_scan_tree_refresh(
-                        rows_or_urls=rows,
+                        rows_or_urls=merged,
                         refresh_fn=self._refresh_ig_channel_tree,
                         backing_count=lambda: len(self._uv_ig_entry_rows),
                         status_setter=self._var_uv_ig_scan_status.set,
-                        status_text=res.get("message") or f"{len(rows)} reel.",
+                        status_text=status,
                         sync_backing=lambda r: setattr(self, "_uv_ig_entry_rows", list(r)),
                     )
                     messagebox.showinfo(
                         "Quét Instagram",
-                        f"{res.get('message', '')}\n\n«Tải hết danh sách» hoặc chọn dòng → «Tải Instagram đã chọn».",
+                        (
+                            f"Thêm {added} reel (tổng {len(merged)}, trùng {dup}).\n"
+                            "Dán profile khác rồi «Quét Instagram» để cộng dồn.\n"
+                            "«Tải hết danh sách» để tải tất cả trong 1 job."
+                        ),
                         parent=self._top,
                     )
                 else:
@@ -3219,6 +3779,15 @@ class AIVideoDialog:
             self._schedule_ui(_ui)
 
         threading.Thread(target=_work, daemon=True, name="uv_scan_ig_channel").start()
+
+    def _on_uv_ig_clear_list(self) -> None:
+        n = len(self._uv_ig_entry_rows)
+        if not self._uv_confirm_clear_scan_list("Xóa danh sách Instagram", n, "reel"):
+            return
+        self._uv_ig_logical_select_all = False
+        self._uv_ig_scan_sources = []
+        self._refresh_ig_channel_tree([])
+        self._var_uv_ig_scan_status.set("Đã xóa danh sách. Dán URL rồi «Quét Instagram» để bắt đầu lại.")
 
     def _on_uv_download_ig_all(self) -> None:
         n = len(self._uv_ig_entry_rows)
@@ -3308,9 +3877,10 @@ class AIVideoDialog:
 
                     self._schedule_ui(_no_root)
                     return
+                opts["queued_urls"] = list(urls)
                 job = down.create_download_job(root, opts)
                 jid = str(job.get("id") or "")
-                self._schedule_ui(lambda j=jid: setattr(self, "_last_download_job_id", j))
+                self._schedule_ui(lambda j=jid: self._uv_remember_job_id(j))
                 cancelled = False
                 if down.is_cancel_requested():
                     cancelled = True
@@ -3478,6 +4048,7 @@ class AIVideoDialog:
                 self._schedule_ui(_bad)
                 return
             try:
+                opts["queued_urls"] = [url]
                 job = down.create_download_job(url, opts)
             except Exception as exc:  # noqa: BLE001
 
@@ -3491,7 +4062,7 @@ class AIVideoDialog:
             jid = job["id"]
 
             def _start_bar() -> None:
-                self._last_download_job_id = jid
+                self._uv_remember_job_id(jid)
                 self._var_uv_operation_status.set(
                     f"Đang tải job {jid} — xem log bên dưới; có thể lâu nếu nhiều video…"
                 )
@@ -3557,25 +4128,61 @@ class AIVideoDialog:
             self._append_uv_log("[INFO] Đã gửi yêu cầu dừng (terminate process nếu đang chạy).")
 
     def _on_uv_resume(self) -> None:
-        if not self._last_download_job_id or not self._uv_downloader:
+        if not self._uv_downloader:
             messagebox.showwarning("Tải video", "Chưa có job gần nhất. Bấm «Tải video» trước.", parent=self._top)
             return
-        jid = self._last_download_job_id
-        self._uv_set_busy(True, f"Đang chạy lại job {jid}…")
+        jid = str(self._last_download_job_id or "").strip()
+        if not jid:
+            try:
+                saved = load_scan_lists()
+                jid = str(saved.get("last_job_id") or "").strip()
+            except Exception:
+                jid = ""
+        if not jid:
+            messagebox.showwarning("Tải video", "Chưa có job gần nhất. Bấm «Tải video» trước.", parent=self._top)
+            return
+        job0 = self._uv_downloader.get_download_job(jid)
+        pending_n = len(extract_job_pending_urls(job0))
+        hint = f" — còn {pending_n} URL chưa tải" if pending_n else ""
+        self._uv_set_busy(True, f"Đang tải tiếp job {jid}{hint}…")
 
         def _run() -> None:
             assert self._uv_downloader is not None
             try:
                 self._uv_downloader.clear_cancel()
                 ph = self._uv_download_progress_hook()
-                done = self._uv_downloader.run_download_job(jid, on_progress=ph)
+
+                def _item_done(idx: int, total: int, _url: str) -> None:
+                    if idx == 1 or idx % 8 == 0 or idx == total:
+                        self._top.after(
+                            0,
+                            lambda i=idx, t=total: self._var_uv_operation_status.set(
+                                f"Đang tải tiếp {i}/{t}…"
+                            ),
+                        )
+
+                done = self._uv_downloader.resume_download_job(
+                    jid, on_progress=ph, on_item_done=_item_done
+                )
                 n_ok = len((done or {}).get("downloaded_files") or [])
                 n_ff = len((done or {}).get("failed_items") or [])
+                n_pend = len(extract_job_pending_urls(done))
+                plat = str((done or {}).get("platform") or "")
+                self._schedule_ui(
+                    lambda jd=done, p=plat: self._uv_keep_undownloaded_after_job(
+                        platform_key=p,
+                        attempted_urls=list((jd or {}).get("queued_urls") or []),
+                        job_done=jd or {},
+                        cancelled=False,
+                    )
+                )
                 self._top.after(
                     0,
-                    lambda j=jid, ok=n_ok, ff=n_ff: messagebox.showinfo(
+                    lambda j=jid, ok=n_ok, ff=n_ff, pd=n_pend: messagebox.showinfo(
                         "Tải video",
-                        f"Chạy lại job {j} xong — {ok} file trong job, {ff} mục lỗi (trùng archive có thể đã bỏ qua).",
+                        f"Tải tiếp job {j} xong — {ok} file trong job, {ff} mục lỗi"
+                        + (f", còn {pd} chưa tải (đã lưu list)." if pd else ".")
+                        + " Trùng archive có thể đã bỏ qua.",
                         parent=self._top,
                     ),
                 )
@@ -3821,6 +4428,21 @@ class AIVideoDialog:
         item_label: str = "video",
     ) -> None:
         """Thông báo hoàn tất batch quét-list + ghi file .txt nếu có URL lỗi."""
+        attempted = [str(u).strip() for u in ((jdone or {}).get("queued_urls") or []) if str(u).strip()]
+        if not attempted:
+            attempted = extract_job_pending_urls(jdone) or [u for u, _ in extract_failed_download_pairs(jdone)]
+        remain = self._uv_keep_undownloaded_after_job(
+            platform_key=platform_key,
+            attempted_urls=attempted,
+            job_done=jdone,
+            cancelled=cancelled,
+        )
+        remain_hint = ""
+        if remain > 0:
+            remain_hint = (
+                f"\nCòn {remain} {item_label} chưa tải — đã lưu lại list. "
+                "Bấm «Tải hết danh sách» hoặc «Tiếp tục job cuối»."
+            )
         log_hint = self._uv_failed_log_hint(jdone, platform_key=platform_key, job_id=job_id)
         if cancelled:
             if job_id:
@@ -3829,6 +4451,7 @@ class AIVideoDialog:
                 title,
                 f"Đã dừng theo «Tạm dừng / Hủy».\n"
                 f"Đã tải thành công {ok_count}/{total} {item_label} (lỗi: {fail_count})."
+                + remain_hint
                 + log_hint,
                 parent=self._top,
             )
@@ -3837,6 +4460,7 @@ class AIVideoDialog:
             title,
             f"Hoàn tất lệnh tải {total} {item_label} — job ({job_id}).\n"
             f"Thành công: {ok_count} | Lỗi: {fail_count}."
+            + remain_hint
             + log_hint,
             job_id=job_id,
             ok_count=ok_count,
@@ -3855,6 +4479,7 @@ class AIVideoDialog:
             pass
         self._refresh_uv_ytdlp_status()
         self._top.after(80, self._refresh_uv_library)
+        self._top.after(90, self._uv_restore_scan_lists)
         self._top.after(120, lambda: self._sync_uv_download_scrollregion(scroll_to_content=False))
 
     def _refresh_uv_library(self) -> None:
@@ -3865,7 +4490,12 @@ class AIVideoDialog:
         refresh_gen = self._uv_lib_refresh_gen
 
         def _worker() -> list[dict[str, Any]]:
-            return down.list_downloaded_videos()
+            try:
+                down.prune_unused_jobs()
+            except Exception:
+                logger.exception("Không dọn được job tải không dùng")
+            rows = down.list_downloaded_videos()
+            return [annotate_downloaded_library_row(r) for r in rows if isinstance(r, dict)]
 
         def _apply(rows: list[dict[str, Any]]) -> None:
             if refresh_gen != self._uv_lib_refresh_gen:
@@ -4099,6 +4729,44 @@ class AIVideoDialog:
         messagebox.showinfo(
             "Tải video",
             f"Đã xóa job: {'OK' if ret.get('deleted_job') else 'không tìm thấy'}\n"
+            f"Số video đã xóa khỏi thư viện: {int(ret.get('deleted_videos') or 0)}\n"
+            f"Chế độ xóa file: {'Có' if remove_files else 'Không'}",
+            parent=self._top,
+        )
+
+    def _on_uv_delete_all_jobs(self) -> None:
+        """Xóa toàn bộ job tải trên tab Tải video."""
+        if self._uv_require_downloader(fail_title="Tải video") is None:
+            return
+        jobs = list(self._uv_downloader.list_jobs() or [])
+        if not jobs:
+            messagebox.showinfo("Tải video", "Không có job tải để xóa.", parent=self._top)
+            return
+        if not messagebox.askyesno(
+            "Tải video",
+            f"Xóa toàn bộ {len(jobs)} job tải và danh sách video thuộc các job đó?",
+            parent=self._top,
+        ):
+            return
+        remove_files = messagebox.askyesnocancel(
+            "Tải video",
+            "Bạn muốn xóa luôn file video/thumbnail/info trên đĩa không?\n\n"
+            "Có = xóa mọi job + xóa file + dọn folder rỗng\n"
+            "Không = chỉ xóa job trong danh sách, giữ nguyên file\n"
+            "Hủy = không thực hiện",
+            parent=self._top,
+        )
+        if remove_files is None:
+            return
+        ret = self._uv_downloader.delete_all_download_jobs(
+            delete_files=bool(remove_files),
+            prune_empty_dirs=bool(remove_files),
+        )
+        self._var_uv_lib_job_filter.set("Tất cả job")
+        self._refresh_uv_library()
+        messagebox.showinfo(
+            "Tải video",
+            f"Đã xóa {int(ret.get('deleted_jobs') or 0)} job.\n"
             f"Số video đã xóa khỏi thư viện: {int(ret.get('deleted_videos') or 0)}\n"
             f"Chế độ xóa file: {'Có' if remove_files else 'Không'}",
             parent=self._top,

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from src.services.universal_video_downloader import (
     DownloadMetadataStore,
+    unique_playable_download_rows,
     _merge_downloader_metadata_canonical,
     _read_json_object_list_file,
     build_download_job_combo_options,
+    prune_unused_download_jobs,
     clear_pending_video_editor_job,
     discover_downloader_data_roots,
     downloader_layout_candidate_roots,
@@ -20,6 +23,29 @@ from src.services.universal_video_downloader import (
     write_pending_video_editor_job,
 )
 from src.utils.paths import reset_project_root_cache
+
+
+def test_unique_rows_keep_one_larger_copy(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.services.universal_video_downloader.downloaded_file_empty_reason",
+        lambda _p: "",
+    )
+    small = tmp_path / "a_tiktok_7414067670032633106.mp4"
+    large = tmp_path / "b_tiktok_7414067670032633106.mp4"
+    other = tmp_path / "c_tiktok_7414067670032633999.mp4"
+    small.write_bytes(b"a" * 1000)
+    large.write_bytes(b"b" * 4000)
+    other.write_bytes(b"c" * 2000)
+    rows = [
+        {"video_path": str(small), "status": "downloaded", "duration": 2, "source_url": "https://www.tiktok.com/@x/video/7414067670032633106"},
+        {"video_path": str(large), "status": "downloaded", "duration": 2, "source_url": "https://www.tiktok.com/@y/video/7414067670032633106"},
+        {"video_path": str(other), "status": "downloaded", "duration": 2, "source_url": "https://www.tiktok.com/@z/video/7414067670032633999"},
+        {"video_path": str(other), "status": "lỗi", "duration": 0},
+    ]
+    kept, dropped = unique_playable_download_rows(rows)
+    assert dropped == 1
+    assert len(kept) == 2
+    assert Path(kept[0]["video_path"]).stat().st_size == 4000
 
 
 def test_combo_shows_job_with_videos() -> None:
@@ -37,13 +63,13 @@ def test_combo_shows_job_with_videos() -> None:
         {"id": "v2", "download_job_id": "dl_abc123", "video_path": "/b.mp4"},
     ]
     vals, mapping = build_download_job_combo_options(jobs, videos, show_empty=False)
-    assert len(vals) == 1
-    assert "2 video" in vals[0]
-    assert mapping[vals[0]] == "dl_abc123"
+    assert len(vals) == 2
+    assert mapping[vals[0]] == "__all_downloaded__"
+    assert "2 video" in vals[1]
+    assert mapping[vals[1]] == "dl_abc123"
 
 
-def test_combo_shows_completed_job_without_video_rows() -> None:
-    """Job vừa finalize nhưng metadata video chưa kịp — vẫn hiện để user thấy."""
+def test_combo_hides_completed_job_without_videos() -> None:
     jobs = [
         {
             "id": "dl_empty1",
@@ -52,14 +78,21 @@ def test_combo_shows_completed_job_without_video_rows() -> None:
             "created_at": "2026-06-02T12:00:00",
         }
     ]
-    vals, mapping = build_download_job_combo_options(jobs, [], show_empty=False)
-    assert len(vals) == 1
-    assert mapping[vals[0]] == "dl_empty1"
-    assert "0 video" in vals[0]
+    vals, _mapping = build_download_job_combo_options(jobs, [], show_empty=False)
+    assert vals == []
+    shown, mapping = build_download_job_combo_options(jobs, [], show_empty=True)
+    assert mapping[shown[0]] == "dl_empty1"
 
 
-def test_combo_shows_running_job_without_videos() -> None:
+def test_combo_hides_stale_running_job_without_videos() -> None:
     jobs = [{"id": "dl_run", "platform": "tiktok", "status": "running", "created_at": "2026-06-02T12:00:00"}]
+    vals, _mapping = build_download_job_combo_options(jobs, [], show_empty=False)
+    assert vals == []
+
+
+def test_combo_shows_fresh_running_job_without_videos() -> None:
+    now = datetime.now().replace(microsecond=0).isoformat()
+    jobs = [{"id": "dl_run", "platform": "tiktok", "status": "running", "started_at": now, "updated_at": now}]
     vals, mapping = build_download_job_combo_options(jobs, [], show_empty=False)
     assert len(vals) == 1
     assert mapping[vals[0]] == "dl_run"
@@ -74,8 +107,9 @@ def test_combo_hides_pending_empty_job() -> None:
 def test_combo_orphan_videos_without_job_record() -> None:
     videos = [{"id": "v1", "download_job_id": "dl_orphan", "video_path": "/x.mp4"}]
     vals, mapping = build_download_job_combo_options([], videos, show_empty=False)
-    assert len(vals) == 1
-    assert mapping[vals[0]] == "dl_orphan"
+    assert len(vals) == 2
+    assert mapping[vals[0]] == "__all_downloaded__"
+    assert mapping[vals[1]] == "dl_orphan"
 
 
 def test_read_json_list_survives_transient_bad_file(tmp_path: Path) -> None:
@@ -85,6 +119,28 @@ def test_read_json_list_survives_transient_bad_file(tmp_path: Path) -> None:
     p.write_text('[{"id": "ok"}]\n', encoding="utf-8")
     rows = _read_json_object_list_file(p, retries=3)
     assert rows and rows[0]["id"] == "ok"
+
+
+def test_prune_unused_download_jobs_keeps_videos(tmp_path: Path) -> None:
+    paths = {
+        "root": tmp_path,
+        "jobs_file": tmp_path / "download_jobs.json",
+        "videos_file": tmp_path / "downloaded_videos.json",
+        "archive": tmp_path / "archive.txt",
+    }
+    store = DownloadMetadataStore(paths=paths)
+    now = datetime.now().replace(microsecond=0).isoformat()
+    store.save_job({"id": "dl_keep", "name": "catmovie", "platform": "tiktok", "status": "running", "updated_at": now})
+    store.save_job({"id": "dl_fail", "name": "catmovie", "platform": "tiktok", "status": "failed", "created_at": "2026-06-01T10:00:00"})
+    store.save_job({"id": "dl_stuck", "name": "yt", "platform": "youtube", "status": "running", "started_at": "2026-06-01T10:00:00"})
+    store.save_downloaded_videos(
+        [{"id": "v1", "download_job_id": "dl_keep", "video_path": str(tmp_path / "a.mp4")}]
+    )
+    removed = prune_unused_download_jobs(store)
+    assert set(removed) == {"dl_fail", "dl_stuck"}
+    left = {str(j.get("id")) for j in store.list_jobs()}
+    assert left == {"dl_keep"}
+    assert store.list_downloaded_videos()[0]["id"] == "v1"
 
 
 def test_metadata_store_atomic_roundtrip(tmp_path: Path) -> None:

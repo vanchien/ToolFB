@@ -6,6 +6,8 @@ import pytest
 
 from src.services.facebook_groups.share_schedule import (
     compose_clock,
+    compose_stamp,
+    date_choices,
     hour_choices,
     machine_clock_text,
     make_queue_item,
@@ -105,10 +107,24 @@ def test_hour_drop_covers_the_machine_day() -> None:
     assert minute_choices()[0] == "00" and minute_choices()[-1] == "59"
     assert compose_clock("22", "07") == "22:07"
     assert compose_clock("", "30") == ""
-    assert machine_clock_text(now) == "Giờ máy 22:07"
+    assert machine_clock_text(now) == "Máy 10/10 22:07"
     item = make_queue_item("https://www.facebook.com/reel/1", compose_clock("22", "07"), now=now)
     assert item.when == datetime(2026, 10, 10, 22, 7)
     assert item.label == "22:07"
+
+
+def test_date_choice_keeps_a_later_day() -> None:
+    now = datetime(2026, 10, 10, 22, 7)
+    days = date_choices(now, days=3)
+    assert days[0].startswith("10/10/2026")
+    assert "hôm nay" in days[0]
+    assert days[1] == "11/10/2026"
+    stamp = compose_stamp(days[1], "08", "30", now=now)
+    assert stamp == "2026-10-11 08:30"
+    item = make_queue_item("https://www.facebook.com/reel/1", stamp, now=now)
+    assert item.when == datetime(2026, 10, 11, 8, 30)
+    assert item.label == "11/10 08:30"
+    assert hour_choices(now, from_midnight=True)[0] == "00"
 
 
 def test_add_without_clock_asks_for_a_time() -> None:

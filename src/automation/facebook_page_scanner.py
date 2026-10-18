@@ -464,7 +464,10 @@ def _collect_pages_from_your_pages(page: Page, status: StatusCallback) -> list[S
             # 3. Thỉnh thoảng thử phím End để trigger load trang dài.
             if i % 10 == 9:
                 try:
-                    page.keyboard.press("End")
+                    page.evaluate(
+                        "() => { const e=document.scrollingElement||document.documentElement;"
+                        " if (e) e.scrollTop = e.scrollHeight; }"
+                    )
                 except Exception:
                     pass
             try:

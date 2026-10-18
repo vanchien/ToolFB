@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
+from src.gui.page_category_filter import PageCategoryFilter, page_choice_label
 from src.gui.ui_responsiveness import schedule_on_main_thread
 
 from src.services.facebook_groups.classify import parse_min_members
@@ -145,8 +146,12 @@ class GroupManagerDialog(tk.Toplevel):
         self.page_label = tk.StringVar()
         self._page_labels: dict[str, str] = {"— Tài khoản —": ""}
         self._page_urls: dict[str, str] = {}
-        self.page_box = ttk.Combobox(share, textvariable=self.page_label, width=36, state="readonly")
-        self.page_box.grid(row=5, column=1, sticky="w")
+        page_row = ttk.Frame(share)
+        page_row.grid(row=5, column=1, sticky="w")
+        self.page_box = ttk.Combobox(page_row, textvariable=self.page_label, width=36, state="readonly")
+        self.page_box.pack(side=tk.LEFT)
+        self.page_category_filter = PageCategoryFilter(page_row, on_change=self._fill_pages, width=20)
+        self.page_category_filter.frame.pack(side=tk.LEFT, padx=(8, 0))
         self._fill_pages()
         ttk.Button(share, text="Chia sẻ", command=self._create_share).grid(row=6, column=1, sticky="w", pady=4)
         self.preview = tk.StringVar(value="")
@@ -256,10 +261,13 @@ class GroupManagerDialog(tk.Toplevel):
 
             account_id = self.account_id.get().strip()
             rows = PagesManager().list_for_account(account_id) if account_id else PagesManager().load_all()
+            self.page_category_filter.refresh(rows)
             for row in rows:
+                if not self.page_category_filter.matches(row):
+                    continue
                 name = str(row.get("page_name") or row.get("id") or "Page")
                 page_id = str(row.get("fb_page_id") or row.get("id") or "")
-                label = f"{name} · {page_id}" if page_id else name
+                label = page_choice_label(name, row.get("page_category"), page_id)
                 mapping[label] = page_id
                 urls[label] = str(row.get("page_url") or "")
                 labels.append(label)

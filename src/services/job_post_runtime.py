@@ -83,9 +83,18 @@ class JobRunTracker:
             p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+_ACC_DISABLED_STATUSES = frozenset({"disabled", "inactive", "banned", "locked", "checkpoint", "paused", "off"})
+
+
 def _acc_status_active(acc: dict[str, Any]) -> bool:
+    """
+    Tài khoản còn được phép đăng.
+
+    ``status`` còn lưu kết quả lần đăng gần nhất (pending/success/failed) — không coi đó là bị tắt;
+    chỉ chặn trạng thái tắt rõ ràng.
+    """
     st = str(acc.get("status", "active")).strip().lower()
-    return st in ("", "active", "ok", "enabled")
+    return st not in _ACC_DISABLED_STATUSES
 
 
 def format_post_job_error(step_key: str, message: str) -> str:

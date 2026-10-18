@@ -22,10 +22,13 @@ def record_created_page(job: dict[str, Any]) -> None:
         page_url = f"https://www.facebook.com/{page_id}"
     if not page_url.startswith("http"):
         return
+    from src.utils.page_categories import normalize_page_category
+
     manager = PagesManager()
     name = str(job.get("page_name") or "").strip()
     account_id = str(job.get("account_id") or "").strip()
     business_id = str(job.get("business_id") or "").strip()
+    category = normalize_page_category(job.get("page_category"))
     for row in manager.load_all():
         same_id = page_id and str(row.get("fb_page_id") or "") == page_id
         same_name = (
@@ -42,22 +45,25 @@ def record_created_page(job: dict[str, Any]) -> None:
         row["business_id"] = business_id
         row["account_id"] = account_id
         row["source"] = "page_creator"
+        if category and not normalize_page_category(row.get("page_category")):
+            row["page_category"] = category
         manager.upsert(row)
         return
-    manager.upsert(
-        {
-            "id": uuid.uuid4().hex[:12],
-            "account_id": account_id,
-            "page_name": name,
-            "page_url": page_url,
-            "fb_page_id": page_id,
-            "business_id": business_id,
-            "page_kind": "fanpage",
-            "post_style": "post",
-            "status": "active",
-            "source": "page_creator",
-        }
-    )
+    new_row: dict[str, Any] = {
+        "id": uuid.uuid4().hex[:12],
+        "account_id": account_id,
+        "page_name": name,
+        "page_url": page_url,
+        "fb_page_id": page_id,
+        "business_id": business_id,
+        "page_kind": "fanpage",
+        "post_style": "post",
+        "status": "active",
+        "source": "page_creator",
+    }
+    if category:
+        new_row["page_category"] = category
+    manager.upsert(new_row)
 
 
 def get_engine():

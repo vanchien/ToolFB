@@ -50,6 +50,32 @@ def test_schedule_on_main_thread_inline_on_main() -> None:
     root.destroy()
 
 
+def test_flush_stops_after_time_budget() -> None:
+    root = tk.Tk()
+    root.withdraw()
+    register_main_thread_dispatcher(root)
+    ran: list[int] = []
+    ready = threading.Event()
+
+    def _slow(i: int) -> None:
+        ran.append(i)
+        time.sleep(0.02)
+
+    def worker() -> None:
+        for i in range(5):
+            schedule_on_main_thread(root, lambda i=i: _slow(i))
+        ready.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    assert ready.wait(timeout=2)
+    n = flush_main_thread_queue(root, max_items=5, budget_sec=0.008)
+    try:
+        assert n >= 1
+        assert len(ran) < 5
+    finally:
+        root.destroy()
+
+
 def test_run_background_then_main_uses_queue() -> None:
     root = tk.Tk()
     root.withdraw()

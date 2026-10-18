@@ -14,7 +14,7 @@ from typing import Any
 from loguru import logger
 
 from src.services.cross_platform_schedule_ctx import unified_chain_is_active
-from src.scheduler import get_schedule_posts_dispatch_pool
+from src.scheduler import get_schedule_posts_dispatch_pool, scheduler_stop_requested
 from src.services.tiktok.account_lock import try_run_for_account
 from src.services.tiktok.account_manager import TikTokAccountStore
 from src.services.tiktok.job_manager import TikTokJobStore
@@ -61,6 +61,13 @@ def _tiktok_run_scheduled_job_impl(job_id: str) -> None:
         return
     if str(job.get("status", "")).strip().lower() != "running":
         return
+    if scheduler_stop_requested():
+        logger.info("[TikTok queue] Lịch đã dừng — job {} chưa chạy, trả về pending.", job_id)
+        cur = dict(job)
+        cur["status"] = "pending"
+        cur["step"] = ""
+        job_store.upsert(cur)
+        return
     aid = str(job.get("account_id", "")).strip()
     acc = acc_store.get_by_id(aid) if aid else None
     if not acc:
@@ -96,7 +103,7 @@ def _tiktok_worker_done(fut: Future[Any]) -> None:
         fut.result()
     except Exception as exc:  # noqa: BLE001
         logger.exception("[TikTok queue] Worker lỗi: {}", exc)
-    if unified_chain_is_active():
+    if unified_chain_is_active() or scheduler_stop_requested():
         return
     if os.environ.get("SCHEDULE_DRAIN_QUEUE_ON_DONE", "1").strip().lower() not in {"1", "true", "yes", "on"}:
         return
@@ -117,6 +124,8 @@ def tick_tiktok_upload_jobs() -> None:
     Job ``pending`` + ``schedule_enabled`` + ``scheduled_at`` (ISO UTC) đến hạn → ``running`` → pool worker.
     Cần «Bắt đầu lịch» (APScheduler) như job Facebook trong ``schedule_posts.json``.
     """
+    if scheduler_stop_requested():
+        return
     jobs_to_dispatch: list[tuple[str, float]] = []
     now = datetime.now(timezone.utc)
     with _tiktok_tick_lock:

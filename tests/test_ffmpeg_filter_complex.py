@@ -16,8 +16,69 @@ from src.services.video_editor.ffmpeg_builder import (
     _build_video_overlay_chain,
     _join_vfilters,
     _validate_filter_complex_graph,
+    exported_mp4_reject_reason,
 )
 from src.utils.ffmpeg_paths import resolve_ffmpeg_executable
+
+
+def test_audio_only_and_too_short_are_skipped(tmp_path: Path) -> None:
+    src = tmp_path / "only_audio.mp4"
+    src.write_bytes(b"not-a-video")
+    base = {
+        "width": 320,
+        "height": 240,
+        "fps": 30,
+        "media": [
+            {
+                "id": "m",
+                "type": "video",
+                "local_path": str(src),
+                "has_video": False,
+                "has_audio": True,
+                "width": 0,
+                "height": 0,
+            }
+        ],
+        "tracks": [
+            {
+                "type": "video",
+                "clips": [
+                    {
+                        "id": "c",
+                        "type": "video",
+                        "media_id": "m",
+                        "timeline_start": 0,
+                        "duration": 2,
+                        "source_start": 0,
+                        "source_end": 2,
+                    }
+                ],
+            }
+        ],
+        "export": {"codec": "libx264", "preset": "veryfast", "crf": 18},
+    }
+    with pytest.raises(ValueError, match="không có hình"):
+        FFmpegCommandBuilder().build_export_command(
+            base,
+            str(tmp_path / "out.mp4"),
+            ffmpeg_bin="ffmpeg",
+            lightweight_mode_override=False,
+        )
+    base["media"][0]["has_video"] = True
+    base["media"][0]["width"] = 320
+    base["media"][0]["height"] = 240
+    base["tracks"][0]["clips"][0]["duration"] = 0.07
+    with pytest.raises(ValueError, match="quá ngắn"):
+        FFmpegCommandBuilder().build_export_command(
+            base,
+            str(tmp_path / "out.mp4"),
+            ffmpeg_bin="ffmpeg",
+            lightweight_mode_override=False,
+        )
+    missing = tmp_path / "missing.mp4"
+    assert "không thấy file" in exported_mp4_reject_reason(
+        missing, expect_w=1080, expect_h=1920, expect_dur=10
+    )
 
 
 def test_validate_rejects_comma_before_output_pad() -> None:
@@ -64,7 +125,10 @@ def test_builder_validates_all_local_projects() -> None:
                 lightweight_mode_override=True,
             )
         except ValueError as e:
-            if "Thiếu media" in str(e) or "Không resolve" in str(e) or "Không có đoạn video" in str(e):
+            if any(
+                s in str(e)
+                for s in ("Thiếu media", "Không resolve", "Không có đoạn video", "bỏ qua")
+            ):
                 continue
             raise
         fc = cmd[cmd.index("-filter_complex") + 1]

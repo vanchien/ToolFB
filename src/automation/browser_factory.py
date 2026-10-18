@@ -835,6 +835,15 @@ class BrowserFactory:
             if use_bundled:
                 for extra in ("--disable-component-update",):
                     _append_unique_arg(args, extra)
+            if _env_bool("FB_MUTE_BROWSER", True):
+                _append_unique_arg(args, "--mute-audio")
+            # Cửa sổ ẩn/bị che không bị hạ tốc vẽ và timer (wizard Reel chạy chậm như Firefox).
+            for extra in (
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+            ):
+                _append_unique_arg(args, extra)
             raw_extra = os.environ.get("FB_CHROMIUM_EXTRA_LAUNCH_ARGS", "").strip()
             if raw_extra:
                 args.extend([p for p in raw_extra.split() if p])
@@ -1136,6 +1145,14 @@ class BrowserFactory:
             ff["browser.tabs.warnOnClose"] = False
             ff["browser.startup.page"] = 1
             ff["browser.startup.homepage"] = "https://www.facebook.com/"
+            # Cửa sổ ẩn/bị che: Firefox hạ requestAnimationFrame xuống ~1 khung/giây → wizard Reel của
+            # Facebook chuyển bước cực chậm, bấm Next xong chờ mãi không thấy Post. Giữ tốc độ vẽ bình thường.
+            ff["widget.windows.window_occlusion_tracking.enabled"] = False
+            ff["layout.throttled_frame_rate"] = 60
+            ff["dom.min_background_timeout_value"] = 4
+            if _env_bool("FB_MUTE_BROWSER", True):
+                # Tắt âm thanh toàn trình duyệt: preview video lúc upload / xem Reel không phát tiếng ra loa.
+                ff["media.volume_scale"] = "0.0"
             if not apply_proxy:
                 # Ép kết nối trực tiếp: profile portable có thể còn PAC/manual proxy từ máy cũ → NS_ERROR_PROXY_*.
                 ff.update(
@@ -1243,6 +1260,22 @@ class BrowserFactory:
                     timeout_sec=launch_slot_timeout_sec,
                 )
                 acquired_launch_sem = True
+            launch_hider = None
+            visible_guard = None
+            if browser_key == "firefox" and sys.platform == "win32":
+                from src.utils.win_browser_window import FirefoxLaunchHider, visible_launch_guard
+
+                if background_firefox:
+                    ff_exe = launch_kwargs.get("executable_path")
+                    if not ff_exe:
+                        try:
+                            ff_exe = browser_type.executable_path
+                        except Exception:  # noqa: BLE001
+                            ff_exe = None
+                    launch_hider = FirefoxLaunchHider(ff_exe).start()
+                else:
+                    visible_guard = visible_launch_guard()
+                    visible_guard.__enter__()
             try:
                 try:
                     context = browser_type.launch_persistent_context(**launch_kwargs)
@@ -1318,6 +1351,11 @@ class BrowserFactory:
                     elif msg:
                         raise
             finally:
+                if launch_hider is not None:
+                    # Firefox đôi khi hiện lại cửa sổ ngay sau khi load trang đầu → ẩn thêm 3 giây.
+                    launch_hider.stop(linger_s=3.0)
+                if visible_guard is not None:
+                    visible_guard.__exit__(None, None, None)
                 if acquired_launch_sem:
                     _browser_launch_semaphore().release()
         except Exception:

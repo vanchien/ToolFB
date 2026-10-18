@@ -20,7 +20,7 @@ def default_export_presets() -> list[dict[str, Any]]:
             "format": "mp4",
             "codec": "libx264",
             "preset": "veryfast",
-            "crf": 23,
+            "crf": 18,
             "audio_codec": "aac",
         },
         {
@@ -32,7 +32,7 @@ def default_export_presets() -> list[dict[str, Any]]:
             "format": "mp4",
             "codec": "libx264",
             "preset": "veryfast",
-            "crf": 23,
+            "crf": 18,
             "audio_codec": "aac",
         },
         {
@@ -44,7 +44,7 @@ def default_export_presets() -> list[dict[str, Any]]:
             "format": "mp4",
             "codec": "libx264",
             "preset": "veryfast",
-            "crf": 23,
+            "crf": 18,
             "audio_codec": "aac",
         },
         {
@@ -56,7 +56,7 @@ def default_export_presets() -> list[dict[str, Any]]:
             "format": "mp4",
             "codec": "libx264",
             "preset": "veryfast",
-            "crf": 23,
+            "crf": 18,
             "audio_codec": "aac",
         },
         {
@@ -68,7 +68,7 @@ def default_export_presets() -> list[dict[str, Any]]:
             "format": "mp4",
             "codec": "libx264",
             "preset": "veryfast",
-            "crf": 23,
+            "crf": 18,
             "audio_codec": "aac",
         },
     ]

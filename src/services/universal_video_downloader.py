@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -35,6 +36,7 @@ UV_DOWNLOAD_SEQUENTIAL_THRESHOLD = 25
 # Sự kiện Tk: tab Tải video báo job xong → Video Editor làm mới combobox job.
 DOWNLOAD_JOB_FINISHED_TK_EVENT = "<<ToolFB_DownloadJobFinished>>"
 PENDING_VE_JOB_FILE = "pending_video_editor_job.json"
+SCAN_LISTS_FILE = "scan_lists.json"
 TOOLFB_PENDING_DOWNLOAD_JOB_ATTR = "_toolfb_pending_download_job_id"
 TOOLFB_VE_AUTO_IMPORT_DOWNLOAD_ATTR = "_toolfb_ve_auto_import_download"
 _DOWNLOADER_MERGE_LOCK = threading.Lock()
@@ -166,16 +168,14 @@ def consume_auto_import_download_job(root: Any) -> bool:
             pass
     return True
 
-# yt-dlp: ưu tiên tối thiểu 720p (HD); trần chiều cao 2160 (Short dọc / 4K). Fallback dần xuống thấp hơn nếu site không có HD.
+# yt-dlp: bản nét nhất có sẵn, trần 2160 (4K). Sắp xếp theo độ phân giải rồi bitrate.
 YTDLP_FORMAT_HD_MERGE = (
-    "bestvideo[height>=720][height<=2160]+bestaudio/"
-    "bestvideo[height>=720]+bestaudio/"
-    "bestvideo*+bestaudio/"
-    "best[height>=720]/best"
+    "bv*[height<=2160]+ba/"
+    "b[height<=2160]/"
+    "bv*+ba/b"
 )
-YTDLP_FORMAT_HD_SINGLE = (
-    "best[height>=720][height<=2160]/best[height>=720]/best[ext=mp4]/best"
-)
+YTDLP_FORMAT_HD_SINGLE = "b[height<=2160]/b"
+YTDLP_FORMAT_SORT = "res,vbr,size,ext:mp4:m4a"
 
 # yt-dlp YouTube (EJS): stderr có thể lặp cảnh báo thiếu JS runtime.
 _YTDLP_JS_WARN_SNIP = "No supported JavaScript runtime"
@@ -273,6 +273,161 @@ def write_failed_download_urls_log(
     return path
 
 
+def downloaded_file_empty_reason(path: Path) -> str:
+    """
+    Lý do bỏ file vừa tải vì không có nội dung.
+    Chuỗi rỗng = file dùng được.
+    """
+    try:
+        if not path.is_file():
+            return ""
+        size = int(path.stat().st_size)
+    except OSError:
+        return ""
+    if size == TIKTOK_EMPTY_LOGO_BYTES:
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            digest = ""
+        if digest == TIKTOK_EMPTY_LOGO_SHA256:
+            return "video hỏng chỉ có logo TikTok, không có nội dung"
+    if size < 20_000:
+        return "file quá nhỏ, không có nội dung"
+    info = _probe_download_streams(path)
+    if not info:
+        return ""
+    if not info.get("has_video"):
+        return "file không có hình"
+    try:
+        dur = float(info.get("duration") or 0)
+        width = int(info.get("width") or 0)
+        height = int(info.get("height") or 0)
+    except (TypeError, ValueError):
+        return "không đọc được thời lượng video"
+    if width < 2 or height < 2 or dur < 0.5:
+        return "video lỗi: không có hình hoặc thời lượng bằng 0"
+    if (
+        not info.get("has_audio")
+        and width == 720
+        and height == 816
+        and 2.0 <= dur <= 2.15
+        and size < 300_000
+    ):
+        return "video hỏng chỉ có logo TikTok, không có nội dung"
+    return ""
+
+
+def annotate_downloaded_library_row(row: dict[str, Any]) -> dict[str, Any]:
+    """File mất hoặc không có nội dung thì trạng thái là lỗi, không phải đã tải."""
+    out = dict(row)
+    vp = Path(str(out.get("video_path") or "")).expanduser()
+    if not vp.is_file():
+        out["status"] = "lỗi"
+        out["duration"] = 0
+        return out
+    why = downloaded_file_empty_reason(vp)
+    if why:
+        out["status"] = "lỗi"
+        return out
+    try:
+        dur = float(out.get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur < 0.5:
+        info = _probe_download_streams(vp)
+        if info and float(info.get("duration") or 0) >= 0.5:
+            out["duration"] = float(info["duration"])
+            out["status"] = "downloaded"
+        else:
+            out["status"] = "lỗi"
+    return out
+
+
+def drop_empty_download_files(paths: list[str], *, log_fn: LogFn | None = None) -> tuple[list[str], list[str]]:
+    """Xóa file hỏng/không nội dung. Trả về (giữ lại, đã bỏ)."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for raw in paths:
+        p = Path(str(raw or "")).expanduser()
+        reason = downloaded_file_empty_reason(p)
+        if not reason:
+            kept.append(str(raw))
+            continue
+        dropped.append(str(raw))
+        if log_fn:
+            log_fn(f"Bỏ qua, không lưu: {p.name} — {reason}")
+        _delete_downloaded_file(p)
+    return kept, dropped
+
+
+def _delete_downloaded_file(path: Path) -> None:
+    for extra in (
+        path,
+        path.with_suffix(".info.json"),
+        Path(str(path) + ".info.json"),
+        path.with_suffix(".jpg"),
+        path.with_suffix(".webp"),
+        path.with_suffix(".png"),
+    ):
+        try:
+            extra.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _probe_download_streams(path: Path) -> dict[str, Any] | None:
+    ff = _resolve_ffmpeg_for_ytdlp()
+    if not ff:
+        return None
+    probe = str(Path(ff).with_name("ffprobe.exe" if ff.lower().endswith(".exe") else "ffprobe"))
+    if not Path(probe).is_file():
+        probe = shutil.which("ffprobe") or ""
+    if not probe:
+        return None
+    cmd = [
+        probe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,width,height",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            **_ytdlp_subprocess_kw(),
+        )
+        data = json.loads(proc.stdout or "{}")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    has_video = False
+    has_audio = False
+    width = height = 0
+    for st in data.get("streams") or []:
+        kind = str(st.get("codec_type") or "")
+        if kind == "audio":
+            has_audio = True
+        elif kind == "video" and not has_video:
+            has_video = True
+            try:
+                width = int(st.get("width") or 0)
+                height = int(st.get("height") or 0)
+            except (TypeError, ValueError):
+                width = height = 0
+    try:
+        dur = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return {"has_video": has_video, "has_audio": has_audio, "width": width, "height": height, "duration": dur}
+
+
 def _ytdlp_subprocess_kw() -> dict[str, Any]:
     """
     Windows: không gắn cửa sổ console cho yt-dlp.exe / python -m yt_dlp
@@ -296,6 +451,9 @@ def _resolve_ffmpeg_for_ytdlp() -> str:
 YTDLP_PYPI_JSON_URL = "https://pypi.org/pypi/yt-dlp/json"
 # File yt-dlp.exe đóng gói kèm app; nhỏ hơn ngưỡng này coi như tải lỗi / placeholder.
 YTDLP_BUNDLE_EXE_MIN_BYTES = 400_000
+# Logo TikTok tĩnh (720×816, 2.066s, không tiếng) — yt-dlp/browser tải nhầm khi video không có nội dung.
+TIKTOK_EMPTY_LOGO_SHA256 = "821065e7f5f631c5aedeb4b23f6f456d5b268b430c17e828880796f6bc113894"
+TIKTOK_EMPTY_LOGO_BYTES = 197971
 YTDLP_WIN_EXE_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 
 _YTDLP_MEDIA_EXTENSIONS = frozenset({".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"})
@@ -358,6 +516,12 @@ def _extract_video_id_for_scan(url: str) -> str:
     if m:
         return m.group(1)
     m = re.search(r"tiktok\.com/@[^/]+/video/(\d+)", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"tiktok\.com/[^/]+/video/(\d+)", u, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"/video/(\d{5,})", u, re.I)
     if m:
         return m.group(1)
     m = re.search(r"facebook\.com/reel/(\d+)", u, re.I)
@@ -894,6 +1058,7 @@ def ensure_downloader_layout() -> dict[str, Path]:
         "jobs_file": root / "download_jobs.json",
         "videos_file": root / "downloaded_videos.json",
         "archive": root / "archive.txt",
+        "scan_lists_file": root / SCAN_LISTS_FILE,
     }
     root.mkdir(parents=True, exist_ok=True)
     for key in ("jobs_file", "videos_file"):
@@ -931,7 +1096,28 @@ def list_videos_for_download_job(
         if str(r.get("download_job_id") or "").strip() == jid
     ]
     if rows:
-        return rows
+        checked: list[dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            row = dict(r)
+            vp = Path(str(row.get("video_path") or "")).expanduser()
+            if not vp.is_file():
+                row["status"] = "lỗi"
+                row["duration"] = 0
+            else:
+                why = downloaded_file_empty_reason(vp)
+                if why:
+                    row["status"] = "lỗi"
+                elif float(row.get("duration") or 0) <= 0:
+                    info = _probe_download_streams(vp)
+                    if info and float(info.get("duration") or 0) >= 0.5:
+                        row["duration"] = float(info["duration"])
+                        row["status"] = "downloaded"
+                    else:
+                        row["status"] = "lỗi"
+            checked.append(row)
+        return checked
     job_row = job if isinstance(job, dict) else meta_store.get_job(jid)
     if not isinstance(job_row, dict):
         return []
@@ -1148,6 +1334,322 @@ def persist_instagram_reels_settings(
     cfg_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"',;]+", re.IGNORECASE)
+
+
+def parse_video_url_list(text: str) -> list[str]:
+    """Tách nhiều link (xuống dòng / dấu phẩy / dán lộn) thành list URL, bỏ trùng."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _HTTP_URL_RE.finditer(str(text or "")):
+        url = match.group(0).rstrip(").,]}>\"'")
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(url)
+    return found
+
+
+def merge_scan_url_list(
+    existing: list[str],
+    incoming: list[str],
+) -> tuple[list[str], int, int]:
+    """Cộng dồn URL quét (giữ thứ tự cũ, bỏ trùng không phân biệt hoa thường).
+
+    Returns:
+        ``(merged, n_added, n_dup)``
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in existing or []:
+        u = str(raw or "").strip()
+        if not u:
+            continue
+        key = u.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+    added = 0
+    dup = 0
+    for raw in incoming or []:
+        u = str(raw or "").strip()
+        if not u:
+            continue
+        key = u.lower()
+        if key in seen:
+            dup += 1
+            continue
+        seen.add(key)
+        out.append(u)
+        added += 1
+    return out, added, dup
+
+
+def merge_scan_entry_rows(
+    existing: list[dict[str, str]],
+    incoming: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], int, int]:
+    """Cộng dồn dòng quét ``{title, url}`` — URL trùng thì giữ bản cũ."""
+    urls_exist = [str((row or {}).get("url") or "") for row in (existing or []) if isinstance(row, dict)]
+    urls_new = [str((row or {}).get("url") or "") for row in (incoming or []) if isinstance(row, dict)]
+    merged_urls, added, dup = merge_scan_url_list(urls_exist, urls_new)
+    by_url: dict[str, dict[str, str]] = {}
+    for row in list(existing or []) + list(incoming or []):
+        if not isinstance(row, dict):
+            continue
+        u = str(row.get("url") or "").strip()
+        if not u:
+            continue
+        key = u.lower()
+        if key in by_url:
+            continue
+        by_url[key] = {
+            "title": str(row.get("title") or "").strip(),
+            "url": u,
+        }
+    merged = [by_url[u.lower()] for u in merged_urls if u.lower() in by_url]
+    return merged, added, dup
+
+
+def _scan_lists_file(*, paths: dict[str, Path] | None = None) -> Path:
+    if paths:
+        explicit = paths.get("scan_lists_file")
+        if explicit:
+            return Path(explicit)
+        root = paths.get("root")
+        if root:
+            return Path(root) / SCAN_LISTS_FILE
+    return ensure_downloader_layout()["root"] / SCAN_LISTS_FILE
+
+
+def empty_scan_lists_payload() -> dict[str, Any]:
+    """Khung JSON danh sách quét (TikTok/YouTube/Instagram/Facebook)."""
+    return {
+        "saved_at": "",
+        "last_job_id": "",
+        "tiktok": {"rows": [], "sources": []},
+        "youtube": {"rows": [], "sources": []},
+        "instagram": {"rows": [], "sources": []},
+        "facebook": {"urls": [], "sources": []},
+    }
+
+
+def _sanitize_scan_entry_rows(raw: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": str(item.get("title") or "").strip(), "url": url})
+        if len(out) >= UV_MAX_PLAYLIST_ENTRIES:
+            break
+    return out
+
+
+def _sanitize_scan_url_list(raw: Any) -> list[str]:
+    out: list[str] = []
+    if not isinstance(raw, list):
+        return out
+    seen: set[str] = set()
+    for item in raw:
+        url = str(item or "").strip()
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(url)
+        if len(out) >= UV_MAX_PLAYLIST_ENTRIES:
+            break
+    return out
+
+
+def load_scan_lists(*, paths: dict[str, Path] | None = None) -> dict[str, Any]:
+    """Đọc danh sách quét còn lại (chưa tải) từ ``data/downloader/scan_lists.json``."""
+    payload = empty_scan_lists_payload()
+    path = _scan_lists_file(paths=paths)
+    if not path.is_file():
+        return payload
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return payload
+    if not isinstance(raw, dict):
+        return payload
+    payload["saved_at"] = str(raw.get("saved_at") or "")
+    payload["last_job_id"] = str(raw.get("last_job_id") or "").strip()
+    for plat in ("tiktok", "youtube", "instagram"):
+        block = raw.get(plat) if isinstance(raw.get(plat), dict) else {}
+        payload[plat] = {
+            "rows": _sanitize_scan_entry_rows((block or {}).get("rows")),
+            "sources": _sanitize_scan_url_list((block or {}).get("sources")),
+        }
+    fb = raw.get("facebook") if isinstance(raw.get("facebook"), dict) else {}
+    payload["facebook"] = {
+        "urls": _sanitize_scan_url_list((fb or {}).get("urls")),
+        "sources": _sanitize_scan_url_list((fb or {}).get("sources")),
+    }
+    return payload
+
+
+def save_scan_lists(payload: dict[str, Any], *, paths: dict[str, Path] | None = None) -> Path:
+    """Ghi danh sách quét (kể cả video chưa tải) để mở lại tab/app vẫn còn."""
+    data = empty_scan_lists_payload()
+    src = payload if isinstance(payload, dict) else {}
+    data["saved_at"] = str(src.get("saved_at") or _now_iso())
+    data["last_job_id"] = str(src.get("last_job_id") or "").strip()
+    for plat in ("tiktok", "youtube", "instagram"):
+        block = src.get(plat) if isinstance(src.get(plat), dict) else {}
+        data[plat] = {
+            "rows": _sanitize_scan_entry_rows((block or {}).get("rows")),
+            "sources": _sanitize_scan_url_list((block or {}).get("sources")),
+        }
+    fb = src.get("facebook") if isinstance(src.get("facebook"), dict) else {}
+    data["facebook"] = {
+        "urls": _sanitize_scan_url_list((fb or {}).get("urls")),
+        "sources": _sanitize_scan_url_list((fb or {}).get("sources")),
+    }
+    path = _scan_lists_file(paths=paths)
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    with json_file_lock(path):
+        _atomic_write_text(path, text)
+    return path
+
+
+def unique_nonempty_urls(urls: list[str] | None) -> list[str]:
+    """URL không rỗng, giữ thứ tự, bỏ trùng (không phân biệt hoa thường)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in urls or []:
+        u = str(raw or "").strip()
+        if not u:
+            continue
+        key = u.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+    return out
+
+
+def url_download_identity(url: str) -> tuple[str, str]:
+    """``(norm_key, video_id)`` để khớp URL đã tải / còn lại."""
+    raw = str(url or "").strip()
+    return _norm_url_key(raw).lower(), _extract_video_id_for_scan(raw)
+
+
+def remaining_urls_after_success(requested: list[str], success_urls: list[str]) -> list[str]:
+    """Giữ URL chưa tải thành công (khớp theo id video hoặc URL chuẩn)."""
+    done_keys: set[str] = set()
+    done_ids: set[str] = set()
+    for u in success_urls or []:
+        key, vid = url_download_identity(u)
+        if key:
+            done_keys.add(key)
+        if vid:
+            done_ids.add(vid)
+    out: list[str] = []
+    for u in unique_nonempty_urls(requested):
+        key, vid = url_download_identity(u)
+        if vid and vid in done_ids:
+            continue
+        if key and key in done_keys:
+            continue
+        out.append(u)
+    return out
+
+
+def remaining_scan_entry_rows(
+    rows: list[dict[str, str]],
+    success_urls: list[str],
+) -> list[dict[str, str]]:
+    """Bỏ dòng đã tải thành công — giữ video chưa tải trong list quét."""
+    keep_urls = remaining_urls_after_success(
+        [str((r or {}).get("url") or "") for r in (rows or []) if isinstance(r, dict)],
+        success_urls,
+    )
+    keep_l = {u.lower() for u in keep_urls}
+    out: list[dict[str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        u = str(row.get("url") or "").strip()
+        if u.lower() in keep_l:
+            out.append({"title": str(row.get("title") or "").strip(), "url": u})
+    return out
+
+
+def extract_job_pending_urls(job: dict[str, Any] | None) -> list[str]:
+    """URL còn phải tải: ``pending_urls`` → ``failed_items`` → ``queued_urls`` (job cũ)."""
+    row = job if isinstance(job, dict) else {}
+    has_pending_key = isinstance(row, dict) and "pending_urls" in row
+    pending = unique_nonempty_urls([str(u) for u in (row.get("pending_urls") or [])])
+    if pending:
+        return pending
+    failed = unique_nonempty_urls([u for u, _ in extract_failed_download_pairs(row)])
+    if failed:
+        return failed
+    if has_pending_key:
+        return []
+    return unique_nonempty_urls([str(u) for u in (row.get("queued_urls") or [])])
+
+
+def urls_refer_to_same_video(a: str, b: str) -> bool:
+    """True nếu hai URL cùng một video (id hoặc URL chuẩn)."""
+    ka, ida = url_download_identity(a)
+    kb, idb = url_download_identity(b)
+    if ida and idb and ida == idb:
+        return True
+    return bool(ka and kb and ka == kb)
+
+
+def mark_job_url_downloaded(job: dict[str, Any], item_url: str) -> None:
+    """Bỏ URL khỏi pending/failed sau khi tải thành công."""
+    job["pending_urls"] = remaining_urls_after_success(
+        [str(u) for u in (job.get("pending_urls") or [])],
+        [item_url],
+    )
+    rest: list[Any] = []
+    for it in job.get("failed_items") or []:
+        if not isinstance(it, dict):
+            continue
+        u = str(it.get("url") or "").strip()
+        if u and urls_refer_to_same_video(u, item_url):
+            continue
+        rest.append(it)
+    job["failed_items"] = rest
+
+
+def upsert_job_failed_item(job: dict[str, Any], item_url: str, error: str) -> None:
+    """Ghi/ghi đè lỗi một URL — URL vẫn nằm trong ``pending_urls`` để tải lại."""
+    rest: list[Any] = []
+    for it in job.get("failed_items") or []:
+        if not isinstance(it, dict):
+            continue
+        u = str(it.get("url") or "").strip()
+        if u and urls_refer_to_same_video(u, item_url):
+            continue
+        rest.append(it)
+    rest.append({"url": str(item_url).strip(), "error": str(error or "")[:1500]})
+    job["failed_items"] = rest
+    pending = unique_nonempty_urls([str(u) for u in (job.get("pending_urls") or [])])
+    if not any(urls_refer_to_same_video(u, item_url) for u in pending):
+        pending.append(str(item_url).strip())
+    job["pending_urls"] = pending
+
+
 def detect_platform(url: str) -> str:
     u = url.lower()
     if "youtube.com" in u or "youtu.be" in u:
@@ -1159,6 +1661,30 @@ def detect_platform(url: str) -> str:
     if "facebook.com" in u or "fb.watch" in u:
         return "facebook"
     return "unknown"
+
+
+def _ytdlp_impersonate_cli_args() -> list[str]:
+    """Thêm ``--impersonate chrome`` khi có curl_cffi (TikTok/FB hay cần)."""
+    try:
+        import curl_cffi  # type: ignore  # noqa: F401
+    except Exception:
+        return []
+    return ["--impersonate", "chrome"]
+
+
+def _ytdlp_tiktok_header_args(url: str) -> list[str]:
+    """User-Agent + Referer cho URL TikTok khi impersonate không có."""
+    if "tiktok.com" not in str(url or "").lower():
+        return []
+    return [
+        "--user-agent",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "--add-header",
+        "Referer:https://www.tiktok.com/",
+    ]
 
 
 _IG_AUTH_HINT = (
@@ -1423,6 +1949,91 @@ def _parse_download_job_time(raw: Any) -> float:
         return 0.0
 
 
+ALL_DOWNLOADED_VIDEOS_JOB_ID = "__all_downloaded__"
+
+
+def downloaded_row_identity(row: dict[str, Any]) -> str:
+    """Id nền tảng của một video đã tải (URL hoặc tên file). Rỗng nếu không nhận ra."""
+    vid = _extract_video_id_for_scan(str(row.get("source_url") or ""))
+    if vid:
+        return vid.lower()
+    stem = Path(str(row.get("video_path") or "")).stem
+    m = re.search(r"(?:tiktok|youtube|reel|instagram|facebook|fb)_([A-Za-z0-9_-]{6,})", stem, re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"(\d{10,})", stem)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _download_row_rank(row: dict[str, Any]) -> tuple[int, float]:
+    path = Path(str(row.get("video_path") or "")).expanduser()
+    try:
+        size = int(path.stat().st_size) if path.is_file() else 0
+    except OSError:
+        size = 0
+    try:
+        dur = float(row.get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return size, dur
+
+
+def unique_playable_download_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """
+    Giữ một bản cho mỗi video dùng được.
+
+    Bỏ file mất hoặc không có nội dung. Trùng id (nhiều job tải cùng một video)
+    hoặc trùng nội dung file thì giữ bản lớn hơn.
+    """
+    from src.utils.media_dedupe import media_file_fingerprint
+
+    playable: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "").strip().lower() == "lỗi":
+            continue
+        path = Path(str(row.get("video_path") or "")).expanduser()
+        if not path.is_file() or downloaded_file_empty_reason(path):
+            continue
+        playable.append(row)
+
+    by_id: dict[str, dict[str, Any]] = {}
+    no_id: list[dict[str, Any]] = []
+    dropped = 0
+    for row in playable:
+        ident = downloaded_row_identity(row)
+        if not ident:
+            no_id.append(row)
+            continue
+        prev = by_id.get(ident)
+        if prev is None:
+            by_id[ident] = row
+            continue
+        dropped += 1
+        by_id[ident] = row if _download_row_rank(row) > _download_row_rank(prev) else prev
+
+    final: list[dict[str, Any]] = []
+    seen_fp: dict[str, int] = {}
+    for row in list(by_id.values()) + no_id:
+        path = Path(str(row.get("video_path") or "")).expanduser()
+        fp = media_file_fingerprint(path)
+        if not fp:
+            final.append(row)
+            continue
+        prev_i = seen_fp.get(fp)
+        if prev_i is None:
+            seen_fp[fp] = len(final)
+            final.append(row)
+            continue
+        dropped += 1
+        if _download_row_rank(row) > _download_row_rank(final[prev_i]):
+            final[prev_i] = row
+    return final, dropped
+
+
 def build_download_job_combo_options(
     jobs: list[dict[str, Any]],
     videos: list[dict[str, Any]],
@@ -1432,8 +2043,8 @@ def build_download_job_combo_options(
     """
     Nhãn combobox «Job tải» cho Video Editor.
 
-    Luôn hiện job có video; job ``completed``/``running``/``failed`` dù chưa ghi metadata video;
-    job ``pending`` rỗng chỉ khi bật «Hiện cả job rỗng/lỗi».
+    Mặc định chỉ hiện job còn video, hoặc job đang tải (vừa chạy, chưa có file).
+    Job rỗng/lỗi chỉ hiện khi bật «Hiện cả job rỗng hoặc lỗi».
     """
     count_by_job: dict[str, int] = {}
     for r in videos:
@@ -1466,8 +2077,7 @@ def build_download_job_combo_options(
             return True
         if show_empty:
             return True
-        st = str((j or {}).get("status") or "").strip().lower()
-        return st in ("completed", "running", "failed", "need_manual_upload")
+        return download_job_is_in_use(j or {"id": jid}, video_count=0)
 
     ordered_ids: list[str] = []
     seen: set[str] = set()
@@ -1500,6 +2110,11 @@ def build_download_job_combo_options(
 
     vals: list[str] = []
     new_map: dict[str, str] = {}
+    total_videos = sum(int(v) for v in count_by_job.values())
+    if total_videos > 0 and len(ordered_ids) >= 1:
+        all_label = f"Tất cả video đã tải | {total_videos} video | bỏ trùng khi nạp"
+        vals.append(all_label)
+        new_map[all_label] = ALL_DOWNLOADED_VIDEOS_JOB_ID
     for jid in ordered_ids:
         j = jobs_by_id.get(jid)
         vcount = int(count_by_job.get(jid, 0))
@@ -1509,6 +2124,89 @@ def build_download_job_combo_options(
         vals.append(label)
         new_map[label] = jid
     return vals, new_map
+
+
+# Job «running» nhưng không có video và không cập nhật trong khoảng này coi là không dùng.
+UNUSED_DOWNLOAD_JOB_STALE_SEC = 10 * 60
+
+
+def count_videos_by_download_job(videos: list[dict[str, Any]]) -> dict[str, int]:
+    """Đếm bản ghi video theo ``download_job_id``."""
+    count_by_job: dict[str, int] = {}
+    for row in videos:
+        if not isinstance(row, dict):
+            continue
+        jid = str(row.get("download_job_id") or "").strip()
+        if not jid:
+            continue
+        count_by_job[jid] = int(count_by_job.get(jid, 0)) + 1
+    return count_by_job
+
+
+def download_job_is_in_use(
+    job: dict[str, Any] | None,
+    *,
+    video_count: int = 0,
+    active_job_id: str = "",
+    now_ts: float | None = None,
+) -> bool:
+    """
+    Job còn dùng khi đã có video, đang là job tải hiện tại, hoặc vừa chuyển ``running``.
+
+    Job failed/pending/completed mà 0 video thì không dùng — có thể xóa metadata.
+    """
+    row = job if isinstance(job, dict) else {}
+    if int(video_count) > 0:
+        return True
+    files = [str(p).strip() for p in (row.get("downloaded_files") or []) if str(p).strip()]
+    if files:
+        return True
+    jid = str(row.get("id") or "").strip()
+    if active_job_id and jid and jid == str(active_job_id).strip():
+        return True
+    status = str(row.get("status") or "").strip().lower()
+    if status != "running":
+        return False
+    now = float(now_ts) if now_ts is not None else datetime.now().timestamp()
+    touched = max(
+        _parse_download_job_time(row.get("updated_at")),
+        _parse_download_job_time(row.get("started_at")),
+        _parse_download_job_time(row.get("created_at")),
+    )
+    if touched <= 0:
+        return False
+    return (now - touched) < UNUSED_DOWNLOAD_JOB_STALE_SEC
+
+
+def prune_unused_download_jobs(
+    store: DownloadMetadataStore,
+    *,
+    active_job_id: str = "",
+    now_ts: float | None = None,
+) -> list[str]:
+    """
+    Xóa job tải không còn dùng (0 video, không đang tải).
+
+    Chỉ xóa bản ghi metadata — không xóa file video trên đĩa.
+    """
+    counts = count_videos_by_download_job(store.list_downloaded_videos())
+    removed: list[str] = []
+    for job in list(store.list_jobs()):
+        if not isinstance(job, dict):
+            continue
+        jid = str(job.get("id") or "").strip()
+        if not jid:
+            continue
+        if download_job_is_in_use(
+            job,
+            video_count=int(counts.get(jid, 0)),
+            active_job_id=active_job_id,
+            now_ts=now_ts,
+        ):
+            continue
+        if store.delete_job(jid):
+            removed.append(jid)
+    return removed
 
 
 def _read_json_object_list_file(path: Path, *, retries: int = 5) -> list[dict[str, Any]]:
@@ -2088,12 +2786,77 @@ class UniversalYTDLPWrapper:
             "warning": warn,
         }
 
+    def _scan_tiktok_profile_via_browser(
+        self,
+        url: str,
+        *,
+        max_entries: int,
+        on_partial: Callable[[list[dict[str, str]]], None] | None,
+        on_status: Callable[[str], None] | None,
+        ytdlp_error: str = "",
+    ) -> dict[str, Any] | None:
+        """Khi yt-dlp gãy extractor kênh TikTok thì quét trang bằng Playwright."""
+        from src.services.tiktok_profile_catalog import scan_tiktok_profile_page
+
+        n = max(1, min(int(max_entries or 50), UV_MAX_PLAYLIST_ENTRIES))
+        note = "yt-dlp không lấy được danh sách kênh TikTok, đang quét bằng trình duyệt…"
+        if on_status:
+            try:
+                on_status(note)
+            except Exception:
+                pass
+        self._log(note)
+
+        def _partial_urls(urls: list[str]) -> None:
+            if not on_partial:
+                return
+            rows = [{"title": f"TikTok {i + 1}", "url": u} for i, u in enumerate(urls)]
+            try:
+                on_partial(rows)
+            except Exception:
+                pass
+
+        res = scan_tiktok_profile_page(
+            page_url=url,
+            max_videos=n,
+            max_scroll_rounds=max(24, min(360, n // 2 + 12)),
+            max_scan_minutes=min(40.0, max(8.0, n / 25.0)),
+            status=on_status,
+            on_partial=_partial_urls,
+        )
+        if not res.get("ok"):
+            msg = str(res.get("message") or "Không quét được profile TikTok.")
+            if ytdlp_error:
+                msg = f"{msg}\n\n(yt-dlp: {ytdlp_error[:400]})"
+            return {"success": False, "error": msg}
+        items = res.get("items") or []
+        entries = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            u = str(item.get("url") or "").strip()
+            if not u:
+                continue
+            title = str(item.get("title") or item.get("video_id") or u)[:500]
+            entries.append({"title": title, "url": u})
+        if not entries:
+            return None
+        return {
+            "success": True,
+            "entries": entries,
+            "playlist_title": "",
+            "extractor": "tiktok_playwright",
+            "partial": False,
+            "warning": "Quét bằng trình duyệt vì yt-dlp không lấy được danh sách kênh.",
+        }
+
     def list_flat_playlist_entries(
         self,
         url: str,
         *,
         max_entries: int = 500,
         on_partial: Callable[[list[dict[str, str]]], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
         playlist_start: int = 1,
         playlist_end: int | None = None,
         _orchestrating: bool = False,
@@ -2306,6 +3069,19 @@ class UniversalYTDLPWrapper:
             return {"success": False, "error": str(exc)}
         if rc != 0:
             err = ("".join(stderr_tail) or "").strip()
+            if platform == "tiktok":
+                from src.services.tiktok_profile_catalog import tiktok_ytdlp_profile_broken
+
+                if tiktok_ytdlp_profile_broken(err):
+                    fb = self._scan_tiktok_profile_via_browser(
+                        raw,
+                        max_entries=n,
+                        on_partial=on_partial,
+                        on_status=on_status,
+                        ytdlp_error=err,
+                    )
+                    if fb:
+                        return fb
             # Fallback tương thích cho bản yt-dlp cũ không hỗ trợ một số cờ scan nhanh.
             cmd_fallback = [
                 *self._resolve_prefix(),
@@ -2344,6 +3120,16 @@ class UniversalYTDLPWrapper:
                 return {"success": False, "error": err[:2200] or "yt-dlp scan failed."}
             if p2.returncode != 0:
                 err2 = (p2.stderr or p2.stdout or "").strip()
+                if platform == "tiktok":
+                    fb = self._scan_tiktok_profile_via_browser(
+                        raw,
+                        max_entries=n,
+                        on_partial=on_partial,
+                        on_status=on_status,
+                        ytdlp_error=err2 or err,
+                    )
+                    if fb:
+                        return fb
                 return {"success": False, "error": (err2 or err)[:2200] or "yt-dlp scan failed."}
             try:
                 data = json.loads(p2.stdout or "{}")
@@ -2440,8 +3226,11 @@ class UniversalYTDLPWrapper:
         cmd: list[str] = [
             *prefix,
             *js_rt,
+            "--no-update",
             "-f",
             fmt,
+            "-S",
+            str(self._yt.get("format_sort") or YTDLP_FORMAT_SORT),
             "--newline",
             "--no-progress",
             "--encoding",
@@ -2455,6 +3244,12 @@ class UniversalYTDLPWrapper:
             "-o",
             output_template,
         ]
+        impersonate_args = _ytdlp_impersonate_cli_args()
+        if impersonate_args:
+            cmd.extend(impersonate_args)
+            log_lines("[yt-dlp] Impersonate Chrome (curl_cffi).")
+        header_probe = urls_batch[0] if use_batch_file else str(url or "")
+        cmd.extend(_ytdlp_tiktok_header_args(header_probe))
         if sock_to > 0:
             cmd.extend(["--socket-timeout", str(max(5, min(600, sock_to)))])
         if has_ffmpeg:
@@ -2754,6 +3549,22 @@ class DownloadJobOptions:
     write_thumbnail: bool
 
 
+def _tiktok_browser_session_dead(message: str) -> bool:
+    """Chromium bị đóng/crash giữa danh sách dài — cần mở lại phiên."""
+    low = str(message or "").lower()
+    return any(
+        key in low
+        for key in (
+            "has been closed",
+            "target closed",
+            "browser has been closed",
+            "connection closed",
+            "target page, context or browser",
+            "crash",
+        )
+    )
+
+
 class UniversalVideoDownloader:
     """
     Module độc lập: tạo job, chạy yt-dlp, lưu metadata, thư viện video.
@@ -2768,6 +3579,8 @@ class UniversalVideoDownloader:
         self._yt = UniversalYTDLPWrapper(yt_cfg=dict(self._uvd.get("yt_dlp") or {}), log=self._log)
         self._cancel = threading.Event()
         self._active_job_id: str | None = None
+        self._tt_browser: Any = None
+        self._tiktok_skip_ytdlp = False
         self._auto_refresh_ytdlp_background()
 
     @property
@@ -2841,12 +3654,114 @@ class UniversalVideoDownloader:
 
     def cancel_current(self) -> None:
         self._cancel.set()
+        self._close_tiktok_browser()
 
     def clear_cancel(self) -> None:
         self._cancel.clear()
 
     def is_cancel_requested(self) -> bool:
         return self._cancel.is_set()
+
+    def _close_tiktok_browser(self) -> None:
+        """Đóng phiên Playwright tải TikTok (nếu đang mở)."""
+        sess = getattr(self, "_tt_browser", None)
+        self._tt_browser = None
+        if sess is None:
+            return
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+    def _tiktok_browser_session(self, cookie_path: str = "") -> Any:
+        """Lấy hoặc mở phiên Chromium dùng lại cho nhiều video TikTok."""
+        from src.services.tiktok_video_download import TikTokBrowserDownloader
+
+        sess = getattr(self, "_tt_browser", None)
+        uses = int(getattr(sess, "_batch_uses", 0) or 0) if sess is not None else 0
+        if sess is not None and (uses >= 20 or not sess.healthy()):
+            self._log("Đổi phiên trình duyệt TikTok để quét/tải tiếp danh sách dài…")
+            self._close_tiktok_browser()
+            sess = None
+        if sess is not None:
+            return sess
+        sess = TikTokBrowserDownloader(
+            cookie_path=cookie_path or None,
+            status=self._log,
+            cancel_check=self.is_cancel_requested,
+        )
+        sess._start_error = ""
+        sess.start()
+        self._tt_browser = sess
+        return sess
+
+    def _download_tiktok_via_browser(
+        self,
+        *,
+        url: str,
+        job: dict[str, Any],
+        ytdlp_error: str = "",
+    ) -> dict[str, Any]:
+        """
+        Fallback khi yt-dlp không lấy được video TikTok.
+
+        Returns cùng shape ``{"success", "filepaths", "error"}`` như ``download()``.
+        """
+        from src.services.tiktok_video_download import (
+            build_tiktok_dest_path,
+            download_tiktok_video_via_browser,
+            is_tiktok_video_url,
+            tiktok_ytdlp_video_broken,
+        )
+
+        if not is_tiktok_video_url(url):
+            return {"success": False, "error": ytdlp_error or "Không phải URL video TikTok.", "filepaths": []}
+        if ytdlp_error and not tiktok_ytdlp_video_broken(ytdlp_error) and "đã hủy" not in ytdlp_error.lower():
+            return {"success": False, "error": ytdlp_error, "filepaths": []}
+        if self.is_cancel_requested():
+            return {"success": False, "error": "Đã hủy/tạm dừng bởi người dùng.", "filepaths": []}
+        dest = build_tiktok_dest_path(
+            output_dir=str(job.get("output_dir") or ""),
+            url=url,
+            organize_by_platform=bool(job.get("organize_by_platform")),
+            organize_by_uploader=bool(job.get("organize_by_uploader")),
+        )
+        self._log("yt-dlp không tải được video TikTok, đang tải bằng trình duyệt…")
+        ret: dict[str, Any] = {"ok": False, "message": ""}
+        last_exc = ""
+        for attempt in (1, 2):
+            try:
+                sess = self._tiktok_browser_session(str(job.get("cookie_path") or ""))
+                ret = download_tiktok_video_via_browser(
+                    page_url=url,
+                    dest=dest,
+                    cookie_path=str(job.get("cookie_path") or ""),
+                    status=self._log,
+                    cancel_check=self.is_cancel_requested,
+                    session=sess,
+                )
+                sess._batch_uses = int(getattr(sess, "_batch_uses", 0) or 0) + 1
+            except Exception as exc:  # noqa: BLE001
+                last_exc = str(exc)
+                ret = {"ok": False, "message": last_exc}
+            msg_try = str(ret.get("message") or last_exc)
+            if ret.get("ok") or attempt == 2 or not _tiktok_browser_session_dead(msg_try):
+                break
+            self._log("Trình duyệt TikTok bị đóng giữa danh sách dài — mở lại rồi tải tiếp video này.")
+            self._close_tiktok_browser()
+        if last_exc and not ret.get("ok") and not ret.get("message"):
+            return {
+                "success": False,
+                "error": f"{ytdlp_error}\n── Fallback trình duyệt ──\n{last_exc}"[:2200],
+                "filepaths": [],
+            }
+        if ret.get("ok") and ret.get("path"):
+            self._log(f"[TikTok] Đã tải bằng trình duyệt → {ret.get('path')}")
+            return {"success": True, "filepaths": [str(ret.get("path"))], "error": ""}
+        msg = str(ret.get("message") or "Fallback trình duyệt thất bại.")
+        self._log(f"[TikTok] Fallback trình duyệt lỗi: {msg}")
+        combined = (ytdlp_error + "\n── Fallback trình duyệt ──\n" + msg).strip()
+        return {"success": False, "error": combined[:2200], "filepaths": []}
 
     def create_download_job(self, url: str, options: dict[str, Any]) -> dict[str, Any]:
         dl = dict(self._uvd.get("download") or {})
@@ -2883,11 +3798,17 @@ class UniversalVideoDownloader:
             "status": "pending",
             "downloaded_files": [],
             "failed_items": [],
+            "queued_urls": unique_nonempty_urls(
+                [str(u) for u in (options.get("queued_urls") or [])]
+            ),
+            "pending_urls": [],
             "created_at": _now_iso(),
             "started_at": "",
             "completed_at": "",
             "error_message": "",
         }
+        if job["queued_urls"]:
+            job["pending_urls"] = list(job["queued_urls"])
         self._store.save_job(job)
         return job
 
@@ -2947,18 +3868,38 @@ class UniversalVideoDownloader:
             return job
         if not bool(ret.get("success")):
             err = str(ret.get("error") or "Lỗi không xác định")
-            if err == "need_manual_upload":
-                job["status"] = "need_manual_upload"
-                job["error_message"] = str(ret.get("message") or err)
-            else:
-                job["status"] = "failed"
-                job["error_message"] = err[:2000]
-            job["completed_at"] = _now_iso()
-            job["failed_items"] = [{"url": job["url"], "error": job["error_message"]}]
-            self._store.save_job(job)
-            self._active_job_id = None
-            return job
+            from src.services.tiktok_video_download import is_tiktok_video_url, tiktok_ytdlp_video_broken
 
+            if (
+                err != "need_manual_upload"
+                and is_tiktok_video_url(str(job.get("url") or ""))
+                and tiktok_ytdlp_video_broken(err)
+            ):
+                fb = self._download_tiktok_via_browser(
+                    url=str(job.get("url") or ""),
+                    job=job,
+                    ytdlp_error=err,
+                )
+                if fb.get("success") and fb.get("filepaths"):
+                    filepaths = list(dict.fromkeys(fb.get("filepaths") or []))
+                    ret = {**ret, "success": True, "filepaths": filepaths, "error": ""}
+                else:
+                    err = str(fb.get("error") or err)
+            if not bool(ret.get("success")):
+                if err == "need_manual_upload":
+                    job["status"] = "need_manual_upload"
+                    job["error_message"] = str(ret.get("message") or err)
+                else:
+                    job["status"] = "failed"
+                    job["error_message"] = err[:2000]
+                job["completed_at"] = _now_iso()
+                job["failed_items"] = [{"url": job["url"], "error": job["error_message"]}]
+                self._store.save_job(job)
+                self._active_job_id = None
+                self._close_tiktok_browser()
+                return job
+
+        filepaths, _dropped_empty = drop_empty_download_files(filepaths, log_fn=self._log)
         records: list[dict[str, Any]] = []
         jid0 = str(job.get("id") or "")
         videos_rows0 = self._store.list_downloaded_videos()
@@ -2983,10 +3924,13 @@ class UniversalVideoDownloader:
         job["completed_at"] = _now_iso()
         if ret.get("paths_unreported") and not job["downloaded_files"]:
             job["error_message"] = "yt-dlp hoàn tất nhưng không trả về đường dẫn file; kiểm tra thư mục tải."
+        elif _dropped_empty and not records:
+            job["error_message"] = "Đã bỏ qua video hỏng không có nội dung."
         else:
             job["error_message"] = ""
         self._store.save_job(job)
         self._active_job_id = None
+        self._close_tiktok_browser()
         return job
 
     def run_download_url_for_job(
@@ -3023,33 +3967,59 @@ class UniversalVideoDownloader:
             job["status"] = "running"
             job["started_at"] = _now_iso()
         job["error_message"] = ""
+        job["updated_at"] = _now_iso()
         self._store.save_job(job)
 
-        ret = self._yt.download(
-            url=item_url,
-            output_template=tmpl,
-            archive_path=self._paths["archive"],
-            url_type="single_video",
-            max_videos=1,
-            skip_existing=bool(job["skip_existing"]),
-            write_info_json=bool(job["write_info_json"]),
-            write_thumbnail=bool(job["write_thumbnail"]),
-            cookie_path=str(job.get("cookie_path") or ""),
-            cancel_event=self._cancel,
-            log_lines=self._log,
-            progress_hook=on_progress,
-        )
+        from src.services.tiktok_video_download import is_tiktok_video_url, tiktok_ytdlp_video_broken
+
+        if self._tiktok_skip_ytdlp and is_tiktok_video_url(item_url):
+            ret = self._download_tiktok_via_browser(url=item_url, job=job)
+        else:
+            ret = self._yt.download(
+                url=item_url,
+                output_template=tmpl,
+                archive_path=self._paths["archive"],
+                url_type="single_video",
+                max_videos=1,
+                skip_existing=bool(job["skip_existing"]),
+                write_info_json=bool(job["write_info_json"]),
+                write_thumbnail=bool(job["write_thumbnail"]),
+                cookie_path=str(job.get("cookie_path") or ""),
+                cancel_event=self._cancel,
+                log_lines=self._log,
+                progress_hook=on_progress,
+            )
+            if (
+                not bool(ret.get("success"))
+                and not ret.get("skipped_only")
+                and is_tiktok_video_url(item_url)
+            ):
+                err0 = str(ret.get("error") or "")
+                if err0 != "need_manual_upload" and "đã hủy" not in err0.lower() and tiktok_ytdlp_video_broken(err0):
+                    self._tiktok_skip_ytdlp = True
+                    ret = self._download_tiktok_via_browser(url=item_url, job=job, ytdlp_error=err0)
         filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
-        if ret.get("skipped_only") and not filepaths:
+        filepaths, dropped_empty = drop_empty_download_files(filepaths, log_fn=self._log)
+        if ret.get("skipped_only") and not filepaths and not dropped_empty:
             od = Path(str(job.get("output_dir") or "")).expanduser().resolve()
             if od.is_dir():
                 rescue = scan_output_dir_for_existing_media(root=od, url=item_url)
                 if rescue:
                     filepaths = list(dict.fromkeys(rescue))
                     ret = {**ret, "skipped_only": False, "filepaths": filepaths, "success": True}
+            filepaths, dropped_more = drop_empty_download_files(filepaths, log_fn=self._log)
+            dropped_empty.extend(dropped_more)
+        if dropped_empty and not filepaths:
+            job = self._store.get_job(job_id) or job
+            upsert_job_failed_item(job, item_url, "Tải lỗi: video không có nội dung hoặc file hỏng.")
+            job["status"] = "running"
+            self._store.save_job(job)
+            self._active_job_id = None
+            return job
         if ret.get("skipped_only"):
             job = self._store.get_job(job_id) or job
             self._attach_existing_sources_to_job(job=job, source_url=item_url, videos_rows=videos_rows)
+            mark_job_url_downloaded(job, item_url)
             job["status"] = "running"
             self._store.save_job(job)
             self._active_job_id = None
@@ -3057,12 +4027,10 @@ class UniversalVideoDownloader:
         if not bool(ret.get("success")):
             err = str(ret.get("error") or "Lỗi không xác định")
             job = self._store.get_job(job_id) or job
-            failed_items = list(job.get("failed_items") or [])
             if err == "need_manual_upload":
-                failed_items.append({"url": item_url, "error": str(ret.get("message") or err)})
+                upsert_job_failed_item(job, item_url, str(ret.get("message") or err))
             else:
-                failed_items.append({"url": item_url, "error": err[:1500]})
-            job["failed_items"] = failed_items
+                upsert_job_failed_item(job, item_url, err[:1500])
             job["status"] = "running"
             self._store.save_job(job)
             self._active_job_id = None
@@ -3087,6 +4055,7 @@ class UniversalVideoDownloader:
             for rec in records:
                 videos_rows.insert(0, rec)
         job["downloaded_files"] = list(dict.fromkeys(job_paths_acc))
+        mark_job_url_downloaded(job, item_url)
         job["status"] = "running"
         if ret.get("paths_unreported") and not filepaths:
             pass
@@ -3101,7 +4070,7 @@ class UniversalVideoDownloader:
         Tải nhiều URL đơn trong **một** tiến trình yt-dlp (``-a`` batch file + ``--ignore-errors``),
         tránh khởi động lại yt-dlp/merge từng URL — nhanh hơn rõ rệt trên máy khách so với tuần tự.
         """
-        urls = [str(u).strip() for u in urls if str(u).strip()]
+        urls = unique_nonempty_urls(urls)
         if not urls:
             raise ValueError("Thiếu URL")
         if len(urls) == 1:
@@ -3112,6 +4081,13 @@ class UniversalVideoDownloader:
         if self.is_cancel_requested():
             self._active_job_id = None
             return job
+        queued = unique_nonempty_urls([str(u) for u in (job.get("queued_urls") or [])])
+        if len(urls) > len(queued):
+            job["queued_urls"] = list(urls)
+        elif not queued:
+            job["queued_urls"] = list(urls)
+        job["pending_urls"] = list(urls)
+        self._store.save_job(job)
         self._active_job_id = job_id
         jid_q = str(job.get("id") or "")
         videos_rows = self._store.list_downloaded_videos()
@@ -3140,7 +4116,17 @@ class UniversalVideoDownloader:
             progress_hook=on_progress,
         )
         filepaths: list[str] = list(dict.fromkeys(ret.get("filepaths") or []))
-        if ret.get("skipped_only") and not filepaths:
+        filepaths, dropped_empty = drop_empty_download_files(filepaths, log_fn=self._log)
+        skipped_empty_urls: set[str] = set()
+        if dropped_empty:
+            for fp in dropped_empty:
+                name_ids = set(re.findall(r"\d{10,}", Path(fp).name))
+                for u in urls:
+                    _key, vid = url_download_identity(u)
+                    if vid and vid in name_ids:
+                        skipped_empty_urls.add(u)
+                        upsert_job_failed_item(job, u, "Tải lỗi: video không có nội dung hoặc file hỏng.")
+        if ret.get("skipped_only") and not filepaths and not dropped_empty:
             od = Path(str(job.get("output_dir") or "")).expanduser().resolve()
             if od.is_dir():
                 rescue_all: list[str] = []
@@ -3149,16 +4135,25 @@ class UniversalVideoDownloader:
                 if rescue_all:
                     filepaths = list(dict.fromkeys(rescue_all))
                     ret = {**ret, "skipped_only": False, "filepaths": filepaths, "success": True}
+            filepaths, dropped_more = drop_empty_download_files(filepaths, log_fn=self._log)
+            dropped_empty.extend(dropped_more)
         job = self._store.get_job(job_id) or job
         failed_items = list(job.get("failed_items") or [])
         if ret.get("skipped_only") and not filepaths:
             for u in urls:
                 self._attach_existing_sources_to_job(job=job, source_url=u, videos_rows=videos_rows)
+                mark_job_url_downloaded(job, u)
             job["status"] = "running"
             self._store.save_job(job)
             self._active_job_id = None
             return job
-        if not bool(ret.get("success")) and not filepaths:
+        from src.services.tiktok_video_download import is_tiktok_video_url, tiktok_ytdlp_video_broken
+
+        tiktok_batch = any(is_tiktok_video_url(u) for u in urls)
+        batch_err = str(ret.get("error") or "")
+        if tiktok_batch and batch_err and tiktok_ytdlp_video_broken(batch_err):
+            self._tiktok_skip_ytdlp = True
+        if not bool(ret.get("success")) and not filepaths and not tiktok_batch:
             err = str(ret.get("error") or "Lỗi không xác định")
             for u in urls:
                 if err == "need_manual_upload":
@@ -3242,8 +4237,11 @@ class UniversalVideoDownloader:
                 continue
             failed_items.append({"url": m, "error": "Không tải được hoặc không khớp metadata sau batch (xem log)."})
             failed_by_url.add(m)
+        if skipped_empty_urls:
+            missing = [u for u in missing if u not in skipped_empty_urls]
         job["failed_items"] = failed_items
         job["downloaded_files"] = list(dict.fromkeys(job_paths_acc))
+        job["pending_urls"] = unique_nonempty_urls(missing)
         job["status"] = "running"
         self._store.save_job(job)
         self._active_job_id = None
@@ -3261,38 +4259,49 @@ class UniversalVideoDownloader:
         Tải lần lượt từng URL trong một job — ổn định với danh sách dài (vài nghìn video).
         Gọi ``finalize_batch_download_job`` sau khi vòng lặp kết thúc.
         """
-        urls = [str(u).strip() for u in urls if str(u).strip()]
+        urls = unique_nonempty_urls(urls)
         if not urls:
             raise ValueError("Thiếu URL")
         total = len(urls)
         job = self._store.get_job(job_id)
         if not job:
             raise KeyError(f"Không có job: {job_id}")
+        queued = unique_nonempty_urls([str(u) for u in (job.get("queued_urls") or [])])
+        if len(urls) > len(queued):
+            job["queued_urls"] = list(urls)
+        elif not queued:
+            job["queued_urls"] = list(urls)
+        job["pending_urls"] = list(urls)
+        self._store.save_job(job)
         videos_rows = self._store.list_downloaded_videos()
         output_validated = False
         refresh_cache_every = max(8, min(40, int(self._uvd.get("yt_dlp", {}).get("sequential_cache_refresh_every") or 20)))
-        for idx, item_url in enumerate(urls, start=1):
-            if self.is_cancel_requested():
-                break
-            if on_item_done is not None:
+        self._tiktok_skip_ytdlp = False
+        try:
+            for idx, item_url in enumerate(urls, start=1):
+                if self.is_cancel_requested():
+                    break
+                if on_item_done is not None:
+                    try:
+                        on_item_done(idx, total, item_url)
+                    except Exception:
+                        pass
                 try:
-                    on_item_done(idx, total, item_url)
-                except Exception:
-                    pass
-            try:
-                job = self.run_download_url_for_job(
-                    job_id,
-                    item_url,
-                    on_progress=on_progress,
-                    videos_rows=videos_rows,
-                    skip_output_dir_validate=output_validated,
-                )
-                output_validated = True
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"[yt-dlp] tuần tự URL {idx}/{total} lỗi: {item_url[:120]}… | {exc}")
-            if idx % refresh_cache_every == 0:
-                videos_rows = self._store.list_downloaded_videos()
-        return self._store.get_job(job_id) or job
+                    job = self.run_download_url_for_job(
+                        job_id,
+                        item_url,
+                        on_progress=on_progress,
+                        videos_rows=videos_rows,
+                        skip_output_dir_validate=output_validated,
+                    )
+                    output_validated = True
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"[yt-dlp] tuần tự URL {idx}/{total} lỗi: {item_url[:120]}… | {exc}")
+                if idx % refresh_cache_every == 0:
+                    videos_rows = self._store.list_downloaded_videos()
+            return self._store.get_job(job_id) or job
+        finally:
+            self._close_tiktok_browser()
 
     def _attach_existing_sources_to_job(
         self,
@@ -3362,28 +4371,65 @@ class UniversalVideoDownloader:
         job = self._store.get_job(job_id)
         if not job:
             raise KeyError(f"Không có job: {job_id}")
-        paths = [
-            str(r.get("video_path") or "")
-            for r in self._store.list_downloaded_videos()
-            if str(r.get("download_job_id") or "") == str(job.get("id") or "") and str(r.get("video_path") or "").strip()
-        ]
+        paths = []
+        for r in self._store.list_downloaded_videos():
+            if str(r.get("download_job_id") or "") != str(job.get("id") or ""):
+                continue
+            raw = str(r.get("video_path") or "").strip()
+            if not raw:
+                continue
+            vp = Path(raw).expanduser()
+            if not vp.is_file() or downloaded_file_empty_reason(vp):
+                continue
+            paths.append(str(vp))
         job["downloaded_files"] = paths
         fails = list(job.get("failed_items") or [])
         n_ok = len(paths)
         n_fail = len(fails)
+        pending = extract_job_pending_urls(job)
+        job["pending_urls"] = pending
         if n_ok == 0 and n_fail > 0:
             job["status"] = "failed"
-            job["error_message"] = f"Tất cả {n_fail} URL lỗi (xem failed_items / log)."
-        elif n_fail > 0:
+            job["error_message"] = f"Tất cả {n_fail} URL lỗi (xem failed_items / log). Còn {len(pending)} URL chưa tải."
+        elif n_fail > 0 or pending:
             job["status"] = "completed"
-            job["error_message"] = f"Hoàn tất: {n_ok} file, {n_fail} URL lỗi."
+            job["error_message"] = (
+                f"Hoàn tất: {n_ok} file, {n_fail} URL lỗi, còn {len(pending)} chưa tải."
+            )
         else:
             job["status"] = "completed"
             job["error_message"] = ""
+            job["pending_urls"] = []
         job["completed_at"] = _now_iso()
         job["updated_at"] = _now_iso()
         self._store.save_job(job)
+        self._close_tiktok_browser()
+        self._tiktok_skip_ytdlp = False
         return job
+
+    def resume_download_job(
+        self,
+        job_id: str,
+        *,
+        on_progress: ProgressHook | None = None,
+        on_item_done: Callable[[int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Tải tiếp URL còn lại của job (``pending_urls`` / lỗi).
+
+        Job list nhiều video không chạy lại URL gốc kênh — chỉ tải những cái chưa xong.
+        """
+        job = self._store.get_job(job_id)
+        if not job:
+            raise KeyError(f"Không có job: {job_id}")
+        pending = extract_job_pending_urls(job)
+        if pending:
+            self.clear_cancel()
+            self.run_download_urls_sequential_for_job(
+                job_id, pending, on_progress=on_progress, on_item_done=on_item_done
+            )
+            return self.finalize_batch_download_job(job_id)
+        return self.run_download_job(job_id, on_progress=on_progress)
 
     def _build_video_record(
         self,
@@ -3447,6 +4493,10 @@ class UniversalVideoDownloader:
                                 break
             except Exception:
                 pass
+        if duration < 0.5 and vp.is_file():
+            probed = _probe_download_streams(vp)
+            if probed and float(probed.get("duration") or 0) >= 0.5:
+                duration = float(probed["duration"])
         return {
             "id": f"src_video_{uuid.uuid4().hex[:10]}",
             "download_job_id": str(job.get("id") or ""),
@@ -3490,6 +4540,13 @@ class UniversalVideoDownloader:
     def list_jobs(self) -> list[dict[str, Any]]:
         return self._store.list_jobs()
 
+    def prune_unused_jobs(self) -> list[str]:
+        """Xóa job 0 video không còn tải — giữ job đang chạy."""
+        return prune_unused_download_jobs(
+            self._store,
+            active_job_id=str(self._active_job_id or ""),
+        )
+
     def get_download_job(self, job_id: str) -> dict[str, Any] | None:
         return self._store.get_job(str(job_id or "").strip())
 
@@ -3502,9 +4559,15 @@ class UniversalVideoDownloader:
         *,
         max_entries: int = 500,
         on_partial: Callable[[list[dict[str, str]]], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Ủy quyền tới ``UniversalYTDLPWrapper`` (quét flat-playlist cho kênh/playlist YouTube)."""
-        return self._yt.list_flat_playlist_entries(url, max_entries=max_entries, on_partial=on_partial)
+        return self._yt.list_flat_playlist_entries(
+            url,
+            max_entries=max_entries,
+            on_partial=on_partial,
+            on_status=on_status,
+        )
 
     def send_to_reverse_prompt_engine(self, video_id: str) -> dict[str, Any]:
         v = self._store.get_video(video_id)
@@ -3575,6 +4638,29 @@ class UniversalVideoDownloader:
             "deleted_job": bool(deleted_job),
             "deleted_videos": int(deleted_videos),
         }
+
+    def delete_all_download_jobs(
+        self,
+        *,
+        delete_files: bool = True,
+        prune_empty_dirs: bool = True,
+    ) -> dict[str, int]:
+        """Xóa mọi job tải và video thuộc các job đó."""
+        deleted_jobs = 0
+        deleted_videos = 0
+        for job in list(self.list_jobs()):
+            job_id = str(job.get("id") or "").strip()
+            if not job_id:
+                continue
+            ret = self.delete_download_job(
+                job_id,
+                delete_files=delete_files,
+                prune_empty_dirs=prune_empty_dirs,
+            )
+            if ret.get("deleted_job"):
+                deleted_jobs += 1
+            deleted_videos += int(ret.get("deleted_videos") or 0)
+        return {"deleted_jobs": deleted_jobs, "deleted_videos": deleted_videos}
 
     def remember_output_dir(self, path: str) -> None:
         cfg_path = project_root() / "config" / "universal_video_downloader.json"

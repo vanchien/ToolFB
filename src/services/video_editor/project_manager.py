@@ -51,7 +51,7 @@ class VideoEditorProjectManager:
                 "format": "mp4",
                 "codec": "libx264",
                 "preset": "veryfast",
-                "crf": 23,
+                "crf": 18,
                 "audio_codec": "aac",
             },
             "created_at": now,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -65,3 +66,15 @@ def test_caption_fingerprint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     cap = "Dòng mở đầu giống nhau\nphần sau khác"
     svc.append_entry(page_id, hook="x", caption=cap, posted_at=_now() - timedelta(days=1))
     assert svc.caption_fingerprint_used_within_days(page_id, cap, days=7, now=_now()) is True
+
+
+def test_corrupt_history_file_returns_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """File lịch sử hỏng / đang ghi dở — không ném lỗi, coi như chưa có bài."""
+    monkeypatch.setattr(pw, "project_root", lambda: tmp_path)
+    page_id = "histpage04"
+    pw.ensure_page_workspace(page_id)
+    hist = tmp_path / "data" / "pages" / page_id / "history" / "published_posts.json"
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    hist.write_text("{", encoding="utf-8")
+    svc = PostHistoryService()
+    assert svc.load_entries(page_id) == []

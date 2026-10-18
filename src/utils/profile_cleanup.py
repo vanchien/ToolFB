@@ -215,6 +215,8 @@ def cleanup_orphan_profile_directories(
     referenced_cookies = collect_referenced_cookie_paths(proot, rows)
     candidates = iter_profile_leaf_dirs(profiles_root)
     deleted: list[str] = []
+    kept_session = 0
+    kept_marker = 0
 
     for folder in candidates:
         if folder in referenced_profiles:
@@ -226,7 +228,8 @@ def cleanup_orphan_profile_directories(
             from src.utils.account_browser_profile import portable_profile_likely_has_session
 
             if portable_profile_likely_has_session(str(folder), project_root_dir=proot):
-                logger.info(
+                kept_session += 1
+                logger.debug(
                     "Giữ profile có phiên/lịch sử — không xóa dù chưa khớp accounts.json: {}",
                     folder,
                 )
@@ -237,7 +240,8 @@ def cleanup_orphan_profile_directories(
         if marker.is_file():
             owner = marker.read_text(encoding="utf-8").strip()
             if owner:
-                logger.info(
+                kept_marker += 1
+                logger.debug(
                     "Giữ profile có marker chủ «{}» — không xóa mồ côi: {}",
                     owner,
                     folder,
@@ -269,6 +273,12 @@ def cleanup_orphan_profile_directories(
             deleted_log=deleted,
         )
 
+    if kept_session or kept_marker:
+        logger.info(
+            "Giữ {} profile có phiên/lịch sử, {} profile có marker chủ (không xóa mồ côi).",
+            kept_session,
+            kept_marker,
+        )
     if deleted and not dry_run:
         logger.info("Dọn profile mồ côi — đã xóa {} mục (thư mục + cookie).", len(deleted))
     elif deleted and dry_run:

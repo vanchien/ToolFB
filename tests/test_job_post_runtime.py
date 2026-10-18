@@ -39,6 +39,16 @@ def test_validate_account_rejects_missing_profile() -> None:
         validate_account_for_post_job(acc, project_root=_project_root())
 
 
+def test_account_post_outcome_status_does_not_block_next_post() -> None:
+    """``status`` success/failed là kết quả lần đăng trước, không phải tài khoản bị tắt."""
+    from src.services.job_post_runtime import _acc_status_active
+
+    for st in ("success", "failed", "pending", "active", ""):
+        assert _acc_status_active({"status": st}), st
+    for st in ("disabled", "banned", "checkpoint"):
+        assert not _acc_status_active({"status": st}), st
+
+
 def test_validate_page_mismatch_account() -> None:
     row = {"id": "p1", "account_id": "other", "page_url": "https://www.facebook.com/x", "page_name": "x"}
     with pytest.raises(ValueError, match="không thuộc"):

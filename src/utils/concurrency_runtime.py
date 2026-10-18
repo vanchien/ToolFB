@@ -47,11 +47,51 @@ def _cpu_cores() -> int:
         return 4
 
 
+def _total_ram_gb() -> float | None:
+    """Tổng RAM máy (GB); None nếu không đọc được."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MemStatus()
+            st.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return st.ullTotalPhys / (1024**3)
+            return None
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024**3)
+    except Exception:
+        return None
+
+
+def ram_browser_cap(total_gb: float | None) -> int | None:
+    """Số browser tối đa theo RAM: chừa ~3GB cho Windows/ToolFB, mỗi browser ~1.2GB."""
+    if total_gb is None or total_gb <= 0:
+        return None
+    return max(1, int((total_gb - 3.0) // 1.2))
+
+
 def apply_multi_task_defaults(*, gui: bool = False) -> None:
     """Gợi ý cấu hình cơ sở — không ghi đè biến người dùng đã đặt."""
     global _base_browser, _base_ffmpeg, _base_dispatch
     cpu = _cpu_cores()
     browser = max(2, min(6, cpu // 2))
+    cap = ram_browser_cap(_total_ram_gb())
+    if cap is not None and cap < browser:
+        logger.info("RAM máy chỉ đủ ~{} browser cùng lúc — giảm từ {}.", cap, browser)
+        browser = cap
     dispatch = max(2, min(8, browser + 1))
     scheduler_pool = max(4, min(16, cpu))
     ffmpeg = 2 if cpu >= 6 else 1

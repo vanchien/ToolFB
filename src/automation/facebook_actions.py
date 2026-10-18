@@ -120,14 +120,18 @@ def save_ui_failure_screenshot(page: Page, reason: str) -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     path = _screenshots_dir() / f"error_{ts}.png"
     try:
-        page.screenshot(path=str(path), full_page=True)
+        try:
+            page.screenshot(path=str(path), full_page=True, timeout=15_000)
+        except PlaywrightTimeoutError:
+            # Trang nặng / cửa sổ ẩn: chụp toàn trang dễ quá giờ — chụp phần đang hiển thị.
+            page.screenshot(path=str(path), full_page=False, timeout=10_000, animations="disabled")
         logger.error("Đã lưu ảnh lỗi UI: {} — {}", path, reason)
     except Exception as exc:  # noqa: BLE001 — vẫn log nếu không chụp được
         msg = str(exc)
         if "Target page, context or browser has been closed" in msg or type(exc).__name__ == "TargetClosedError":
             logger.warning("Không chụp được screenshot (context đã đóng): {} — {}", reason, msg)
             return
-        logger.exception("Không thể chụp màn hình lỗi ({}): {}", reason, exc)
+        logger.error("Không thể chụp màn hình lỗi ({}): {}", reason, exc)
 
 
 def _failure_screenshot(page: Page, reason: str) -> None:
@@ -724,13 +728,13 @@ def _dismiss_leaked_native_file_dialog(page: Page) -> None:
             break
 
 
-def _enable_view_only_guard(page: Page) -> None:
+def _enable_view_only_guard(page: Page, *, force: bool = False) -> None:
     """
     Khóa thao tác chuột / cảm ứng trên vùng trang (overlay trong suốt).
     Không chặn sự kiện bàn phím toàn cục để Playwright vẫn ``type`` được; người dùng khó thao tác vì không click được xuống DOM.
     MutationObserver giữ overlay khi Facebook thay DOM (SPA).
     """
-    if not _view_only_mode_enabled():
+    if not force and not _view_only_mode_enabled():
         return
     script = """
 (() => {
@@ -798,29 +802,35 @@ def _enable_view_only_guard(page: Page) -> None:
         pass
 
 
-def register_view_only_page_hooks(page: Page) -> None:
+def register_view_only_page_hooks(page: Page, *, force: bool = False) -> None:
     """
     Sau mỗi lần tải trang (domcontentloaded), lắp lại lớp chỉ-xem.
     Gọi một lần trên ``page`` trước khi chạy luồng đăng Facebook.
     """
-    if not _view_only_mode_enabled():
+    if not force and not _view_only_mode_enabled():
         return
     if getattr(page, "_toolfb_view_only_hooks_registered", False):
         return
     setattr(page, "_toolfb_view_only_hooks_registered", True)
+    setattr(page, "_toolfb_view_only_force", bool(force))
 
     def _on_dom_content_loaded(*_args: object) -> None:
         try:
-            _enable_view_only_guard(page)
+            _enable_view_only_guard(
+                page,
+                force=bool(getattr(page, "_toolfb_view_only_force", False)),
+            )
         except Exception:
             pass
 
-    page.on("domcontentloaded", _on_dom_content_loaded)
+    try:
+        page.on("domcontentloaded", _on_dom_content_loaded)
+    except Exception:
+        return
 
 
 def _disable_view_only_guard(page: Page) -> None:
-    if not _view_only_mode_enabled():
-        return
+    """Gỡ lớp khóa. Luôn gỡ được, kể cả khi khóa được bật cưỡng bức lúc chia sẻ."""
     try:
         page.evaluate(
             """
@@ -1132,8 +1142,10 @@ def ensure_facebook_session_for_post(
         wait_for_recaptcha_and_solve,
     )
     from src.services.facebook_session_recovery import (
+        facebook_checkpoint_is_blocking,
         facebook_page_is_hard_checkpoint,
         try_recover_facebook_session,
+        try_skip_soft_facebook_checkpoint,
     )
     from src.utils.account_credentials import account_can_auto_reauth
 
@@ -1163,12 +1175,20 @@ def ensure_facebook_session_for_post(
         auto_solve_facebook_recaptcha_if_present(page, account, stage="ensure_session:start")
     url_now = page.url or ""
     if facebook_page_is_hard_checkpoint(url_now):
+        if try_skip_soft_facebook_checkpoint(page) and facebook_session_appears_logged_in(page):
+            logger.info("[FB] Đã bỏ qua checkpoint nhẹ — tiếp tục phiên.")
+            return
         if account and wait_for_recaptcha_and_solve(
             page, account, stage="ensure_session:checkpoint", wait_timeout_ms=12_000
         ):
             if facebook_session_appears_logged_in(page):
                 logger.info("[FB] CapSolver đã xử lý reCAPTCHA — tiếp tục phiên.")
                 return
+        if facebook_checkpoint_is_blocking(page) or facebook_page_is_hard_checkpoint(page.url or ""):
+            _raise_checkpoint(
+                "FACEBOOK_CHECKPOINT: Checkpoint cứng — bỏ qua TK, chạy TK tiếp "
+                "(không chờ captcha tay)."
+            )
         _raise_checkpoint(
             "FACEBOOK_CHECKPOINT: Meta yêu cầu xác minh (checkpoint/captcha/danh tính) — "
             "cấu hình CapSolver (TOOLFB_CAPSOLVER_API_KEY) hoặc xử lý tay."
@@ -1191,12 +1211,15 @@ def ensure_facebook_session_for_post(
         page.reload(wait_until="domcontentloaded", timeout=45_000)
         _force_www_facebook_if_mobile_redirect(page)
         if facebook_page_is_hard_checkpoint(page.url or ""):
+            if try_skip_soft_facebook_checkpoint(page) and facebook_session_appears_logged_in(page):
+                logger.info("[FB] Sau refresh — đã bỏ qua checkpoint nhẹ.")
+                return
             if account and wait_for_recaptcha_and_solve(
                 page, account, stage="ensure_session:after_refresh_checkpoint", wait_timeout_ms=12_000
             ):
                 if facebook_session_appears_logged_in(page):
                     return
-            _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau refresh vẫn ở checkpoint Meta.")
+            _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau refresh vẫn ở checkpoint Meta — bỏ qua TK.")
         if facebook_session_appears_logged_in(page):
             logger.info("[FB] Sau refresh, profile đã đăng nhập — bỏ qua nạp cookie.")
             return
@@ -1232,12 +1255,15 @@ def ensure_facebook_session_for_post(
     logger.info("[FB] Thử khôi phục phiên bằng cookie: {}", path)
     login_with_cookie(page, path)
     if facebook_page_is_hard_checkpoint(page.url or ""):
+        if try_skip_soft_facebook_checkpoint(page) and facebook_session_appears_logged_in(page):
+            logger.info("[FB] Sau cookie — đã bỏ qua checkpoint nhẹ.")
+            return
         if account and wait_for_recaptcha_and_solve(
             page, account, stage="ensure_session:after_cookie_checkpoint", wait_timeout_ms=12_000
         ):
             if facebook_session_appears_logged_in(page):
                 return
-        _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau nạp cookie vẫn ở checkpoint Meta.")
+        _raise_checkpoint("FACEBOOK_CHECKPOINT: Sau nạp cookie vẫn ở checkpoint Meta — bỏ qua TK.")
     if _facebook_url_is_security_interstitial(page.url or ""):
         if account and wait_for_recaptcha_and_solve(
             page,
@@ -2389,6 +2415,15 @@ _PAGE_SWITCH_CTA_CARD_JS = _PAGE_SWITCH_META_EXACT_CLICK_JS
 _PAGE_SIDEBAR_SWITCH_JS = _PAGE_SWITCH_META_EXACT_CLICK_JS
 
 
+def _facebook_content_unavailable(page: Page) -> bool:
+    """Trang «This content isn't available» không phải Page đã chuyển thành công."""
+    try:
+        body = str(page.inner_text("body", timeout=1_500) or "").casefold()
+    except Exception:
+        return False
+    return "content isn't available" in body or "nội dung này hiện không có" in body
+
+
 def _view_only_guard_active_on_page(page: Page) -> bool:
     try:
         return bool(page.evaluate("() => Boolean(window.__toolfb_view_guard_active)"))
@@ -2431,19 +2466,10 @@ def _click_meta_switch_cta_exact(page: Page, *, timeout_ms: int = 3000) -> bool:
             if loc.count() <= 0 or not loc.is_visible(timeout=1_200):
                 continue
             loc.scroll_into_view_if_needed(timeout=2_500)
-            # Firefox: ưu tiên mouse (evaluate đôi khi không kích hoạt switch thật)
-            try:
-                box = loc.bounding_box()
-                if box:
-                    page.mouse.click(
-                        box["x"] + box["width"] / 2,
-                        box["y"] + box["height"] / 2,
-                    )
-                    logger.info("[FB] Đã bấm Switch CTA (mouse tại tâm nút).")
-                    page.wait_for_timeout(2_200)
-                    return True
-            except Exception:
-                pass
+            if _mouse_click_locator_center(page, loc, label="Switch CTA"):
+                logger.info("[FB] Đã bấm Switch CTA trong trang, không chiếm chuột.")
+                page.wait_for_timeout(2_200)
+                return True
             try:
                 loc.evaluate(_PAGE_SWITCH_META_EXACT_CLICK_JS)
                 logger.info("[FB] Đã bấm Switch CTA (evaluate trên html-div/role=none).")
@@ -2881,15 +2907,10 @@ def _click_switch_profiles_popup_confirm(
             if loc.count() <= 0 or not loc.is_visible(timeout=1_200):
                 continue
             loc.scroll_into_view_if_needed(timeout=2_000)
-            try:
-                box = loc.bounding_box()
-                if box:
-                    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                    logger.info("[FB] Đã bấm Switch popup (mouse, role=button).")
-                    if _after_click_pause():
-                        return True
-            except Exception:
-                pass
+            if _mouse_click_locator_center(page, loc, label="Switch popup"):
+                logger.info("[FB] Đã bấm Switch popup trong trang, không chiếm chuột.")
+                if _after_click_pause():
+                    return True
             loc.click(timeout=min(timeout_ms, 5_000), force=True, no_wait_after=True)
             logger.info("[FB] Đã bấm Switch popup (force, role=button).")
             if _after_click_pause():
@@ -3068,11 +3089,74 @@ def _manage_page_switch_cta_still_visible(page: Page, *, timeout_ms: int = 450) 
     return _page_switch_sidebar_hint_visible(page, timeout_ms=timeout_ms)
 
 
-def _page_role_acting_as_page(page: Page, *, timeout_ms: int = 700) -> bool:
+_PAGE_BUSINESS_NAV_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Business\s+Dashboard|Bảng điều khiển doanh nghiệp", re.I),
+    re.compile(r"Ads\s+Manager|Trình quản lý quảng cáo", re.I),
+    re.compile(r"Ad\s+Center|Trung tâm quảng cáo", re.I),
+)
+
+
+def _locator_visible(loc: Any, timeout_ms: int) -> bool:
+    """True nếu locator hiện trên màn hình."""
+    try:
+        return bool(loc.first.is_visible(timeout=timeout_ms))
+    except Exception:
+        return False
+
+
+def _page_business_home_visible(page: Page, *, timeout_ms: int = 500) -> bool:
+    """
+    Home Page kiểu mới: sidebar có Business Dashboard và Ads Manager / Ad Center.
+
+    Chỉ tính khi không còn nút Switch (hàm gọi đã kiểm tra trước).
+    """
+    hits = 0
+    per = max(200, min(int(timeout_ms), 700))
+    for pat in _PAGE_BUSINESS_NAV_PATTERNS:
+        if _locator_visible(page.get_by_role("link", name=pat), per):
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
+def _composer_addresses_page(page: Page, page_display_name: str, *, timeout_ms: int = 500) -> bool:
+    """Ô «What's on your mind, {tên Page}?» — đã đứng vai trò đúng Page đó."""
+    name = str(page_display_name or "").strip()
+    if len(name) < 2:
+        return False
+    mind = re.compile(
+        rf"(What.?s on your mind|Bạn đang nghĩ gì|Bạn viết gì).{{0,16}}{re.escape(name)}",
+        re.I,
+    )
+    per = max(200, min(int(timeout_ms), 700))
+    for role in ("button", "textbox"):
+        if _locator_visible(page.get_by_role(role, name=mind), per):
+            return True
+    return _locator_visible(page.get_by_text(mind), per)
+
+
+def _slug_matches_page_display_name(current_url: str, page_display_name: str) -> bool:
+    """Slug ``QV.Entertainment305`` khớp tên «QV - Entertainment» (Facebook gắn số đuôi)."""
+    slug = _normalize_compact_page_name(_facebook_slug_from_url(current_url))
+    compact = _normalize_compact_page_name(page_display_name)
+    if len(compact) < 6 or len(slug) < 6:
+        return False
+    return slug.startswith(compact) or compact.startswith(slug)
+
+
+def _page_role_acting_as_page(
+    page: Page,
+    *,
+    timeout_ms: int = 700,
+    page_display_name: str = "",
+) -> bool:
     """
     Đã switch sang vai trò Page — không chỉ mở đúng URL (vẫn xem bằng profile cá nhân).
 
     Không được đăng Reel nếu hàm này trả False.
+    Nhận cả sidebar cũ (Professional dashboard / Insights) và home Page mới
+    (Business Dashboard + ô soạn bài ghi tên Page).
     """
     if _page_switch_ui_visible(page, timeout_ms=timeout_ms):
         return False
@@ -3094,7 +3178,9 @@ def _page_role_acting_as_page(page: Page, *, timeout_ms: int = 700) -> bool:
             return True
     except Exception:
         pass
-    return False
+    if _composer_addresses_page(page, page_display_name, timeout_ms=timeout_ms):
+        return True
+    return _page_business_home_visible(page, timeout_ms=timeout_ms)
 
 
 def _target_page_role_satisfied(
@@ -3102,14 +3188,19 @@ def _target_page_role_satisfied(
     dest: str = "",
     *,
     timeout_ms: int = 800,
+    page_display_name: str = "",
 ) -> bool:
     """Đã switch vai trò Page (và nếu có ``dest`` thì cùng Page đích hoặc slug redirect)."""
-    if not _page_role_acting_as_page(page, timeout_ms=timeout_ms):
+    pname = str(page_display_name or "").strip()
+    if not _page_role_acting_as_page(page, timeout_ms=timeout_ms, page_display_name=pname):
         return False
     d = str(dest or "").strip()
     if not d:
         return True
-    return _urls_refer_same_facebook_page(d, str(page.url or ""), page=page)
+    cur = str(page.url or "")
+    if _urls_refer_same_facebook_page(d, cur, page=page):
+        return True
+    return _slug_matches_page_display_name(cur, pname)
 
 
 def _try_click_page_match_in_scope(
@@ -3209,7 +3300,7 @@ def _require_page_role_switched(
     context: str = "reel",
 ) -> None:
     """Chặn pipeline nếu chưa switch — tránh đăng nhầm profile cá nhân."""
-    if _page_role_acting_as_page(page, timeout_ms=900):
+    if _page_role_acting_as_page(page, timeout_ms=900, page_display_name=page_display_name):
         logger.info("[FB] Xác nhận đã switch vai trò Page ({})", context)
         return
     _failure_screenshot(page, f"page_role_not_switched_{context}")
@@ -3293,22 +3384,26 @@ _CLICK_SWITCH_NOW_ANY_JS = """
 
 
 def _mouse_click_locator_center(page: Page, loc: Locator, *, label: str = "switch") -> bool:
-    """Click tâm locator bằng mouse — tránh overlay chặn Playwright click."""
+    """Bấm nút chuyển Page trong trang. Không dùng chuột hệ thống."""
+    from src.utils.dom_input import click_locator_dom, click_point_dom
+
     try:
         if not loc.is_visible(timeout=1_200):
             return False
         loc.scroll_into_view_if_needed(timeout=2_500)
+        human_pause(kind="click", label=label)
+        if click_locator_dom(loc):
+            return True
         box = loc.bounding_box()
         if box:
-            human_pause(kind="click", label=label)
-            page.mouse.click(
+            return click_point_dom(
+                page,
                 float(box["x"]) + float(box["width"]) / 2.0,
                 float(box["y"]) + float(box["height"]) / 2.0,
             )
-            return True
     except Exception:
         pass
-    return False
+    return click_locator_dom(loc)
 
 
 def _click_switch_now_banner(page: Page, *, timeout_ms: int = 2800) -> bool:
@@ -3659,7 +3754,9 @@ def _select_page_via_profile_switcher(
     waited = _wait_after_page_switch_click(
         page, page_display_name=pname, page_url=dest, timeout_ms=12_000
     )
-    return waited and _target_page_role_satisfied(page, dest, timeout_ms=1_200)
+    return waited and _target_page_role_satisfied(
+        page, dest, timeout_ms=1_200, page_display_name=pname
+    )
 
 
 def _attempt_page_role_switch_clicks(page: Page, *, timeout_ms: int = 2_200) -> bool:
@@ -3705,8 +3802,13 @@ def _try_page_role_switch_direct(
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
 
-    if _page_role_acting_as_page(page, timeout_ms=700):
-        if not dest or _urls_refer_same_facebook_page(dest, str(page.url or ""), page=page):
+    if _page_role_acting_as_page(page, timeout_ms=700, page_display_name=pname):
+        cur = str(page.url or "")
+        if (
+            not dest
+            or _urls_refer_same_facebook_page(dest, cur, page=page)
+            or _slug_matches_page_display_name(cur, pname)
+        ):
             return True
 
     if _quick_switch_on_page_surface(page, page_display_name=pname, page_url=dest):
@@ -3739,13 +3841,13 @@ def _robust_switch_to_target_page(
     if guard_was_blocking:
         _disable_view_only_guard(page)
     try:
-        if _target_page_role_satisfied(page, dest, timeout_ms=900):
+        if _target_page_role_satisfied(page, dest, timeout_ms=900, page_display_name=pname):
             logger.info("[FB] Đã ở vai trò Page đúng đích.")
             return True
 
         # ① Một lượt switch nhanh trên bề mặt Page (không lặp ensure/recovery)
         if _quick_switch_on_page_surface(page, page_display_name=pname, page_url=dest):
-            if not dest or _target_page_role_satisfied(page, dest, timeout_ms=900):
+            if not dest or _target_page_role_satisfied(page, dest, timeout_ms=900, page_display_name=pname):
                 logger.info("[FB] Switch Page OK — surface nhanh.")
                 return True
 
@@ -3768,11 +3870,12 @@ def _robust_switch_to_target_page(
                         "[FB] Switch Page OK — profile switcher từ account chính (attempt={}).",
                         switcher_attempt,
                     )
-                    if dest:
+                    if dest and not _facebook_content_unavailable(page):
                         navigate_to_url(page, dest)
-                        page.wait_for_timeout(1_400)
-                    if _target_page_role_satisfied(page, dest, timeout_ms=1_000):
-                        return True
+                        page.wait_for_timeout(1_200)
+                        if _facebook_content_unavailable(page):
+                            logger.info("[FB] Link Page báo không xem được. Giữ vai trò vừa chuyển, sang Page sau nếu cần.")
+                    return True
             if switcher_attempt >= 2:
                 break
             if not _personal_reset_confirmed(page):
@@ -3785,7 +3888,7 @@ def _robust_switch_to_target_page(
             page.wait_for_timeout(1_600)
 
         if _quick_switch_on_page_surface(page, page_display_name=pname, page_url=dest):
-            if not dest or _target_page_role_satisfied(page, dest, timeout_ms=900):
+            if not dest or _target_page_role_satisfied(page, dest, timeout_ms=900, page_display_name=pname):
                 logger.info("[FB] Switch Page OK — surface sau account chính.")
                 return True
 
@@ -3796,46 +3899,86 @@ def _robust_switch_to_target_page(
             _enable_view_only_guard(page)
 
 
+def _dismiss_open_profile_menu(page: Page) -> None:
+    """Đóng menu avatar còn mở sau khi bấm Page, để xác nhận vai trò không bị menu che."""
+    keyboard = getattr(page, "keyboard", None)
+    if keyboard is None:
+        return
+    try:
+        keyboard.press("Escape")
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        page.wait_for_timeout(700)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _ensure_page_role_switched(
     page: Page,
     *,
     page_display_name: str = "",
     page_url: str = "",
-    max_attempts: int = 2,
-    wait_timeout_ms: int = 12_000,
+    max_attempts: int = 3,
+    wait_timeout_ms: int = 18_000,
 ) -> bool:
     """
     Chuyển sang vai trò Page — ủy quyền luồng ``_robust_switch_to_target_page`` (một điểm vào).
+
+    Facebook thường chuyển xong nhưng chậm. Mỗi lần chuyển xong đều đóng menu rồi xác nhận lại.
+    Chỉ báo lỗi sau lần đầu và 2 lần replay.
 
     Returns:
         True chỉ khi **đã switch vai trò Page** (không còn CTA Switch / menu bị khóa).
     """
     pname = str(page_display_name or "").strip()
     dest = str(page_url or "").strip()
-    _ = max(1, min(int(max_attempts), 2))  # giữ API; robust đã giới hạn vòng lặp nội bộ
-    _ = wait_timeout_ms
+    attempts = max(1, min(int(max_attempts), 3))
+    confirm_ms = max(4_000, min(int(wait_timeout_ms), 20_000))
     guard_was_blocking = _view_only_guard_active_on_page(page)
     if guard_was_blocking:
         _disable_view_only_guard(page)
     try:
-        if _target_page_role_satisfied(page, dest, timeout_ms=700):
-            logger.info("[FB] Đã ở vai trò Page (không cần bấm Switch).")
-            return True
-
-        ok = _robust_switch_to_target_page(
-            page,
-            page_display_name=pname,
-            page_url=dest,
-        )
-        if ok and _target_page_role_satisfied(page, dest, timeout_ms=800):
-            return True
-        if not ok:
-            logger.warning("[FB] Vẫn chưa switch vào vai trò Page (robust thất bại).")
-            _failure_screenshot(page, "page_switch_still_visible")
-        return _target_page_role_satisfied(page, dest, timeout_ms=800)
+        for attempt in range(1, attempts + 1):
+            if _target_page_role_satisfied(
+                page, dest, timeout_ms=1_200, page_display_name=pname
+            ) and not _facebook_content_unavailable(page):
+                logger.info("[FB] Đã ở vai trò Page (không cần bấm Switch).")
+                return True
+            ok = _robust_switch_to_target_page(
+                page,
+                page_display_name=pname,
+                page_url=dest,
+            )
+            if (
+                ok
+                and _target_page_role_satisfied(
+                    page, dest, timeout_ms=min(4_000, confirm_ms), page_display_name=pname
+                )
+                and not _facebook_content_unavailable(page)
+            ):
+                return True
+            logger.info("[FB] Chuyển Page lần {} chưa xác nhận — đóng menu và chờ thêm.", attempt)
+            _dismiss_open_profile_menu(page)
+            try:
+                page.wait_for_timeout(2_000)
+            except Exception:  # noqa: BLE001
+                pass
+            if _target_page_role_satisfied(
+                page, dest, timeout_ms=confirm_ms, page_display_name=pname
+            ) and not _facebook_content_unavailable(page):
+                logger.info("[FB] Đã xác nhận vai trò Page sau khi chờ (lần {}).", attempt)
+                return True
+            if _facebook_content_unavailable(page):
+                logger.info("[FB] Link Page báo không xem được. Thử chuyển lại, không dừng chương trình.")
+            if attempt < attempts:
+                logger.info("[FB] Replay chuyển Page, lần {}/{}.", attempt + 1, attempts)
+        logger.warning("[FB] Vẫn chưa switch vào vai trò Page sau {} lần.", attempts)
+        _failure_screenshot(page, "page_switch_still_visible")
+        return False
     finally:
         if guard_was_blocking:
-            _enable_view_only_guard(page)
+            _enable_view_only_guard(page, force=True)
 
 
 def _ensure_switched_into_page_if_needed(
@@ -4769,19 +4912,28 @@ def _try_click_reel_wizard_next(page: Page) -> bool:
 
 
 def _wait_after_reel_next_click(page: Page, *, prev_label: str = "") -> None:
-    """Chờ UI chuyển màn sau Next (caption / post / hết processing)."""
+    """
+    Chờ UI chuyển màn sau Next: đổi step, có ô caption, có Post, hoặc Next mới đã xanh.
+
+    Không chờ đủ thời gian cố định — màn mới sẵn sàng là đi tiếp, chỉ nghỉ ngắn giống người.
+    """
     inner = time.time() + 20.0
+    settled_without_change = 0
     while time.time() < inner:
+        page.wait_for_timeout(250)
         if prev_label and _reel_active_step_label(page) != prev_label:
             break
-        if _reel_caption_input_usable(page, timeout_ms=320):
+        if _reel_caption_input_usable(page, timeout_ms=250):
             break
-        if _reel_post_button_maybe_visible(page, timeout_ms=320):
+        if _reel_post_button_maybe_visible(page, timeout_ms=250):
             break
-        if not _reel_wizard_processing(page, timeout_ms=220):
+        if _reel_wizard_processing(page, timeout_ms=200):
+            settled_without_change = 0
+            continue
+        settled_without_change += 1
+        if settled_without_change >= 6:
             break
-        page.wait_for_timeout(320)
-    page.wait_for_timeout(random.randint(700, 1400))
+    page.wait_for_timeout(_reel_inter_click_wait_ms())
 
 
 def _reel_wizard_needs_next(
@@ -5983,15 +6135,55 @@ def _reel_scope_upload_ready(scope: Locator) -> bool:
     return False
 
 
-def _reel_composer_already_visible(page: Page) -> bool:
-    """True khi wizard/dialog upload Reel đã mở (Create có thể bỏ qua menu Reel)."""
+_NON_COMPOSER_DIALOG_RE = re.compile(r"Messenger|Chats?\b|Đoạn chat|Notifications|Thông báo", re.I)
+
+
+def _visible_composer_dialog(page: Page) -> Locator | None:
+    """Dialog đang hiển thị gần nhất, bỏ qua khung Messenger/thông báo ẩn mà Facebook luôn gắn sẵn."""
+    dialogs = page.locator("[role='dialog']")
     try:
-        dlg = page.locator("[role='dialog']").last
-        if dlg.count() > 0 and dlg.is_visible(timeout=450) and _reel_scope_upload_ready(dlg):
-            return True
+        cnt = int(dialogs.count())
     except Exception:
-        pass
-    return _reel_scope_upload_ready(page)
+        return None
+    for i in range(cnt - 1, -1, -1):
+        dlg = dialogs.nth(i)
+        try:
+            if not dlg.is_visible():
+                continue
+            label = str(dlg.get_attribute("aria-label", timeout=500) or "")
+        except Exception:
+            continue
+        if _NON_COMPOSER_DIALOG_RE.search(label):
+            continue
+        return dlg
+    return None
+
+
+def _on_reel_create_url(page: Page) -> bool:
+    """Đang ở trang tạo Reel dạng toàn trang (không phải popup)."""
+    url = str(page.url or "").lower()
+    return "reels/create" in url or "create_reel" in url
+
+
+def _reel_composer_already_visible(page: Page) -> bool:
+    """True khi wizard/dialog upload Reel đã mở thật (Create có thể bỏ qua menu Reel)."""
+    dlg = _visible_composer_dialog(page)
+    if dlg is not None and _reel_scope_upload_ready(dlg):
+        return True
+    return _on_reel_create_url(page) and _reel_scope_upload_ready(page)
+
+
+def _wait_reel_composer_scope(page: Page, *, timeout_s: float) -> Locator | None:
+    """Chờ popup Reel (hoặc trang tạo Reel) sẵn sàng; trả về vùng thao tác hoặc None."""
+    deadline = time.time() + max(1.0, timeout_s)
+    while time.time() < deadline:
+        dlg = _visible_composer_dialog(page)
+        if dlg is not None and _reel_scope_upload_ready(dlg):
+            return dlg
+        if _on_reel_create_url(page) and _reel_scope_upload_ready(page):
+            return page.locator("body")
+        page.wait_for_timeout(400)
+    return None
 
 
 def _locate_create_post_menu(page: Page) -> Locator:
@@ -6010,6 +6202,28 @@ def _locate_create_post_menu(page: Page) -> Locator:
             except Exception:
                 continue
     return page.locator("body")
+
+
+def _wait_content_library_ready(page: Page, *, timeout_ms: int = 12_000) -> bool:
+    """Chờ Content Library hiện nút Create (sidebar hoặc vùng chính) — sẵn sàng là đi tiếp."""
+    deadline = time.time() + max(1.0, timeout_ms / 1000.0)
+    page.wait_for_timeout(600)
+    while time.time() < deadline:
+        if _reel_composer_already_visible(page):
+            return True
+        for loc in (
+            page.get_by_role("button", name=_CREATE_SIDEBAR_POST_RE),
+            _locator_sidebar_create_a_post(page),
+            _locator_main_content_create(page),
+        ):
+            try:
+                if loc.first.is_visible(timeout=200):
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(300)
+    logger.info("[Reel] Content Library chưa thấy nút Create sau {} ms — vẫn thử bấm.", timeout_ms)
+    return False
 
 
 def _create_post_menu_visible(page: Page, *, timeout_ms: int = 500) -> bool:
@@ -7146,14 +7360,19 @@ def _click_reel_post_locator(
                     return
             except Exception:
                 pass
+        from src.utils.dom_input import click_locator_dom, click_point_dom
+
         box = target.bounding_box()
-        if box:
-            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-            logger.info("{} [POST_TARGET] reel_post_mouse_click {}", stage, tag)
+        if box and click_point_dom(
+            page,
+            float(box["x"]) + float(box["width"]) / 2,
+            float(box["y"]) + float(box["height"]) / 2,
+        ):
+            logger.info("{} [POST_TARGET] reel_post_dom_click {}", stage, tag)
             page.wait_for_timeout(max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 500)))
             return
-        target.click(timeout=1400, force=True, no_wait_after=True)
-        logger.info("{} [POST_TARGET] reel_post_force_click {}", stage, tag)
+        if click_locator_dom(target):
+            logger.info("{} [POST_TARGET] reel_post_dom_locator {}", stage, tag)
         page.wait_for_timeout(max(350, _env_int("FB_REEL_POST_CLICK_SETTLE_MS", 500)))
     finally:
         if guard_on:
@@ -7433,7 +7652,12 @@ def _input_reel_title_content_and_hashtags(
 
 
 def _active_reel_dialog(page: Page) -> Locator:
-    """Dialog Reel hiện tại — luôn lấy mới sau mỗi Next (tránh locator cũ detached)."""
+    """Dialog Reel hiện tại — luôn lấy mới sau mỗi Next (tránh locator cũ detached), bỏ qua Messenger ẩn."""
+    dlg = _visible_composer_dialog(page)
+    if dlg is not None:
+        return dlg
+    if _on_reel_create_url(page):
+        return page.locator("body")
     return page.locator("[role='dialog']").last
 
 
@@ -7894,9 +8118,31 @@ def complete_reel_wizard_fill_next_and_post(
 
     logger.info("{} Bắt đầu wizard (submit_mode={}): payload={} ký tự.", stage, mode, len(payload))
     _mute_browser_video_previews_after_attach(page, attempts=3)
+    started_at = time.time()
+    last_beat = started_at
 
     while time.time() < deadline:
+        if time.time() - last_beat >= 20.0:
+            last_beat = time.time()
+            _fire(
+                "WAIT",
+                _reel_wizard_status_text(page, started_at=started_at, next_clicks=next_clicks, filled=filled),
+            )
         _mute_browser_video_previews(page, silent=True)
+        need_caption_here = bool(payload) and not filled and _reel_caption_input_usable(page, timeout_ms=300)
+        if (
+            not need_caption_here
+            and next_clicks < max_next_clicks
+            and _meta_reel_next_clickable(page)
+            and not _reel_strict_post_button_visible(page, timeout_ms=250)
+        ):
+            before = _reel_active_step_label(page)
+            _fire("CLICK_NEXT", f"Next đã sẵn sàng — bấm ngay (lần {next_clicks + 1}).")
+            if _try_click_reel_wizard_next(page):
+                next_clicks += 1
+                _wait_after_reel_next_click(page, prev_label=before)
+                continue
+
         if _try_submit():
             return next_clicks, filled, post_clicked
 
@@ -7910,7 +8156,7 @@ def complete_reel_wizard_fill_next_and_post(
                     return next_clicks, filled, post_clicked
             else:
                 logger.warning("{} Nhập caption thất bại — thử lại.", stage)
-            page.wait_for_timeout(random.randint(500, 1100))
+            page.wait_for_timeout(_reel_inter_click_wait_ms())
             continue
 
         if filled and _reel_settings_screen_visible(page, timeout_ms=400):
@@ -7936,7 +8182,7 @@ def complete_reel_wizard_fill_next_and_post(
                 logger.warning("{} Next visible nhưng click thất bại (lần {}).", stage, next_clicks + 1)
 
         if _reel_wizard_processing(page, timeout_ms=350):
-            page.wait_for_timeout(random.randint(900, 1800))
+            page.wait_for_timeout(400)
             continue
 
         if _reel_strict_post_button_usable(page, timeout_ms=450) and _try_submit():
@@ -7946,7 +8192,7 @@ def complete_reel_wizard_fill_next_and_post(
             page.wait_for_timeout(500)
             continue
 
-        page.wait_for_timeout(450)
+        page.wait_for_timeout(300)
 
     if payload and not filled and _reel_caption_input_usable(page, timeout_ms=800):
         filled = _fill_reel_dashboard_caption(page, title=title, content=content, hashtags=hashtags)
@@ -7965,15 +8211,38 @@ def complete_reel_wizard_fill_next_and_post(
         )
         return next_clicks, filled, post_clicked
 
+    status = _reel_wizard_status_text(page, started_at=started_at, next_clicks=next_clicks, filled=filled)
     _failure_screenshot(page, "reel_wizard_fill_next_post_timeout")
     if payload and not filled:
         raise PlaywrightTimeoutError(
-            f"Sau {next_clicks} lần Next vẫn chưa nhập được caption (có payload)."
+            f"Sau {next_clicks} lần Next vẫn chưa nhập được caption (có payload). Trạng thái cuối: {status}"
         )
     submit_label = "Post" if mode == "post" else "Share" if mode == "share" else "Post/Share"
     raise PlaywrightTimeoutError(
-        f"Sau {next_clicks} lần Next không thấy {submit_label}. Xem logs/screenshots."
+        f"Sau {next_clicks} lần Next không thấy {submit_label}. Trạng thái cuối: {status}. Xem logs/screenshots."
     )
+
+
+def _reel_wizard_status_text(page: Page, *, started_at: float, next_clicks: int, filled: bool) -> str:
+    """Mô tả ngắn wizard Reel đang ở đâu (dùng cho log nhịp tim và thông báo lỗi)."""
+
+    def _safe(fn: Callable[[], Any], default: Any) -> Any:
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            return default
+
+    label = _safe(lambda: _reel_active_step_label(page), "") or "?"
+    processing = _safe(lambda: _reel_wizard_processing(page, timeout_ms=200), False)
+    next_ok = _safe(lambda: _meta_reel_next_clickable(page), False)
+    post_seen = _safe(lambda: _reel_strict_post_button_visible(page, timeout_ms=200), False)
+    elapsed = int(time.time() - started_at)
+    bits = [f"đã chờ {elapsed}s", f"bước «{label}»", f"Next×{next_clicks}"]
+    bits.append("video đang xử lý" if processing else "không thấy xử lý video")
+    bits.append("Next bấm được" if next_ok else "Next chưa bấm được")
+    bits.append("thấy Post" if post_seen else "chưa thấy Post")
+    bits.append("đã nhập caption" if filled else "chưa nhập caption")
+    return ", ".join(bits)
 
 
 def advance_reel_wizard_until_description_input(
@@ -8165,7 +8434,9 @@ def post_reel_via_page_dashboard(
         page_display_name=str(page_display_name or "").strip(),
     )
     try:
-        page.mouse.wheel(0, 420)
+        from src.utils.dom_input import scroll_by_dom
+
+        scroll_by_dom(page, 420)
     except Exception:
         pass
     _step_pause(900, 1800, label="sau OPEN_PAGE_CONTEXT")
@@ -8180,8 +8451,8 @@ def post_reel_via_page_dashboard(
     _step("OPEN_CONTENT_LIBRARY", "Mở Professional Dashboard Content Library.")
     dash_url = "https://www.facebook.com/professional_dashboard/content/content_library/"
     page.goto(dash_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(4000)
-    _step_pause(1200, 2400, label="sau OPEN_CONTENT_LIBRARY")
+    _wait_content_library_ready(page, timeout_ms=12_000)
+    _step_pause(700, 1400, label="sau OPEN_CONTENT_LIBRARY")
     cur = str(page.url or "").lower()
     if "professional_dashboard" not in cur:
         _failure_screenshot(page, "reel_dashboard_not_reachable")
@@ -8196,13 +8467,25 @@ def post_reel_via_page_dashboard(
             "Kiểm tra quyền Page và ngôn ngữ UI (English/Việt)."
         )
     logger.info("{} Mở Reel composer qua: {}.", stage, open_via)
-    _step_pause(900, 1900, label="sau CLICK_CREATE")
 
     _step("SELECT_REEL", "Đã chọn Reel trong menu (hoặc composer mở sẵn).")
-    _step_pause(1400, 2600, label="sau SELECT_REEL")
+    _step_pause(700, 1400, label="sau SELECT_REEL")
     _step("WAIT_REEL_POPUP", "Chờ popup Reel xuất hiện.")
-    dialog = page.locator("[role='dialog']").last
-    dialog.wait_for(state="visible", timeout=25_000)
+    dialog = _wait_reel_composer_scope(page, timeout_s=12)
+    if dialog is None:
+        logger.warning("{} Chưa thấy popup Reel sau Create — mở lại composer (menu Create → Reel / URL tạo Reel).", stage)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        if _open_reel_composer_from_content_library(page) or _open_reel_composer_direct(page):
+            dialog = _wait_reel_composer_scope(page, timeout_s=15)
+    if dialog is None:
+        _failure_screenshot(page, "reel_popup_not_visible")
+        raise PlaywrightTimeoutError(
+            "Không thấy popup tạo Reel sau khi bấm Create → Reel (đã thử mở lại). "
+            "Kiểm tra quyền Page hoặc giao diện Content Library."
+        )
     # Sau khi popup xuất hiện, chờ state ổn định.
     # Lưu ý: UI Create reel thường CHƯA có Next trước khi upload, và input[type=file]
     # có thể ẩn. Vì vậy cần chấp nhận tín hiệu "Add video"/"Upload" là ready.
@@ -8229,14 +8512,14 @@ def post_reel_via_page_dashboard(
         if has_file or has_next or has_add_video or has_upload:
             ready = True
             break
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(250)
     if not ready:
         # Không fail cứng ở đây nữa: để bước UPLOAD_VIDEO thử nhiều chiến lược import.
         logger.warning(
             "{} Popup Reel chưa thấy marker ready rõ ràng; tiếp tục thử import video trực tiếp.",
             stage,
         )
-    _step_pause(900, 1700, label="sau WAIT_REEL_POPUP")
+    _step_pause(500, 1000, label="sau WAIT_REEL_POPUP")
 
     _step("UPLOAD_VIDEO", f"Upload video: {video_path}")
     uploaded = _attach_media_automatic(
@@ -8255,8 +8538,7 @@ def post_reel_via_page_dashboard(
         )
     logger.info("{} Đã import video tự động (không popup OS chọn file)", stage)
 
-    page.wait_for_timeout(1800)
-    # Chờ upload thực sự được nhận trước khi Next.
+    # Chờ upload thực sự được nhận trước khi Next — kiểm tra liên tục, thấy Next xanh là đi tiếp.
     upload_deadline = time.time() + 120.0
     upload_ok = False
     processing_re = re.compile(r"Processing|Uploading|Đang xử lý|đang tải", re.I)
@@ -8306,20 +8588,21 @@ def post_reel_via_page_dashboard(
                 publish_ready,
             )
             break
-        page.wait_for_timeout(450)
+        page.wait_for_timeout(300)
     if not upload_ok:
         _failure_screenshot(page, "reel_upload_not_accepted")
         raise PlaywrightTimeoutError("Đã import video nhưng UI chưa nhận upload (placeholder vẫn còn / Next chưa sẵn sàng).")
 
-    dialog = _active_reel_dialog(page)
-    _mute_browser_video_previews_after_attach(page, scope=dialog)
-    _step_pause(1200, 2600, label="sau UPLOAD_VIDEO")
-    _mute_browser_video_previews_after_attach(page, scope=_active_reel_dialog(page), attempts=3)
+    _mute_browser_video_previews(page, scope=_active_reel_dialog(page), silent=True)
+    page.wait_for_timeout(_reel_inter_click_wait_ms())
 
-    ui_way = detect_meta_reel_ui_way(page)
-    if ui_way == "unknown":
-        page.wait_for_timeout(1500)
+    if _meta_reel_next_clickable(page):
+        ui_way = "way1"
+    else:
         ui_way = detect_meta_reel_ui_way(page)
+        if ui_way == "unknown":
+            page.wait_for_timeout(800)
+            ui_way = detect_meta_reel_ui_way(page)
     if ui_way == "unknown" and _meta_reel_next_any_visible(page):
         ui_way = "way1"
     if ui_way == "unknown":
@@ -8421,10 +8704,10 @@ def post_reel_via_page_dashboard(
             page.wait_for_timeout(5000)
 
     snippet = (payload_text or "").strip()[:200] or None
-    delay_ms = max(5000, _env_int("FB_REEL_POST_VERIFY_DELAY_MS", 5000))
+    delay_ms = max(1500, _env_int("FB_REEL_POST_VERIFY_DELAY_MS", 5000))
     _step(
         "VERIFY_POST_SUBMITTED",
-        f"Đã bấm Post — chờ {delay_ms}ms load rồi xác nhận video trên Page.",
+        f"Đã bấm Post — chờ tối đa {delay_ms}ms, có tín hiệu đã đăng thì xác nhận ngay.",
     )
     verify_reel_dashboard_post_submitted(
         page,
@@ -8817,9 +9100,15 @@ def verify_reel_dashboard_post_submitted(
         raise RuntimeError(
             "VERIFY_REEL: Chưa xác nhận được đã bấm nút Post trong wizard. need_manual_check"
         )
-    delay_ms = max(5000, int(post_verify_delay_ms or _env_int("FB_REEL_POST_VERIFY_DELAY_MS", 5000)))
-    logger.info("{} Chờ {} ms sau Post trước khi xác nhận đăng.", stage, delay_ms)
-    page.wait_for_timeout(delay_ms)
+    delay_ms = max(1500, int(post_verify_delay_ms or _env_int("FB_REEL_POST_VERIFY_DELAY_MS", 5000)))
+    logger.info("{} Chờ tối đa {} ms sau Post — có tín hiệu đã đăng thì xác nhận ngay.", stage, delay_ms)
+    page.wait_for_timeout(1200)
+    signal_deadline = time.time() + max(0.0, (delay_ms - 1200) / 1000.0)
+    while time.time() < signal_deadline:
+        if _reel_post_submit_strong_signal(page, timeout_ms=250):
+            logger.info("{} Đã thấy tín hiệu Post được nhận — xác nhận ngay.", stage)
+            break
+        page.wait_for_timeout(350)
 
     try:
         verify_post_submitted(
@@ -8855,7 +9144,12 @@ def verify_reel_dashboard_post_submitted(
                 pass
 
     _navigate_meta_published_posts_best_effort(page, page_url=page_url)
-    page.wait_for_timeout(max(3000, delay_ms // 2))
+    published_deadline = time.time() + max(3.0, delay_ms / 2000.0)
+    while time.time() < published_deadline:
+        if _meta_published_posts_has_video_row(page, timeout_ms=300):
+            logger.info("{} Đã thấy video/reel trong danh sách Published của Page.", stage)
+            return
+        page.wait_for_timeout(400)
     if _meta_published_posts_has_video_row(page, timeout_ms=8_000):
         logger.info("{} Đã thấy video/reel trong danh sách Published của Page.", stage)
         return

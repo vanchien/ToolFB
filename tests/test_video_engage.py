@@ -13,6 +13,7 @@ from src.services.facebook_groups.video_engage import (
     clamp_watch_max_minutes,
     clamp_watch_seconds,
     engage_source_video,
+    like_open_video,
     share_open_video,
     optional_watch_bounds,
     parse_comment_lines,
@@ -46,6 +47,9 @@ class _Control:
 
     def type(self, text: str, delay: int = 0) -> None:
         del delay
+        self.typed = text
+
+    def fill(self, text: str) -> None:
         self.typed = text
 
     def press(self, key: str) -> None:
@@ -132,10 +136,88 @@ def test_comment_opens_after_watch_and_ignores_like() -> None:
     page.comment.type = typed
     result = engage_source_video(page, watch_seconds=2, comment="Dưới video")
     assert result["commented"] is True
-    assert steps == ["watch", "watch", "comment"]
+    assert steps[:3] == ["watch", "watch", "comment"]
     assert page.play.clicked is True
     assert opener.clicked is True
     assert page.like.clicked is False
+
+
+def test_comment_bubble_icon_opens_the_box() -> None:
+    page = _Page("https://www.facebook.com/reel/1")
+    page.comment.visible = False
+    icon = _Control("")
+
+    def click(timeout: int = 0) -> None:
+        del timeout
+        icon.clicked = True
+        page.comment.visible = True
+
+    icon.click = click
+
+    def evaluate_handle(script: str):
+        assert "M12 .5C18.351" in script
+        return icon
+
+    page.evaluate_handle = evaluate_handle
+    result = engage_source_video(page, watch_seconds=0, comment="Hay quá")
+    assert result["commented"] is True
+    assert icon.clicked is True
+    assert page.comment.typed == "Hay quá"
+    assert page.like.clicked is False
+
+
+def _timeline_page() -> tuple[_Page, list[tuple[str, int]]]:
+    """Trang giả ghi lại lúc Like / bình luận xảy ra so với tổng thời gian đã chờ."""
+    page = _Page("https://www.facebook.com/reel/1")
+    events: list[tuple[str, int]] = []
+    original_wait = page.wait_for_timeout
+    original_like = page.like.click
+    original_type = page.comment.type
+
+    def like_click(timeout: int = 0) -> None:
+        original_like(timeout)
+        events.append(("like", sum(page.waits)))
+
+    def typed(text: str, delay: int = 0) -> None:
+        original_type(text, delay=delay)
+        events.append(("comment", sum(page.waits)))
+
+    page.wait_for_timeout = original_wait
+    page.like.click = like_click
+    page.comment.type = typed
+    return page, events
+
+
+def test_like_and_comment_happen_while_watching_one_at_a_time() -> None:
+    """Video dài: Like và bình luận chen vào giữa lúc xem, từng việc một, rồi xem nốt."""
+    page, events = _timeline_page()
+    result = engage_source_video(
+        page, watch_seconds=12, comment="Hay", like=True, rng=random.Random(3)
+    )
+    assert result["liked"] is True and result["commented"] is True
+    assert sorted(name for name, _ in events) == ["comment", "like"]
+    assert events[0][1] >= 1_000, "đã xem một lúc mới bấm"
+    assert events[0][1] < events[1][1], "hai việc không cùng lúc"
+    assert sum(page.waits) - events[1][1] >= 1_000, "sau việc cuối vẫn xem tiếp"
+    assert sum(page.waits) >= 12_000
+
+
+def test_like_comment_order_is_random() -> None:
+    """Like trước hay bình luận trước đều được — đổi theo từng lần."""
+    orders = set()
+    for seed in range(12):
+        page, events = _timeline_page()
+        engage_source_video(page, watch_seconds=10, comment="Hay", like=True, rng=random.Random(seed))
+        orders.add(tuple(name for name, _ in events))
+    assert orders == {("like", "comment"), ("comment", "like")}
+
+
+def test_short_video_likes_and_comments_after_watching() -> None:
+    """Video ngắn (dưới 6 giây) xem xong mới Like và bình luận."""
+    page, events = _timeline_page()
+    result = engage_source_video(page, watch_seconds=3, comment="Hay", like=True, rng=random.Random(1))
+    assert result["liked"] is True and result["commented"] is True
+    assert all(at >= 3_000 for _, at in events)
 
 
 def test_checkpoint_stops_before_watch() -> None:
@@ -204,14 +286,12 @@ def test_watch_bounds_are_random_per_page() -> None:
     assert len(drawn) > 1
 
 
-def test_share_now_picks_the_page_name_and_not_the_video_button() -> None:
+def test_share_dialog_without_page_menu_clicks_share_now() -> None:
     page = _Page("https://www.facebook.com/reel/9")
     video_share = _Control("Share this reel")
     share_now = _Control("Share now")
-    page_row = _Control("Cửa hàng")
-    post = _Control("Post")
     page._roles = {
-        "button": [video_share, share_now, page_row, post],
+        "button": [video_share, share_now],
         "textbox": [_Control("Say something")],
         "menuitem": [],
     }
@@ -219,9 +299,6 @@ def test_share_now_picks_the_page_name_and_not_the_video_button() -> None:
     assert sent["error_code"] == ""
     assert video_share.clicked is True
     assert share_now.clicked is True
-    assert page_row.clicked is True
-    assert post.clicked is True
-    assert page.keyboard.keys[-1] == "Escape"
 
 
 def test_share_button_on_the_video_goes_to_page_then_group() -> None:
@@ -257,6 +334,313 @@ def test_share_button_on_the_video_goes_to_page_then_group() -> None:
     assert group.clicked is True
     assert post.clicked is True
     assert caption.typed == "Vào nhóm"
+
+
+def test_reel_share_arrow_icon_opens_the_page_sheet() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    icon = _Control("")
+    to_page = _Control("Share to a Page")
+    own_page = _Control("Cửa hàng")
+    post = _Control("Post")
+    page._roles = {
+        "button": [page.like, to_page, own_page, post],
+        "textbox": [],
+        "menuitem": [],
+    }
+
+    def evaluate_handle(script: str):
+        assert "M12.863 3.156A.504.504" in script
+        return icon
+
+    page.evaluate_handle = evaluate_handle
+    sent = share_open_video(page, kind="page", target_id="111", target_name="Cửa hàng")
+    assert sent["error_code"] == ""
+    assert icon.clicked is True
+    assert to_page.clicked is True
+    assert own_page.clicked is True
+    assert post.clicked is True
+    assert page.like.clicked is False
+
+
+def test_reel_share_count_label_goes_to_the_page() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    like = _Control("Like, 5 likes")
+    share = _Control("Share, 0 shares")
+    to_page = _Control("Share to a Page")
+    own_page = _Control("Minh Tuyết Family")
+    post = _Control("Post")
+    page._roles = {
+        "button": [like, share, to_page, own_page, post],
+        "textbox": [],
+        "menuitem": [],
+    }
+    sent = share_open_video(
+        page,
+        kind="page",
+        target_id="111",
+        target_name="Minh Tuyết Family",
+        caption="",
+        like=True,
+    )
+    assert sent["error_code"] == ""
+    assert like.clicked is True
+    assert share.clicked is True
+    assert to_page.clicked is True
+    assert own_page.clicked is True
+    assert post.clicked is True
+
+
+def test_exact_page_name_wins_over_a_longer_name() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    share = _Control("Share, 0 shares")
+    to_page = _Control("Share to a Page")
+    longer = _Control("Life of Mine")
+    exact = _Control("Life")
+    post = _Control("Post")
+    page._roles = {
+        "button": [share, to_page, longer, exact, post],
+        "textbox": [],
+        "menuitem": [],
+    }
+    sent = share_open_video(page, kind="page", target_id="111", target_name="Life")
+    assert sent["error_code"] == ""
+    assert exact.clicked is True
+    assert longer.clicked is False
+    assert post.clicked is True
+
+
+def test_search_box_finds_a_page_below_the_fold() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    share = _Control("Share")
+    to_page = _Control("Share to a Page")
+    search = _Control("Search for a Page")
+    hidden = _Control("Cửa hàng xa")
+    hidden.visible = False
+    post = _Control("Post")
+
+    def typed(text: str, delay: int = 0) -> None:
+        del delay
+        search.typed = text
+        hidden.visible = True
+
+    search.type = typed  # type: ignore[method-assign]
+    page._roles = {
+        "button": [share, to_page, hidden, post],
+        "textbox": [search],
+        "menuitem": [],
+    }
+    sent = share_open_video(page, kind="page", target_id="111", target_name="Cửa hàng xa")
+    assert sent["error_code"] == ""
+    assert search.typed == "Cửa hàng xa"
+    assert hidden.clicked is True
+    assert post.clicked is True
+
+
+def test_share_now_span_is_clicked_when_it_is_not_a_button() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    share = _Control("Share")
+    now = _Control("Share now")
+    caption = _Control("Say something about this")
+    page._roles = {"button": [share], "textbox": [caption], "menuitem": []}
+
+    def evaluate_handle(script: str):
+        assert "share now" in script
+        return now
+
+    page.evaluate_handle = evaluate_handle
+    sent = share_open_video(page, kind="page", target_id="111", target_name="RicardoInfor", caption="Lên page")
+    assert sent["error_code"] == ""
+    assert share.clicked is True
+    assert now.clicked is True
+    assert caption.typed == "Lên page"
+
+
+def test_reel_end_to_end_opens_share_box_then_clicks_share_now() -> None:
+    """Reel: bình luận, Like, mũi tên chia sẻ, hộp Share hiện ra, bấm Share now."""
+    page = _Page("https://www.facebook.com/reel/9")
+    like = _Control("Like")
+    react = _Control("React")
+    comment_icon = _Control("")
+    share_icon = _Control("")
+    now = _Control("Share now")
+    feed = _Control("Feed")
+    public = _Control("Public")
+    whatsapp = _Control("WhatsApp")
+    story = _Control("Your story")
+    copy = _Control("Copy link")
+    group = _Control("Group")
+    caption = _Control("Say something about this")
+    page.comment.visible = False
+    page._roles = {
+        "button": [page.play, like, react, feed, public, whatsapp, story, copy, group],
+        "textbox": [page.comment, caption],
+        "menuitem": [],
+    }
+    order: list[str] = []
+
+    def mark(name: str, control: _Control):
+        original = control.click
+
+        def click(timeout: int = 0) -> None:
+            original(timeout)
+            order.append(name)
+            if name == "comment":
+                page.comment.visible = True
+
+        control.click = click
+
+    mark("like", like)
+    mark("comment", comment_icon)
+    mark("share", share_icon)
+    mark("now", now)
+
+    def evaluate(script: str):
+        if "M10.999.5a2.5" in script:
+            return "ready"
+        if "share now" in script:
+            return True
+        return ""
+
+    def evaluate_handle(script: str):
+        if "M12 .5C18.351" in script:
+            return comment_icon
+        if "M12.863 3.156A.504.504" in script:
+            return share_icon
+        if "M10.999.5a2.5" in script:
+            return like
+        if "share now" in script:
+            return now
+        raise AssertionError(script[:48])
+
+    page.evaluate = evaluate
+    page.evaluate_handle = evaluate_handle
+    watched = engage_source_video(page, watch_seconds=0, comment="")
+    liked = like_open_video(page)
+    commented = engage_source_video(page, watch_seconds=0, comment="Hay quá")
+    sent = share_open_video(page, kind="page", target_id="111", target_name="RicardoInfor", caption="Lên page")
+    assert watched["commented"] is False
+    assert liked is True
+    assert commented["commented"] is True
+    assert sent["error_code"] == ""
+    assert page.comment.typed == "Hay quá"
+    assert caption.typed == "Lên page"
+    assert order.index("like") < order.index("comment") < order.index("share") < order.index("now")
+    assert react.clicked is False
+    assert feed.clicked is False
+    assert public.clicked is False
+    assert whatsapp.clicked is False
+    assert story.clicked is False
+    assert copy.clicked is False
+    assert group.clicked is False
+
+
+def test_page_share_does_not_post_with_share_now() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    share = _Control("Share")
+    to_page = _Control("Share to a Page")
+    own_page = _Control("Cửa hàng")
+    share_now = _Control("Share now")
+    page._roles = {
+        "button": [share, to_page, own_page, share_now],
+        "textbox": [],
+        "menuitem": [],
+    }
+    sent = share_open_video(page, kind="page", target_id="111", target_name="Cửa hàng")
+    assert sent["error_code"] == "TIMEOUT"
+    assert own_page.clicked is True
+    assert share_now.clicked is False
+
+
+def test_reel_rail_comments_likes_then_shares_to_the_page() -> None:
+    """Cột Reel: bình luận bằng bong bóng, Like bằng ngón tay, chia sẻ bằng mũi tên, rồi gửi Page."""
+    page = _Page("https://www.facebook.com/reel/9")
+    like = _Control("Like")
+    react = _Control("React")
+    comment_icon = _Control("")
+    share_icon = _Control("")
+    to_page = _Control("Share to a Page")
+    own_page = _Control("Cửa hàng")
+    post = _Control("Post")
+    page.comment.visible = False
+    page._roles = {
+        "button": [page.play, like, react, to_page, own_page, post],
+        "textbox": [page.comment],
+        "menuitem": [],
+    }
+    order: list[str] = []
+
+    def mark(name: str, control: _Control):
+        original = control.click
+
+        def click(timeout: int = 0) -> None:
+            original(timeout)
+            order.append(name)
+            if name == "comment":
+                page.comment.visible = True
+
+        control.click = click
+
+    mark("like", like)
+    mark("comment", comment_icon)
+    mark("share", share_icon)
+
+    def evaluate(script: str) -> str:
+        if "M10.999.5a2.5" in script:
+            return "ready"
+        return ""
+
+    def evaluate_handle(script: str):
+        if "M12 .5C18.351" in script:
+            return comment_icon
+        if "M12.863 3.156A.504.504" in script:
+            return share_icon
+        if "M10.999.5a2.5" in script:
+            return like
+        raise AssertionError(script[:40])
+
+    page.evaluate = evaluate
+    page.evaluate_handle = evaluate_handle
+
+    watched = engage_source_video(page, watch_seconds=0, comment="Hay quá")
+    sent = share_open_video(page, kind="page", target_id="111", target_name="Cửa hàng", like=True)
+    assert watched["commented"] is True
+    assert sent["error_code"] == ""
+    assert page.comment.typed == "Hay quá"
+    assert order[0] == "comment"
+    assert order.index("like") < order.index("share")
+    assert react.clicked is False
+    assert to_page.clicked is True
+    assert own_page.clicked is True
+    assert post.clicked is True
+
+
+def test_reel_like_is_the_thumbs_up_not_the_react_button() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    react = _Control("React")
+    like = _Control("Like")
+    page._roles["button"] = [react]
+
+    def evaluate(script: str) -> str:
+        assert "M10.999.5a2.5" in script
+        return "ready"
+
+    def evaluate_handle(script: str):
+        assert "M10.999.5a2.5" in script
+        return like
+
+    page.evaluate = evaluate
+    page.evaluate_handle = evaluate_handle
+    assert like_open_video(page) is True
+    assert like.clicked is True
+    assert react.clicked is False
+
+
+def test_like_video_skips_a_button_already_pressed() -> None:
+    page = _Page("https://www.facebook.com/reel/9")
+    liked = _Control("Unlike")
+    page._roles["button"] = [liked]
+    assert like_open_video(page) is False
+    assert liked.clicked is False
 
 
 def test_browse_reels_moves_down_without_clicking() -> None:

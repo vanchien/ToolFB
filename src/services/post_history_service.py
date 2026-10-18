@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import random
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -73,12 +74,26 @@ class PostHistoryService:
     def _load_raw(self, page_id: str) -> dict[str, Any]:
         ensure_page_workspace(page_id)
         path = _history_path(page_id)
-        if not path.is_file():
-            return {"entries": []}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"entries": []}
+        from src.utils.json_store_lock import json_file_lock
+
+        last_exc: Exception | None = None
+        with json_file_lock(path):
+            if not path.is_file():
+                return {"entries": []}
+            for attempt in range(4):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    break
+                except (OSError, json.JSONDecodeError) as exc:
+                    last_exc = exc
+                    time.sleep(0.05 * (attempt + 1))
+            else:
+                logger.warning(
+                    "Không đọc được lịch sử đăng {} — dùng danh sách trống: {}",
+                    path,
+                    last_exc,
+                )
+                return {"entries": []}
         if not isinstance(data, dict):
             return {"entries": []}
         entries = data.get("entries")
@@ -90,26 +105,29 @@ class PostHistoryService:
         return list(self._load_raw(page_id)["entries"])
 
     def _atomic_write(self, path: Path, payload: dict[str, Any]) -> None:
+        from src.utils.json_store_lock import json_file_lock
+
         path.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         d = path.parent
-        fd, tmp = tempfile.mkstemp(prefix="hist_", suffix=".tmp.json", dir=str(d))
-        try:
-            import os
-
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(text)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except Exception:
+        with json_file_lock(path):
+            fd, tmp = tempfile.mkstemp(prefix="hist_", suffix=".tmp.json", dir=str(d))
             try:
                 import os
 
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    import os
+
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
     def append_entry(
         self,

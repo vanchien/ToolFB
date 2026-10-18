@@ -49,7 +49,14 @@ from playwright.sync_api import Frame, Page
 from loguru import logger
 from src.services.totp_service import generate_totp_code
 from src.utils.account_credentials import AccountCredentialBundle, load_account_credential_bundle
+from src.utils.dom_input import click_point_dom
 from src.utils.paths import project_root
+
+
+def _page_click_xy(page: Page, x: float, y: float) -> None:
+    """Bấm tọa độ trong trang, không chiếm chuột hệ thống."""
+    if not click_point_dom(page, float(x), float(y)):
+        raise RuntimeError("Không bấm được tọa độ trong trang (DOM).")
 
 PostLoginState = Literal["logged_in", "totp", "checkpoint", "timeout"]
 TotpSubmitOutcome = Literal["logged_in", "remember_browser", "totp", "checkpoint", "timeout"]
@@ -271,6 +278,195 @@ def facebook_page_is_hard_checkpoint(url: str) -> bool:
     if "facebook.com" not in u:
         return False
     return any(m in u for m in _UNSUPPORTED_URL_MARKERS)
+
+
+# Checkpoint máy/cookie — thường có nút Continue / Bỏ qua (không phải giấy tờ / khóa nick).
+_SOFT_CHECKPOINT_IDS = frozenset(
+    {
+        "1501092823525282",
+        "828281030927956",
+    }
+)
+
+_HARD_CHECKPOINT_BODY_MARKERS = (
+    "upload an id",
+    "upload your id",
+    "government-issued",
+    "government issued",
+    "giấy tờ tùy thân",
+    "giay to tuy than",
+    "photo of yourself",
+    "ảnh của chính bạn",
+    "video selfie",
+    "confirm your identity with a photo",
+    "xác minh danh tính bằng ảnh",
+    "account has been disabled",
+    "disabled your account",
+    "tài khoản của bạn đã bị vô hiệu",
+    "we've locked your account",
+    "locked your account",
+    "đã khóa tài khoản",
+    "community standards",
+    "tiêu chuẩn cộng đồng",
+    "account quality",
+    "your account has been suspended",
+    "tài khoản đã bị đình chỉ",
+)
+
+_SOFT_CHECKPOINT_CLICK_SELECTORS = (
+    "button:has-text('This is me')",
+    "button:has-text('This Was Me')",
+    "div[role='button']:has-text('This is me')",
+    "button:has-text('Đây là tôi')",
+    "div[role='button']:has-text('Đây là tôi')",
+    "button:has-text('Yes, this is me')",
+    "button[name='submit[Continue]']",
+    "button[name='submit[Next]']",
+    "#checkpointSubmitButton",
+    "button#checkpointSubmitButton",
+    "button:has-text('Continue')",
+    "div[role='button']:has-text('Continue')",
+    "button:has-text('Tiếp tục')",
+    "div[role='button']:has-text('Tiếp tục')",
+    "button:has-text('Not now')",
+    "div[role='button']:has-text('Not now')",
+    "button:has-text('Để sau')",
+    "div[role='button']:has-text('Để sau')",
+    "button:has-text('Skip')",
+    "button:has-text('Bỏ qua')",
+    "div[role='button']:has-text('Bỏ qua')",
+    "a:has-text('Skip')",
+    "a:has-text('Bỏ qua')",
+    "button[data-cookiebanner='accept_button']",
+    "button:has-text('Allow all cookies')",
+    "button:has-text('Cho phép tất cả cookie')",
+    "button:has-text('Chấp nhận tất cả')",
+    "button:has-text('OK')",
+    "div[role='button']:has-text('OK')",
+    "button:has-text('Got it')",
+    "button:has-text('Đã hiểu')",
+)
+
+
+def facebook_checkpoint_id_from_url(url: str) -> str:
+    """ID checkpoint trên URL ``/checkpoint/<id>/`` — rỗng nếu không có."""
+    m = re.search(r"/checkpoint/(\d+)", str(url or ""), re.I)
+    return str(m.group(1) or "").strip() if m else ""
+
+
+def facebook_checkpoint_may_skip_url(url: str) -> bool:
+    """
+    URL checkpoint có thể bấm Continue/Bỏ qua — không gồm khóa nick / giấy tờ / recover.
+    """
+    u = str(url or "").strip().lower()
+    if "facebook.com" not in u and "fb.com" not in u:
+        return False
+    if any(m in u for m in ("accountquality", "suspended", "confirm_identity", "/recover/")):
+        return False
+    cid = facebook_checkpoint_id_from_url(u)
+    if cid in _SOFT_CHECKPOINT_IDS:
+        return True
+    return "/checkpoint/" in u or "checkpoint?" in u
+
+
+def facebook_checkpoint_body_is_hard(body: str) -> bool:
+    """Giấy tờ / khóa / vô hiệu hóa — không tự vượt, bỏ TK chạy TK tiếp."""
+    blob = str(body or "").strip().lower()
+    if not blob:
+        return False
+    return any(m in blob for m in _HARD_CHECKPOINT_BODY_MARKERS)
+
+
+def facebook_checkpoint_blocks_retries(detail: str, url: str = "") -> bool:
+    """True nếu không nên F5/thử lại — checkpoint cứng hoặc đã thử skip."""
+    blob = f"{detail or ''} {url or ''}".lower()
+    if "checkpoint cứng" in blob or "bỏ qua tk" in blob:
+        return True
+    if "vẫn ở checkpoint" in blob:
+        return True
+    return facebook_page_is_hard_checkpoint(url) and not facebook_checkpoint_may_skip_url(url)
+
+
+def _checkpoint_page_text(page: Page) -> str:
+    try:
+        return (page.locator("body").inner_text(timeout=2_000) or "").lower()
+    except Exception:
+        try:
+            return (page.content() or "").lower()
+        except Exception:
+            return ""
+
+
+def facebook_checkpoint_is_blocking(page: Page) -> bool:
+    """Checkpoint không bỏ qua được (giấy tờ / khóa nick / recover)."""
+    u = _url_lower(page)
+    if any(m in u for m in ("accountquality", "suspended", "confirm_identity", "/recover/")):
+        return True
+    return facebook_checkpoint_body_is_hard(_checkpoint_page_text(page))
+
+
+def try_skip_soft_facebook_checkpoint(page: Page, *, max_clicks: int = 4) -> bool:
+    """
+    Bấm Continue / Đây là tôi / Bỏ qua / Not now trên checkpoint nhẹ.
+
+    Không bấm khi đang TOTP, reCAPTCHA, hoặc nội dung giấy tờ/khóa nick.
+
+    Returns:
+        True nếu đã thoát ``/checkpoint`` hoặc đã vào phiên.
+    """
+    u = _url_lower(page)
+    if not facebook_page_is_hard_checkpoint(u):
+        return _session_logged_in(page)
+    if not facebook_checkpoint_may_skip_url(u):
+        return False
+    if facebook_page_looks_like_totp_prompt(page):
+        return False
+    try:
+        from src.services.facebook_recaptcha import facebook_page_has_recaptcha
+
+        if facebook_page_has_recaptcha(page):
+            return False
+    except Exception:
+        pass
+    if facebook_checkpoint_is_blocking(page):
+        return False
+
+    clicked = 0
+    for _ in range(max(1, int(max_clicks))):
+        u = _url_lower(page)
+        if _session_logged_in(page) and "checkpoint" not in u:
+            return True
+        if not facebook_page_is_hard_checkpoint(u):
+            logger.info("[FB recovery] Đã qua checkpoint nhẹ — url={}", page.url)
+            return True
+        if facebook_checkpoint_is_blocking(page):
+            return False
+        hit = False
+        for ctx in _login_browser_contexts(page):
+            if _click_first(ctx, _SOFT_CHECKPOINT_CLICK_SELECTORS, label="bỏ qua checkpoint nhẹ"):
+                hit = True
+                break
+        if not hit:
+            break
+        clicked += 1
+        logger.info(
+            "[FB recovery] Bấm bỏ qua checkpoint nhẹ lần {} — url={}",
+            clicked,
+            (page.url or "")[:160],
+        )
+        try:
+            page.wait_for_timeout(1_100)
+        except Exception:
+            time.sleep(1.1)
+        if facebook_page_is_trust_device_prompt(page):
+            _dismiss_remember_browser(page)
+    u = _url_lower(page)
+    ok = (not facebook_page_is_hard_checkpoint(u)) or (
+        _session_logged_in(page) and "checkpoint" not in u
+    )
+    if ok:
+        logger.info("[FB recovery] Checkpoint nhẹ đã bỏ qua — tiếp tục phiên url={}", page.url)
+    return ok
 
 
 def facebook_page_blocks_recovery_email(url: str) -> bool:
@@ -655,10 +851,18 @@ def confirm_facebook_session_logged_in(
                 return False, "Màn Continue/mật khẩu — không F5, không mở lại trang"
         u = _url_lower(page)
         if facebook_page_is_hard_checkpoint(u):
-            last_detail = f"Vẫn ở checkpoint ({page.url})"
-            stable_hits = 0
-            page.wait_for_timeout(500)
-            continue
+            if try_skip_soft_facebook_checkpoint(page):
+                last_detail = "Đã bỏ qua checkpoint nhẹ"
+                stable_hits = 0
+                page.wait_for_timeout(400)
+                continue
+            if facebook_checkpoint_is_blocking(page):
+                return False, (
+                    f"Checkpoint cứng — bỏ qua TK, chạy TK tiếp ({(page.url or '')[:120]})"
+                )
+            return False, (
+                f"Vẫn ở checkpoint ({page.url}) — bỏ qua TK, chạy TK tiếp"
+            )
         if facebook_page_looks_like_totp_prompt(page):
             last_detail = f"Vẫn ở màn nhập mã 2FA ({page.url})"
             stable_hits = 0
@@ -891,6 +1095,9 @@ def _locate_login_password_input(page: Page, *, timeout_ms: int = 1_200):
 
 def _dismiss_login_obstacles(page: Page) -> None:
     """Đóng banner cookie / popup che form login nếu có."""
+    if facebook_checkpoint_may_skip_url(_url_lower(page)):
+        if try_skip_soft_facebook_checkpoint(page, max_clicks=2):
+            return
     for ctx in _login_browser_contexts(page):
         for sel in (
             "button[data-cookiebanner='accept_button']",
@@ -952,6 +1159,11 @@ def _wait_for_login_form(
         if _session_logged_in(page):
             return True
         if facebook_page_is_hard_checkpoint(_url_lower(page)):
+            if try_skip_soft_facebook_checkpoint(page):
+                if _session_logged_in(page):
+                    return True
+                if not facebook_page_is_hard_checkpoint(_url_lower(page)):
+                    continue
             return False
         _dismiss_login_obstacles(page)
         if _reveal_login_email_field(page):
@@ -1184,7 +1396,12 @@ def _wait_after_totp_code_submit(
         if facebook_page_is_trust_device_prompt(page):
             return "remember_browser"
         if facebook_page_is_hard_checkpoint(u):
-            return "checkpoint"
+            if try_skip_soft_facebook_checkpoint(page) and _session_logged_in(page):
+                return "logged_in"
+            if facebook_checkpoint_is_blocking(page):
+                return "checkpoint"
+            page.wait_for_timeout(450)
+            continue
         if facebook_page_looks_like_totp_prompt(page):
             last_totp = True
             page.wait_for_timeout(450)
@@ -1199,6 +1416,8 @@ def _wait_after_totp_code_submit(
     if facebook_page_is_trust_device_prompt(page):
         return "remember_browser"
     if facebook_page_is_hard_checkpoint(u):
+        if try_skip_soft_facebook_checkpoint(page) and _session_logged_in(page):
+            return "logged_in"
         return "checkpoint"
     if last_totp or facebook_page_looks_like_totp_prompt(page):
         return "totp"
@@ -1500,7 +1719,7 @@ def _click_saved_profile_continue(page: Page) -> bool:
         logger.debug("[FB recovery] Tọa độ Continue: {}", exc)
     if isinstance(point, dict) and isinstance(point.get("x"), (int, float)) and isinstance(point.get("y"), (int, float)):
         try:
-            page.mouse.click(float(point["x"]), float(point["y"]))
+            _page_click_xy(page, float(point["x"]), float(point["y"]))
             logger.info(
                 "[FB recovery] Đã bấm Continue ({:.0f},{:.0f}).",
                 float(point["x"]),
@@ -1753,7 +1972,7 @@ def _type_password_via_probe(page: Page, password: str) -> bool:
     _disable_click_blocker(page)
     x, y = point
     try:
-        page.mouse.click(x, y)
+        _page_click_xy(page, x, y)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[FB recovery] Không bấm được ô mật khẩu: {}", exc)
         return False
@@ -1771,7 +1990,7 @@ def _type_password_via_probe(page: Page, password: str) -> bool:
         login = _point_xy(again.get("login")) if isinstance(again, dict) else None
     if login is not None:
         try:
-            page.mouse.click(login[0], login[1])
+            _page_click_xy(page, login[0], login[1])
             logger.info("[FB recovery] Đã bấm Log in ({:.0f},{:.0f}).", login[0], login[1])
             return True
         except Exception as exc:  # noqa: BLE001
@@ -1874,7 +2093,7 @@ def _click_password_log_in_button(page: Page) -> bool:
         point = None
     if isinstance(point, dict) and isinstance(point.get("x"), (int, float)) and isinstance(point.get("y"), (int, float)):
         try:
-            page.mouse.click(float(point["x"]), float(point["y"]))
+            _page_click_xy(page, float(point["x"]), float(point["y"]))
             logger.info("[FB recovery] Đã bấm Log in ({:.0f},{:.0f}).", float(point["x"]), float(point["y"]))
             return True
         except Exception as exc:  # noqa: BLE001
@@ -2047,7 +2266,7 @@ def _dismiss_invalid_auth_request(page: Page) -> None:
     point = _point_xy(probe.get("ok"))
     if point is not None:
         try:
-            page.mouse.click(point[0], point[1])
+            _page_click_xy(page, point[0], point[1])
             logger.info("[FB recovery] Đã bấm OK trên hộp Invalid request.")
             return
         except Exception as exc:  # noqa: BLE001
@@ -2058,7 +2277,11 @@ def _dismiss_invalid_auth_request(page: Page) -> None:
         if isinstance(count, int) and count > 0:
             box = btn.first.bounding_box(timeout=1_000)
             if isinstance(box, dict):
-                page.mouse.click(float(box["x"]) + float(box["width"]) / 2, float(box["y"]) + float(box["height"]) / 2)
+                _page_click_xy(
+                    page,
+                    float(box["x"]) + float(box["width"]) / 2,
+                    float(box["y"]) + float(box["height"]) / 2,
+                )
                 logger.info("[FB recovery] Đã bấm OK (role=button) trên hộp Invalid request.")
     except Exception as exc:  # noqa: BLE001
         logger.debug("[FB recovery] OK role=button: {}", exc)
@@ -2222,7 +2445,7 @@ def complete_saved_continue_and_totp(page: Page, account: dict[str, Any] | None)
             _disable_click_blocker(page)
             try:
                 fresh = _point_xy((_probe_login_gate(page) or {}).get("continue")) or cont
-                page.mouse.click(fresh[0], fresh[1])
+                _page_click_xy(page, fresh[0], fresh[1])
                 clicks += 1
                 clicked_at = time.time()
                 logger.info("[FB recovery] Đã bấm Continue ({:.0f},{:.0f}).", fresh[0], fresh[1])
@@ -2554,7 +2777,7 @@ def _wait_post_login_state(
     Captcha: tối đa **một** lần auto (pipeline) + **một** lần chờ tay — không lặp mỗi 500ms.
     """
     from src.services.facebook_recaptcha import (
-        facebook_page_may_need_recaptcha,
+        facebook_page_has_recaptcha,
         try_solve_facebook_recaptcha,
     )
 
@@ -2571,9 +2794,16 @@ def _wait_post_login_state(
         u = _url_lower(page)
         if any(m in u for m in ("two_step", "authentication", "two_factor")):
             _mark_auth_flow_active(account)
-        if account and (
-            facebook_page_may_need_recaptcha(page) or facebook_page_is_hard_checkpoint(u)
-        ):
+        if facebook_page_is_hard_checkpoint(u) and not facebook_page_has_recaptcha(page):
+            if try_skip_soft_facebook_checkpoint(page):
+                if _session_logged_in(page):
+                    return "logged_in"
+                if facebook_page_looks_like_totp_prompt(page):
+                    return "totp"
+                u = _url_lower(page)
+            if facebook_checkpoint_is_blocking(page) or facebook_page_is_hard_checkpoint(u):
+                return "checkpoint"
+        if account and facebook_page_has_recaptcha(page):
             if not captcha_auto_attempted:
                 captcha_auto_attempted = True
                 _mark_auth_flow_active(account)
@@ -2722,7 +2952,10 @@ def _submit_email_password(
         return "logged_in"
     _goto_facebook_login(page)
     if facebook_page_is_hard_checkpoint(_url_lower(page)):
-        return "checkpoint"
+        if try_skip_soft_facebook_checkpoint(page) and _session_logged_in(page):
+            return "logged_in"
+        if facebook_page_is_hard_checkpoint(_url_lower(page)):
+            return "checkpoint"
     _dismiss_login_obstacles(page)
     if not _wait_for_login_form(page, account=account):
         logger.warning("[FB recovery] Form login chưa hiện — thử mở lại trang login url={}", page.url)
@@ -2919,6 +3152,12 @@ def save_session_to_cookie_path(page: Page, cookie_path: str | Path | None) -> N
         p = (project_root() / p).resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
     page.context.storage_state(path=str(p))
+    try:
+        from src.services.facebook_session_persist import invalidate_cookie_session_cache
+
+        invalidate_cookie_session_cache(p)
+    except Exception:
+        pass
     logger.info("[FB recovery] Đã lưu storage_state → {}", p)
 
 
@@ -3165,6 +3404,11 @@ def try_recover_facebook_session(
         _set_session_status(account, "cancelled")
         return False
     if facebook_page_is_hard_checkpoint(_url_lower(page)):
+        if try_skip_soft_facebook_checkpoint(page) and (
+            _session_logged_in(page) or not facebook_page_is_hard_checkpoint(_url_lower(page))
+        ):
+            if _session_logged_in(page):
+                return _finalize_successful_recovery(page, account, cookie_path, log_label="skip_checkpoint")
         if _try_capsolver_if_checkpoint(page, account, should_stop=should_stop):
             return _finalize_successful_recovery(page, account, cookie_path, log_label="captcha")
         if bundle.has_recovery_email and not facebook_page_blocks_recovery_email(_url_lower(page)):
@@ -3176,6 +3420,13 @@ def try_recover_facebook_session(
                 should_stop=should_stop,
             ):
                 return True
+        if facebook_checkpoint_is_blocking(page) or facebook_page_is_hard_checkpoint(_url_lower(page)):
+            logger.warning(
+                "[FB recovery] Checkpoint cứng — bỏ qua TK, chạy TK tiếp url={}",
+                (page.url or "")[:160],
+            )
+            _set_session_status(account, "checkpoint")
+            return False
         logger.warning(
             "[FB recovery] Checkpoint — không vượt được (email khôi phục / CapSolver / Meta chặn)."
         )

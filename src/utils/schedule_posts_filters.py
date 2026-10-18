@@ -16,8 +16,19 @@ _PLACEHOLDER_ACCOUNT_NAMES = {
     "tài khoản mới",
     "tai khoan moi",
     "new account",
+    "edit",
+    "edit profile",
+    "chỉnh sửa",
+    "chinh sua",
+    "sửa hồ sơ",
+    "chats",
+    "chat",
+    "messenger",
+    "đoạn chat",
+    "doan chat",
 }
 _INTERNAL_ACCOUNT_ID = re.compile(r"(?:acc|uid)_[0-9a-z]+", re.IGNORECASE)
+_GENERIC_ACCOUNT_LABEL = re.compile(r"facebo+k\d*", re.IGNORECASE)
 
 
 RETRY_MODES: tuple[str, ...] = ("all", "retry_0", "retry_gt_0", "retry_ge_2")
@@ -62,7 +73,40 @@ def account_name_is_placeholder(name: str, account_id: str = "") -> bool:
         return True
     if raw.casefold() in _PLACEHOLDER_ACCOUNT_NAMES:
         return True
+    if _GENERIC_ACCOUNT_LABEL.fullmatch(raw):
+        return True
     return bool(_INTERNAL_ACCOUNT_ID.fullmatch(raw))
+
+
+def account_ids_for_name_refresh(
+    rows: Iterable[dict[str, Any]],
+    ticked_ids: Iterable[str] | None = None,
+) -> tuple[list[str], bool]:
+    """Id cần lấy tên. Có tick thì chỉ những dòng đó; không tick thì mọi tên còn mặc định."""
+    ordered: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row in rows:
+        aid = str(row.get("id") or "").strip()
+        if not aid or aid in seen:
+            continue
+        seen.add(aid)
+        ordered.append((aid, str(row.get("name") or "")))
+    picked = [str(item or "").strip() for item in (ticked_ids or []) if str(item or "").strip() in seen]
+    if picked:
+        return picked, True
+    pending = [aid for aid, name in ordered if account_name_is_placeholder(name, aid)]
+    return pending, False
+
+
+def account_name_should_take_facebook_name(current: str, discovered: str, account_id: str = "") -> bool:
+    """Chỉ thay tên khi bản ghi còn nhãn mặc định và Facebook đã hiện tên người dùng."""
+    found = " ".join(str(discovered or "").split())
+    now = " ".join(str(current or "").split())
+    if not found or found.isdigit() or found.casefold() == now.casefold():
+        return False
+    if account_name_is_placeholder(found, account_id):
+        return False
+    return account_name_is_placeholder(now, account_id)
 
 
 def format_account_filter_label(account_id: str, account_name: str = "") -> str:

@@ -433,6 +433,26 @@ def _try_comment_visible_post(page: Page, ha: HumanAction, *, use_ai: bool) -> N
         pass
 
 
+def _like_open_video(page: Page) -> bool:
+    """Like video/Reel đang mở. Nút bài viết trên bảng tin không dùng hàm này."""
+    from src.services.facebook_groups.video_engage import like_open_video
+
+    try:
+        return bool(like_open_video(page))
+    except Exception as exc:  # noqa: BLE001
+        _re_raise_browser_closed(exc)
+        logger.debug("[Human] Like video: {}", exc)
+        return False
+
+
+def _maybe_like_open_video(page: Page, profile: HumanInteractionProfile) -> None:
+    """Like video theo tỷ lệ đã đặt trong tab Tương tác."""
+    rate = max(0.0, min(1.0, float(profile.like_rate_pct or 0)))
+    if rate <= 0 or random.random() >= rate:
+        return
+    _like_open_video(page)
+
+
 def module_newsfeed_like(
     page: Page,
     *,
@@ -461,7 +481,8 @@ def module_newsfeed_like(
         def on_like(p: Page) -> None:
             if should_stop and should_stop():
                 return
-            _try_like_visible_post(p, _human(p, profile))
+            if not _try_like_visible_post(p, _human(p, profile)):
+                _like_open_video(p)
 
         def on_comment(p: Page) -> None:
             if should_stop and should_stop():
@@ -577,6 +598,7 @@ def module_search_reels(
         if not _open_search_and_type(page, ha, kw, profile):
             return False
         _scroll_feed_top_to_bottom(ha, profile, short=True, should_stop=should_stop)
+        _maybe_like_open_video(page, profile)
         human_pause(kind="step", label="trước tab Reels")
         time.sleep(random.uniform(0.9, 1.6))
         reels_tab = page.locator(
@@ -596,6 +618,7 @@ def module_search_reels(
             page.keyboard.press("ArrowDown")
             human_pause(kind="action", label="xem reel")
             _reels_clip_wait(page, profile)
+            _maybe_like_open_video(page, profile)
         return True
     except Exception as exc:  # noqa: BLE001
         _re_raise_browser_closed(exc)
@@ -623,12 +646,18 @@ def module_reels_watch(
             _page_load_pause(profile)
         _module_micro_pause(profile, label="reels_load")
         _scroll_feed_top_to_bottom(
-            ha, profile, short=True, like_rate=profile.like_rate_pct * 0.45, should_stop=should_stop
+            ha,
+            profile,
+            short=True,
+            like_rate=profile.like_rate_pct * 0.45,
+            on_like=lambda p: _like_open_video(p),
+            should_stop=should_stop,
         )
         for _ in range(random.randint(1, 3)):
             page.keyboard.press("ArrowDown")
             human_pause(kind="action", label="reel tiếp")
             _reels_clip_wait(page, profile)
+            _maybe_like_open_video(page, profile)
         return True
     except Exception as exc:  # noqa: BLE001
         _re_raise_browser_closed(exc)
@@ -771,6 +800,24 @@ def run_shuffled_interaction_modules(
             logger.info("[Human] Đã đủ {} module/lượt — bỏ qua phần còn lại", max_mod)
             break
         _raise_if_browser_closed(page)
+        try:
+            from src.services.facebook_session_recovery import (
+                facebook_checkpoint_is_blocking,
+                facebook_page_is_hard_checkpoint,
+                try_skip_soft_facebook_checkpoint,
+            )
+
+            if facebook_page_is_hard_checkpoint(str(page.url or "")):
+                if try_skip_soft_facebook_checkpoint(page):
+                    logger.info("[Human] Đã bỏ qua checkpoint nhẹ trước module {}", name)
+                elif facebook_checkpoint_is_blocking(page):
+                    logger.warning(
+                        "[Human] Checkpoint cứng — dừng tương tác, chạy TK tiếp (module {})",
+                        name,
+                    )
+                    break
+        except Exception as cp_exc:  # noqa: BLE001
+            logger.debug("[Human] Kiểm tra checkpoint trước module: {}", cp_exc)
         if on_status:
             on_status("running", f"Module: {name}")
         _module_micro_pause(cfg, label=f"trước {name}")

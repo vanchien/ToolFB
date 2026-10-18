@@ -806,7 +806,15 @@ def _download_images_via_ui_download_button(page, *, limit: int) -> list[bytes]:
                 continue
             if box.get("width", 0) < 220 or box.get("height", 0) < 220:
                 continue
-            im.hover(timeout=3000)
+            try:
+                im.evaluate(
+                    """el => {
+                      el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true, cancelable:true, view:window}));
+                      el.dispatchEvent(new MouseEvent('mouseenter', {bubbles:true, cancelable:true, view:window}));
+                    }"""
+                )
+            except Exception:
+                pass
             _human_pause(0.1, 0.25)
         except Exception:
             continue
@@ -1907,6 +1915,12 @@ def generate_chatgpt_browser_images(prompt: str, *, account_id: str, number_of_i
         return [blob]
 
 
+def chatgpt_window_allowed() -> bool:
+    """Chỉ mở cửa sổ ChatGPT khi người dùng cho phép. Mặc định không tự mở."""
+    raw = os.environ.get("TOOLFB_ALLOW_CHATGPT_BROWSER", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _chatgpt_web_session(account_id: str, *, headless: bool, background: bool = False):
     """Mở phiên ChatGPT đã đăng nhập rồi đóng. headless=True thì không hiện cửa sổ."""
     from contextlib import contextmanager
@@ -1916,6 +1930,10 @@ def _chatgpt_web_session(account_id: str, *, headless: bool, background: bool = 
         profile = chatgpt_profile_dir(account_id)
         if not profile.is_dir() or not any(profile.iterdir()):
             raise RuntimeError("Chưa đăng nhập ChatGPT trên web. Bấm Mở ChatGPT, đăng nhập, đóng cửa sổ rồi chạy lại.")
+        if not chatgpt_window_allowed():
+            raise RuntimeError(
+                "Chưa cho phép mở ChatGPT. Chương trình không tự mở cửa sổ. Bấm Mở ChatGPT khi bạn muốn."
+            )
         pw = sync_playwright().start()
         context = None
         try:

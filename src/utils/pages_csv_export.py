@@ -1,4 +1,4 @@
-"""Xuất danh sách Page ra CSV (Tên page, Link page)."""
+"""Xuất danh sách Page ra CSV (Tên page, Link page, Phân loại)."""
 
 from __future__ import annotations
 
@@ -6,17 +6,20 @@ import csv
 from pathlib import Path
 from typing import Any, Iterable
 
-CSV_HEADERS = ("Tên page", "Link page")
+from src.utils.page_categories import normalize_page_category, page_category_label
+
+CSV_HEADERS = ("Tên page", "Link page", "Phân loại")
 
 
-def page_csv_row(page: dict[str, Any]) -> tuple[str, str]:
+def page_csv_row(page: dict[str, Any]) -> tuple[str, str, str]:
     name = str(page.get("page_name", "") or "").strip()
     url = str(page.get("page_url", "") or "").strip()
-    return name, url
+    cat = normalize_page_category(page.get("page_category"))
+    return name, url, page_category_label(cat) if cat else ""
 
 
-def pages_to_csv_rows(pages: Iterable[dict[str, Any]]) -> list[tuple[str, str]]:
-    rows: list[tuple[str, str]] = []
+def pages_to_csv_rows(pages: Iterable[dict[str, Any]]) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
     seen_urls: set[str] = set()
     for p in pages:
         if not isinstance(p, dict):

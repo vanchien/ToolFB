@@ -621,3 +621,170 @@ def _try_focus_window(profile_key: str) -> bool:
 
     user32.EnumWindows(_enum_cb, 0)
     return focused
+
+
+_visible_launch_lock = threading.Lock()
+_visible_launch_count = 0
+
+
+class visible_launch_guard:
+    """
+    Đánh dấu đang mở một Firefox có hiện cửa sổ (mở thủ công).
+
+    Trong lúc này ``FirefoxLaunchHider`` không ẩn cửa sổ mới, tránh giấu nhầm cửa sổ người dùng muốn xem.
+    """
+
+    def __enter__(self) -> "visible_launch_guard":
+        """Tăng bộ đếm phiên mở có cửa sổ."""
+        global _visible_launch_count
+        with _visible_launch_lock:
+            _visible_launch_count += 1
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        """Giảm bộ đếm phiên mở có cửa sổ."""
+        global _visible_launch_count
+        with _visible_launch_lock:
+            _visible_launch_count = max(0, _visible_launch_count - 1)
+
+
+def _visible_launch_active() -> bool:
+    """True khi có phiên mở Firefox hiện cửa sổ đang khởi chạy."""
+    with _visible_launch_lock:
+        return _visible_launch_count > 0
+
+
+class FirefoxLaunchHider:
+    """
+    Ẩn ngay cửa sổ Firefox mới xuất hiện trong lúc khởi chạy chế độ ngầm (giảm nhấp nháy).
+
+    Không dùng PowerShell như ``hide_firefox_window_for_profile`` (chậm 1–3 giây): quét Win32 mỗi ~30ms,
+    chỉ ẩn cửa sổ ``MozillaWindowClass`` mới sinh ra sau khi bắt đầu, thuộc đúng file firefox.exe
+    mà Playwright đang chạy.
+    """
+
+    _WINDOW_CLASSES = ("MozillaWindowClass", "MozillaDialogClass")
+
+    def __init__(self, executable_path: str | None, *, interval_s: float = 0.03) -> None:
+        """
+        Args:
+            executable_path: Đường dẫn firefox.exe Playwright sẽ chạy (None = không lọc theo exe).
+            interval_s: Chu kỳ quét cửa sổ.
+        """
+        self._exe = self._norm(executable_path) if executable_path else ""
+        self._interval = max(0.01, float(interval_s))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._before: set[int] = set()
+        self._pid_exe: dict[int, str] = {}
+        self.hidden_count = 0
+
+    @staticmethod
+    def _norm(path: str) -> str:
+        """Chuẩn hóa đường dẫn để so sánh không phân biệt hoa thường."""
+        try:
+            return str(Path(path).resolve()).lower().replace("/", "\\")
+        except OSError:
+            return str(path).lower().replace("/", "\\")
+
+    def start(self) -> "FirefoxLaunchHider":
+        """Chụp danh sách cửa sổ Firefox hiện có rồi bắt đầu luồng ẩn."""
+        if sys.platform != "win32":
+            return self
+        try:
+            self._before = set(self._list_mozilla_windows(visible_only=False))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("FirefoxLaunchHider: không liệt kê được cửa sổ: {}", exc)
+            return self
+        self._thread = threading.Thread(target=self._run, name="ff-launch-hider", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self, *, linger_s: float = 0.0) -> None:
+        """
+        Dừng luồng ẩn.
+
+        Args:
+            linger_s: Tiếp tục ẩn thêm vài giây ở nền (Firefox đôi khi hiện lại cửa sổ sau khi load trang).
+        """
+        if self._thread is None:
+            return
+        if linger_s > 0:
+            threading.Timer(float(linger_s), self._stop.set).start()
+        else:
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+
+    def __enter__(self) -> "FirefoxLaunchHider":
+        """Bắt đầu ẩn khi vào khối ``with``."""
+        return self.start()
+
+    def __exit__(self, *_exc: object) -> None:
+        """Ngừng ẩn ngay khi rời khối ``with``."""
+        self.stop()
+
+    def _list_mozilla_windows(self, *, visible_only: bool) -> list[int]:
+        """Liệt kê HWND cấp cao có lớp cửa sổ của Firefox."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        found: list[int] = []
+        buf = ctypes.create_unicode_buffer(64)
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_cb(hwnd: int, _lparam: int) -> bool:
+            if visible_only and not user32.IsWindowVisible(hwnd):
+                return True
+            user32.GetClassNameW(hwnd, buf, 64)
+            if buf.value in self._WINDOW_CLASSES:
+                found.append(int(hwnd))
+            return True
+
+        user32.EnumWindows(_enum_cb, 0)
+        return found
+
+    def _exe_of_hwnd(self, hwnd: int) -> str:
+        """Đường dẫn exe của tiến trình sở hữu cửa sổ (có cache theo PID)."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        key = int(pid.value)
+        if key in self._pid_exe:
+            return self._pid_exe[key]
+        path = ""
+        handle = kernel32.OpenProcess(0x1000, False, key)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            try:
+                size = wintypes.DWORD(1024)
+                out = ctypes.create_unicode_buffer(1024)
+                if kernel32.QueryFullProcessImageNameW(handle, 0, out, ctypes.byref(size)):
+                    path = self._norm(out.value)
+            finally:
+                kernel32.CloseHandle(handle)
+        self._pid_exe[key] = path
+        return path
+
+    def _run(self) -> None:
+        """Vòng quét: ẩn cửa sổ Firefox mới hiện ra cho tới khi bị dừng."""
+        import ctypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        sw_hide = 0
+        while not self._stop.is_set():
+            try:
+                if not _visible_launch_active():
+                    for hwnd in self._list_mozilla_windows(visible_only=True):
+                        if hwnd in self._before:
+                            continue
+                        if self._exe and self._exe_of_hwnd(hwnd) != self._exe:
+                            continue
+                        user32.ShowWindow(hwnd, sw_hide)
+                        self.hidden_count += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("FirefoxLaunchHider: {}", exc)
+            self._stop.wait(self._interval)

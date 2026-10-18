@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from src.services.page_creation.engine import calculate_delay_seconds
+from src.utils.feature_busy import (
+    acquire_share_after_schedule,
+    get_conflict_gap_minutes,
+    normalize_page_keys,
+    parse_conflict_gap_minutes,
+)
 
 from .fingerprint import assert_link_only, classify_source_url, normalize_share_images, share_fingerprint
 from .video_engage import parse_comment_lines, pick_page_watch_seconds, pick_share_comment
@@ -66,6 +74,8 @@ from .states import (
 )
 from .store import GroupStore
 
+logger = logging.getLogger(__name__)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -102,6 +112,11 @@ class GroupEngine:
         self.provider = provider
         self._sleep = sleep or time.sleep
         self._rng = rng or random.Random()
+        self._rng_lock = threading.Lock()
+        self._step_lock = threading.Lock()
+        self._live_steps: dict[str, dict[str, str]] = {}
+        self._account_labels: dict[str, str] = {}
+        self._tls = threading.local()
         self._cancel: set[str] = set()
 
     def recover(self) -> dict[str, int]:
@@ -500,8 +515,10 @@ class GroupEngine:
         jobs: list[dict[str, Any]] = []
         duplicates: list[str] = []
         skipped: list[str] = list(targets["skipped"])
+        done_fps = self.store.completed_share_fingerprints()
         for group_id in targets["group_ids"]:
-            if self.store.completed_share_fingerprint(target_id, group_id, source_url, text, images):
+            fp = share_fingerprint(target_id, group_id, source_url, text, images)
+            if fp in done_fps:
                 duplicates.append(group_id or page_id)
                 continue
             jobs.append(
@@ -522,7 +539,7 @@ class GroupEngine:
                     "max_retry": MAX_RETRY,
                     "error_code": "",
                     "error_message": "",
-                    "fingerprint": share_fingerprint(target_id, group_id, source_url, text, images),
+                    "fingerprint": fp,
                     "started_at": "",
                     "finished_at": "",
                 }
@@ -588,6 +605,7 @@ class GroupEngine:
         watch_max_seconds: int = 0,
         reel_seconds: int = 0,
         comment: str = "",
+        like_video: bool = False,
     ) -> dict[str, Any]:
         """Cùng một link cho nhiều page. Mỗi page xem một số giây ngẫu nhiên trong khoảng đã đặt."""
         assert_link_only({"source_url": source_url, "text": text})
@@ -596,10 +614,17 @@ class GroupEngine:
         source_type = classify_source_url(source_url)
         watch_low = max(0, int(watch_seconds or 0))
         watch_high = max(watch_low, int(watch_max_seconds or 0))
+        self._account_labels = {}
+        for page in pages:
+            aid = str(page.get("account_id") or "").strip()
+            label = str(page.get("account_name") or "").strip()
+            if aid and label:
+                self._account_labels[aid] = label
         by_account: dict[str, list[dict[str, Any]]] = {}
         page_watch: dict[tuple[str, str], int] = {}
         duplicates: list[str] = []
         skipped: list[str] = []
+        done_fps = self.store.completed_share_fingerprints()
         for page in pages:
             account_id = str(page.get("account_id") or "").strip()
             page_id = str(page.get("page_id") or "").strip()
@@ -623,7 +648,8 @@ class GroupEngine:
             bucket = by_account.setdefault(account_id, [])
             for spec in specs:
                 group_id = spec["group_id"]
-                if self.store.completed_share_fingerprint(page_id, group_id, source_url, text, images):
+                fp = share_fingerprint(page_id, group_id, source_url, text, images)
+                if fp in done_fps:
                     duplicates.append(group_id or page_id)
                     continue
                 bucket.append(
@@ -644,10 +670,11 @@ class GroupEngine:
                         "max_retry": MAX_RETRY,
                         "error_code": "",
                         "error_message": "",
-                        "fingerprint": share_fingerprint(page_id, group_id, source_url, text, images),
+                        "fingerprint": fp,
                         "page_name": str(page.get("page_name") or ""),
                         "group_name": self._group_name(group_id),
                         "watch_seconds": page_watch[watch_key],
+                        "comment": "",
                         "started_at": "",
                         "finished_at": "",
                     }
@@ -656,12 +683,20 @@ class GroupEngine:
         created = 0
         comment_pool = parse_comment_lines(comment)
         used_comments: list[str] = []
+        page_comments: dict[tuple[str, str], str] = {}
+        for jobs in by_account.values():
+            for job in jobs:
+                key = (str(job.get("account_id") or ""), str(job.get("page_id") or ""))
+                if key not in page_comments:
+                    chosen = pick_share_comment(comment_pool, used_comments, self._rng)
+                    if chosen:
+                        used_comments.append(chosen)
+                    page_comments[key] = chosen
+                job["comment"] = page_comments[key]
         for account_id, jobs in by_account.items():
             if not jobs:
                 continue
-            chosen_comment = pick_share_comment(comment_pool, used_comments, self._rng)
-            if chosen_comment:
-                used_comments.append(chosen_comment)
+            chosen_comment = next((str(job.get("comment") or "") for job in jobs if job.get("comment")), "")
             batch = self.store.add_share_batch(
                 {
                     "account_id": account_id,
@@ -678,6 +713,7 @@ class GroupEngine:
                     "watch_max_seconds": watch_high,
                     "reel_seconds": max(0, int(reel_seconds or 0)),
                     "comment": chosen_comment,
+                    "like_video": bool(like_video),
                 },
                 jobs,
             )
@@ -709,11 +745,11 @@ class GroupEngine:
         return self.run_share_wave(batch_ids)
 
     def run_share_wave(self, batch_ids: list[str]) -> dict[str, Any]:
-        """Chạy lần lượt từng tài khoản. Trình duyệt đóng xong mới sang tài khoản sau."""
-        finished: list[dict[str, Any]] = []
+        """Mỗi tài khoản một trình duyệt. Cùng lúc mỗi tài khoản chỉ chia sẻ một Page, rồi sang Page kế của tài khoản đó."""
+        specs: list[tuple[str, str, int]] = []
         for batch_id in batch_ids:
             if batch_id in self._cancel:
-                break
+                continue
             try:
                 batch = self._batch(batch_id)
             except KeyError:
@@ -721,11 +757,52 @@ class GroupEngine:
             account_id = str(batch.get("account_id") or "")
             jobs = self._batch_jobs(batch_id)
             pages = len({str(item.get("page_id") or "") for item in jobs})
-            self._note(f"Tài khoản {account_id}: {pages} page, {len(jobs)} bài")
-            finished.append(self.run_share_batch(batch_id))
-            if str(self._batch(batch_id).get("status") or "") == BATCH_PAUSED:
-                break
-        return {"batches": finished}
+            specs.append((batch_id, account_id, pages))
+        if not specs:
+            return {"batches": []}
+        with self._step_lock:
+            self._live_steps.clear()
+        if len(specs) == 1:
+            batch_id, account_id, pages = specs[0]
+            self._note(f"Tài khoản {account_id}: {pages} page")
+            return {"batches": [self.run_share_batch(batch_id)]}
+        self._note(f"{len(specs)} tài khoản chạy cùng lúc, mỗi tài khoản một Page")
+        finished: list[dict[str, Any] | None] = [None] * len(specs)
+        threads: list[threading.Thread] = []
+        for index, (batch_id, account_id, pages) in enumerate(specs):
+            self._note(f"Tài khoản {account_id}: {pages} page, lần lượt từng Page")
+
+            def _work(slot: int = index, token: str = batch_id) -> None:
+                self._tls.provider = self._spawn_provider()
+                self._tls.session_ok = {}
+                try:
+                    finished[slot] = self.run_share_batch(token)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Lượt chia sẻ của một tài khoản lỗi. Các tài khoản khác vẫn chạy.")
+                    try:
+                        finished[slot] = self._batch(token)
+                    except Exception:  # noqa: BLE001
+                        finished[slot] = None
+                finally:
+                    self._tls.provider = None
+
+            thread = threading.Thread(target=_work, name=f"share-{account_id}", daemon=True)
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return {"batches": [item for item in finished if item is not None]}
+
+    def _spawn_provider(self) -> Any:
+        """Profile riêng khi nhiều tài khoản chia sẻ cùng lúc. Test dùng chung provider giả."""
+        maker = getattr(self.provider, "spawn", None)
+        if callable(maker):
+            return maker()
+        return self.provider
+
+    def _active_provider(self) -> Any:
+        bound = getattr(self._tls, "provider", None)
+        return bound if bound is not None else self.provider
 
     def _wave_specs(
         self,
@@ -815,11 +892,54 @@ class GroupEngine:
         account_id = str(batch.get("account_id") or "")
         if self._publish_busy(account_id, str(batch.get("page_id") or ""), except_batch=batch_id):
             return batch
+        # Không giữ khóa cả batch: mỗi Page chờ đăng lịch xong + giãn cách rồi mới chia sẻ.
         self._begin(account_id)
         try:
             return self._run_share_batch(batch_id, account_id)
         finally:
             self._end(account_id)
+
+    def _conflict_gap_minutes(self) -> tuple[float, float]:
+        """Đọc khoảng giãn cách đăng→chia sẻ từ settings (fallback cấu hình hiện tại)."""
+        try:
+            data = self.store.share_settings()
+            return parse_conflict_gap_minutes(
+                data.get("conflict_gap_min"),
+                data.get("conflict_gap_max"),
+            )
+        except Exception:  # noqa: BLE001
+            return get_conflict_gap_minutes()
+
+    def _page_alias_index(self) -> dict[str, dict[str, Any]]:
+        """Map local id / Meta id / URL → bản ghi Page (một lần mỗi engine)."""
+        cached = getattr(self, "_page_alias_cache", None)
+        if isinstance(cached, dict) and cached:
+            return cached
+        index: dict[str, dict[str, Any]] = {}
+        try:
+            from src.utils.pages_manager import get_default_pages_manager
+
+            for item in get_default_pages_manager().load_all():
+                row = dict(item)
+                for key in (
+                    str(row.get("id") or "").strip(),
+                    str(row.get("fb_page_id") or "").strip(),
+                    str(row.get("page_url") or "").strip().rstrip("/").casefold(),
+                ):
+                    if key:
+                        index[key] = row
+        except Exception:  # noqa: BLE001
+            index = {}
+        self._page_alias_cache = index
+        return index
+
+    def _share_page_keys(self, *, account_id: str, page_id: str, target_url: str = "") -> frozenset[str]:
+        """Khóa Page để không trùng lịch đăng (local id + Meta id)."""
+        pid = str(page_id or "").strip()
+        want_url = str(target_url or "").strip().rstrip("/").casefold()
+        index = self._page_alias_index()
+        row = index.get(pid) or (index.get(want_url) if want_url else None)
+        return normalize_page_keys(pid, target_url, page_row=row)
 
     def _run_share_batch(self, batch_id: str, account_id: str) -> dict[str, Any]:
         batch = self._batch(batch_id)
@@ -828,8 +948,10 @@ class GroupEngine:
         self.store.save_share_batch(batch)
         batch["status"] = BATCH_RUNNING
         self.store.save_share_batch(batch)
-        if self._browse_reels(batch_id):
-            return self._batch(batch_id)
+        self._tls.session_ok = {}
+        liked_pages: set[str] = set()
+        failed_pages: set[str] = set()
+        gap_lo, gap_hi = self._conflict_gap_minutes()
         while True:
             batch = self._batch(batch_id)
             if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED} or batch_id in self._cancel:
@@ -837,17 +959,87 @@ class GroupEngine:
             job = self._next_share_job(batch_id)
             if job is None:
                 break
-            if self._watch_page_before_share(batch_id, str(job.get("page_id") or "")):
-                return self._batch(batch_id)
-            self._run_one_share(batch, job)
+            page_id = str(job.get("page_id") or "")
+            if page_id in failed_pages:
+                self._fail_share_job(job, "TEMPORARY_ERROR", "Chưa chuyển được sang Page này")
+                continue
+            page_keys = self._share_page_keys(
+                account_id=str(job.get("account_id") or account_id),
+                page_id=page_id,
+                target_url=str(job.get("target_url") or ""),
+            )
+            name = str(job.get("page_name") or page_id)
+            job_account = str(job.get("account_id") or account_id)
+
+            def _stop_share() -> bool:
+                # Ưu tiên cờ hủy in-memory — tránh đọc store mỗi 2s khi chờ lịch.
+                return batch_id in self._cancel
+
+            def _wait_msg(text: str) -> None:
+                self._share_step(batch, page_id=page_id, page_name=name, step=text)
+                self._note(text)
+
+            # Ưu tiên đăng lịch: chờ xong → nghỉ theo khoảng người dùng cài → mới chia sẻ.
+            page_lease = acquire_share_after_schedule(
+                account_id=job_account,
+                page_keys=page_keys,
+                detail=f"share:{batch_id}:{page_id}",
+                poll=2.5,
+                should_stop=_stop_share,
+                on_wait=_wait_msg,
+                gap_min_minutes=gap_lo,
+                gap_max_minutes=gap_hi,
+            )
+            if page_lease is None:
+                logger.info(
+                    "Batch %s Page %s dừng chờ (đã hủy/tạm dừng) — giữ job để chạy lại sau.",
+                    batch_id,
+                    page_id,
+                )
+                break
+            try:
+                switched = self._switch_share_page(batch_id, job)
+                if switched == "stop":
+                    return self._batch(batch_id)
+                if switched == "skip":
+                    failed_pages.add(page_id)
+                    continue
+                if self._browse_reels(batch_id, page_id):
+                    return self._batch(batch_id)
+                share_like = bool(batch.get("like_video")) and page_id not in liked_pages
+                stop, liked = self._engage_page_before_share(batch_id, page_id, like=share_like)
+                if stop:
+                    return self._batch(batch_id)
+                if liked:
+                    liked_pages.add(page_id)
+                    share_like = False
+                self._run_one_share(batch, job, like_video=share_like)
+                if share_like:
+                    liked_pages.add(page_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Page %s lỗi. Chuyển sang Page tiếp theo.", page_id)
+                self._share_step(
+                    batch,
+                    page_id=page_id,
+                    page_name=str(job.get("page_name") or page_id),
+                    step="Lỗi, đang sang Page tiếp theo",
+                )
+                self._fail_share_job(job, "TEMPORARY_ERROR", f"Page lỗi, chuyển sang Page sau: {exc}")
+                if page_id:
+                    failed_pages.add(page_id)
+                continue
+            finally:
+                page_lease.release()
             batch = self.store.refresh_batch_counts(batch_id) or batch
             if job_hold := self._batch(batch_id).get("status") in {BATCH_PAUSED}:
                 break
             remaining = self._next_share_job(batch_id)
             if remaining is None:
                 break
-            self._delay_batch(batch)
+            page_switch = str(remaining.get("page_id") or "") != str(job.get("page_id") or "")
+            self._delay_batch(batch, page_switch=page_switch)
         batch = self.store.refresh_batch_counts(batch_id) or self._batch(batch_id)
+        self._clear_share_step(str(batch.get("account_id") or account_id))
         if batch.get("status") not in {BATCH_PAUSED, BATCH_CANCELLED, BATCH_FAILED}:
             pending = [item for item in self._batch_jobs(batch_id) if item.get("status") in {SHARE_PENDING, SHARE_VERIFY_FIRST}]
             if not pending:
@@ -857,15 +1049,63 @@ class GroupEngine:
                 self.store.save_share_batch(batch)
         return batch
 
-    def _browse_reels(self, batch_id: str) -> bool:
-        """Lướt Reel trước. True khi phải dừng cả lượt chia sẻ."""
+    def _switch_share_page(self, batch_id: str, job: dict[str, Any]) -> str:
+        """Vào đúng Page trước khi lướt, xem, like, bình luận và chia sẻ.
+
+        Trả về ``stop`` khi phải dừng cả lượt, ``skip`` khi Page này chưa chuyển được.
+        """
+        page_id = str(job.get("page_id") or "")
         batch = self._batch(batch_id)
-        if batch.get("reels_browsed"):
+        if page_id and str(batch.get("active_page_id") or "") == page_id:
+            return ""
+        name = str(job.get("page_name") or page_id or "Page")
+        self._share_step(batch, page_id=page_id, page_name=name, step="Đang chuyển Page")
+        provider = self._active_provider()
+        if hasattr(provider, "switch_to_page"):
+            result = self._call(
+                "switch_to_page",
+                account_id=str(job.get("account_id") or batch.get("account_id") or ""),
+                page_id=page_id,
+                page_name=str(job.get("page_name") or ""),
+                page_url=str(job.get("target_url") or ""),
+            )
+            if self._pause_prepare(batch_id, result):
+                return "stop"
+            if result.get("error_code"):
+                self._fail_share_job(
+                    job,
+                    str(result.get("error_code") or "TEMPORARY_ERROR"),
+                    str(result.get("error_message") or f"Chưa chuyển được sang Page {name}"),
+                )
+                return "skip"
+        batch = self._batch(batch_id)
+        batch["active_page_id"] = page_id
+        self.store.save_share_batch(batch)
+        return ""
+
+    def _fail_share_job(self, job: dict[str, Any], code: str, message: str) -> None:
+        """Đánh lỗi một bài để sang Page sau, không chia sẻ nhầm vai trò."""
+        job["status"] = SHARE_FAILED
+        job["error_code"] = code
+        job["error_message"] = message
+        job["finished_at"] = _now()
+        self.store.save_share_job(job)
+
+    def _browse_reels(self, batch_id: str, page_id: str = "") -> bool:
+        """Lướt Reel sau khi đã vào Page. Mỗi Page một lần. True khi phải dừng."""
+        batch = self._batch(batch_id)
+        seen = [str(item) for item in (batch.get("reels_browsed_page_ids") or [])]
+        if page_id and page_id in seen:
             return False
         seconds = int(batch.get("reel_seconds") or 0)
-        if seconds <= 0 or not hasattr(self.provider, "browse_reels"):
+        if seconds <= 0 or not hasattr(self._active_provider(), "browse_reels"):
             return False
-        self._note(f"Đang lướt Reel {seconds} giây trước khi xem video")
+        self._share_step(
+            batch,
+            page_id=page_id,
+            page_name=self._page_label(batch_id, page_id),
+            step=f"Đang lướt Reel {seconds} giây",
+        )
         result = self._call(
             "browse_reels",
             account_id=str(batch.get("account_id") or ""),
@@ -875,66 +1115,96 @@ class GroupEngine:
         if self._pause_prepare(batch_id, result):
             return True
         batch = self._batch(batch_id)
+        seen = [str(item) for item in (batch.get("reels_browsed_page_ids") or [])]
+        if page_id and page_id not in seen:
+            seen.append(page_id)
+        batch["reels_browsed_page_ids"] = seen
         batch["reels_browsed"] = True
         self.store.save_share_batch(batch)
-        self._note("Đã lướt Reel. Đang mở video để xem.")
+        self._share_step(
+            batch,
+            page_id=page_id,
+            page_name=self._page_label(batch_id, page_id),
+            step="Đã lướt Reel, đang mở video",
+        )
         return False
 
-    def _watch_page_before_share(self, batch_id: str, page_id: str) -> bool:
-        """Xem video theo số giây của page này, rồi mới chia sẻ. True khi phải dừng."""
+    def _page_share_comment(self, batch_id: str, page_id: str) -> str:
+        """Câu bình luận đã bốc cho Page này. Trống thì dùng câu của cả batch."""
+        token = str(page_id or "").strip()
+        for job in self._batch_jobs(batch_id):
+            if str(job.get("page_id") or "") == token and str(job.get("comment") or "").strip():
+                return str(job.get("comment") or "").strip()
+        return str(self._batch(batch_id).get("comment") or "").strip()
+
+    def _engage_page_before_share(self, batch_id: str, page_id: str, *, like: bool) -> tuple[bool, bool]:
+        """Một lần mở video: xem, trong lúc xem thì Like và bình luận lần lượt (không cùng lúc).
+
+        Returns:
+            ``(dừng, đã_like)`` — dừng khi Facebook chặn hoặc người dùng bấm Dừng.
+        """
         batch = self._batch(batch_id)
         watched = [str(item) for item in (batch.get("watched_page_ids") or [])]
-        already = bool(batch.get("source_watched")) or page_id in watched
-        comment = str(batch.get("comment") or "").strip()
-        need_comment = bool(comment) and not batch.get("source_commented")
-        if already and not need_comment:
-            return False
+        commented = [str(item) for item in (batch.get("commented_page_ids") or [])]
+        already = page_id in watched
+        comment = self._page_share_comment(batch_id, page_id)
+        posted = {
+            self._page_share_comment(batch_id, token)
+            for token in commented
+            if self._page_share_comment(batch_id, token)
+        }
+        need_comment = bool(comment) and page_id not in commented and comment not in posted
         seconds = 0 if already else self._page_watch_seconds(batch_id, page_id)
-        if seconds <= 0 and not need_comment:
-            return False
-        if not hasattr(self.provider, "prepare_source_video"):
-            return False
-        if already:
-            self._note("Đang bình luận dưới video trước khi chia sẻ")
-        else:
-            self._note(
-                f"Page {page_id}: đang xem video {seconds} giây"
-                + (" rồi bình luận" if need_comment else "")
+        if seconds <= 0 and not need_comment and not like:
+            return False, False
+        provider = self._active_provider()
+        page_name = self._page_label(batch_id, page_id)
+        if not hasattr(provider, "prepare_source_video"):
+            if not like or not hasattr(provider, "like_source_video"):
+                return False, False
+            self._share_step(batch, page_id=page_id, page_name=page_name, step="Đang bấm Like")
+            result = self._call(
+                "like_source_video",
+                account_id=str(batch.get("account_id") or ""),
+                source_url=str(batch.get("source_url") or ""),
             )
+            return self._pause_prepare(batch_id, result), bool(result.get("liked"))
+        doing = [part for part, on in (("Like", like), ("bình luận", need_comment)) if on]
+        step = f"Đang xem video {seconds} giây" if seconds > 0 else "Đang mở video"
+        if doing:
+            step += ", vừa xem vừa " + " + ".join(doing)
+        self._share_step(batch, page_id=page_id, page_name=page_name, step=step)
         result = self._call(
             "prepare_source_video",
             account_id=str(batch.get("account_id") or ""),
             source_url=str(batch.get("source_url") or ""),
             watch_seconds=seconds,
             comment=comment if need_comment else "",
+            like=like,
             should_stop=lambda: batch_id in self._cancel,
         )
         if self._pause_prepare(batch_id, result):
-            return True
+            return True, False
+        liked = bool(like and result.get("liked"))
         batch = self._batch(batch_id)
         if not already:
             batch["watched_page_ids"] = [*watched, page_id]
             batch["source_watched"] = True
         note = str(result.get("error_message") or "")
         if need_comment and not result.get("commented"):
-            batch["source_commented"] = False
-            batch["source_prepared"] = False
-            batch["watch_note"] = note or "Chưa bình luận được dưới video — chưa chia sẻ"
-            batch["status"] = BATCH_PAUSED
-            self.store.save_share_batch(batch)
-            self._cancel.add(batch_id)
-            self._note(str(batch["watch_note"]))
-            return True
-        if need_comment:
+            batch["comment_warning"] = note or "Chưa thấy ô bình luận — vẫn chia sẻ video"
+            self._share_step(batch, page_id=page_id, page_name=page_name, step="Chưa bình luận được, vẫn chia sẻ")
+        elif need_comment:
+            batch["commented_page_ids"] = [*commented, page_id]
             batch["source_commented"] = True
-            self._note("Đã bình luận. Đang bấm nút chia sẻ trên video.")
+            self._share_step(batch, page_id=page_id, page_name=page_name, step="Đã xem + bình luận, chuẩn bị chia sẻ")
         else:
             batch["source_commented"] = True
-            self._note(f"Đã xem {seconds} giây. Đang bấm nút chia sẻ trên video.")
+            self._share_step(batch, page_id=page_id, page_name=page_name, step="Đã xem, chuẩn bị chia sẻ")
         batch["source_prepared"] = True
         batch["watch_note"] = ""
         self.store.save_share_batch(batch)
-        return False
+        return False, liked
 
     def _page_watch_seconds(self, batch_id: str, page_id: str) -> int:
         """Số giây đã bốc cho page. Mọi đích của page đó dùng cùng một lần xem."""
@@ -1001,7 +1271,7 @@ class GroupEngine:
             "share_batches": len(shares),
         }
 
-    def _run_one_share(self, batch: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    def _run_one_share(self, batch: dict[str, Any], job: dict[str, Any], *, like_video: bool = False) -> dict[str, Any]:
         account_id = str(job.get("account_id") or "")
         page_id = str(job.get("page_id") or "")
         group_id = str(job.get("group_id") or "")
@@ -1029,7 +1299,12 @@ class GroupEngine:
             job["started_at"] = job.get("started_at") or _now()
             self.store.save_share_job(job)
             where = "Page" if str(job.get("destination") or "") == "page" else (group_id or "nhóm")
-            self._note(f"Đang bấm chia sẻ trên video → {where}")
+            self._share_step(
+                batch,
+                page_id=page_id,
+                page_name=str(job.get("page_name") or page_id),
+                step=f"Đang chia sẻ, bấm Share now → {where}",
+            )
             published = self._call(
                 "publish_link",
                 account_id=account_id,
@@ -1041,6 +1316,7 @@ class GroupEngine:
                 target_url=str(job.get("target_url") or ""),
                 page_name=str(job.get("page_name") or ""),
                 group_name=str(job.get("group_name") or ""),
+                like_video=like_video,
             )
             if self._hold_share(batch, job, published):
                 return job
@@ -1190,33 +1466,98 @@ class GroupEngine:
         self.store.save_join_job(job)
         return job
 
+    def _account_label(self, batch: dict[str, Any]) -> str:
+        """Tên tài khoản để hiện trên trạng thái. Không có tên thì dùng mã."""
+        account_id = str(batch.get("account_id") or "")
+        return str(self._account_labels.get(account_id) or account_id or "Tài khoản")
+
+    def _page_label(self, batch_id: str, page_id: str) -> str:
+        """Tên Page đang chạy. Không có tên thì dùng mã Page."""
+        for job in self._batch_jobs(batch_id):
+            if str(job.get("page_id") or "") == str(page_id or ""):
+                name = str(job.get("page_name") or "").strip()
+                if name:
+                    return name
+        return str(page_id or "Page")
+
+    def _share_step(self, batch: dict[str, Any], *, page_id: str = "", page_name: str = "", step: str) -> None:
+        """Ghi bước của một tài khoản và báo cả các tài khoản đang chạy song song."""
+        account_id = str(batch.get("account_id") or "")
+        label = self._account_label(batch)
+        page = str(page_name or "").strip() or "Page"
+        line = f"{label} · {page} — {step}"
+        with self._step_lock:
+            self._live_steps[account_id or label] = {
+                "account_id": account_id,
+                "page_id": str(page_id or ""),
+                "page_name": page,
+                "step": step,
+                "line": line,
+            }
+            board = "\n".join(item["line"] for item in self._live_steps.values())
+        self._note(board)
+
+    def _clear_share_step(self, account_id: str) -> None:
+        """Bỏ tài khoản khỏi bảng đang chạy khi lượt của tài khoản đó kết thúc."""
+        with self._step_lock:
+            self._live_steps.pop(str(account_id or ""), None)
+            board = "\n".join(item["line"] for item in self._live_steps.values())
+        if board:
+            self._note(board)
+
+    def live_board(self) -> str:
+        """Các tài khoản đang chạy, mỗi tài khoản một dòng: tên, Page và bước."""
+        with self._step_lock:
+            return "\n".join(item["line"] for item in self._live_steps.values())
+
+    def live_step_for(self, account_id: str, page_id: str) -> str:
+        """Bước hiện tại nếu Page này đang được tài khoản xử lý."""
+        with self._step_lock:
+            item = self._live_steps.get(str(account_id or ""))
+        if not item:
+            return ""
+        current = str(item.get("page_id") or "")
+        if page_id and current and current != str(page_id):
+            return ""
+        return str(item.get("step") or "")
+
     def _note(self, text: str) -> None:
         callback = getattr(self, "on_progress", None)
         if callable(callback):
             callback(text)
 
     def _begin(self, account_id: str) -> None:
-        if account_id and hasattr(self.provider, "begin_account"):
-            self.provider.begin_account(account_id)
+        provider = self._active_provider()
+        if account_id and hasattr(provider, "begin_account"):
+            provider.begin_account(account_id)
 
     def _end(self, account_id: str) -> None:
-        if account_id and hasattr(self.provider, "end_account"):
+        provider = self._active_provider()
+        if account_id and hasattr(provider, "end_account"):
             try:
-                self.provider.end_account(account_id)
+                provider.end_account(account_id)
             except Exception:  # noqa: BLE001
                 return
 
     def _session_block(self, account_id: str) -> str:
-        if not account_id or not hasattr(self.provider, "check_session"):
+        provider = self._active_provider()
+        if not account_id or not hasattr(provider, "check_session"):
             return ""
+        cache = getattr(self._tls, "session_ok", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._tls.session_ok = cache
+        if account_id in cache:
+            return cache[account_id]
         try:
-            code = self.provider.check_session(account_id)
+            code = str(provider.check_session(account_id) or "")
         except Exception:
             return ""
-        return str(code or "")
+        cache[account_id] = code
+        return code
 
     def _call(self, name: str, **kwargs: Any) -> dict[str, Any]:
-        fn = getattr(self.provider, name)
+        fn = getattr(self._active_provider(), name)
         result = fn(**kwargs)
         if isinstance(result, dict):
             return result
@@ -1238,14 +1579,24 @@ class GroupEngine:
         if seconds > 0:
             self._sleep(seconds)
 
-    def _delay_batch(self, batch: dict[str, Any]) -> None:
+    def _delay_batch(self, batch: dict[str, Any], *, page_switch: bool = False) -> None:
+        """Nghỉ giữa các bài. Sang Page khác của cùng tài khoản thì nghỉ gấp đôi."""
         batch = dict(batch)
         batch["delay_enabled"] = True
         batch["delay_mode"] = batch.get("cooldown_mode") or "fixed"
         batch["delay_fixed_seconds"] = batch.get("cooldown_fixed") or 0
         batch["delay_min_seconds"] = batch.get("cooldown_min") or 0
         batch["delay_max_seconds"] = batch.get("cooldown_max") or 0
-        seconds = calculate_delay_seconds(batch, self._rng)
+        with self._rng_lock:
+            seconds = calculate_delay_seconds(batch, self._rng)
+        if page_switch and seconds > 0:
+            seconds *= 2
+        if seconds <= 0:
+            return
+        if page_switch:
+            self._share_step(batch, page_name=self._page_label(str(batch.get("id") or ""), str(batch.get("live_page_id") or "")), step=f"Nghỉ {seconds} giây trước Page tiếp theo")
+        else:
+            self._share_step(batch, step=f"Nghỉ {seconds} giây trước bài tiếp theo")
         batch_id = str(batch.get("id"))
         stored = self._batch(batch_id)
         stored["status"] = BATCH_DELAYING
@@ -1260,6 +1611,7 @@ class GroupEngine:
             self.store.save_share_batch(stored)
 
     def _publish_busy(self, account_id: str, page_id: str, *, except_batch: str) -> bool:
+        """True nếu batch chia sẻ khác đang chạy cùng account/page (lịch đăng chờ ở acquire)."""
         for job in self.store.share_jobs():
             if str(job.get("batch_id")) == except_batch:
                 continue

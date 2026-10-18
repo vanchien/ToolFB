@@ -13,6 +13,12 @@ from typing import Any
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from src.utils.page_categories import (
+    PAGE_CATEGORY_CHOICES,
+    UNCATEGORIZED_LABEL,
+    normalize_page_category,
+    page_category_label,
+)
 from src.utils.page_insights_format import format_metric
 from src.utils.pages_manager import PageRecord, PagesManager
 
@@ -119,6 +125,11 @@ class PageFormDialog:
         pk = str(init.get("page_kind", "")).strip().lower()
         self._cb_kind.set(pk if pk in kinds else "")
         add_row("page_kind (Fanpage/Profile/Group)", self._cb_kind)
+
+        cat_labels = [UNCATEGORIZED_LABEL] + [label for _key, label in PAGE_CATEGORY_CHOICES]
+        self._cb_category = ttk.Combobox(form, values=cat_labels, state="readonly", width=40)
+        self._cb_category.set(page_category_label(init.get("page_category")))
+        add_row("Phân loại", self._cb_category)
 
         self._e_name = ttk.Entry(form)
         self._e_name.insert(0, str(init.get("page_name", "")))
@@ -228,6 +239,11 @@ class PageFormDialog:
             row["page_kind"] = kind
         else:
             row.pop("page_kind", None)
+        category = normalize_page_category(self._cb_category.get())
+        if category:
+            row["page_category"] = category
+        else:
+            row.pop("page_category", None)
         if not str(row.get("id", "")).strip():
             row["id"] = ""
         chk = dict(row)

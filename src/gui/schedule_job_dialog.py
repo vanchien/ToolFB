@@ -16,6 +16,7 @@ from src.utils.page_schedule import (
     scheduler_tz,
 )
 from src.utils.pages_manager import PagesManager
+from src.gui.page_category_filter import PageCategoryFilter, page_choice_label
 from src.utils.schedule_batch_preview import build_schedule_by_daily_slots, page_post_style_for_post_type
 from src.utils.schedule_job_content import (
     build_schedule_slot_hhmm,
@@ -154,6 +155,11 @@ class SchedulePostJobDialog:
             self._cb_acc.set(self._owner_ids[0])
         n = row(n, "Tài khoản *", self._cb_acc)
 
+        self._page_label_to_id: dict[str, str] = {}
+        self._page_id_to_label: dict[str, str] = {}
+        self._page_cat_filter = PageCategoryFilter(form, on_change=self._refresh_page_combo)
+        n = row(n, "Lọc Page", self._page_cat_filter.frame)
+        self._page_cat_filter.frame.grid_configure(sticky="w")
         self._cb_page = ttk.Combobox(form, state="readonly", width=48)
         n = row(n, "Page *", self._cb_page)
         self._cb_acc.bind("<<ComboboxSelected>>", lambda _e: self._refresh_page_combo())
@@ -161,9 +167,11 @@ class SchedulePostJobDialog:
 
         pid0 = str(self._init.get("page_id", "")).strip()
         if pid0:
-            vals = list(self._cb_page["values"])
-            if pid0 in vals:
-                self._cb_page.set(pid0)
+            if pid0 not in self._page_id_to_label:
+                self._page_cat_filter.reset()
+                self._refresh_page_combo()
+            if pid0 in self._page_id_to_label:
+                self._cb_page.set(self._page_id_to_label[pid0])
 
         pt_vals = ("text", "image", "video", "text_image", "text_video", "reel")
         self._cb_pt = ttk.Combobox(form, values=pt_vals, state="readonly", width=46)
@@ -431,7 +439,7 @@ class SchedulePostJobDialog:
         self._e_video_path = ttk.Entry(vp_fr, width=40)
         self._e_video_path.insert(0, str(self._init.get("video_path", "")))
         self._e_video_path.grid(row=0, column=0, sticky="ew")
-        ttk.Button(vp_fr, text="Chọn file…", command=self._browse_video_path, width=11).grid(
+        ttk.Button(vp_fr, text="Chọn từ thư mục…", command=self._browse_video_path, width=16).grid(
             row=0, column=1, padx=(6, 0)
         )
         ttk.Label(ai_fr, text="hashtags (phẩy)").grid(row=9, column=0, sticky="nw", pady=2, padx=(0, 8))
@@ -505,11 +513,11 @@ class SchedulePostJobDialog:
         self._top.wait_window()
 
     def _browse_video_path(self) -> None:
-        """Chọn file video từ thư mục (mặc định renders) — chỉ ghi đường dẫn, không import vào VE."""
+        """Chọn video từ thư mục — chỉ ghi đường dẫn gốc, không copy/import vào ToolFB."""
         picked = pick_video_media_files(
             self._top,
             path_hint=self._e_video_path.get().strip(),
-            title="Chọn file video cho job lịch đăng",
+            title="Chọn video từ thư mục (không copy vào ToolFB)",
             multiple=False,
         )
         if not picked:
@@ -644,22 +652,36 @@ class SchedulePostJobDialog:
 
     def _refresh_page_combo(self) -> None:
         aid = self._cb_acc.get().strip()
+        cur_id = self._selected_page_id() if hasattr(self, "_cb_page") else ""
         opts: list[str] = []
+        self._page_label_to_id = {}
+        self._page_id_to_label = {}
         try:
-            for p in self._pages.load_all():
-                if str(p.get("account_id", "")).strip() == aid:
-                    pid = str(p.get("id", "")).strip()
-                    if pid:
-                        opts.append(pid)
+            owned = [p for p in self._pages.load_all() if str(p.get("account_id", "")).strip() == aid]
         except Exception:  # noqa: BLE001
-            pass
+            owned = []
+        self._page_cat_filter.refresh(owned)
+        for p in owned:
+            pid = str(p.get("id", "")).strip()
+            if not pid or not self._page_cat_filter.matches(p):
+                continue
+            label = page_choice_label(str(p.get("page_name", "") or ""), p.get("page_category"), pid)
+            self._page_label_to_id[label] = pid
+            self._page_id_to_label[pid] = label
+            opts.append(label)
         self._cb_page.configure(values=opts or [""])
         if opts:
-            cur = self._cb_page.get().strip()
-            if cur not in opts:
+            if cur_id in self._page_id_to_label:
+                self._cb_page.set(self._page_id_to_label[cur_id])
+            else:
                 self._cb_page.set(opts[0])
         else:
             self._cb_page.set("")
+
+    def _selected_page_id(self) -> str:
+        """Id Page từ nhãn đang chọn (nhãn có tên + phân loại)."""
+        raw = self._cb_page.get().strip()
+        return str(self._page_label_to_id.get(raw, raw) or "").strip()
 
     @property
     def result(self) -> dict[str, Any] | None:
@@ -667,7 +689,7 @@ class SchedulePostJobDialog:
 
     def _ok(self) -> None:
         aid = self._cb_acc.get().strip()
-        pid = self._cb_page.get().strip()
+        pid = self._selected_page_id()
         if not aid or not pid:
             messagebox.showerror("Thiếu dữ liệu", "Chọn tài khoản và Page.", parent=self._top)
             return

@@ -65,6 +65,11 @@ class VideoTransformFilterBuilder:
             parts.extend(["transpose=1", "transpose=1"])
         elif rot == 270:
             parts.append("transpose=2")
+        elif rot:
+            rad = rot * 3.141592653589793 / 180.0
+            parts.append(
+                f"rotate={rad:.6f}:ow=rotw({rad:.6f}):oh=roth({rad:.6f}):c=black"
+            )
         if clip.get("flip_horizontal"):
             parts.append("hflip")
         if clip.get("flip_vertical"):
@@ -74,7 +79,7 @@ class VideoTransformFilterBuilder:
             sw = max(2, int(sc.get("width") or 2))
             sh = max(2, int(sc.get("height") or 2))
             if sc.get("keep_aspect", True):
-                parts.append(f"scale={sw}:{sh}:force_original_aspect_ratio=decrease")
+                parts.append(f"scale={sw}:{sh}:force_original_aspect_ratio=decrease:flags=lanczos")
             else:
-                parts.append(f"scale={sw}:{sh}")
+                parts.append(f"scale={sw}:{sh}:flags=lanczos")
         return ",".join(parts)

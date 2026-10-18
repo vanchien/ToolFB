@@ -29,6 +29,7 @@ from src.gui.ui_responsiveness import (
 from src.services.page_creation.runtime import get_engine
 from src.services.page_creation.store import PageCreationStore
 from src.services.page_creation.validate import validate_page_list
+from src.utils.page_categories import PAGE_CATEGORY_CHOICES, UNCATEGORIZED_LABEL, normalize_page_category
 
 _STATUS_VI = {
     "PENDING": "Đang chờ",
@@ -205,6 +206,15 @@ class PageCreatorDialog(tk.Toplevel):
             value="profile",
             command=self._on_create_path_changed,
         ).pack(side=tk.LEFT, padx=8)
+        ttk.Label(path, text="Phân loại Page mới").pack(side=tk.LEFT, padx=(16, 4))
+        self._new_page_category = tk.StringVar(value=UNCATEGORIZED_LABEL)
+        ttk.Combobox(
+            path,
+            textvariable=self._new_page_category,
+            values=[UNCATEGORIZED_LABEL] + [label for _key, label in PAGE_CATEGORY_CHOICES],
+            state="readonly",
+            width=18,
+        ).pack(side=tk.LEFT)
 
         mode = ttk.LabelFrame(body, text="Số lượng")
         mode.pack(fill=tk.X, **pad)
@@ -618,6 +628,7 @@ class PageCreatorDialog(tk.Toplevel):
             "auto_resume_after_restart": False,
             "create_mode": self._create_path.get() or "bm",
             "admin_targets": self._admin_targets(),
+            "page_category": normalize_page_category(self._new_page_category.get()),
         }
 
     def _known_business_ids(self) -> set[str]:

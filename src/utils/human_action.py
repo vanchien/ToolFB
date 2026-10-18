@@ -17,6 +17,7 @@ from loguru import logger
 from playwright.sync_api import BrowserContext, Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 from src.utils.delays import random_ms
+from src.utils.dom_input import click_locator_dom, click_point_dom, scroll_by_dom
 
 # Vị trí chuột ảo theo từng Page (tránh nhảy từ góc 0,0 mỗi lần click).
 _MOUSE_STATE: weakref.WeakKeyDictionary[Page, dict[str, float]] = weakref.WeakKeyDictionary()
@@ -278,14 +279,15 @@ class HumanAction:
             self._update_virtual_cursor(*end, mode=cursor_mode)
             return
         path = _bezier_points(start, end, steps=steps)
-        mouse = self.page.mouse
         last_i = len(path) - 1
         update_stride = max(1, _env_int("FB_CURSOR_UPDATE_EVERY", 2))
         for i, (px, py) in enumerate(path):
-            mouse.move(px, py)
+            # Chỉ con trỏ ảo trong trang — không page.mouse.move (chiếm chuột Windows).
             step_mode = cursor_mode if i == last_i else "default"
             if self.show_cursor and (i == last_i or i % update_stride == 0):
                 self._update_virtual_cursor(px, py, mode=step_mode)
+            else:
+                self._set_pos(px, py, mode=step_mode)
             if i < last_i:
                 time.sleep(random.uniform(0.005, 0.018))
         self._set_pos(*end, mode=cursor_mode)
@@ -326,7 +328,8 @@ class HumanAction:
             x, y = self._pos()
             self._update_virtual_cursor(x, y, mode="pointer")
             time.sleep(pause)
-            self.page.mouse.click(x, y, delay=random.randint(45, 160))
+            if not click_locator_dom(loc):
+                click_point_dom(self.page, x, y)
             self._update_virtual_cursor(x, y, mode="pointer")
             tag = label or (str(target)[:40] if isinstance(target, str) else "locator")
             logger.debug("[HumanAction] smart_click OK — {}", tag)
@@ -442,10 +445,11 @@ class HumanAction:
         steps = max(1, min(12, abs(dy) // 70))
         step = dy / steps
         for _ in range(steps):
-            try:
-                self.page.mouse.wheel(0, step)
-            except Exception:
-                self.page.evaluate("(y) => window.scrollBy(0, y)", step)
+            if not scroll_by_dom(self.page, step):
+                try:
+                    self.page.evaluate("(y) => window.scrollBy(0, y)", step)
+                except Exception:
+                    pass
             time.sleep(random.uniform(0.04, 0.16))
 
     def smart_type_search(

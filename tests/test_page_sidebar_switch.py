@@ -107,6 +107,30 @@ def test_ensure_page_role_switched_delegates_to_robust() -> None:
         )
 
 
+def test_ensure_page_role_confirms_after_a_slow_switch() -> None:
+    """Chuyển xong nhưng Facebook chậm. Đóng menu, chờ, xác nhận rồi mới coi là thành công."""
+    page = MagicMock()
+    with (
+        patch(
+            "src.automation.facebook_actions._view_only_guard_active_on_page",
+            return_value=False,
+        ),
+        patch(
+            "src.automation.facebook_actions._target_page_role_satisfied",
+            side_effect=[False, False, True],
+        ),
+        patch(
+            "src.automation.facebook_actions._robust_switch_to_target_page",
+            return_value=True,
+        ) as robust,
+        patch("src.automation.facebook_actions._failure_screenshot") as shot,
+    ):
+        assert _ensure_page_role_switched(page, page_display_name="Happy Stories Time")
+    robust.assert_called_once()
+    page.keyboard.press.assert_called_with("Escape")
+    shot.assert_not_called()
+
+
 def test_ensure_page_role_fails_if_url_ok_but_still_cta() -> None:
     """Không coi đúng URL là đã switch."""
     page = MagicMock()

@@ -16,7 +16,14 @@ from typing import Any, Iterable, Optional, TypedDict
 
 from loguru import logger
 
+from src.utils.json_list_cache import (
+    forget_json_list,
+    peek_json_list_fresh,
+    peek_json_list_stale,
+    remember_json_list,
+)
 from src.utils.json_store_lock import json_file_lock
+from src.utils.page_categories import PAGE_CATEGORY_KEYS, normalize_page_category
 from src.utils.page_workspace import ensure_page_workspace
 from src.utils.paths import project_root
 
@@ -33,6 +40,7 @@ class PageRecord(TypedDict, total=False):
     post_style: str
     schedule_time: str
     page_kind: str
+    page_category: str
     topic: str
     content_style: str
     post_image_path: str
@@ -87,6 +95,14 @@ class PagesManager:
     def _invalidate_rows_cache(self) -> None:
         self._rows_cache = None
         self._rows_mtime = None
+        forget_json_list(self.file_path)
+
+    def _remember_rows(self, rows: list[PageRecord], mtime: Optional[float]) -> None:
+        """Đồng bộ cache instance + process-wide."""
+        self._rows_cache = rows
+        self._rows_mtime = mtime
+        if mtime is not None:
+            remember_json_list(self.file_path, mtime, rows)
 
     def reload_from_disk(self) -> list[PageRecord]:
         self._invalidate_rows_cache()
@@ -109,6 +125,12 @@ class PagesManager:
             pk_s = str(pk).strip().lower()
             if pk_s not in self.PAGE_KINDS:
                 raise ValueError(f"page_kind phải là một trong: {', '.join(self.PAGE_KINDS)}")
+        cat = row.get("page_category")
+        if cat is not None and str(cat).strip():
+            key = normalize_page_category(cat)
+            if not key:
+                raise ValueError(f"page_category phải là một trong: {', '.join(PAGE_CATEGORY_KEYS)}")
+            row["page_category"] = key
 
     def _normalize_fb_page_id(self, row: dict[str, Any]) -> str:
         v = str(row.get("fb_page_id", "") or "").strip()
@@ -131,13 +153,36 @@ class PagesManager:
         self._validate(d)
 
     def load_all(self) -> list[PageRecord]:
-        with json_file_lock(self.file_path):
+        hit = peek_json_list_fresh(self.file_path)
+        if hit is not None:
+            try:
+                self._rows_mtime = self.file_path.stat().st_mtime
+            except OSError:
+                self._rows_mtime = None
+            self._rows_cache = hit  # type: ignore[assignment]
+            return list(hit)
+        with json_file_lock(self.file_path, timeout=0.2) as got:
+            if not got:
+                stale = peek_json_list_stale(self.file_path)
+                if stale is not None:
+                    logger.debug("pages load_all: cache cũ vì file đang ghi")
+                    return list(stale)
+                with json_file_lock(self.file_path):
+                    return self._load_all_unlocked()
             return self._load_all_unlocked()
 
     def _load_all_unlocked(self) -> list[PageRecord]:
         if not self.file_path.is_file():
             self._invalidate_rows_cache()
             raise FileNotFoundError(str(self.file_path))
+        shared = peek_json_list_fresh(self.file_path)
+        if shared is not None:
+            try:
+                mtime = self.file_path.stat().st_mtime
+            except OSError:
+                mtime = None
+            self._remember_rows(shared, mtime)  # type: ignore[arg-type]
+            return list(shared)
         mtime = self.file_path.stat().st_mtime
         if self._rows_cache is not None and self._rows_mtime == mtime:
             logger.debug("pages load_all: dùng cache ({} dòng)", len(self._rows_cache))
@@ -152,9 +197,8 @@ class PagesManager:
                 raise ValueError(f"Phần tử {i} không phải object.")
             self._validate(item)
             out.append(item)  # type: ignore[arg-type]
-        self._rows_cache = out
-        self._rows_mtime = mtime
-        logger.info("Đã đọc {} page/group từ {}", len(out), self.file_path)
+        self._remember_rows(out, mtime)
+        logger.debug("Đã đọc {} page/group từ {}", len(out), self.file_path)
         return list(out)
 
     def save_all(self, rows: Iterable[PageRecord]) -> None:
@@ -163,8 +207,7 @@ class PagesManager:
             for r in lst:
                 self._validate(r)
             self._atomic_write(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
-            self._rows_cache = list(lst)
-            self._rows_mtime = self.file_path.stat().st_mtime
+            self._remember_rows(list(lst), self.file_path.stat().st_mtime)
             logger.info("Đã ghi {} page/group vào {}", len(lst), self.file_path)
 
     def upsert(self, row: PageRecord) -> None:
@@ -198,8 +241,7 @@ class PagesManager:
             if not replaced:
                 new_list.append(d)  # type: ignore[arg-type]
             self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
-            self._rows_cache = new_list
-            self._rows_mtime = self.file_path.stat().st_mtime
+            self._remember_rows(new_list, self.file_path.stat().st_mtime)
         try:
             ensure_page_workspace(nid)
         except ValueError as exc:
@@ -262,8 +304,7 @@ class PagesManager:
 
             new_list = list(by_id.values())
             self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
-            self._rows_cache = new_list
-            self._rows_mtime = self.file_path.stat().st_mtime
+            self._remember_rows(new_list, self.file_path.stat().st_mtime)
 
         for d in incoming:
             nid = str(d.get("id") or "").strip()
@@ -337,6 +378,7 @@ class PagesManager:
                 "source",
                 "topic",
                 "page_kind",
+                "page_category",
                 "schedule_time",
             )
             mcount = sum(1 for k in meta_fields if str(rec.get(k, "") or "").strip())
@@ -382,6 +424,42 @@ class PagesManager:
             # Bản trùng bị loại.
         self.save_all(new_list)
         return {"groups": dup_groups, "removed": removed}
+
+    def set_category_for_ids(self, page_ids: Iterable[str], category: str) -> int:
+        """
+        Gán phân loại cho nhiều Page trong một lần ghi ``pages.json``.
+
+        ``category`` rỗng = bỏ phân loại. Trả về số Page đã đổi.
+        """
+        ids = {str(x).strip() for x in page_ids if str(x).strip()}
+        if not ids:
+            return 0
+        key = normalize_page_category(category)
+        if str(category or "").strip() and not key:
+            raise ValueError(f"page_category phải là một trong: {', '.join(PAGE_CATEGORY_KEYS)}")
+        changed = 0
+        with json_file_lock(self.file_path):
+            self._invalidate_rows_cache()
+            current = self._load_all_unlocked()
+            new_list: list[PageRecord] = []
+            for rec in current:
+                if str(rec.get("id", "")).strip() not in ids:
+                    new_list.append(rec)
+                    continue
+                d = dict(rec)
+                old = normalize_page_category(d.get("page_category"))
+                if key:
+                    d["page_category"] = key
+                else:
+                    d.pop("page_category", None)
+                if old != key:
+                    changed += 1
+                new_list.append(d)  # type: ignore[arg-type]
+            if changed:
+                self._atomic_write(json.dumps(new_list, ensure_ascii=False, indent=2) + "\n")
+                self._remember_rows(new_list, self.file_path.stat().st_mtime)
+        logger.info("Đã gán phân loại {!r} cho {} Page", key or "chưa phân loại", changed)
+        return changed
 
     def list_for_account(self, account_id: str) -> list[PageRecord]:
         aid = str(account_id).strip()

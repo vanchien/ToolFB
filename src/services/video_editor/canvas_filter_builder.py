@@ -13,12 +13,12 @@ class CanvasFilterBuilder:
         """
         mode = str(clip.get("canvas_mode") or "fit").lower().strip()
         if mode == "fill":
-            return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+            return f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}"
         if mode == "stretch":
-            return f"scale={w}:{h}"
+            return f"scale={w}:{h}:flags=lanczos"
         # fit (default)
         return (
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
         )
 
@@ -43,12 +43,12 @@ class CanvasFilterBuilder:
             sw = max(wi + 2, int(round(wi * z)))
             sh = max(hi + 2, int(round(hi * z)))
             return (
-                f"scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                f"scale={sw}:{sh}:force_original_aspect_ratio=increase:flags=lanczos,"
                 f"crop={wi}:{hi}:(iw-{wi})/2:(ih-{hi})/2"
             )
         sw = max(2, int(round(wi * z)))
         sh = max(2, int(round(hi * z)))
         return (
-            f"scale={sw}:{sh}:force_original_aspect_ratio=decrease,"
+            f"scale={sw}:{sh}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={wi}:{hi}:(ow-iw)/2:(oh-ih)/2:black"
         )

@@ -251,6 +251,7 @@ class PageCreationStore:
                     "address": str(page.get("address") or "").strip(),
                     "create_mode": str(settings.get("create_mode") or "bm"),
                     "admin_targets": list(settings.get("admin_targets") or []),
+                    "page_category": str(settings.get("page_category") or "").strip(),
                     "status": JOB_PENDING,
                     "retry_count": 0,
                     "max_retry": int(settings.get("max_retry") or 3),

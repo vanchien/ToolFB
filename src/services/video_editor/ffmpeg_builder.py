@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +80,165 @@ def _source_trim_duration_sec(du: float, speed: float) -> float:
     if sp <= 0:
         sp = 1.0
     return max(0.05, float(du) * sp)
+
+
+def _ffprobe_has_video(path: Path) -> bool | None:
+    """True/False nếu ffprobe đọc được. None khi không chạy được ffprobe."""
+    from src.utils.ffmpeg_paths import resolve_ffmpeg_ffprobe_paths
+
+    _ff, ffprobe = resolve_ffmpeg_ffprobe_paths()
+    if not ffprobe or not path.is_file():
+        return None
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+        str(path),
+    ]
+    kw: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 25,
+    }
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kw["creationflags"] = int(subprocess.CREATE_NO_WINDOW)
+    try:
+        proc = subprocess.run(cmd, **kw)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return False
+    return "video" in (proc.stdout or "").lower()
+
+
+def media_has_video_stream(media: dict[str, Any], path: Path) -> bool:
+    """
+    File .mp4 tải về đôi khi chỉ là MP3 đổi đuôi — không có luồng hình.
+    width/height > 0 thì coi là có hình, khỏi gọi ffprobe.
+    """
+    if "has_video" in media:
+        return bool(media.get("has_video"))
+    try:
+        if int(media.get("width") or 0) > 0 and int(media.get("height") or 0) > 0:
+            media["has_video"] = True
+            return True
+    except (TypeError, ValueError):
+        pass
+    probed = _ffprobe_has_video(path)
+    if probed is None:
+        media["has_video"] = False
+        return False
+    media["has_video"] = probed
+    return probed
+
+
+def clip_export_skip_reason(media: dict[str, Any], path: Path, duration_sec: float) -> str:
+    """Lý do không xuất clip. Chuỗi rỗng nghĩa là được xuất."""
+    if not path.is_file():
+        return "không thấy file nguồn — bỏ qua, không xuất"
+    if not media_has_video_stream(media, path):
+        return "không có hình (chỉ có tiếng hoặc file hỏng) — bỏ qua, không xuất"
+    try:
+        dur = float(duration_sec)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur < 0.5:
+        return f"chỉ còn {dur:.2f}s sau khi cắt — quá ngắn, bỏ qua, không xuất"
+    return ""
+
+
+def exported_mp4_reject_reason(
+    path: Path,
+    *,
+    expect_w: int,
+    expect_h: int,
+    expect_dur: float,
+) -> str:
+    """File đã ghi nhưng không đạt chất lượng thì bỏ, không giữ."""
+    if not path.is_file():
+        return "không thấy file xuất — bỏ qua"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "không đọc được file xuất — bỏ qua"
+    if expect_dur >= 0.5 and size < 8_192:
+        return "file quá nhỏ — bỏ qua, không giữ"
+    probed = _ffprobe_export_picture(path)
+    if probed is None:
+        return ""
+    if not probed.get("has_video"):
+        return "file xuất không có hình — bỏ qua, không giữ"
+    w = int(probed.get("width") or 0)
+    h = int(probed.get("height") or 0)
+    ew = max(2, int(expect_w))
+    eh = max(2, int(expect_h))
+    if ew % 2:
+        ew += 1
+    if eh % 2:
+        eh += 1
+    if w < 2 or h < 2 or w % 2 or h % 2:
+        return "kích thước hình không hợp lệ — bỏ qua, không giữ"
+    if w != ew or h != eh:
+        return f"kích thước {w}x{h} khác khung {ew}x{eh} — bỏ qua, không giữ"
+    try:
+        got = float(probed.get("duration") or 0)
+    except (TypeError, ValueError):
+        got = 0.0
+    if expect_dur >= 1.0 and got < expect_dur * 0.5:
+        return f"độ dài {got:.1f}s lệch so với {expect_dur:.1f}s — bỏ qua, không giữ"
+    return ""
+
+
+def _ffprobe_export_picture(path: Path) -> dict[str, Any] | None:
+    from src.utils.ffmpeg_paths import resolve_ffmpeg_ffprobe_paths
+
+    _ff, ffprobe = resolve_ffmpeg_ffprobe_paths()
+    if not ffprobe:
+        return None
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,width,height",
+        "-of",
+        "json",
+        str(path),
+    ]
+    kw: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 25,
+    }
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kw["creationflags"] = int(subprocess.CREATE_NO_WINDOW)
+    try:
+        proc = subprocess.run(cmd, **kw)
+        data = json.loads(proc.stdout or "{}")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    width = height = 0
+    has_video = False
+    for st in data.get("streams") or []:
+        if st.get("codec_type") == "video" and not has_video:
+            has_video = True
+            width = int(st.get("width") or 0)
+            height = int(st.get("height") or 0)
+    try:
+        dur = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return {"has_video": has_video, "width": width, "height": height, "duration": dur}
 
 
 def _join_vfilters(parts: list[str], *, out_label: str | None = None) -> str:
@@ -377,17 +538,22 @@ class FFmpegCommandBuilder:
             if not vp:
                 raise ValueError(f"Không resolve được file media {mid}")
             ensure_video_transform_defaults(clip, project)
-            vi = file_input_index(vp)
+            has_audio = bool(media.get("has_audio", True))
             ss = float(clip.get("source_start") or 0)
             se = float(clip.get("source_end") or 0)
             du = float(clip.get("duration") or 0)
             sp = clip_speed(clip)
             ss, se = _normalize_video_source_trim(ss, se, du, sp)
             src_dur = _source_trim_duration_sec(du, sp)
+            skip = clip_export_skip_reason(media, vp, du)
+            if skip:
+                raise ValueError(skip)
             fi = float(clip.get("fade_in") or 0)
             fo = float(clip.get("fade_out") or 0)
 
-            has_audio = bool(media.get("has_audio", True))
+            vi = file_input_index(vp)
+            v_ss = ss
+            v_len = src_dur
 
             vlab = f"sv{si}"
             alab = f"sa{si}"
@@ -398,10 +564,14 @@ class FFmpegCommandBuilder:
             col_vf = color_vf_for(clip)
             tf = self._vtf.build_transform_filters(clip, project).strip()
             vol_fade = self._afb.build_volume_fade_filters(clip, du)
+            play_reverse = bool(clip.get("reverse"))
+            rev_vf = "reverse" if play_reverse else ""
+            rev_af = "areverse" if play_reverse else ""
 
             vchain = _join_vfilters(
                 [
-                    f"[{vi}:v]trim=start={ss}:duration={src_dur:.6f},setpts=PTS-STARTPTS",
+                    f"[{vi}:v]trim=start={v_ss}:duration={v_len:.6f},setpts=PTS-STARTPTS",
+                    rev_vf,
                     vf_speed,
                     tf,
                 ],
@@ -426,7 +596,7 @@ class FFmpegCommandBuilder:
                 st_out = max(0.0, du - fo)
                 v_up_parts.append(f"fade=t=out:st={st_out}:d={fo}")
             v_up_parts.append(
-                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p"
             )
             fc.append(_join_vfilters(v_up_parts, out_label=vlab))
@@ -435,6 +605,7 @@ class FFmpegCommandBuilder:
                 achain = _join_vfilters(
                     [
                         f"[{vi}:a]atrim=start={ss}:duration={src_dur:.6f},asetpts=PTS-STARTPTS",
+                        rev_af,
                         af_speed,
                         "aresample=48000",
                         vol_fade,

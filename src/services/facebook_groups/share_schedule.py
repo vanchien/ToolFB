@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
 _DATE_TIME = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?:\s+(.*))?$"
@@ -21,6 +22,9 @@ class PlannedShareLink:
     label: str = ""
     state: str = "waiting"
     qid: str = ""
+    # Page nhận riêng (iid trong bảng Page) — dòng do «Theo dõi Page nguồn» thêm; rỗng = Page đang tích.
+    targets: list[str] = field(default_factory=list)
+    source: str = ""
 
 
 def make_queue_item(
@@ -39,10 +43,59 @@ def make_queue_item(
         return PlannedShareLink(when=moment, url=cleaned, label="Ngay")
     stamp = str(clock or "").strip()
     if not stamp:
-        raise ValueError("Nhập giờ HH:MM cho link này, hoặc bấm Chia sẻ ngay.")
+        raise ValueError("Chọn ngày và giờ cho link này, hoặc bấm Chia sẻ ngay.")
     when = _resolve_stamp(stamp, moment)
     label = when.strftime("%H:%M") if when.date() == moment.date() else when.strftime("%d/%m %H:%M")
     return PlannedShareLink(when=when, url=cleaned, label=label)
+
+
+def queue_to_settings(items: list[PlannedShareLink]) -> list[dict[str, Any]]:
+    """Link còn chờ, để mở lại app vẫn thấy list."""
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if item.state not in {"waiting", "running"}:
+            continue
+        row: dict[str, Any] = {
+            "url": item.url,
+            "when": item.when.replace(microsecond=0).isoformat(),
+            "label": item.label or "",
+            "state": "waiting",
+        }
+        if item.targets:
+            row["targets"] = list(item.targets)
+        if item.source:
+            row["source"] = item.source
+        rows.append(row)
+    return rows
+
+
+def queue_from_settings(rows: object) -> list[PlannedShareLink]:
+    """Đọc list chờ đã lưu. Bỏ dòng thiếu link hoặc thiếu giờ."""
+    found: list[PlannedShareLink] = []
+    if not isinstance(rows, list):
+        return found
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "").strip()
+        raw_when = str(row.get("when") or "").strip()
+        if not url or not raw_when:
+            continue
+        try:
+            when = datetime.fromisoformat(raw_when)
+        except ValueError:
+            continue
+        found.append(
+            PlannedShareLink(
+                when=when,
+                url=url,
+                label=str(row.get("label") or ""),
+                state="waiting",
+                targets=[str(x) for x in (row.get("targets") or []) if str(x).strip()],
+                source=str(row.get("source") or ""),
+            )
+        )
+    return found
 
 
 def queue_state_from_results(
@@ -153,8 +206,50 @@ def _resolve_stamp(clock: str, now: datetime) -> datetime:
     return _resolve_clock(clock, now)
 
 
-def hour_choices(now: datetime | None = None) -> list[str]:
-    """24 giờ, bắt đầu từ giờ hiện tại của máy rồi vòng qua ngày hôm sau."""
+def date_choices(now: datetime | None = None, days: int = 30) -> list[str]:
+    """Hôm nay và các ngày tới, để xếp nhiều link theo ngày."""
+    moment = (now or datetime.now()).replace(microsecond=0)
+    found: list[str] = []
+    for offset in range(max(1, min(int(days), 90))):
+        day = moment + timedelta(days=offset)
+        label = day.strftime("%d/%m/%Y")
+        if offset == 0:
+            label = f"{label} hôm nay"
+        found.append(label)
+    return found
+
+
+def parse_date_choice(label: str, now: datetime | None = None) -> str:
+    """Đổi nhãn ngày trên dropdown thành YYYY-MM-DD."""
+    text = str(label or "").replace("hôm nay", "").strip()
+    if not text:
+        moment = now or datetime.now()
+        return moment.strftime("%Y-%m-%d")
+    parts = text.replace("-", "/").split("/")
+    if len(parts) != 3:
+        raise ValueError("Ngày dùng dạng dd/mm/yyyy")
+    try:
+        day_no, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+        chosen = datetime(year, month, day_no)
+    except ValueError as exc:
+        raise ValueError("Ngày dùng dạng dd/mm/yyyy") from exc
+    return chosen.strftime("%Y-%m-%d")
+
+
+def date_choice_is_today(label: str, now: datetime | None = None) -> bool:
+    """Ô ngày đang chọn hôm nay thì giờ bắt đầu từ giờ máy."""
+    try:
+        iso = parse_date_choice(label, now)
+    except ValueError:
+        return True
+    moment = now or datetime.now()
+    return iso == moment.strftime("%Y-%m-%d")
+
+
+def hour_choices(now: datetime | None = None, *, from_midnight: bool = False) -> list[str]:
+    """24 giờ. Ngày khác hôm nay thì bắt đầu từ 00."""
+    if from_midnight:
+        return [f"{hour:02d}" for hour in range(24)]
     start = (now or datetime.now()).hour
     return [f"{(start + offset) % 24:02d}" for offset in range(24)]
 
@@ -174,10 +269,19 @@ def compose_clock(hour: str, minute: str) -> str:
     return f"{parsed_hour:02d}:{parsed_minute:02d}"
 
 
+def compose_stamp(date_label: str, hour: str, minute: str, *, now: datetime | None = None) -> str:
+    """Ghép ngày, giờ, phút thành YYYY-MM-DD HH:MM để xếp lịch nhiều ngày."""
+    clock = compose_clock(hour, minute)
+    if not clock:
+        return ""
+    day = parse_date_choice(date_label, now)
+    return f"{day} {clock}"
+
+
 def machine_clock_text(now: datetime | None = None) -> str:
-    """Nhãn giờ máy đang chạy Tool, dùng làm mốc cho khung 24 giờ."""
+    """Nhãn ngày giờ máy đang chạy Tool."""
     moment = now or datetime.now().replace(microsecond=0)
-    return f"Giờ máy {moment.strftime('%H:%M')}"
+    return f"Máy {moment.strftime('%d/%m %H:%M')}"
 
 
 def _resolve_clock(clock: str, now: datetime) -> datetime:

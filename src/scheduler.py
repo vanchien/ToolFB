@@ -70,14 +70,23 @@ from src.utils.account_proxy_mapper import prepare_account_dict_for_browser_run
 from src.utils.proxy_check import verify_browser_facebook_via_proxy
 from src.services.cross_platform_schedule_ctx import unified_chain_is_active
 from src.services.schedule_queue_dispatcher import (
+    archive_finished_jobs,
     compute_smart_delay_ms,
     count_pending_due,
     ensure_schedule_queue_recovery,
+    find_orphan_running_jobs,
     note_job_dispatched,
     promote_due_pending_to_ready,
     select_dispatch_batch,
     sort_queue_jobs,
     write_queue_monitor,
+)
+from src.utils.feature_busy import (
+    FEATURE_SCHEDULE,
+    acquire_schedule_preferring,
+    busy_reason,
+    is_cross_busy,
+    normalize_page_keys,
 )
 
 _schedule_posts_tick_lock = threading.Lock()
@@ -94,6 +103,222 @@ _account_run_lock = threading.Lock()
 _account_run_inflight: dict[str, int] = {}
 _page_run_lock = threading.Lock()
 _page_run_inflight: dict[str, int] = {}
+# Job đã giao cho worker nhưng chưa xong: job_id -> (account_id, monotonic lúc giao).
+_dispatch_track_lock = threading.Lock()
+_dispatch_tracked: dict[str, tuple[str, float]] = {}
+_dispatch_abandoned: set[str] = set()
+_archive_last_mono: float = 0.0
+# Bật khi bấm Dừng lịch: không giao job mới, không drain, không thử lại — job đang đăng dở được chạy nốt.
+_scheduler_stop = threading.Event()
+_scheduler_generation = 0
+_dispatch_ctx = threading.local()
+
+
+def request_scheduler_stop() -> None:
+    """Báo dừng lịch cho mọi luồng dispatcher (tick, drain sau job, thử lại lần 2, job còn chờ trong pool)."""
+    if not _scheduler_stop.is_set():
+        _scheduler_stop.set()
+        logger.info("[Lịch] Đã nhận lệnh dừng — không giao job mới; job đang đăng dở sẽ chạy nốt rồi dừng.")
+
+
+def scheduler_stop_requested() -> bool:
+    """True khi lịch đã bị dừng (nút Dừng / Ctrl+C)."""
+    return _scheduler_stop.is_set()
+
+
+def scheduler_inflight_count() -> int:
+    """Số job dispatcher đã giao mà chưa xong (đang đăng dở hoặc còn chờ trong pool)."""
+    with _dispatch_track_lock:
+        return len(_dispatch_tracked)
+
+
+def _return_job_to_ready_queue(job_id: str) -> None:
+    """Trả job chưa kịp chạy về ``ready_queue`` để lần bật lịch sau chạy tiếp, không tính là lỗi."""
+    _untrack_dispatch(job_id)
+    try:
+        get_default_schedule_posts_manager().update_job_fields(
+            job_id, status="ready_queue", running_started_at=""
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không trả job {} về hàng đợi: {}", job_id, exc)
+
+
+def _run_dispatched_post_job(
+    account_id: str,
+    *,
+    page_id: str | None,
+    draft_id: str | None,
+    schedule_post_job_id: str,
+) -> bool:
+    """
+    Worker của dispatcher: bỏ qua (trả về hàng đợi) nếu lịch đã dừng lúc job còn chờ trong pool.
+
+    Returns:
+        Kết quả ``run_scheduled_post_for_account``; False nếu bị bỏ qua vì đã dừng.
+    """
+    if scheduler_stop_requested():
+        logger.info("[Lịch] Đã dừng — job {} chưa chạy, trả về hàng đợi.", schedule_post_job_id)
+        _return_job_to_ready_queue(schedule_post_job_id)
+        return False
+    _dispatch_ctx.active = True
+    try:
+        return run_scheduled_post_for_account(
+            account_id,
+            page_id=page_id,
+            draft_id=draft_id,
+            schedule_post_job_id=schedule_post_job_id,
+        )
+    finally:
+        _dispatch_ctx.active = False
+
+
+def _job_max_minutes() -> float:
+    """Một job đăng quá số phút này coi là treo — giải phóng tài khoản cho Page tiếp theo."""
+    raw = os.environ.get("SCHEDULE_JOB_MAX_MINUTES", "40").strip()
+    try:
+        return max(10.0, min(240.0, float(raw)))
+    except ValueError:
+        return 40.0
+
+
+def _track_dispatch(job_id: str, account_id: str) -> None:
+    """Giữ chỗ tài khoản ngay lúc giao job — job chờ trong hàng worker cũng tính là bận."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+    with _dispatch_track_lock:
+        _dispatch_tracked[jid] = (str(account_id or "").strip(), time.monotonic())
+
+
+def _untrack_dispatch(job_id: str) -> None:
+    """Bỏ giữ chỗ khi job xong (hoặc đã bị watchdog giải phóng)."""
+    jid = str(job_id or "").strip()
+    with _dispatch_track_lock:
+        _dispatch_tracked.pop(jid, None)
+
+
+def _dispatch_is_abandoned(job_id: str | None) -> bool:
+    """Job đã bị watchdog giải phóng — worker treo khi trả về không được nhả slot lần nữa."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return False
+    with _dispatch_track_lock:
+        return jid in _dispatch_abandoned
+
+
+def _dispatched_count() -> int:
+    """Số job đã giao mà chưa xong."""
+    with _dispatch_track_lock:
+        return len(_dispatch_tracked)
+
+
+def _account_busy_count(account_id: str) -> int:
+    """Tài khoản bận = đang mở browser hoặc đã có job giao đang chờ worker."""
+    aid = str(account_id or "").strip()
+    with _dispatch_track_lock:
+        reserved = sum(1 for a, _t in _dispatch_tracked.values() if a == aid)
+    return max(reserved, _account_inflight_count(aid))
+
+
+def _dispatch_capacity(pool: ThreadPoolExecutor) -> int:
+    """Còn bao nhiêu worker rảnh — không giao quá số worker để job chưa chạy vẫn ở ready_queue."""
+    workers = int(getattr(pool, "_max_workers", 0) or _schedule_dispatch_workers_default())
+    return max(0, workers - _dispatched_count())
+
+
+def _watchdog_hung_and_orphan_jobs(sp: Any) -> None:
+    """
+    Chạy mỗi tick (24/7):
+
+    - Job giao quá ``SCHEDULE_JOB_MAX_MINUTES`` chưa xong → ghi failed, nhả tài khoản để Page sau chạy.
+    - Job ``running`` trong file mà không còn worker (worker chết) → ghi failed, không đăng lại kẻo trùng.
+    """
+    limit_sec = _job_max_minutes() * 60.0
+    now_mono = time.monotonic()
+    hung: list[tuple[str, str]] = []
+    with _dispatch_track_lock:
+        for jid, (aid, t0) in list(_dispatch_tracked.items()):
+            if now_mono - t0 >= limit_sec:
+                hung.append((jid, aid))
+                _dispatch_tracked.pop(jid, None)
+                _dispatch_abandoned.add(jid)
+        tracked_ids = set(_dispatch_tracked)
+    for jid, aid in hung:
+        logger.error(
+            "[Watchdog] Job {} (account {}) quá {:.0f} phút chưa xong — nhả tài khoản, chuyển Page tiếp theo.",
+            jid,
+            aid,
+            limit_sec / 60,
+        )
+        _release_account_run_slot(aid)
+        try:
+            sp.update_job_fields(
+                jid,
+                status="failed",
+                error_note=f"Quá {limit_sec / 60:.0f} phút chưa đăng xong (treo) — đã dừng chờ.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Watchdog] Không ghi failed job {}: {}", jid, exc)
+    try:
+        orphans = find_orphan_running_jobs(sp.load_all(), tracked_ids=tracked_ids)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Watchdog] quét running mồ côi lỗi: {}", exc)
+        orphans = []
+    for jid in orphans:
+        logger.warning("[Watchdog] Job {} đang 'running' nhưng không còn worker — ghi failed.", jid)
+        try:
+            sp.update_job_fields(
+                jid,
+                status="failed",
+                error_note="Worker dừng giữa chừng — kiểm tra Page trước khi đăng lại.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Watchdog] Không ghi failed job {}: {}", jid, exc)
+
+
+def _roll_overdue_jobs(sp: Any, *, now: datetime) -> None:
+    """
+    Job đã trễ quá ``SCHEDULE_OVERDUE_ROLL_MINUTES`` mà chưa bắt đầu đăng
+    → báo quá giờ và tự dời lịch (chuỗi: sau bài cuối Page; đăng lẻ: xếp lại cách 2–10 phút).
+
+    Tránh dồn đăng bù khi mở lại app sau sự cố / tắt máy quá giờ hẹn.
+    """
+    from src.services.schedule_alerts import has_overdue_to_roll, roll_overdue_to_series_end
+
+    try:
+        if not has_overdue_to_roll(sp.load_all(), now=now):
+            return
+        rolled = sp.mutate(lambda rows: roll_overdue_to_series_end(rows, now=now))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Lịch] Dời job quá hạn lỗi (bỏ qua): {}", exc)
+        return
+    if rolled:
+        logger.warning(
+            "[Lịch] Đã tự dời {} bài quá giờ (không dồn đăng bù). Ví dụ: {}",
+            len(rolled),
+            (rolled[0].get("error_note") or "")[:160],
+        )
+    for row in rolled:
+        logger.warning(
+            "[Lịch] Job {} page={} quá giờ chưa đăng — {}",
+            row.get("id"),
+            row.get("page_id"),
+            row.get("error_note"),
+        )
+
+
+def _maybe_archive_finished_jobs(sp: Any) -> None:
+    """Mỗi giờ một lần: dọn job đã đăng xong hơn 7 ngày sang file archive."""
+    global _archive_last_mono
+    now_mono = time.monotonic()
+    if _archive_last_mono and now_mono - _archive_last_mono < 3600:
+        return
+    _archive_last_mono = now_mono
+    try:
+        days = int(os.environ.get("SCHEDULE_ARCHIVE_DAYS", "7") or "7")
+        archive_finished_jobs(sp, older_than_days=days)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Schedule queue] Dọn job cũ lỗi (bỏ qua): {}", exc)
 
 
 def _schedule_low_ram_mode() -> bool:
@@ -151,6 +376,8 @@ def _should_skip_idle_schedule_tick() -> bool:
 def _maybe_drain_queue_after_job_done() -> None:
     """Drain hàng đợi sau job xong — có debounce để tránh tick storm trên máy yếu."""
     global _queue_last_drain_mono
+    if scheduler_stop_requested():
+        return
     if os.environ.get("SCHEDULE_DRAIN_QUEUE_ON_DONE", "1").strip().lower() not in {
         "1",
         "true",
@@ -329,6 +556,9 @@ def _log_dispatch_done(
 ) -> None:
     """Ghi log khi một job dispatch hoàn tất."""
     _mark_dispatch_done(engine)
+    _untrack_dispatch(job_id)
+    with _dispatch_track_lock:
+        _dispatch_abandoned.discard(str(job_id or "").strip())
     try:
         ok = fut.result()
         logger.info(
@@ -827,6 +1057,19 @@ def _note_fleet_issue(job: dict[str, Any] | None, message: str) -> None:
         logger.warning("Không ghi được nhắc AI Fleet: {}", exc)
 
 
+def _post_failure_is_final(note: str) -> bool:
+    """Lỗi cần người xử lý — thử lại ngay cũng không đăng được."""
+    low = str(note or "").lower()
+    if "need_manual_check" in low:
+        return True
+    try:
+        from src.services.ai_fleet.gate import is_approval_block
+
+        return bool(is_approval_block(note))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_note: str = "") -> None:
     """Cập nhật ``schedule_posts.json`` khi job queue gọi ``run_scheduled_post_for_account``."""
     if not job_id:
@@ -879,33 +1122,15 @@ def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_
                 _note_fleet_issue(job, note)
                 return
             manual = "need_manual_check" in note.lower()
-            # Rule mới: lỗi thì retry tối đa 3 lần, mỗi lần cách nhau 5 phút.
-            # Nếu 1 lần thành công thì dừng ngay (đã xử lý ở nhánh success phía trên).
-            max_retry = 3
-            retry_delay_min = 5
             new_rc = rc + 1
             if manual:
                 sp.update_job_fields(jid, status="need_manual_check", error_note=note, retry_count=new_rc)
                 _note_fleet_issue(job, note)
-            elif new_rc <= max_retry:
-                nxt = (datetime.now(timezone.utc) + timedelta(minutes=retry_delay_min)).replace(microsecond=0)
-                nxt_iso = nxt.isoformat()
-                sp.update_job_fields(
-                    jid,
-                    status="pending",
-                    scheduled_at=nxt_iso,
-                    error_note=note,
-                    retry_count=new_rc,
-                )
-                logger.info(
-                    "Job {} — thử lại ({}/{}), hẹn pending lúc {}",
-                    jid,
-                    new_rc,
-                    max_retry,
-                    nxt_iso,
-                )
             else:
+                # Lần đăng và lần thử lại đã chạy xong trong cùng lượt. Không hẹn lại —
+                # Page tiếp theo đang chờ hàng sẽ chạy ngay.
                 sp.update_job_fields(jid, status="failed", error_note=note, retry_count=new_rc)
+                logger.info("Job {} — không đăng được sau lần thử lại, chuyển Page tiếp theo.", jid)
                 _note_fleet_issue(job, note)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không cập nhật schedule_posts job {}: {}", job_id, exc)
@@ -993,13 +1218,8 @@ def _parallel_same_account_enabled() -> bool:
 
 
 def _per_account_parallel_limit() -> int:
-    """Giới hạn số job đồng thời cho mỗi account (mặc định 1 browser/account)."""
-    raw = os.environ.get("SCHEDULE_PER_ACCOUNT_MAX_PARALLEL", "1").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 1
-    return max(1, min(4, n))
+    """Cùng một tài khoản chỉ đăng một Page tại một thời điểm. Page sau xếp hàng, không bỏ."""
+    return 1
 
 
 def _per_page_parallel_limit() -> int:
@@ -1105,6 +1325,8 @@ def tick_schedule_post_jobs() -> None:
     4. Dispatch: 1 browser/account; account busy → chờ tick sau
     """
     global _queue_next_due_hint_utc, _queue_idle_probe_after_utc, _queue_hint_refresh_after_utc
+    if scheduler_stop_requested():
+        return
     accounts_mgr = AccountsDatabaseManager()
     now = datetime.now(timezone.utc)
     prefetch_sec = _prefetch_window_seconds()
@@ -1117,9 +1339,12 @@ def tick_schedule_post_jobs() -> None:
         try:
             sp = get_default_schedule_posts_manager()
             ensure_schedule_queue_recovery(sp)
+            _watchdog_hung_and_orphan_jobs(sp)
+            _maybe_archive_finished_jobs(sp)
+            _roll_overdue_jobs(sp, now=now)
             jobs = sp.load_all()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("schedule_posts tick: không đọc được: {}", exc)
+            logger.warning("schedule_posts tick: không đọc được: {}", exc)
             return
         next_due: datetime | None = None
         for job in jobs:
@@ -1161,9 +1386,10 @@ def tick_schedule_post_jobs() -> None:
 
         batch = select_dispatch_batch(
             sorted_ready,  # type: ignore[arg-type]
-            account_inflight=_account_inflight_count,
+            account_inflight=_account_busy_count,
             per_account_limit=per_acc_limit,
         )
+        batch = batch[: _dispatch_capacity(get_schedule_posts_dispatch_pool())]
 
         jobs_to_dispatch = []
         queued_waiting = max(0, len(sorted_ready) - len(batch))
@@ -1176,13 +1402,43 @@ def tick_schedule_post_jobs() -> None:
             fresh = sp.get_by_id(jid)
             if not fresh or str(fresh.get("status", "")).strip().lower() != "ready_queue":
                 continue
+            # Tránh giao job khi Page/tài khoản đang chia sẻ — để lại ready_queue, tick sau chạy.
+            page_row_peek = None
             try:
-                sp.update_job_fields(jid, status="running")
+                page_row_peek = get_default_pages_manager().get_by_id(pid)
+            except Exception:  # noqa: BLE001
+                page_row_peek = None
+            peek_keys = normalize_page_keys(pid, page_row=page_row_peek)
+            if is_cross_busy(feature=FEATURE_SCHEDULE, account_id=aid, page_keys=peek_keys):
+                reason = busy_reason(account_id=aid, page_keys=peek_keys) or "đang chia sẻ"
+                logger.info(
+                    "[Queue dispatcher] Hoãn job {} — {} (chờ xong rồi đăng).",
+                    jid,
+                    reason,
+                )
+                queued_waiting += 1
+                continue
+            try:
+                sp.update_job_fields(
+                    jid,
+                    status="running",
+                    running_started_at=datetime.now(timezone.utc).isoformat(),
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Job {} không chuyển running: {}", jid, exc)
                 continue
-            did = _draft_id_for_queue_job(dict(job))
-            engine = _resolve_engine_for_account(aid, accounts=accounts_mgr)
+            _track_dispatch(jid, aid)
+            try:
+                did = _draft_id_for_queue_job(dict(job))
+                engine = _resolve_engine_for_account(aid, accounts=accounts_mgr)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Job {} lỗi chuẩn bị dispatch — trả về ready_queue: {}", jid, exc)
+                _untrack_dispatch(jid)
+                try:
+                    sp.update_job_fields(jid, status="ready_queue")
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
             waited_seconds = max(0.0, (now - when).total_seconds())
             jobs_to_dispatch.append((jid, aid, pid, did or None, engine, waited_seconds))
@@ -1225,6 +1481,9 @@ def tick_schedule_post_jobs() -> None:
         len(jobs_to_dispatch),
     )
     for jid, aid, pid, did, engine, waited_seconds in jobs_to_dispatch:
+        if scheduler_stop_requested():
+            _return_job_to_ready_queue(jid)
+            continue
         _mark_dispatch_submitted(engine)
         logger.info(
             "[Queue dispatcher] Submit job={} account={} page={} | engine={} | waited={:.1f}s",
@@ -1236,13 +1495,23 @@ def tick_schedule_post_jobs() -> None:
         )
         if smart_ms > 0 and len(jobs_to_dispatch) > 1:
             time.sleep(min(smart_ms, 3000) / 1000.0)
-        fut = pool.submit(
-            run_scheduled_post_for_account,
-            aid,
-            page_id=pid,
-            draft_id=did,
-            schedule_post_job_id=jid,
-        )
+        try:
+            fut = pool.submit(
+                _run_dispatched_post_job,
+                aid,
+                page_id=pid,
+                draft_id=did,
+                schedule_post_job_id=jid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[Queue dispatcher] Không submit được job={}: {} — trả về ready_queue.", jid, exc)
+            _mark_dispatch_done(engine)
+            _untrack_dispatch(jid)
+            try:
+                get_default_schedule_posts_manager().update_job_fields(jid, status="ready_queue")
+            except Exception:  # noqa: BLE001
+                pass
+            continue
         fut.add_done_callback(
             lambda f, _jid=jid, _aid=aid, _pid=pid, _eng=engine: _log_dispatch_done(
                 f,
@@ -1317,6 +1586,8 @@ def _tick_merged_serial_facebook_tiktok() -> None:
         tiktok_schedule_tick_lock,
     )
 
+    if scheduler_stop_requested():
+        return
     accounts_mgr = AccountsDatabaseManager()
     now = datetime.now(timezone.utc)
     prefetch_sec = _prefetch_window_seconds()
@@ -1328,9 +1599,11 @@ def _tick_merged_serial_facebook_tiktok() -> None:
         with tiktok_schedule_tick_lock():
             try:
                 sp = get_default_schedule_posts_manager()
+                _watchdog_hung_and_orphan_jobs(sp)
+                _roll_overdue_jobs(sp, now=now)
                 jobs = sp.load_all()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("merged tick: không đọc schedule_posts: {}", exc)
+                logger.warning("merged tick: không đọc schedule_posts: {}", exc)
                 return
             promote_due_pending_to_ready(sp, now=now)
             jobs = sp.load_all()
@@ -1364,9 +1637,10 @@ def _tick_merged_serial_facebook_tiktok() -> None:
             sorted_ready = sort_queue_jobs(ready_jobs)  # type: ignore[arg-type]
             batch = select_dispatch_batch(
                 sorted_ready,  # type: ignore[arg-type]
-                account_inflight=_account_inflight_count,
+                account_inflight=_account_busy_count,
                 per_account_limit=per_acc_limit,
             )
+            batch = batch[: _dispatch_capacity(get_schedule_posts_dispatch_pool())]
             queued_due_count = max(0, len(sorted_ready) - len(batch))
             for job in batch:
                 jid = str(job.get("id", "")).strip()
@@ -1378,8 +1652,12 @@ def _tick_merged_serial_facebook_tiktok() -> None:
                 if not fresh or str(fresh.get("status", "")).strip().lower() != "ready_queue":
                     continue
                 when = _parse_queue_job_scheduled_at(job.get("scheduled_at"))
-                did = _draft_id_for_queue_job(dict(job))
-                engine = _resolve_engine_for_account(aid, accounts=accounts_mgr)
+                try:
+                    did = _draft_id_for_queue_job(dict(job))
+                    engine = _resolve_engine_for_account(aid, accounts=accounts_mgr)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Merged: job {} lỗi chuẩn bị — để lại ready_queue: {}", jid, exc)
+                    continue
                 waited_seconds = max(0.0, (now - when).total_seconds())
                 fb_batch.append((when, jid, aid, pid, did or None, engine, waited_seconds))
                 note_job_dispatched(aid)
@@ -1468,10 +1746,15 @@ def _tick_merged_serial_facebook_tiktok() -> None:
                 if item[0] == "fb":
                     _, when, jid, aid, pid, did, engine, waited = item
                     try:
-                        sp.update_job_fields(jid, status="running")
+                        sp.update_job_fields(
+                            jid,
+                            status="running",
+                            running_started_at=datetime.now(timezone.utc).isoformat(),
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Merged: không chuyển running FB job {}: {}", jid, exc)
                         continue
+                    _track_dispatch(jid, aid)
                     chain_steps.append(("fb", jid, aid, pid, did, engine, waited))
                 else:
                     _, tw, jid, waited = item
@@ -1519,6 +1802,46 @@ def _tick_merged_serial_facebook_tiktok() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.debug("[Cross-platform queue] Drain TikTok: {}", exc)
 
+    def release_rest(start: int) -> None:
+        """Chuỗi bị đứt: trả các job FB chưa chạy về ready_queue để tick sau chạy tiếp."""
+        sp_rel = get_default_schedule_posts_manager()
+        for st in chain_steps[start:]:
+            if st[0] == "tt":
+                try:
+                    tt_store = TikTokJobStore()
+                    tt_row = tt_store.get_by_id(st[1])
+                    if tt_row and str(tt_row.get("status", "")).strip().lower() == "running":
+                        tt_row = dict(tt_row)
+                        tt_row["status"] = "pending"
+                        tt_row["step"] = ""
+                        tt_store.upsert(tt_row)
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            if st[0] != "fb":
+                continue
+            _untrack_dispatch(st[1])
+            try:
+                sp_rel.update_job_fields(st[1], status="ready_queue")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def continue_chain(next_idx: int) -> None:
+        """Chạy bước kế tiếp; lỗi submit thì nhả phần còn lại thay vì kẹt 'running'."""
+        if next_idx >= n:
+            drain_both()
+            return
+        if scheduler_stop_requested():
+            release_rest(next_idx)
+            unified_chain_end()
+            return
+        try:
+            submit_one(next_idx)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Cross-platform queue] Đứt chuỗi ở bước {}: {}", next_idx + 1, exc)
+            release_rest(next_idx)
+            drain_both()
+
     def submit_one(idx: int) -> None:
         step = chain_steps[idx]
         kind = step[0]
@@ -1543,13 +1866,10 @@ def _tick_merged_serial_facebook_tiktok() -> None:
                     page_id=pid,
                     engine=engine,
                 )
-                if i + 1 < n:
-                    submit_one(i + 1)
-                else:
-                    drain_both()
+                continue_chain(i + 1)
 
             fut2 = pool.submit(
-                run_scheduled_post_for_account,
+                _run_dispatched_post_job,
                 aid,
                 page_id=pid,
                 draft_id=did,
@@ -1568,38 +1888,40 @@ def _tick_merged_serial_facebook_tiktok() -> None:
 
             def on_tt_done(fut: Future[Any], i: int = idx) -> None:
                 _tiktok_worker_done(fut)
-                if i + 1 < n:
-                    submit_one(i + 1)
-                else:
-                    drain_both()
+                continue_chain(i + 1)
 
             fut3 = pool.submit(run_tiktok_scheduled_slot_job, jid)
             fut3.add_done_callback(on_tt_done)
 
-    try:
-        submit_one(0)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("[Cross-platform queue] Lỗi khởi chạy chuỗi: {}", exc)
-        drain_both()
+    continue_chain(0)
 
 
 def tick_cross_platform_schedule_jobs() -> None:
     """
     Một tick cho cả ``schedule_posts.json`` và TikTok: nếu **cùng lúc** cả hai nền tảng có job đến hạn,
     chạy tuần tự có thứ tự ưu tiên; không thì giữ hành vi song song như trước.
-    """
-    if _should_skip_idle_schedule_tick():
-        return
-    if _peek_facebook_due_pending() and _peek_tiktok_due_pending():
-        _tick_merged_serial_facebook_tiktok()
-    else:
-        tick_schedule_post_jobs()
-        try:
-            from src.services.tiktok.schedule_tick import tick_tiktok_upload_jobs
 
-            tick_tiktok_upload_jobs()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("tick TikTok: {}", exc)
+    Mọi lỗi đều bị bắt và ghi log — vòng quét 24/7 không bao giờ dừng vì một job lỗi.
+    """
+    try:
+        if _should_skip_idle_schedule_tick():
+            return
+        if _peek_facebook_due_pending() and _peek_tiktok_due_pending():
+            _tick_merged_serial_facebook_tiktok()
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[Schedule tick] Lỗi quét gộp FB+TikTok (tick sau chạy lại): {}", exc)
+        return
+    try:
+        tick_schedule_post_jobs()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[Schedule tick] Lỗi quét lịch Facebook (tick sau chạy lại): {}", exc)
+    try:
+        from src.services.tiktok.schedule_tick import tick_tiktok_upload_jobs
+
+        tick_tiktok_upload_jobs()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("tick TikTok: {}", exc)
 
 
 def run_scheduled_post_for_account(
@@ -1613,6 +1935,8 @@ def run_scheduled_post_for_account(
     headless: bool | None = None,
     schedule_post_job_id: str | None = None,
     force_post_now: bool = False,
+    _attempt: int = 1,
+    _keep_account_lock: bool = False,
 ) -> bool:
     """
     Pipeline một lượt đăng: nội dung (draft hoặc AI) → (chờ slot) → profile/proxy → cookie → đích đăng → đăng.
@@ -1640,10 +1964,19 @@ def run_scheduled_post_for_account(
     """
     outcome_ok = False
     err_msg = ""
+    retry_same_page = False
+    deferred_for_busy = False
     runtime_profile_dir: Path | None = None
     account_run_slot = 0
     page_run_slot = 0
     page_slot_id = ""
+    feature_lease = None
+    self_tracked = False
+    if schedule_post_job_id and not _keep_account_lock:
+        with _dispatch_track_lock:
+            self_tracked = str(schedule_post_job_id).strip() not in _dispatch_tracked
+        if self_tracked:
+            _track_dispatch(str(schedule_post_job_id), account_id)
     try:
         mgr = accounts or AccountsDatabaseManager()
         pool = browser_pool or get_default_browser_pool()
@@ -1657,7 +1990,8 @@ def run_scheduled_post_for_account(
                 f"(sau cập nhật: chạy «Di chuyển dữ liệu» hoặc thêm lại tài khoản).",
             )
             return False
-        account_run_slot = _acquire_account_run_slot(account_id)
+        if not _keep_account_lock:
+            account_run_slot = _acquire_account_run_slot(account_id)
         session_status_before = str(acc.get("session_status") or "active").strip() or "active"
         try:
             log_job_step(STEP_LOAD_ACCOUNT, "Chuẩn bị tài khoản (registry, profile, proxy).", account_id=account_id)
@@ -1773,6 +2107,40 @@ def run_scheduled_post_for_account(
                 return False
         content_page_row = merge_queue_job_content_into_page_row(page_row, queue_job)
         page_slot_id = str((page_row or content_page_row or {}).get("id") or pid_raw or "").strip()
+        page_busy_keys = normalize_page_keys(
+            page_slot_id,
+            pid_raw,
+            page_row=page_row or content_page_row,
+        )
+        # Ưu tiên đăng lịch: chờ chia sẻ nhả Page/tài khoản (không ghi lỗi). Hết giờ → trả hàng chờ.
+        if not _keep_account_lock:
+            if is_cross_busy(
+                feature=FEATURE_SCHEDULE, account_id=account_id, page_keys=page_busy_keys
+            ):
+                reason = busy_reason(account_id=account_id, page_keys=page_busy_keys) or "đang chia sẻ"
+                logger.info(
+                    "[Lịch] Job {} chờ nhường — {} (ưu tiên đăng sau khi chia sẻ xong Page hiện tại).",
+                    schedule_post_job_id or "—",
+                    reason,
+                )
+            feature_lease = acquire_schedule_preferring(
+                account_id=account_id,
+                page_keys=page_busy_keys,
+                detail=str(schedule_post_job_id or "")[:40],
+                timeout=300.0,
+                poll=2.0,
+            )
+            if feature_lease is None:
+                reason = busy_reason(account_id=account_id, page_keys=page_busy_keys) or "đang chia sẻ"
+                logger.info(
+                    "[Lịch] Hoãn job {} — vẫn {} sau khi chờ. Giữ hàng chờ, tick sau chạy tiếp.",
+                    schedule_post_job_id or "—",
+                    reason,
+                )
+                deferred_for_busy = True
+                if schedule_post_job_id:
+                    _return_job_to_ready_queue(str(schedule_post_job_id))
+                return False
         if page_slot_id:
             page_run_slot = _acquire_page_run_slot(page_slot_id)
             logger.info(
@@ -2071,19 +2439,73 @@ def run_scheduled_post_for_account(
                 logger.exception("Không ghi được status=failed cho {}.", account_id)
 
         outcome_ok = post_ok
-        return outcome_ok
+        if (
+            not outcome_ok
+            and _attempt < 2
+            and schedule_post_job_id
+            and not _post_failure_is_final(err_msg)
+        ):
+            retry_same_page = True
+        else:
+            return outcome_ok
     finally:
-        if schedule_post_job_id:
+        inner_finalized = False
+        if retry_same_page and getattr(_dispatch_ctx, "active", False) and scheduler_stop_requested():
+            retry_same_page = False
+            logger.info("[Đăng] Lịch đã dừng — bỏ lượt thử lại lần 2 cho job {}.", schedule_post_job_id)
+        if retry_same_page:
+            logger.warning(
+                "[Đăng] Job {} lỗi — thử lại lần 2 ngay, chưa chuyển Page. {}",
+                schedule_post_job_id,
+                (err_msg or "")[:240],
+            )
+            try:
+                outcome_ok = run_scheduled_post_for_account(
+                    account_id,
+                    entity_id=entity_id,
+                    page_id=page_id,
+                    draft_id=draft_id,
+                    accounts=accounts,
+                    browser_pool=browser_pool,
+                    headless=headless,
+                    schedule_post_job_id=schedule_post_job_id,
+                    force_post_now=force_post_now,
+                    _attempt=_attempt + 1,
+                    _keep_account_lock=True,
+                )
+                inner_finalized = True
+                if outcome_ok:
+                    err_msg = ""
+            except Exception as exc:  # noqa: BLE001
+                outcome_ok = False
+                err_msg = f"{err_msg} | thử lại lần 2 lỗi: {exc}"[:900]
+                logger.exception("[Đăng] Thử lại lần 2 thất bại. job={}", schedule_post_job_id)
+        if schedule_post_job_id and not inner_finalized and not deferred_for_busy:
             _finalize_schedule_post_job_record(schedule_post_job_id, outcome_ok, err_msg)
-        if account_run_slot > 0:
+        if (
+            not _keep_account_lock
+            and account_run_slot > 0
+            and not _dispatch_is_abandoned(schedule_post_job_id)
+        ):
             _release_account_run_slot(account_id)
+        if self_tracked:
+            _untrack_dispatch(str(schedule_post_job_id))
+            with _dispatch_track_lock:
+                _dispatch_abandoned.discard(str(schedule_post_job_id).strip())
         if page_run_slot > 0 and page_slot_id:
             _release_page_run_slot(page_slot_id)
+        if feature_lease is not None and not _keep_account_lock:
+            try:
+                feature_lease.release()
+            except Exception:  # noqa: BLE001
+                pass
+            feature_lease = None
         if runtime_profile_dir is not None:
             try:
                 shutil.rmtree(runtime_profile_dir, ignore_errors=True)
             except Exception:
                 pass
+    return outcome_ok
 
 
 def __env_headless_default() -> bool:
@@ -2369,6 +2791,10 @@ def run_forever(
     interval = int(os.environ.get("STATUS_LOG_INTERVAL_SEC", str(status_interval_sec)))
     if interval < 10:
         interval = 10
+    global _scheduler_generation
+    _scheduler_generation += 1
+    my_generation = _scheduler_generation
+    _scheduler_stop.clear()
     sched = build_scheduler(mgr)
     try:
         ensure_schedule_queue_recovery(get_default_schedule_posts_manager())
@@ -2394,6 +2820,9 @@ def run_forever(
     except KeyboardInterrupt:
         logger.info("Đang shutdown scheduler (Ctrl+C)...")
     finally:
+        # Bấm Dừng rồi Bắt đầu nhanh: vòng cũ thoát muộn không được tắt lịch mới.
+        if my_generation == _scheduler_generation:
+            request_scheduler_stop()
         try:
             sched.shutdown(wait=False)
         except Exception as exc:  # noqa: BLE001

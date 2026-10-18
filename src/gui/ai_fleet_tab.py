@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 from tkinter import messagebox, ttk
 from typing import Any
 
-from src.gui.ui_responsiveness import schedule_on_main_thread
+from src.gui.page_category_filter import PageCategoryFilter
+from src.gui.ui_responsiveness import (
+    ASYNC_PREP_MIN_ROWS,
+    schedule_on_main_thread,
+    tree_delete_all,
+    tree_insert_chunked,
+)
+from src.utils.page_categories import normalize_page_category, page_category_label
 from src.services.ai_fleet.gate import human_decide, review_content, schedule_block_reason
 from src.services.ai_fleet.pipeline import (
     IMAGE_PROVIDERS,
@@ -202,6 +209,7 @@ class AiFleetTab:
         self.store = FleetStore()
         self._pages: list[dict[str, str]] = []
         self._chosen_page_id = ""
+        self._pages_tree_gen = 0
         self._build()
         self.refresh()
         parent.reload_from_sync = self.refresh
@@ -332,6 +340,8 @@ class AiFleetTab:
         )
         status_filter.pack(side=tk.LEFT, padx=(6, 12))
         status_filter.bind("<<ComboboxSelected>>", lambda _event: self._fill_pages())
+        self.page_category_filter = PageCategoryFilter(bar, on_change=self._fill_pages, width=20)
+        self.page_category_filter.frame.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(bar, text="Tìm").pack(side=tk.LEFT)
         self.page_query = tk.StringVar()
         ttk.Entry(bar, textvariable=self.page_query, width=28).pack(side=tk.LEFT, padx=6)
@@ -343,10 +353,13 @@ class AiFleetTab:
         list_wrap = ttk.Frame(panes, padding=(0, 0, 8, 0))
         list_wrap.rowconfigure(0, weight=1)
         list_wrap.columnconfigure(0, weight=1)
-        self.page_tree = ttk.Treeview(list_wrap, columns=("stt", "name", "account", "status"), show="headings", height=12)
+        self.page_tree = ttk.Treeview(
+            list_wrap, columns=("stt", "name", "category", "account", "status"), show="headings", height=12
+        )
         for key, title, width, stretch in (
             ("stt", "STT", 48, False),
             ("name", "Page", 180, True),
+            ("category", "Phân loại", 96, False),
             ("account", "Tài khoản", 130, True),
             ("status", "Trạng thái", 90, False),
         ):
@@ -516,7 +529,7 @@ class AiFleetTab:
         flags = ttk.Frame(pick)
         flags.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(flags, text="Ảnh đi kèm để agent tổng duyệt", variable=self.make_image).pack(side=tk.LEFT)
-        ttk.Checkbutton(flags, text="Khi bật, nhận mọi Page", variable=self.auto_all).pack(side=tk.LEFT, padx=12)
+        ttk.Checkbutton(flags, text="Khi bật, nhận mọi Page (theo Phân loại đang lọc)", variable=self.auto_all).pack(side=tk.LEFT, padx=12)
         ttk.Button(flags, text="Mở ChatGPT", command=self._open_chatgpt_browser).pack(side=tk.LEFT, padx=12)
         ttk.Button(flags, text="Thêm tài khoản", command=self._focus_new_account).pack(side=tk.LEFT)
         ttk.Button(flags, text="Xóa tài khoản", command=self._delete_ready_accounts).pack(side=tk.LEFT, padx=8)
@@ -749,33 +762,60 @@ class AiFleetTab:
         query = self.page_query.get().strip().casefold() if hasattr(self, "page_query") else ""
         account_id = self._account_by_label.get(self.account_pick.get(), "") if hasattr(self, "account_pick") else ""
         names = {row["id"]: row["name"] for row in getattr(self, "_accounts", [])}
-        self.page_tree.delete(*self.page_tree.get_children())
+        tree_delete_all(self.page_tree)
         shown = 0
-        for row in self._pages:
-            if account_id and row.get("account_id") != account_id:
+        scope = [row for row in self._pages if not account_id or row.get("account_id") == account_id]
+        self.page_category_filter.refresh(scope)
+        specs: list[dict[str, Any]] = []
+        for row in scope:
+            if not self.page_category_filter.matches(row):
                 continue
+            category = page_category_label(row.get("page_category")) if row.get("page_category") else "—"
             profile = profiles.get(row["page_id"]) or {}
             status = _status_label(str(profile.get("status") or ""))
             account_name = names.get(row.get("account_id") or "", row.get("account_id") or "")
             wanted = self.page_status_filter.get() if hasattr(self, "page_status_filter") else "Mọi trạng thái"
             if wanted and wanted != "Mọi trạng thái" and status != wanted:
                 continue
-            blob = f"{row['page_name']} {row['page_id']} {account_name} {status}".casefold()
+            blob = f"{row['page_name']} {row['page_id']} {account_name} {status} {category}".casefold()
             if query and query not in blob:
                 continue
             shown += 1
-            self.page_tree.insert(
-                "",
-                tk.END,
-                iid=row["page_id"],
-                values=(shown, row["page_name"], account_name, status),
+            specs.append(
+                {
+                    "iid": row["page_id"],
+                    "values": (shown, row["page_name"], category, account_name, status),
+                }
             )
-        if hasattr(self, "page_count"):
-            self.page_count.set(f"{shown} Page")
-        chosen = getattr(self, "_chosen_page_id", "")
-        if chosen and self.page_tree.exists(chosen):
-            self.page_tree.selection_set(chosen)
-            self.page_tree.see(chosen)
+        self._pages_tree_gen += 1
+        gen = self._pages_tree_gen
+
+        def _restore() -> None:
+            if gen != self._pages_tree_gen:
+                return
+            if hasattr(self, "page_count"):
+                self.page_count.set(f"{shown} Page")
+            chosen = getattr(self, "_chosen_page_id", "")
+            if chosen and self.page_tree.exists(chosen):
+                self.page_tree.selection_set(chosen)
+                self.page_tree.see(chosen)
+
+        if len(specs) < ASYNC_PREP_MIN_ROWS:
+            for spec in specs:
+                try:
+                    self.page_tree.insert("", tk.END, **spec)
+                except tk.TclError:
+                    pass
+            _restore()
+            return
+        tree_insert_chunked(
+            self.root,
+            self.page_tree,
+            specs,
+            generation=gen,
+            is_current=lambda g: g == self._pages_tree_gen,
+            on_complete=_restore,
+        )
 
     def _load_accounts(self) -> list[dict[str, str]]:
         try:
@@ -1005,6 +1045,7 @@ class AiFleetTab:
                         "page_name": str(row.get("page_name") or page_id),
                         "account_id": str(row.get("account_id") or "").strip(),
                         "topic": str(row.get("topic") or "").strip(),
+                        "page_category": normalize_page_category(row.get("page_category")),
                     }
                 )
             return rows
@@ -1374,7 +1415,10 @@ class AiFleetTab:
         self.login_status.set("Kiểm tra đạt. Tài khoản đã hiện ở tab Viết bài để chọn.")
 
     def _open_chatgpt_browser(self) -> None:
-        """Mở chatgpt.com bằng phiên đã lưu của tài khoản đang chọn. Đóng cửa sổ thì lần sau vẫn đăng nhập."""
+        """Mở chatgpt.com khi người dùng bấm nút. Không tự mở nếu chưa cho phép."""
+        import os
+
+        os.environ["TOOLFB_ALLOW_CHATGPT_BROWSER"] = "1"
         selected = []
         if hasattr(self, "ready_list"):
             for index in self.ready_list.curselection():
@@ -1497,7 +1541,10 @@ class AiFleetTab:
     def _pages_for_auto(self) -> list[dict[str, str]]:
         selected = self._selected_page_id()
         if self.auto_all.get():
-            return list(self._pages)
+            category_filter = getattr(self, "page_category_filter", None)
+            if category_filter is None:
+                return list(self._pages)
+            return [row for row in self._pages if category_filter.matches(row)]
         if not selected:
             return []
         return [row for row in self._pages if row["page_id"] == selected]

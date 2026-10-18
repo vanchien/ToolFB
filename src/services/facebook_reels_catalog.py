@@ -1,8 +1,8 @@
 """
-Thu thập danh sách link ``/reel/<id>`` trên tab Reels của profile Facebook.
+Thu thập danh sách link ``/reel/<id>`` trên tab Reels / Videos của Page Facebook.
 
-yt-dlp không hỗ trợ URL dạng ``…/username/reels/`` — dùng Playwright cuộn trang
-và trích href / HTML trên trang public (không dùng cookie/session đăng nhập).
+Dùng ``launch_persistent_context`` với ``portable_path`` của tài khoản đã login
+(cuộn tab Reels/Videos bằng session thật). yt-dlp không hỗ trợ URL ``…/username/reels/``.
 """
 
 from __future__ import annotations
@@ -30,38 +30,59 @@ _FB_WATCH_V_RE = re.compile(
 )
 _FB_PLAYABLE_ID_RE = re.compile(r'"playable_id"\s*:\s*"(\d{11,})"', re.IGNORECASE)
 
-_JS_SCROLL_SNAP = """
-() => {
-  const e = document.scrollingElement || document.documentElement;
-  const b = document.body;
-  const sh = Math.max(e.scrollHeight, b ? b.scrollHeight : 0);
-  const st = e.scrollTop;
-  const ch = e.clientHeight || window.innerHeight || 0;
-  return {
-    st,
-    sh,
-    ch,
-    atBottom: st + ch >= sh - 120,
-  };
-}
+# Ưu tiên vùng [role=main] / feed cuộn được — Facebook thường không cuộn document.
+_JS_PICK_SCROLL_EL = """
+  const doc = document.scrollingElement || document.documentElement;
+  const prefer = [];
+  const main = document.querySelector('[role="main"]');
+  if (main) prefer.push(main);
+  document.querySelectorAll('[role="main"] div, [data-pagelet]').forEach((el) => prefer.push(el));
+  const scored = [];
+  const seen = new Set();
+  for (const el of prefer) {
+    if (!el || seen.has(el)) continue;
+    seen.add(el);
+    try {
+      const sh = el.scrollHeight || 0;
+      const ch = el.clientHeight || 0;
+      if (sh > ch + 120) scored.push([el, sh - ch]);
+    } catch (_e) {}
+  }
+  if (!scored.length) {
+    for (const el of Array.from(document.querySelectorAll("div"))) {
+      try {
+        const sh = el.scrollHeight || 0;
+        const ch = el.clientHeight || 0;
+        if (sh > ch + 120) scored.push([el, sh - ch]);
+      } catch (_e) {}
+    }
+  }
+  scored.sort((a, b) => b[1] - a[1]);
+  const target = (scored[0] && scored[0][0]) || doc;
 """
 
-_JS_SCROLL_DEEP = """
-() => {
-  const doc = document.scrollingElement || document.documentElement;
-  const divs = Array.from(document.querySelectorAll("div"));
-  const cands = divs.filter(el => {
-    try {
-      return (el.scrollHeight || 0) > ((el.clientHeight || 0) + 120);
-    } catch (_e) {
-      return false;
-    }
-  });
-  cands.sort((a, b) => (b.scrollHeight - a.scrollHeight));
-  const target = cands[0] || doc;
+_JS_SCROLL_SNAP = (
+    "() => {\n"
+    + _JS_PICK_SCROLL_EL
+    + """
+  const e = document.scrollingElement || document.documentElement;
+  const b = document.body;
+  const sh = Math.max(target.scrollHeight || 0, e.scrollHeight || 0, b ? b.scrollHeight : 0);
+  const st = Math.max(target.scrollTop || 0, e.scrollTop || 0);
+  const ch = target.clientHeight || e.clientHeight || window.innerHeight || 0;
+  return { st, sh, ch, atBottom: st + ch >= sh - 120 };
+}
+"""
+)
+
+_JS_SCROLL_DEEP = (
+    "() => {\n"
+    + _JS_PICK_SCROLL_EL
+    + """
   const step = Math.max(700, Math.floor((target.clientHeight || window.innerHeight || 800) * 0.95));
   const before = target.scrollTop || 0;
-  target.scrollBy(0, step);
+  try { target.scrollBy(0, step); } catch (_e) { doc.scrollBy(0, step); }
+  try { window.scrollBy(0, Math.floor((window.innerHeight || 800) * 0.85)); } catch (_e2) {}
   const after = target.scrollTop || 0;
   return {
     before,
@@ -72,6 +93,7 @@ _JS_SCROLL_DEEP = """
   };
 }
 """
+)
 
 
 def _noop_status(_: str) -> None:
@@ -107,11 +129,124 @@ def _is_profile_locked(profile_dir: Path, browser_type: str) -> bool:
     return False
 
 
+# File/thư mục không cần cho session login — copy chúng lúc Firefox đang mở sẽ WinError 32
+# (parent.lock) và làm chậm mở app vì cache2 có hàng nghìn file.
+_CLONE_SKIP_NAMES = frozenset(
+    {
+        "parent.lock",
+        "lock",
+        ".parentlock",
+        "singletonlock",
+        "singletoncookie",
+        "singletonsocket",
+        "cache2",
+        "startupcache",
+        "shader-cache",
+        "thumbnails",
+        "datareporting",
+        "crashes",
+        "minidumps",
+        "saved-telemetry-pings",
+        "jumpListCache",
+        "activity-stream.inferred_personalization_feed.json",
+        "activity-stream.weather_feed.json",
+    }
+)
+
+
+def _clone_ignore(_directory: str, names: list[str]) -> list[str]:
+    """Bỏ lock + cache khi clone profile để quét — tránh lỗi đọc file đang bị Firefox giữ."""
+    skip: list[str] = []
+    for name in names:
+        if str(name).strip().lower() in _CLONE_SKIP_NAMES:
+            skip.append(name)
+    return skip
+
+
+def _clone_copy2(src: str, dst: str, *, follow_symlinks: bool = True) -> None:
+    """copy2 nhưng bỏ qua file đang khóa (WinError 32) thay vì làm hỏng cả lượt clone."""
+    try:
+        shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    except OSError as exc:
+        logger.debug("Bỏ file profile đang khóa khi clone quét: {} — {}", src, exc)
+
+
 def _clone_profile_for_scan(src: Path) -> Path:
+    """
+    Snapshot profile để quét song song với lịch đăng.
+
+    Không copy ``parent.lock`` / ``cache2`` — Firefox đang mở sẽ chặn đọc các file đó.
+    """
     tmp = Path(tempfile.mkdtemp(prefix="toolfb_fbscan_profile_"))
     dst = tmp / "profile"
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    try:
+        shutil.copytree(
+            src,
+            dst,
+            dirs_exist_ok=True,
+            ignore=_clone_ignore,
+            copy_function=_clone_copy2,
+            ignore_dangling_symlinks=True,
+        )
+    except shutil.Error as exc:
+        logger.warning("Clone profile quét thiếu vài file (bỏ file đang khóa): {}", exc)
     return dst
+
+
+_FB_RESERVED_SEGMENTS = frozenset(
+    {
+        "watch",
+        "groups",
+        "events",
+        "pages",
+        "reel",
+        "reels",
+        "share",
+        "stories",
+        "ads",
+        "marketplace",
+        "gaming",
+        "login",
+        "profile.php",
+        "home.php",
+        "notifications",
+        "friends",
+        "messages",
+        "settings",
+        "help",
+    }
+)
+
+
+def facebook_page_identity(url: str) -> str:
+    """
+    Khóa nhận diện Page/profile từ URL (vanity hoặc ``id=``).
+
+    Dùng để kiểm tra trình duyệt còn đúng Page nguồn sau ``goto`` / click tab.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    low = u.casefold()
+    m_id = re.search(r"facebook\.com/profile\.php\?[^#]*\bid=(\d+)", low)
+    if m_id:
+        return f"id:{m_id.group(1)}"
+    m = re.search(r"facebook\.com/([^/?#]+)", low)
+    if not m:
+        return ""
+    seg = m.group(1).strip().casefold()
+    if not seg or seg in _FB_RESERVED_SEGMENTS:
+        return ""
+    return f"vanity:{seg}"
+
+
+def url_matches_facebook_page(current_url: str, expected_page_url: str) -> bool:
+    """True nếu URL hiện tại vẫn thuộc cùng Page với URL nguồn đã chọn."""
+    want = facebook_page_identity(expected_page_url)
+    got = facebook_page_identity(current_url)
+    if not want or not got:
+        return False
+    return want == got
 
 
 def normalize_facebook_reels_tab_url(url: str) -> str:
@@ -134,21 +269,7 @@ def normalize_facebook_reels_tab_url(url: str) -> str:
     m = re.match(r"https?://(?:[\w-]+\.)?facebook\.com/([^/?#]+)/?(?:[?#].*)?$", u, re.I)
     if m:
         seg = m.group(1).lower()
-        reserved = {
-            "watch",
-            "groups",
-            "events",
-            "pages",
-            "reel",
-            "share",
-            "stories",
-            "ads",
-            "marketplace",
-            "gaming",
-            "login",
-            "profile.php",
-        }
-        if seg not in reserved:
+        if seg not in _FB_RESERVED_SEGMENTS:
             return u + "/reels/"
     return url.strip()
 
@@ -223,6 +344,27 @@ def _extract_video_ids_from_hrefs(hrefs: list[str]) -> list[str]:
     return out
 
 
+def _collect_main_hrefs(page: Any) -> list[str]:
+    """Chỉ lấy ``a[href]`` trong ``[role=main]`` — bỏ sidebar / Reels toàn cục / gợi ý."""
+    try:
+        hrefs = page.eval_on_selector_all(
+            "[role='main'] a[href]",
+            "els => els.map(a => a.getAttribute('href') || a.href || '')",
+        )
+        if hrefs:
+            return [str(h) for h in hrefs]
+    except Exception:
+        pass
+    try:
+        hrefs = page.eval_on_selector_all(
+            "a[href]",
+            "els => els.map(a => a.getAttribute('href') || a.href || '')",
+        )
+        return [str(h) for h in (hrefs or [])]
+    except Exception:
+        return []
+
+
 def _profile_videos_tab_url(page_url: str) -> str:
     u = (page_url or "").strip()
     m = re.match(r"^(https?://(?:[\w-]+\.)?facebook\.com/[^/?#]+)", u, re.I)
@@ -247,9 +389,15 @@ def scan_facebook_profile_reels_page(
     headless: bool | None = None,
     status: StatusFn | None = None,
     on_partial: Optional[Callable[[list[str]], None]] = None,
+    include_html_ids: bool = True,
+    scan_videos_tab: bool = True,
 ) -> dict[str, Any]:
     """
     Mở tab Reels, cuộn tải thêm nội dung, trả về danh sách URL ``https://www.facebook.com/reel/<id>``.
+
+    ``include_html_ids=False``: chỉ lấy ``a[href]`` trên trang (theo dõi chia sẻ — tránh ID
+    trong JSON gợi ý / related bị nhận nhầm là video mới của Page).
+    ``scan_videos_tab=False``: không sang tab Videos (tránh video cũ ID cao đẩy mốc sai).
 
     Returns:
         ``{ "ok": bool, "items": [{"video_id", "url"}], "message": str }``
@@ -258,6 +406,15 @@ def scan_facebook_profile_reels_page(
     url = normalize_facebook_reels_tab_url(page_url.strip())
     if "facebook.com" not in url.lower():
         return {"ok": False, "items": [], "message": "URL không phải Facebook."}
+    if not facebook_page_identity(url) and not facebook_page_identity(page_url):
+        return {
+            "ok": False,
+            "items": [],
+            "message": (
+                "Link không phải Page nguồn (vd. facebook.com/TenPage). "
+                "Không dùng link /reel/… hay trang Reels toàn cục."
+            ),
+        }
 
     hl = _env_headless_default() if headless is None else bool(headless)
     scroll_pause_sec = _env_scroll_pause(scroll_pause_sec)
@@ -368,20 +525,27 @@ def scan_facebook_profile_reels_page(
                     if existing_pages:
                         page = existing_pages[0]
                     else:
-                        return {
-                            "ok": False,
-                            "items": [],
-                            "message": "Profile không có tab khả dụng. Dừng quét (không dùng new_page).",
-                        }
+                        # Profile đã login thường vẫn mở được tab mới trong cùng context.
+                        st("Profile chưa có tab — mở tab mới trong session đã đăng nhập…")
+                        page = context.new_page()
                     try:
                         stealth = Stealth()
                         stealth.apply_stealth_sync(page)
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("stealth.apply_stealth_sync: {}", exc)
 
-                    st("Đang tải trang Reels (có thể 30–90s)…")
+                    expected_identity = facebook_page_identity(url) or facebook_page_identity(page_url)
+                    st("Đang tải tab Reels bằng tài khoản đã login (có thể 30–90s)…")
                     page.goto(url, wait_until="load", timeout=120_000)
                     time.sleep(min(1.35, scroll_pause_sec + 0.35))
+                    # Chờ lưới video/reel hiện — session login thường render chậm hơn public.
+                    try:
+                        page.wait_for_selector(
+                            "a[href*='/reel/'], a[href*='/videos/'], [role='main']",
+                            timeout=12_000,
+                        )
+                    except Exception:
+                        pass
                     try:
                         body_text = page.inner_text("body", timeout=3000)
                     except Exception:
@@ -400,12 +564,57 @@ def scan_facebook_profile_reels_page(
                         return {
                             "ok": False,
                             "items": [],
-                            "message": "Không thể quét tiếp nếu không dùng cookies/session.",
+                            "message": (
+                                "Session chưa đăng nhập / checkpoint. "
+                                "Mở profile tài khoản Page nhận, đăng nhập Facebook rồi quét lại."
+                            ),
                         }
-                    try:
-                        hrefs = page.eval_on_selector_all("a[href]", "els => els.map(a => a.getAttribute('href') || a.href || '')")
-                    except Exception:
-                        hrefs = []
+                    # Không bấm link «Reels» trên menu trái (facebook.com/reels) — dễ nhảy nhầm trang.
+                    # Chỉ mở tab Reels của đúng Page nguồn (href chứa vanity/id của Page).
+                    if not url_matches_facebook_page(page.url, url):
+                        st(f"URL lệch Page nguồn ({page.url}) — điều hướng lại…")
+                        page.goto(url, wait_until="load", timeout=120_000)
+                        time.sleep(min(1.0, scroll_pause_sec + 0.2))
+                    if expected_identity and not url_matches_facebook_page(page.url, url):
+                        return {
+                            "ok": False,
+                            "items": [],
+                            "message": (
+                                f"Không đứng đúng Page nguồn cần quét (đang ở {page.url}). "
+                                "Kiểm tra link Page nguồn và session đăng nhập."
+                            ),
+                        }
+                    if "/reels" not in (page.url or "").lower() and "sk=reels" not in (page.url or "").lower():
+                        try:
+                            from src.utils.dom_input import click_locator_dom
+
+                            vanity = ""
+                            if expected_identity.startswith("vanity:"):
+                                vanity = expected_identity.split(":", 1)[1]
+                            page_id = ""
+                            if expected_identity.startswith("id:"):
+                                page_id = expected_identity.split(":", 1)[1]
+                            tab = None
+                            if vanity:
+                                tab = page.locator(
+                                    f"[role='main'] a[href*='/{vanity}/reels'], "
+                                    f"a[href*='/{vanity}/reels']"
+                                ).first
+                            elif page_id:
+                                tab = page.locator(
+                                    f"a[href*='profile.php?id={page_id}'][href*='reels'], "
+                                    f"a[href*='id={page_id}'][href*='sk=reels']"
+                                ).first
+                            if tab is not None:
+                                click_locator_dom(tab, timeout_ms=2500)
+                                time.sleep(0.8)
+                                if expected_identity and not url_matches_facebook_page(page.url, url):
+                                    st("Click tab Reels lệch trang — quay lại URL Page nguồn.")
+                                    page.goto(url, wait_until="load", timeout=90_000)
+                                    time.sleep(0.8)
+                        except Exception:
+                            pass
+                    hrefs = _collect_main_hrefs(page)
                     for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
                         if rid in seen:
                             continue
@@ -414,7 +623,8 @@ def scan_facebook_profile_reels_page(
                         seen.add(rid)
                         ordered_ids.append(rid)
                         _add_url(f"https://www.facebook.com/reel/{rid}")
-                    _add_from_text(page.content())
+                    if include_html_ids:
+                        _add_from_text(page.content())
                     _emit_partial()
 
                     stable = 0
@@ -438,8 +648,14 @@ def scan_facebook_profile_reels_page(
                         try:
                             # Public page đôi khi có nút tải thêm nội dung.
                             try:
-                                page.get_by_role("button", name=re.compile(r"(xem thêm|see more|show more)", re.I)).first.click(
-                                    timeout=800
+                                from src.utils.dom_input import click_locator_dom
+
+                                click_locator_dom(
+                                    page.get_by_role(
+                                        "button",
+                                        name=re.compile(r"(xem thêm|see more|show more)", re.I),
+                                    ).first,
+                                    timeout_ms=800,
                                 )
                             except Exception:
                                 pass
@@ -448,9 +664,6 @@ def scan_facebook_profile_reels_page(
                                     "() => { const e=document.scrollingElement||document.documentElement;"
                                     " e.scrollTop = e.scrollHeight; }"
                                 )
-                            elif i % 4 == 3:
-                                page.keyboard.press("End")
-                                time.sleep(0.25)
                             else:
                                 page.evaluate(
                                     "() => { const e=document.scrollingElement||document.documentElement;"
@@ -458,14 +671,6 @@ def scan_facebook_profile_reels_page(
                                 )
                             try:
                                 page.evaluate(_JS_SCROLL_DEEP)
-                            except Exception:
-                                pass
-                            try:
-                                page.mouse.wheel(0, 2800)
-                            except Exception:
-                                pass
-                            try:
-                                page.keyboard.press("PageDown")
                             except Exception:
                                 pass
                         except Exception as exc:  # noqa: BLE001
@@ -496,13 +701,10 @@ def scan_facebook_profile_reels_page(
                                 "items": [],
                                 "message": "Không thể quét tiếp nếu không dùng cookies/session.",
                             }
-                        try:
-                            hrefs = page.eval_on_selector_all(
-                                "a[href]",
-                                "els => els.map(a => a.getAttribute('href') || a.href || '')",
-                            )
-                        except Exception:
-                            hrefs = []
+                        if expected_identity and not url_matches_facebook_page(page.url, url):
+                            st("Đã lệch khỏi Page nguồn khi cuộn — dừng để tránh lấy nhầm trang.")
+                            break
+                        hrefs = _collect_main_hrefs(page)
                         for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
                             if rid in seen:
                                 continue
@@ -511,7 +713,8 @@ def scan_facebook_profile_reels_page(
                             seen.add(rid)
                             ordered_ids.append(rid)
                             _add_url(f"https://www.facebook.com/reel/{rid}")
-                        _add_from_text(page.content())
+                        if include_html_ids:
+                            _add_from_text(page.content())
                         _emit_partial()
                         after = page.evaluate(_JS_SCROLL_SNAP)
                         sh = int(after.get("sh") or 0)
@@ -542,40 +745,52 @@ def scan_facebook_profile_reels_page(
                             stable = 0
                         prev_count = len(ordered_ids)
 
-                    # Fallback public-only: một số profile chỉ render ít reel ở reels_tab khi chưa login.
-                    # Thử quét tab videos public để lấy thêm id rồi normalize về /reel/<id>.
-                    if len(ordered_ids) < max_reels:
+                    # Tab Videos: chỉ khi thu thập catalog đầy đủ — theo dõi chia sẻ tắt để tránh video cũ.
+                    if scan_videos_tab and len(ordered_ids) < max_reels:
                         try:
                             vurl = _profile_videos_tab_url(url)
-                            st("Đang quét bổ sung tab Videos public…")
+                            st("Đang quét bổ sung tab Videos (cùng tài khoản đã login)…")
                             page.goto(vurl, wait_until="load", timeout=90_000)
                             time.sleep(min(1.15, scroll_pause_sec + 0.15))
-                            for j in range(min(max_scroll_rounds, 80)):
+                            try:
+                                page.wait_for_selector(
+                                    "a[href*='/videos/'], a[href*='/reel/'], [role='main']",
+                                    timeout=10_000,
+                                )
+                            except Exception:
+                                pass
+                            if expected_identity and not url_matches_facebook_page(page.url, url):
+                                st("Tab Videos lệch Page nguồn — bỏ qua bước Videos.")
+                                raise RuntimeError("videos_tab_wrong_page")
+                            video_rounds = min(max(6, max_scroll_rounds), 80 if scroll_until_end else 12)
+                            for j in range(video_rounds):
                                 if len(ordered_ids) >= max_reels:
                                     break
-                                try:
-                                    hrefs2 = page.eval_on_selector_all(
-                                        "a[href]",
-                                        "els => els.map(a => a.getAttribute('href') || a.href || '')",
-                                    )
-                                except Exception:
-                                    hrefs2 = []
+                                hrefs2 = _collect_main_hrefs(page)
                                 for vid in _extract_video_ids_from_hrefs([str(h) for h in hrefs2]):
                                     if vid in seen:
                                         continue
                                     seen.add(vid)
                                     ordered_ids.append(vid)
                                     _add_url(f"https://www.facebook.com/reel/{vid}")
+                                for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs2]):
+                                    if rid in seen:
+                                        continue
+                                    seen.add(rid)
+                                    ordered_ids.append(rid)
+                                    _add_url(f"https://www.facebook.com/reel/{rid}")
+                                if include_html_ids:
+                                    _add_from_text(page.content())
                                 _emit_partial()
                                 try:
                                     page.evaluate(_JS_SCROLL_DEEP)
                                 except Exception:
                                     pass
-                                try:
-                                    page.mouse.wheel(0, 2600)
-                                except Exception:
-                                    pass
                                 time.sleep(scroll_pause_sec)
+                                st(
+                                    f"Tab Videos — cuộn {j + 1}/{video_rounds} — "
+                                    f"đã có {len(ordered_ids)} video/reel…"
+                                )
                         except Exception as exc:  # noqa: BLE001
                             logger.debug("videos fallback scan: {}", exc)
                 finally:
@@ -597,9 +812,9 @@ def scan_facebook_profile_reels_page(
             "ok": False,
             "items": [],
             "message": (
-                "Không trích được link reel nào. Thử: (1) file cookie Playwright đã đăng nhập, "
-                "(2) bật cửa sổ trình duyệt TOOLFB_FB_REELS_HEADLESS=0 để xem lỗi, "
-                "(3) kiểm tra URL tab Reels đúng kênh."
+                "Không trích được link reel/video nào. Thử: (1) mở profile tài khoản Page nhận "
+                "và đăng nhập Facebook, (2) đặt TOOLFB_FB_REELS_HEADLESS=0 để xem cửa sổ quét, "
+                "(3) dán đúng link Page nguồn (có tab Reels/Videos)."
             ),
         }
     return {

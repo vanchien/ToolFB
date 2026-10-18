@@ -47,6 +47,7 @@ from src.utils.schedule_batch_preview import (
 from src.utils.schedule_posts_manager import SchedulePostsManager
 from src.utils.ffmpeg_paths import portable_ffmpeg_bin_dir, resolve_ffmpeg_ffprobe_paths
 from src.gui.file_dialog_defaults import default_video_media_initialdir, pick_video_media_files
+from src.gui.page_category_filter import PageCategoryFilter, page_choice_label
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 
 _FFMPEG_INSTALL_ATTEMPTED = False
@@ -676,6 +677,11 @@ class ScheduleBatchJobDialog:
         self._cb_acc.grid(row=r, column=1, sticky="w")
         r += 1
 
+        self._page_cat_filter = PageCategoryFilter(fr, on_change=self._refresh_pages)
+        ttk.Label(fr, text="Lọc Page").grid(row=r, column=0, sticky="nw", padx=(0, 8))
+        self._page_cat_filter.frame.grid(row=r, column=1, sticky="w", pady=(0, 2))
+        r += 1
+
         self._cb_page = ttk.Combobox(fr, state="readonly", width=40)
         ttk.Label(fr, text="Page *").grid(row=r, column=0, sticky="nw", padx=(0, 8))
         self._cb_page.grid(row=r, column=1, sticky="w")
@@ -801,32 +807,27 @@ class ScheduleBatchJobDialog:
     def _refresh_pages(self) -> None:
         aid = self._cb_acc.get().strip()
         opts: list[str] = []
+        prev_id = self._selected_page_id() if hasattr(self, "_page_label_to_id") else ""
         self._page_label_to_id = {}
         self._page_id_to_label = {}
         try:
-            for p in self._pages.load_all():
-                if str(p.get("account_id", "")).strip() == aid:
-                    pid = str(p.get("id", "")).strip()
-                    if pid:
-                        pname = str(p.get("page_name", "") or "").strip()
-                        base = f"{pname} ({pid})" if pname else pid
-                        label = base
-                        suffix = 2
-                        while label in self._page_label_to_id:
-                            label = f"{base} [{suffix}]"
-                            suffix += 1
-                        self._page_label_to_id[label] = pid
-                        self._page_id_to_label[pid] = label
-                        opts.append(label)
+            owned = [p for p in self._pages.load_all() if str(p.get("account_id", "")).strip() == aid]
         except Exception:  # noqa: BLE001
-            pass
+            owned = []
+        self._page_cat_filter.refresh(owned)
+        for p in owned:
+            pid = str(p.get("id", "")).strip()
+            if not pid or not self._page_cat_filter.matches(p):
+                continue
+            pname = str(p.get("page_name", "") or "").strip()
+            label = page_choice_label(pname, p.get("page_category"), pid)
+            self._page_label_to_id[label] = pid
+            self._page_id_to_label[pid] = label
+            opts.append(label)
         self._cb_page.configure(values=opts or [""])
         if opts:
-            cur = self._cb_page.get().strip()
-            if cur in self._page_label_to_id:
-                self._cb_page.set(cur)
-            elif cur in self._page_id_to_label:
-                self._cb_page.set(self._page_id_to_label[cur])
+            if prev_id in self._page_id_to_label:
+                self._cb_page.set(self._page_id_to_label[prev_id])
             else:
                 self._cb_page.set(opts[0])
         else:
@@ -1173,7 +1174,7 @@ class ScheduleBatchJobDialog:
     def _manual_add_media(self) -> None:
         paths = pick_video_media_files(
             self._top,
-            title="Chọn file video cho batch job lịch đăng",
+            title="Chọn video từ thư mục cho batch lịch (không copy vào ToolFB)",
             multiple=True,
         )
         for p in paths:

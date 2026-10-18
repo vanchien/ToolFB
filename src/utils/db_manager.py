@@ -10,12 +10,19 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional, TypedDict
 
 from loguru import logger
 
+from src.utils.json_list_cache import (
+    forget_json_list,
+    peek_json_list_fresh,
+    peek_json_list_stale,
+    remember_json_list,
+)
 from src.utils.json_store_lock import json_file_lock
 from src.utils.paths import project_root
 
@@ -66,6 +73,10 @@ def _default_accounts_path() -> Path:
         Path tới file accounts.json.
     """
     return project_root() / "config" / "accounts.json"
+
+
+# Lần ghi log INFO gần nhất theo file: (mtime, số tài khoản) — nhiều manager cùng đọc một file chỉ log một lần.
+_LOGGED_LOAD: dict[str, tuple[float, int]] = {}
 
 
 class AccountsDatabaseManager:
@@ -219,6 +230,14 @@ class AccountsDatabaseManager:
         """
         self._rows_cache = None
         self._rows_mtime = None
+        forget_json_list(self.file_path)
+
+    def _remember_rows(self, rows: list[AccountRecord], mtime: Optional[float]) -> None:
+        """Đồng bộ cache instance + cache process-wide."""
+        self._rows_cache = rows
+        self._rows_mtime = mtime
+        if mtime is not None:
+            remember_json_list(self.file_path, mtime, rows)
 
     def reload_from_disk(self) -> list[AccountRecord]:
         """
@@ -235,7 +254,8 @@ class AccountsDatabaseManager:
         """
         Đọc toàn bộ danh sách tài khoản từ file JSON.
 
-        Dùng cache theo ``mtime`` để tránh đọc đĩa lặp khi scheduler / ``get_by_id`` gọi nhiều lần.
+        Cache process-wide theo ``mtime`` — nhiều ``AccountsDatabaseManager()`` dùng chung một lần đọc.
+        GUI không đợi khóa ghi quá 0.2s (dùng cache cũ) để tránh Not Responding.
 
         Returns:
             Danh sách các bản ghi tài khoản (list of dict).
@@ -245,7 +265,22 @@ class AccountsDatabaseManager:
             json.JSONDecodeError: Nội dung không phải JSON hợp lệ.
             ValueError: Cấu trúc không phải mảng hoặc phần tử không phải object.
         """
-        with json_file_lock(self.file_path):
+        hit = peek_json_list_fresh(self.file_path)
+        if hit is not None:
+            try:
+                self._rows_mtime = self.file_path.stat().st_mtime
+            except OSError:
+                self._rows_mtime = None
+            self._rows_cache = hit  # type: ignore[assignment]
+            return list(hit)
+        with json_file_lock(self.file_path, timeout=0.2) as got:
+            if not got:
+                stale = peek_json_list_stale(self.file_path)
+                if stale is not None:
+                    logger.debug("load_all: cache cũ vì {} đang bị ghi", self.file_path.name)
+                    return list(stale)
+                with json_file_lock(self.file_path):
+                    return self._load_all_unlocked()
             return self._load_all_unlocked()
 
     def _load_all_unlocked(self) -> list[AccountRecord]:
@@ -280,9 +315,13 @@ class AccountsDatabaseManager:
                 "Đã chuẩn hóa đường dẫn relative trong {} (portable/cookie) — portable sang máy khác.",
                 self.file_path.name,
             )
-        self._rows_cache = out
-        self._rows_mtime = mtime
-        logger.info("Đã đọc {} tài khoản từ {}", len(out), self.file_path)
+        self._remember_rows(out, mtime)
+        key = str(self.file_path)
+        if _LOGGED_LOAD.get(key) != (mtime, len(out)):
+            _LOGGED_LOAD[key] = (mtime, len(out))
+            logger.info("Đã đọc {} tài khoản từ {}", len(out), self.file_path)
+        else:
+            logger.debug("Đã đọc {} tài khoản từ {}", len(out), self.file_path)
         return list(out)
 
     def save_all(self, accounts: Iterable[AccountRecord]) -> None:
@@ -304,8 +343,7 @@ class AccountsDatabaseManager:
                 rows.append(acc)
             text = json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
             self._atomic_write_text(text)
-            self._rows_cache = rows
-            self._rows_mtime = self.file_path.stat().st_mtime
+            self._remember_rows(rows, self.file_path.stat().st_mtime)
             logger.info("Đã ghi {} tài khoản xuống {}", len(rows), self.file_path)
 
     def get_by_id(self, account_id: str) -> Optional[AccountRecord]:
@@ -387,8 +425,7 @@ class AccountsDatabaseManager:
                 logger.info("Cập nhật tài khoản id={}", acc_id)
             text = json.dumps(new_list, ensure_ascii=False, indent=2) + "\n"
             self._atomic_write_text(text)
-            self._rows_cache = new_list
-            self._rows_mtime = self.file_path.stat().st_mtime
+            self._remember_rows(new_list, self.file_path.stat().st_mtime)
 
     def update_account_fields(self, account_id: str, updates: dict[str, Any]) -> None:
         """
@@ -425,8 +462,7 @@ class AccountsDatabaseManager:
                     new_list.append(row)
             text = json.dumps(new_list, ensure_ascii=False, indent=2) + "\n"
             self._atomic_write_text(text)
-            self._rows_cache = new_list
-            self._rows_mtime = self.file_path.stat().st_mtime
+            self._remember_rows(new_list, self.file_path.stat().st_mtime)
             logger.info("Đã cập nhật trường {} cho id={}", list(updates.keys()), account_id)
 
     def record_post_outcome(self, account_id: str, *, success: bool) -> None:
@@ -473,11 +509,12 @@ class AccountsDatabaseManager:
                 delete_account_browser_bundle(dict(removed))
             text = json.dumps(new_list, ensure_ascii=False, indent=2) + "\n"
             self._atomic_write_text(text)
-            self._rows_cache = new_list
             try:
-                self._rows_mtime = self.file_path.stat().st_mtime
+                self._remember_rows(new_list, self.file_path.stat().st_mtime)
             except OSError:
+                self._rows_cache = new_list
                 self._rows_mtime = None
+                forget_json_list(self.file_path)
         logger.info("Đã xóa tài khoản id={} (kèm profile/cookie/vault)", account_id)
         return True
 
@@ -490,5 +527,18 @@ def update_last_post_time(account_id: str, manager: Optional[AccountsDatabaseMan
         account_id: ``id`` trong ``accounts.json``.
         manager: Bộ quản lý JSON; mặc định dùng ``AccountsDatabaseManager()`` với đường dẫn chuẩn.
     """
-    db = manager if manager is not None else AccountsDatabaseManager()
+    db = manager if manager is not None else get_default_accounts_manager()
     db.record_post_outcome(account_id, success=True)
+
+
+_default_accounts_mgr: Optional[AccountsDatabaseManager] = None
+_default_accounts_lock = threading.Lock()
+
+
+def get_default_accounts_manager() -> AccountsDatabaseManager:
+    """Singleton ``accounts.json`` — GUI, scheduler và worker dùng chung cache."""
+    global _default_accounts_mgr
+    with _default_accounts_lock:
+        if _default_accounts_mgr is None:
+            _default_accounts_mgr = AccountsDatabaseManager()
+        return _default_accounts_mgr

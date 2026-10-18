@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,22 @@ from playwright.sync_api import BrowserContext, Page
 
 from src.services.facebook_session_recovery import save_session_to_cookie_path
 from src.utils.paths import project_root
+
+_COOKIE_SESSION_GUARD = threading.Lock()
+_COOKIE_SESSION_CACHE: dict[str, tuple[float, int, bool]] = {}
+_COOKIE_SESSION_CACHE_MAX = 1024
+
+
+def invalidate_cookie_session_cache(cookie_path: str | Path | None = None) -> None:
+    """Xóa cache ``c_user`` sau khi ghi file cookie (hoặc xóa hết nếu ``cookie_path`` rỗng)."""
+    with _COOKIE_SESSION_GUARD:
+        if cookie_path is None or str(cookie_path).strip() == "":
+            _COOKIE_SESSION_CACHE.clear()
+            return
+        resolved = resolve_cookie_file(cookie_path)
+        if resolved is None:
+            return
+        _COOKIE_SESSION_CACHE.pop(str(resolved), None)
 
 
 def resolve_cookie_file(cookie_path: str | Path | None) -> Path | None:
@@ -34,20 +51,37 @@ def cookie_file_has_session(cookie_path: str | Path | None) -> bool:
     if p is None or not p.is_file():
         return False
     try:
+        st = p.stat()
+        sig = (st.st_mtime, int(st.st_size))
+    except OSError:
+        return False
+    key = str(p)
+    with _COOKIE_SESSION_GUARD:
+        hit = _COOKIE_SESSION_CACHE.get(key)
+        if hit is not None and hit[0] == sig[0] and hit[1] == sig[1]:
+            return hit[2]
+    try:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return False
-    cookies: list[Any]
-    if isinstance(raw, dict) and isinstance(raw.get("cookies"), list):
-        cookies = raw["cookies"]
-    elif isinstance(raw, list):
-        cookies = raw
+        result = False
     else:
-        return False
-    for c in cookies:
-        if isinstance(c, dict) and str(c.get("name") or "") == "c_user" and str(c.get("value") or "").strip():
-            return True
-    return False
+        cookies: list[Any]
+        if isinstance(raw, dict) and isinstance(raw.get("cookies"), list):
+            cookies = raw["cookies"]
+        elif isinstance(raw, list):
+            cookies = raw
+        else:
+            cookies = []
+        result = False
+        for c in cookies:
+            if isinstance(c, dict) and str(c.get("name") or "") == "c_user" and str(c.get("value") or "").strip():
+                result = True
+                break
+    with _COOKIE_SESSION_GUARD:
+        if len(_COOKIE_SESSION_CACHE) >= _COOKIE_SESSION_CACHE_MAX:
+            _COOKIE_SESSION_CACHE.pop(next(iter(_COOKIE_SESSION_CACHE)))
+        _COOKIE_SESSION_CACHE[key] = (sig[0], sig[1], result)
+    return result
 
 
 def _expected_facebook_uid_from_account(account: dict[str, Any] | None) -> str:

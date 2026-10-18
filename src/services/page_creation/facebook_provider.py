@@ -17,6 +17,7 @@ from urllib.parse import unquote
 from loguru import logger
 
 from src.automation.facebook_actions import _facebook_url_is_security_interstitial
+from src.utils.dom_input import click_locator_dom, click_point_dom
 from src.utils.paths import project_root
 
 from .provider import PageCreationOutcome, PageCreationRequest
@@ -3145,7 +3146,7 @@ def _mouse_click_in_frame(page, frame, x: float, y: float) -> None:
                 ox, oy = float(box["x"]), float(box["y"])
         except Exception:  # noqa: BLE001
             ox, oy = 0.0, 0.0
-    page.mouse.click(ox + float(x), oy + float(y))
+    click_point_dom(page, ox + float(x), oy + float(y))
 
 
 def _agreement_is_checked(page) -> bool:
@@ -3374,17 +3375,23 @@ def _button_allows_click(item) -> bool:
 
 
 def _click_control_center(page, item) -> bool:
-    """Bấm giữa nút bằng chuột thật. Không ép click khi nút còn khóa."""
+    """Bấm giữa nút trong trang (DOM). Không ép click khi nút còn khóa."""
     try:
         box = item.bounding_box()
     except Exception:  # noqa: BLE001
         box = None
     if box:
         try:
-            page.mouse.click(float(box["x"]) + float(box["width"]) / 2, float(box["y"]) + float(box["height"]) / 2)
-            return True
+            if click_point_dom(
+                page,
+                float(box["x"]) + float(box["width"]) / 2,
+                float(box["y"]) + float(box["height"]) / 2,
+            ):
+                return True
         except Exception as exc:  # noqa: BLE001
             logger.debug("Không bấm được giữa nút Tạo Trang: {}", exc)
+    if click_locator_dom(item):
+        return True
     try:
         item.click(timeout=8_000)
         return True

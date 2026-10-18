@@ -15,6 +15,18 @@ from typing import Any, Callable
 from src.services.video_editor.layout import ensure_video_editor_layout
 
 
+def _short_ffmpeg_stderr(body: str) -> str:
+    """Giữ dòng lỗi, bỏ cả filter_complex dài mà FFmpeg in ra console."""
+    text = (body or "").strip()
+    if not text:
+        return "Không có stderr."
+    keys = ("error", "invalid", "matches no", "no such", "failed", "conversion failed")
+    picked = [ln.strip() for ln in text.splitlines() if any(k in ln.lower() for k in keys)]
+    if picked:
+        return "\n".join(picked[-8:])[:900]
+    return text[-400:]
+
+
 ProgressCb = Callable[[float], None]
 WaitHeartbeatCb = Callable[[], None]
 
@@ -343,10 +355,17 @@ class RenderWorker:
             if self._cancel_event.is_set():
                 out["error_message"] = "Đã dừng export."
                 return out
-            tail = body.strip()[-1200:] if body.strip() else "Không có stderr."
+            tail = _short_ffmpeg_stderr(body)
             rc = int(proc.returncode)
+            if rc > 2_147_483_647:
+                rc -= 4_294_967_296
             hint = ""
             low = body.lower()
+            if "matches no streams" in low:
+                hint = (
+                    "\n\n(Gợi ý: file không có đúng luồng hình hoặc tiếng mà lệnh đang gọi. "
+                    "File .mp4 chỉ chứa tiếng sẽ được xuất hình đen — nếu vẫn lỗi, file có thể hỏng.)"
+                )
             # Windows: 3221225477 / -1073741819 = 0xC0000005 (access violation) — FFmpeg crash, không phải lỗi mã hóa thông thường.
             if os.name == "nt" and rc in (-1073741819, 3221225477):
                 hint = (
