@@ -686,6 +686,34 @@ def test_share_wave_many_pages_one_browser_per_account(tmp_path) -> None:
     assert joined_only["accounts"] == 1
 
 
+def test_pause_share_outside_accounts_stops_other_tk(tmp_path) -> None:
+    """Lọc 1 TK → pause batch của TK khác (wave cũ không chạy ngầm)."""
+    _store, engine, _fake = _engine(tmp_path)
+    wave_a = engine.create_share_wave(
+        pages=[{"account_id": "acc-a", "page_id": "p1", "target_url": "https://www.facebook.com/p1"}],
+        source_url="https://www.facebook.com/reel/1",
+        text="A",
+        destination="page",
+        cooldown_fixed=0,
+    )
+    wave_b = engine.create_share_wave(
+        pages=[{"account_id": "acc-b", "page_id": "p2", "target_url": "https://www.facebook.com/p2"}],
+        source_url="https://www.facebook.com/reel/2",
+        text="B",
+        destination="page",
+        cooldown_fixed=0,
+    )
+    bid_a = wave_a["batch_ids"][0]
+    bid_b = wave_b["batch_ids"][0]
+    assert engine._batch(bid_a)["status"] == "READY"
+    assert engine._batch(bid_b)["status"] == "READY"
+    stopped = engine.pause_share_outside_accounts({"acc-a"})
+    assert "acc-b" in stopped
+    assert engine._batch(bid_b)["status"] == "PAUSED"
+    assert engine._batch(bid_a)["status"] == "READY"
+    assert bid_b in engine._cancel
+
+
 def test_share_two_batches_same_account_never_concurrent_browser(tmp_path) -> None:
     """Resume nhiều batch cùng TK: chỉ 1 begin tại một thời điểm (không 2 Firefox)."""
     store, engine, fake = _engine(tmp_path)

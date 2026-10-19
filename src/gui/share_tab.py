@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Iterable
 
+from loguru import logger
+
 from src.gui.ui_responsiveness import (
     ASYNC_PREP_MIN_ROWS,
     schedule_on_main_thread,
@@ -922,12 +924,69 @@ class ShareTab:
         aid = str(self._account_labels.get(choice) or "").strip()
         return {aid} if aid else None
 
+    def _allowed_run_account_ids(self) -> set[str] | None:
+        """
+        Tập TK được phép chia sẻ ngay bây giờ.
+
+        - Lọc 1 TK → chỉ id đó (bỏ tick TK khác không đủ để dừng wave cũ).
+        - «Tất cả» → chỉ các TK còn ít nhất một Page đang tick.
+        """
+        scope = self._account_scope_ids()
+        if scope is not None:
+            return set(scope)
+        checked_aids = {
+            str(row.get("account_id") or "").strip()
+            for row in self.pages
+            if row["iid"] in self._checked and str(row.get("account_id") or "").strip()
+        }
+        return checked_aids if checked_aids else set()
+
     def _scope_page_rows(self, rows: list[dict[str, str]]) -> list[dict[str, str]]:
         """Lọc Page nhận theo tài khoản đang chọn trên combobox."""
         scope = self._account_scope_ids()
         if not scope:
             return list(rows)
         return [row for row in rows if str(row.get("account_id") or "") in scope]
+
+    def _enforce_run_scope(self, *, reason: str = "") -> list[str]:
+        """
+        Dừng chia sẻ + đóng Firefox của mọi TK không còn trong phạm vi chạy.
+
+        Gọi khi đổi lọc / bỏ tick / trước resume — wave cũ không được chạy tiếp ngầm.
+        """
+        allowed = self._allowed_run_account_ids()
+        try:
+            stopped = self.engine.pause_share_outside_accounts(allowed)
+        except Exception:  # noqa: BLE001
+            logger.exception("enforce_run_scope pause thất bại")
+            stopped = []
+        if stopped:
+            self._kill_stale_browsers_for_accounts(stopped)
+            # Bỏ batch_ids của TK đã dừng khỏi theo dõi UI.
+            keep: list[str] = []
+            for bid in list(self.batch_ids):
+                try:
+                    row = next(
+                        (b for b in self.store.share_batches() if str(b.get("id") or "") == bid),
+                        None,
+                    )
+                except Exception:  # noqa: BLE001
+                    row = None
+                aid = str((row or {}).get("account_id") or "")
+                if allowed is None or (aid and aid in allowed):
+                    keep.append(bid)
+            self.batch_ids = keep
+            label = reason or "đổi phạm vi TK"
+            self.status.set(
+                f"Đã dừng {len(stopped)} TK ngoài phạm vi ({label}): "
+                + ", ".join(stopped)
+                + ". Chỉ chạy TK đang chọn/tick."
+            )
+            try:
+                self._fill_results()
+            except Exception:  # noqa: BLE001
+                pass
+        return stopped
 
     def _kill_stale_browsers_for_accounts(self, account_ids: Iterable[str]) -> None:
         """Đóng Firefox còn sót của các TK sắp chia sẻ (sau tắt/mở app)."""
@@ -948,6 +1007,8 @@ class ShareTab:
         """Mở lại app: chạy tiếp batch dở + list chờ (chỉ TK đang lọc nếu không chọn «Tất cả»)."""
         if self._running or self._cancel_schedule.is_set():
             return
+        # Siết phạm vi trước — wave cũ của TK đã bỏ lọc/tick không được chạy tiếp.
+        self._enforce_run_scope(reason="mở lại app")
         scope = self._account_scope_ids()
         if any(item.state == "waiting" for item in self._queue):
             overdue = self._promote_overdue_queue()
@@ -1196,6 +1257,8 @@ class ShareTab:
     def _on_account_filter(self, _event: object = None) -> None:
         """Ghi nhận người dùng đã chọn tài khoản rồi vẽ lại bảng."""
         self._account_chosen = True
+        # Đổi lọc → dừng ngay TK không còn trong phạm vi (kể cả wave đang chạy).
+        self._enforce_run_scope(reason="đổi lọc tài khoản")
         self._fill_pages()
 
     def _refresh_account_filter(self) -> None:
@@ -1335,6 +1398,10 @@ class ShareTab:
         tag = self._outcomes.get((row["account_id"], row["page_id"]), ("", "", ""))[2]
         return (tag,) if tag else ()
 
+    def _after_selection_changed(self) -> None:
+        """Sau đổi tick Page: siết phạm vi chạy (dừng TK hết tick / ngoài lọc)."""
+        self._enforce_run_scope(reason="đổi tick Page nhận")
+
     def _sync_checked_targets(self) -> None:
         """Đồng bộ tick UI ↔ targets lưu. Đổi lọc tài khoản không xóa tick đã chọn."""
         if not self.pages:
@@ -1366,6 +1433,7 @@ class ShareTab:
                     f"«{name}» trùng trên nhiều tài khoản — chỉ nhận 1 dòng, đã bỏ {len(dropped)} dòng trùng."
                 )
         self._sync_checked_targets()
+        self._after_selection_changed()
         self._refresh_checkmarks()
         self._estimate()
         self._schedule_save_settings()
@@ -1415,14 +1483,16 @@ class ShareTab:
         if skipped:
             self.status.set(f"Đã bỏ qua {skipped} dòng Page trùng (cùng một Page Facebook).")
         self._sync_checked_targets()
+        self._after_selection_changed()
         self._fill_pages()
         self._schedule_save_settings()
 
     def _clear_selection(self) -> None:
-        """Bỏ tick các Page đang hiện; tick tài khoản khác vẫn giữ."""
+        """Bỏ tick các Page đang hiện; tick tài khoản khác vẫn giữ (nhưng TK hết tick sẽ bị dừng)."""
         visible = {row["iid"] for row in self.pages if self._row_visible(row)}
         self._checked.difference_update(visible)
         self._sync_checked_targets()
+        self._after_selection_changed()
         self._fill_pages()
         self._schedule_save_settings()
 
@@ -1985,6 +2055,8 @@ class ShareTab:
         del params  # Mỗi lượt đọc lại form — thay đổi nút/ô cài đặt áp dụng ngay cho link kế tiếp.
         # Giữ batch_ids cũ để cột Kết quả còn đếm bài đã chia; chỉ thêm id wave mới.
         self._cancel_schedule.clear()
+        self._enforce_run_scope(reason="chạy list chờ")
+        selected = self._scope_page_rows(list(selected or []))
         overdue = self._promote_overdue_queue()
         waiting = [item for item in self._queue if item.state == "waiting"]
         if not waiting:
@@ -2243,8 +2315,23 @@ class ShareTab:
     def resume(self) -> None:
         if self._running or not self.batch_ids:
             return
+        self._enforce_run_scope(reason="tiếp tục")
+        allowed = self._allowed_run_account_ids()
+        ids: list[str] = []
+        for bid in list(self.batch_ids):
+            row = next(
+                (b for b in self.store.share_batches() if str(b.get("id") or "") == bid),
+                None,
+            )
+            aid = str((row or {}).get("account_id") or "")
+            if allowed is not None and aid and aid not in allowed:
+                continue
+            ids.append(bid)
+        self.batch_ids = ids
+        if not ids:
+            self.status.set("Không còn batch trong phạm vi TK đang chọn — không chạy tiếp.")
+            return
         self._running = True
-        ids = list(self.batch_ids)
 
         def _work() -> None:
             try:

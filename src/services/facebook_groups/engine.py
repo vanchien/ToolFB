@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from src.services.page_creation.engine import calculate_delay_seconds
 from src.utils.feature_busy import (
@@ -1598,6 +1598,62 @@ class GroupEngine:
         batch["status"] = BATCH_PAUSED
         self.store.save_share_batch(batch)
         self._cancel.add(batch_id)
+
+    def pause_share_accounts(self, account_ids: Iterable[str]) -> list[str]:
+        """
+        Dừng mọi batch chia sẻ của các tài khoản (READY/RUNNING/DELAYING/VALIDATING).
+
+        Trả về danh sách account_id đã có batch bị pause — dùng để đóng Firefox sót.
+        """
+        want = {str(a).strip() for a in account_ids if str(a or "").strip()}
+        if not want:
+            return []
+        paused_accounts: set[str] = set()
+        active = {BATCH_READY, BATCH_RUNNING, BATCH_DELAYING, BATCH_VALIDATING}
+        for batch in list(self.store.share_batches()):
+            aid = str(batch.get("account_id") or "").strip()
+            if aid not in want:
+                continue
+            if batch.get("status") not in active:
+                continue
+            bid = str(batch.get("id") or "")
+            if not bid:
+                continue
+            try:
+                self.pause(bid)
+                paused_accounts.add(aid)
+            except Exception:  # noqa: BLE001
+                logger.exception("Không pause được batch {} (account={})", bid, aid)
+        if paused_accounts:
+            logger.info(
+                "Đã dừng chia sẻ các TK ngoài phạm vi: {}",
+                ", ".join(sorted(paused_accounts)),
+            )
+        return sorted(paused_accounts)
+
+    def pause_share_outside_accounts(self, allowed_account_ids: set[str] | None) -> list[str]:
+        """
+        Chỉ giữ các TK trong ``allowed``; pause mọi TK khác đang chia sẻ.
+
+        ``allowed is None`` → không giới hạn (Tất cả tài khoản).
+        """
+        if allowed_account_ids is None:
+            return []
+        allowed = {str(a).strip() for a in allowed_account_ids if str(a or "").strip()}
+        if not allowed:
+            # Không có TK hợp lệ → dừng hết đang chạy.
+            all_aids = {
+                str(b.get("account_id") or "").strip()
+                for b in self.store.share_batches()
+                if str(b.get("account_id") or "").strip()
+            }
+            return self.pause_share_accounts(all_aids)
+        stop: set[str] = set()
+        for batch in self.store.share_batches():
+            aid = str(batch.get("account_id") or "").strip()
+            if aid and aid not in allowed:
+                stop.add(aid)
+        return self.pause_share_accounts(stop)
 
     def resume(self, batch_id: str) -> dict[str, Any]:
         self._cancel.discard(batch_id)
