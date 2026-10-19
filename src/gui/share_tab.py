@@ -8,7 +8,7 @@ import time
 import tkinter as tk
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
-from typing import Any
+from typing import Any, Iterable
 
 from src.gui.ui_responsiveness import (
     ASYNC_PREP_MIN_ROWS,
@@ -196,8 +196,9 @@ class ShareTab:
                 )
         except Exception:  # noqa: BLE001
             pass
-        self.root.after(2200, self._watch_resume_saved)
-        self.root.after(3500, self._resume_queue_if_needed)
+        # Watch sau hàng chờ — tránh mở Firefox quét trùng lúc resume chia sẻ.
+        self.root.after(5500, self._resume_queue_if_needed)
+        self.root.after(12000, self._watch_resume_saved)
 
     def _build(self) -> None:
         """
@@ -908,21 +909,76 @@ class ShareTab:
             self._schedule_save_settings()
             return
 
+    def _account_scope_ids(self) -> set[str] | None:
+        """
+        Tài khoản đang lọc trên UI.
+
+        ``None`` = «Tất cả tài khoản» (mọi TK đang tick).
+        ``set`` một id = chỉ chạy TK đó — tránh mở Firefox của TK khác khi đang xem 1 TK.
+        """
+        choice = str(self.filter_account.get() or "").strip()
+        if choice in ("", "Chọn tài khoản", "Tất cả tài khoản"):
+            return None
+        aid = str(self._account_labels.get(choice) or "").strip()
+        return {aid} if aid else None
+
+    def _scope_page_rows(self, rows: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Lọc Page nhận theo tài khoản đang chọn trên combobox."""
+        scope = self._account_scope_ids()
+        if not scope:
+            return list(rows)
+        return [row for row in rows if str(row.get("account_id") or "") in scope]
+
+    def _kill_stale_browsers_for_accounts(self, account_ids: Iterable[str]) -> None:
+        """Đóng Firefox còn sót của các TK sắp chia sẻ (sau tắt/mở app)."""
+        from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
+
+        seen: set[str] = set()
+        for raw in account_ids:
+            aid = str(raw or "").strip()
+            if not aid or aid in seen:
+                continue
+            seen.add(aid)
+            try:
+                FacebookGroupProvider._kill_stale_firefox(aid)
+            except Exception:  # noqa: BLE001
+                continue
+
     def _resume_queue_if_needed(self) -> None:
-        """Mở lại app: chạy tiếp batch dở + list chờ (kể cả khi chưa bật theo dõi)."""
+        """Mở lại app: chạy tiếp batch dở + list chờ (chỉ TK đang lọc nếu không chọn «Tất cả»)."""
         if self._running or self._cancel_schedule.is_set():
             return
+        scope = self._account_scope_ids()
         if any(item.state == "waiting" for item in self._queue):
             overdue = self._promote_overdue_queue()
             waiting_n = sum(1 for i in self._queue if i.state == "waiting")
             extra = f" · {overdue} video quá giờ xếp chạy ngay" if overdue else ""
-            self.status.set(f"Mở lại app — tiếp tục {waiting_n} video trong hàng chờ{extra}.")
+            scope_hint = ""
+            if scope:
+                label = self.filter_account.get().strip()
+                scope_hint = f" · chỉ TK «{label}»"
+                # Dọn Firefox sót trước khi mở lại — tránh 2 cửa sổ cùng profile.
+                self._kill_stale_browsers_for_accounts(scope)
+            else:
+                aids = {
+                    str(row.get("account_id") or "")
+                    for row in self._scope_page_rows(self._live_receiving_pages())
+                    if str(row.get("account_id") or "")
+                }
+                self._kill_stale_browsers_for_accounts(aids)
+            self.status.set(
+                f"Mở lại app — tiếp tục {waiting_n} video trong hàng chờ{extra}{scope_hint}."
+            )
             self._ensure_queue_worker()
             return
         # Không còn waiting nhưng còn batch READY sau recover — bấm Tiếp tục giúp.
         orphan_ids: list[str] = []
+        orphan_accounts: list[str] = []
         for batch in self.store.share_batches():
             if batch.get("status") != "READY":
+                continue
+            aid = str(batch.get("account_id") or "").strip()
+            if scope is not None and aid not in scope:
                 continue
             bid = str(batch.get("id") or "")
             if not bid:
@@ -935,9 +991,13 @@ class ShareTab:
             ]
             if pending:
                 orphan_ids.append(bid)
+                if aid:
+                    orphan_accounts.append(aid)
         if orphan_ids:
+            self._kill_stale_browsers_for_accounts(orphan_accounts)
             self.batch_ids = list(dict.fromkeys([*self.batch_ids, *orphan_ids]))
-            self.status.set(f"Còn {len(orphan_ids)} batch chia sẻ dở — đang chạy tiếp.")
+            scope_hint = f" (lọc {self.filter_account.get().strip()})" if scope else ""
+            self.status.set(f"Còn {len(orphan_ids)} batch chia sẻ dở{scope_hint} — đang chạy tiếp.")
             self.resume()
 
     def _safe_parse_sources(self) -> list[str]:
@@ -1336,6 +1396,7 @@ class ShareTab:
     def _selected_pages(self) -> list[dict[str, str]]:
         """Các page đang được tích — mỗi Page Facebook chỉ một tài khoản."""
         rows = dedupe_receiving_pages([row for row in self.pages if row["iid"] in self._checked])
+        rows = self._scope_page_rows(rows)
         return interleave_pages_by_account(rows)
 
     def _select_all(self) -> None:
@@ -1797,7 +1858,7 @@ class ShareTab:
             rows = [row for row in self.pages if row["iid"] in wanted]
         else:
             rows = selected
-        return dedupe_receiving_pages(rows)
+        return dedupe_receiving_pages(self._scope_page_rows(rows))
 
     def start(self) -> None:
         if self._running:
@@ -2051,6 +2112,13 @@ class ShareTab:
                     pending_left = sum(1 for row in self._queue if row.state == "waiting")
                     # Ưu tiên chạy tiếp batch dở cùng video (sau tắt/mở) — tránh tạo wave trùng.
                     resume_ids = self.engine.incomplete_share_batch_ids_for_url(item.url)
+                    scope = self._account_scope_ids()
+                    if resume_ids and scope is not None:
+                        by_id = {
+                            str(row.get("id") or ""): str(row.get("account_id") or "")
+                            for row in self.store.share_batches()
+                        }
+                        resume_ids = [bid for bid in resume_ids if by_id.get(str(bid)) in scope]
                     if resume_ids:
                         ids = list(resume_ids)
                         self.batch_ids = list(dict.fromkeys([*self.batch_ids, *ids]))
@@ -2310,7 +2378,9 @@ class ShareTab:
             return selected
         if self._watch_targets:
             wanted = set(self._watch_targets)
-            return dedupe_receiving_pages([row for row in self.pages if row["iid"] in wanted])
+            return dedupe_receiving_pages(
+                self._scope_page_rows([row for row in self.pages if row["iid"] in wanted])
+            )
         return []
 
     def _current_plan_key(self) -> tuple[Any, ...]:
