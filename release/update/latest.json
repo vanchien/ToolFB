@@ -1,7 +1,7 @@
 {
-  "version": "1.0.118",
-  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.118/ToolFB_release_bundle.zip",
-  "sha256": "88f9479bd94a67b59ffd9da17d83c1011879f772b18f72121bc1c6020aec0474",
-  "notes": "Quet Page: chon tai khoan theo ten nguoi dung.",
-  "generated_at": "2026-10-15T14:29:24"
+  "version": "1.0.120",
+  "download_url": "https://github.com/vanchien/ToolFB/releases/download/v1.0.120/ToolFB_release_bundle.zip",
+  "sha256": "2d6367da148df82974935e73add1880c8f5930acdd7048a157a1e20082820e9f",
+  "notes": "1.0.120: import Via an toan, cap nhat ten tuan tu, share 24/7 tu ha concurrency",
+  "generated_at": "2026-10-19T18:29:26"
 }
