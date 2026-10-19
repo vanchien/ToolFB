@@ -665,21 +665,26 @@ class FacebookGroupProvider:
         )
         self._factory = factory
         self._context = context
-        # Chỉ giữ 1 page — đóng tab thừa từ session cũ nếu có.
-        pages = list(context.pages) if context.pages else []
-        if not pages:
-            self._page = context.new_page()
-        else:
-            self._page = pages[0]
-            for extra in pages[1:]:
-                try:
-                    extra.close()
-                except Exception:  # noqa: BLE001
-                    pass
+        # Chỉ giữ 1 page lúc mở — đóng tab thừa từ session cũ (không auto-đóng popup Switch).
+        self._page = self._keep_single_page(context)
         self._account_id = account_id
         from src.services.facebook_groups.video_engage import _lock_user
 
         _lock_user(self._page)
+
+    @staticmethod
+    def _keep_single_page(context: Any) -> Any:
+        """Giữ pages[0], đóng mọi tab còn lại khi vừa launch."""
+        pages = list(context.pages) if context.pages else []
+        if not pages:
+            return context.new_page()
+        main = pages[0]
+        for extra in pages[1:]:
+            try:
+                extra.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return main
 
     def _click_join(self, page: Any) -> str:
         try:

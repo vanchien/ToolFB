@@ -127,3 +127,30 @@ def test_clone_profile_skips_lock_and_cache(tmp_path) -> None:
         import shutil
 
         shutil.rmtree(dst.parent, ignore_errors=True)
+
+
+def test_wait_profile_unlocked_times_out_while_locked(tmp_path) -> None:
+    """Profile đang mở → chờ hết giờ trả False (không clone / không mở Firefox 2)."""
+    from src.services.facebook_reels_catalog import _wait_profile_unlocked
+
+    src = tmp_path / "profile"
+    src.mkdir()
+    (src / "parent.lock").write_text("locked", encoding="utf-8")
+    notes: list[str] = []
+    ok = _wait_profile_unlocked(
+        src,
+        "firefox",
+        timeout_sec=0.6,
+        poll_sec=0.2,
+        status=notes.append,
+    )
+    assert ok is False
+    assert notes and "không mở Firefox thứ 2" in notes[0]
+
+
+def test_wait_profile_unlocked_ok_when_free(tmp_path) -> None:
+    from src.services.facebook_reels_catalog import _wait_profile_unlocked
+
+    src = tmp_path / "profile"
+    src.mkdir()
+    assert _wait_profile_unlocked(src, "firefox", timeout_sec=2.0, poll_sec=0.1) is True

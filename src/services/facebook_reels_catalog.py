@@ -194,6 +194,35 @@ def _is_profile_locked(profile_dir: Path, browser_type: str) -> bool:
     return False
 
 
+def _wait_profile_unlocked(
+    profile_dir: Path,
+    browser_type: str,
+    *,
+    timeout_sec: float = 900.0,
+    status: StatusFn | None = None,
+    poll_sec: float = 2.0,
+) -> bool:
+    """
+    Chờ profile rảnh — không clone / không mở Firefox thứ 2 cùng tài khoản.
+
+    True nếu hết khóa trước timeout; False nếu hết giờ vẫn bị giữ.
+    """
+    st = status or _noop_status
+    deadline = time.monotonic() + max(5.0, float(timeout_sec))
+    noted = False
+    while _is_profile_locked(profile_dir, browser_type):
+        if time.monotonic() >= deadline:
+            return False
+        if not noted:
+            st(
+                "Profile tài khoản đang chia sẻ / mở — chờ xong rồi mới quét "
+                "(không mở Firefox thứ 2)…"
+            )
+            noted = True
+        time.sleep(max(0.5, float(poll_sec)))
+    return True
+
+
 # File/thư mục không cần cho session login — copy chúng lúc Firefox đang mở sẽ WinError 32
 # (parent.lock) và làm chậm mở app vì cache2 có hàng nghìn file.
 _CLONE_SKIP_NAMES = frozenset(
@@ -789,16 +818,48 @@ def scan_facebook_profile_reels_page(
                 profile_path = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
                 browser_type = str(acc.get("browser_type") or "chromium").strip().lower()
                 browser_exe = str(acc.get("browser_exe_path") or "").strip()
-                temp_profile_root: Path | None = None
+                account_id = str(acc.get("id") or acc.get("account_id") or "").strip() or "(scan)"
+                profile_slot = None
+                temp_profile_root: Path | None = None  # giữ tên cũ — không còn clone song song
                 if profile_path:
                     profile_dir = Path(profile_path).resolve()
                     os.makedirs(str(profile_dir), exist_ok=True)
-                    run_profile = profile_dir
-                    if _is_profile_locked(profile_dir, browser_type):
-                        st("Profile tài khoản đang được dùng, tạo profile tạm để quét bằng session hiện có…")
-                        run_profile = _clone_profile_for_scan(profile_dir)
-                        temp_profile_root = run_profile.parent
-                    user_data_dir = str(run_profile)
+                    # Không clone profile khi đang chia sẻ — chờ 1 Firefox/TK.
+                    if not _wait_profile_unlocked(
+                        profile_dir,
+                        browser_type,
+                        timeout_sec=max(120.0, float(max_scan_minutes or 30) * 60.0),
+                        status=st,
+                    ):
+                        return {
+                            "ok": False,
+                            "items": [],
+                            "message": (
+                                "Profile tài khoản vẫn đang mở (chia sẻ/đăng lịch). "
+                                "Đã chờ hết giờ — không mở Firefox thứ 2. Thử quét lại sau."
+                            ),
+                        }
+                    from src.automation.browser_factory import (
+                        account_use_proxy_enabled,
+                        acquire_profile_browser_slot,
+                        release_profile_browser_slot,
+                    )
+                    from src.utils.account_proxy_mapper import require_account_proxy_live
+                    from src.utils.proxy_check import build_playwright_proxy_settings
+
+                    try:
+                        profile_slot = acquire_profile_browser_slot(
+                            profile_dir,
+                            account_id,
+                            timeout_sec=max(120.0, float(max_scan_minutes or 30) * 60.0),
+                        )
+                    except RuntimeError as exc:
+                        return {
+                            "ok": False,
+                            "items": [],
+                            "message": str(exc) or "Không chiếm được slot profile để quét.",
+                        }
+                    user_data_dir = str(profile_dir)
                     launch_kwargs: dict[str, Any] = {
                         "user_data_dir": user_data_dir,
                         "headless": hl,
@@ -807,20 +868,22 @@ def scan_facebook_profile_reels_page(
                     }
                     if browser_exe and Path(browser_exe).is_file():
                         launch_kwargs["executable_path"] = str(Path(browser_exe).resolve())
-                    from src.automation.browser_factory import account_use_proxy_enabled
-                    from src.utils.account_proxy_mapper import require_account_proxy_live
-                    from src.utils.proxy_check import build_playwright_proxy_settings
 
                     if account_use_proxy_enabled(acc):
                         require_account_proxy_live(acc)
                         launch_kwargs["proxy"] = build_playwright_proxy_settings(
                             acc.get("proxy") if isinstance(acc.get("proxy"), dict) else {}
                         )
-                    if browser_type in ("firefox",):
-                        context = pw.firefox.launch_persistent_context(**launch_kwargs)
-                    else:
-                        context = pw.chromium.launch_persistent_context(**launch_kwargs)
-                    st("Đang dùng browser profile của tài khoản đã chọn.")
+                    try:
+                        if browser_type in ("firefox",):
+                            context = pw.firefox.launch_persistent_context(**launch_kwargs)
+                        else:
+                            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+                    except Exception:
+                        release_profile_browser_slot(profile_dir, account_id, profile_slot)
+                        profile_slot = None
+                        raise
+                    st("Đang dùng browser profile của tài khoản đã chọn (1 cửa sổ / TK).")
                 else:
                     return {
                         "ok": False,
@@ -1227,7 +1290,22 @@ def scan_facebook_profile_reels_page(
                         except Exception:
                             pass
                     if context:
-                        context.close()
+                        try:
+                            context.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if profile_slot is not None and profile_path:
+                        try:
+                            from src.automation.browser_factory import release_profile_browser_slot
+
+                            release_profile_browser_slot(
+                                Path(profile_path).resolve(),
+                                account_id,
+                                profile_slot,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("release scan profile slot: {}", exc)
+                        profile_slot = None
                     if temp_profile_root is not None:
                         shutil.rmtree(temp_profile_root, ignore_errors=True)
             finally:

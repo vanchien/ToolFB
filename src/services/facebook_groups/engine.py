@@ -1190,9 +1190,21 @@ class GroupEngine:
                 )
                 waited = True
             self._sleep(1.0)
+        batch_lease = None
         try:
             with self._live_lock:
                 self._live_batches.add(str(batch_id))
+            # Giữ FeatureBusy cả batch — watcher/quét nguồn không mở Firefox thứ 2 giữa các Page.
+            try:
+                from src.utils.feature_busy import FEATURE_SHARE, try_acquire, release as release_busy
+
+                batch_lease = try_acquire(
+                    feature=FEATURE_SHARE,
+                    account_id=account_id,
+                    detail=f"share-batch:{batch_id}",
+                )
+            except Exception:  # noqa: BLE001
+                batch_lease = None
             self._share_step(
                 batch,
                 page_id="",
@@ -1207,7 +1219,20 @@ class GroupEngine:
                     self._live_batches.discard(str(batch_id))
                 self._end(account_id)
                 self._clear_share_step(account_id)
+                if batch_lease is not None:
+                    try:
+                        release_busy(batch_lease)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    batch_lease = None
         finally:
+            if batch_lease is not None:
+                try:
+                    from src.utils.feature_busy import release as release_busy
+
+                    release_busy(batch_lease)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 acc_lock.release()
             except RuntimeError:

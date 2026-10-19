@@ -11,6 +11,7 @@ from __future__ import annotations
 import random
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable
@@ -533,6 +534,46 @@ class SourceWatcher:
         """Bỏ thời gian nghỉ, quét vòng kế tiếp ngay."""
         self._wake.set()
 
+    def _wait_account_browser_idle(self, *, timeout_sec: float = 3600.0) -> bool:
+        """
+        Chờ tài khoản rảnh (không chia sẻ / đăng lịch) rồi mới quét Page nguồn.
+
+        Tránh mở Firefox thứ 2 trên cùng profile. False nếu bị dừng hoặc hết giờ.
+        """
+        aid = str(
+            self.account.get("id")
+            or self.account.get("account_id")
+            or ""
+        ).strip()
+        if not aid:
+            return True
+        deadline = time.monotonic() + max(30.0, float(timeout_sec))
+        noted = False
+        while not self._stop.is_set():
+            reason = ""
+            try:
+                from src.utils.feature_busy import busy_reason
+
+                reason = busy_reason(account_id=aid) or ""
+            except Exception:  # noqa: BLE001
+                reason = ""
+            if not reason:
+                return True
+            if time.monotonic() >= deadline:
+                self._on_status(
+                    f"Chờ TK rảnh quá lâu ({reason}) — bỏ vòng quét này, thử sau."
+                )
+                return False
+            if not noted:
+                self._on_status(
+                    f"TK đang {reason} — tạm dừng quét nguồn (1 browser / TK)…"
+                )
+                noted = True
+            # Đánh thức sớm nếu user bấm dừng.
+            self._wake.wait(timeout=2.0)
+            self._wake.clear()
+        return False
+
     def update_settings(
         self,
         *,
@@ -590,6 +631,9 @@ class SourceWatcher:
         n_src = len(self.sources)
         for index, url in enumerate(self.sources, start=1):
             if self._stop.is_set():
+                break
+            # Không quét khi cùng TK đang chia sẻ / đăng lịch — tránh mở Firefox thứ 2.
+            if not self._wait_account_browser_idle():
                 break
             key = source_state_key(url)
             state = self.states.setdefault(key, SourceState())
