@@ -924,22 +924,28 @@ class ShareTab:
         aid = str(self._account_labels.get(choice) or "").strip()
         return {aid} if aid else None
 
-    def _allowed_run_account_ids(self) -> set[str] | None:
-        """
-        Tập TK được phép chia sẻ ngay bây giờ.
-
-        - Lọc 1 TK → chỉ id đó (bỏ tick TK khác không đủ để dừng wave cũ).
-        - «Tất cả» → chỉ các TK còn ít nhất một Page đang tick.
-        """
-        scope = self._account_scope_ids()
-        if scope is not None:
-            return set(scope)
-        checked_aids = {
+    def _checked_account_ids(self) -> set[str]:
+        """Các account_id còn ít nhất một Page đang tick «Nhận»."""
+        return {
             str(row.get("account_id") or "").strip()
             for row in self.pages
             if row["iid"] in self._checked and str(row.get("account_id") or "").strip()
         }
-        return checked_aids if checked_aids else set()
+
+    def _allowed_run_account_ids(self) -> set[str] | None:
+        """
+        Tập TK được phép chia sẻ ngay bây giờ = giao của lọc UI và Page đang tick.
+
+        Bỏ hết tick một TK → TK đó không còn trong tập → pause + đóng Firefox ngay.
+        """
+        from src.services.facebook_groups.share_schedule import compute_allowed_share_accounts
+
+        scope = self._account_scope_ids()
+        filter_id = next(iter(scope), "") if scope is not None else None
+        return compute_allowed_share_accounts(
+            checked_account_ids=self._checked_account_ids(),
+            filter_account_id=filter_id,
+        )
 
     def _scope_page_rows(self, rows: list[dict[str, str]]) -> list[dict[str, str]]:
         """Lọc Page nhận theo tài khoản đang chọn trên combobox."""
@@ -973,14 +979,15 @@ class ShareTab:
                 except Exception:  # noqa: BLE001
                     row = None
                 aid = str((row or {}).get("account_id") or "")
-                if allowed is None or (aid and aid in allowed):
+                # allowed luôn là set (không còn None): chỉ giữ batch của TK còn tick ∩ lọc.
+                if aid and allowed is not None and aid in allowed:
                     keep.append(bid)
             self.batch_ids = keep
             label = reason or "đổi phạm vi TK"
             self.status.set(
                 f"Đã dừng {len(stopped)} TK ngoài phạm vi ({label}): "
                 + ", ".join(stopped)
-                + ". Chỉ chạy TK đang chọn/tick."
+                + ". Chỉ chạy TK đang tick."
             )
             try:
                 self._fill_results()

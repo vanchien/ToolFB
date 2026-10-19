@@ -1213,6 +1213,9 @@ class GroupEngine:
             )
             self._begin(account_id)
             try:
+                batch = self._batch(batch_id)
+                if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED} or batch_id in self._cancel:
+                    return batch
                 return self._run_share_batch(batch_id, account_id)
             finally:
                 with self._live_lock:
@@ -1287,9 +1290,15 @@ class GroupEngine:
 
     def _run_share_batch(self, batch_id: str, account_id: str) -> dict[str, Any]:
         batch = self._batch(batch_id)
+        # Bỏ tick / đổi lọc có thể pause trong lúc begin_account — không ghi đè thành RUNNING.
+        if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED} or batch_id in self._cancel:
+            return batch
         batch["status"] = BATCH_VALIDATING
         batch["started_at"] = batch.get("started_at") or _now()
         self.store.save_share_batch(batch)
+        batch = self._batch(batch_id)
+        if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED} or batch_id in self._cancel:
+            return batch
         batch["status"] = BATCH_RUNNING
         self.store.save_share_batch(batch)
         self._tls.session_ok = {}

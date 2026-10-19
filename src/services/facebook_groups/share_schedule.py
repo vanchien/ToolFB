@@ -318,6 +318,25 @@ def machine_clock_text(now: datetime | None = None) -> str:
     return f"Máy {moment.strftime('%d/%m %H:%M')}"
 
 
+def compute_allowed_share_accounts(
+    *,
+    checked_account_ids: set[str] | list[str],
+    filter_account_id: str | None = None,
+) -> set[str]:
+    """
+    Tài khoản được phép chia sẻ = Page đang tick ∩ (lọc combobox nếu có).
+
+    - Bỏ hết tick một TK → TK đó không còn trong kết quả → phải dừng ngay.
+    - Lọc «Andy» nhưng không tick Page Andy → tập rỗng → dừng cả Andy.
+    - «Tất cả» + tick A,B → {A,B}; bỏ tick B → {A}.
+    """
+    checked = {str(a).strip() for a in (checked_account_ids or []) if str(a or "").strip()}
+    filt = str(filter_account_id or "").strip()
+    if filt:
+        return checked & {filt}
+    return checked
+
+
 def _resolve_clock(clock: str, now: datetime) -> datetime:
     hour, minute = _hour_minute(clock)
     candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
