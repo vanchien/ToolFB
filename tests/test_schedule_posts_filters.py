@@ -188,8 +188,13 @@ def test_name_refresh_targets_placeholders_unless_ticked() -> None:
 
 
 def test_placeholder_name_takes_facebook_display_name() -> None:
-    from src.utils.schedule_posts_filters import account_name_should_take_facebook_name
+    from src.utils.schedule_posts_filters import (
+        account_name_is_placeholder,
+        account_name_should_take_facebook_name,
+    )
 
+    assert account_name_is_placeholder("550708732", "UID_550708732")
+    assert account_name_should_take_facebook_name("550708732", "Minh Tuyết", "UID_550708732")
     assert account_name_should_take_facebook_name("Tài khoản mới", "Đinh Bảo Toàn", "acc_1")
     assert account_name_should_take_facebook_name("facebok1", "Nguyễn Văn A", "acc_1")
     assert account_name_should_take_facebook_name("Edit", "Nguyễn Văn A", "acc_1")

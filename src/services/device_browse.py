@@ -169,12 +169,18 @@ def read_account_display_name(page: Any, *, visit_profile: bool = False) -> str:
 
     Trang bảng tin thường không có tên. Khi ``visit_profile`` bật, mở trang cá nhân
     để đọc tên trên nút cạnh dòng follower, rồi quay lại trang trước.
+    Khi DOM trống (SPA chưa hydrate) vẫn đọc ``\"NAME\"`` trong HTML.
     """
-    from src.utils.account_proxy_mapper import facebook_href_is_own_profile
+    from src.utils.account_proxy_mapper import facebook_href_is_own_profile, name_from_profile_html
 
     found = _usable_account_name(read_profile_header_name(page)) or _usable_account_name(
         read_logged_in_display_name(page)
     )
+    if not found:
+        try:
+            found = _usable_account_name(name_from_profile_html(page.content() or ""))
+        except Exception:
+            found = found or ""
     if found or not visit_profile:
         return found
     uid = facebook_uid_on_page(page)

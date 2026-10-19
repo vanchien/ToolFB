@@ -27,6 +27,7 @@ else:
 from src.automation.mobile_viewport import resolve_mobile_viewport
 from src.utils.browser_fingerprint import (
     apply_fingerprint_init_script,
+    default_desktop_chrome_user_agent,
     default_desktop_firefox_user_agent,
     merge_firefox_user_prefs,
     resolve_browser_locale,
@@ -366,6 +367,37 @@ def _firefox_launch_timed_out(exc: BaseException) -> bool:
     """Playwright hết giờ ngay tại ``<launching> firefox.exe``."""
     msg = str(exc).lower()
     return "timeout" in msg and "launch" in msg
+
+
+def _playwright_firefox_binary_ready() -> bool:
+    """True nếu có ``firefox.exe`` Playwright (bundle / LOCALAPPDATA), không tính Via."""
+    candidates: list[Path] = []
+    raw = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if raw:
+        candidates.append(Path(raw))
+    try:
+        bundled = _project_root() / "_internal" / "ms-playwright"
+        candidates.append(bundled)
+    except Exception:  # noqa: BLE001
+        pass
+    local = Path(os.environ.get("LOCALAPPDATA", "") or "") / "ms-playwright"
+    if local.as_posix() != ".":
+        candidates.append(local)
+    for root in candidates:
+        if not root.is_dir():
+            continue
+        try:
+            for child in root.iterdir():
+                if not child.is_dir() or not child.name.lower().startswith("firefox-"):
+                    continue
+                exe = child / "firefox" / "firefox.exe"
+                if exe.is_file():
+                    # Ép path này để lần launch sau không rơi vào cache sandbox rỗng.
+                    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def _release_stale_firefox_profile(user_data_dir: Path) -> None:
@@ -1041,6 +1073,9 @@ class BrowserFactory:
             ua = mv.user_agent
         elif effective_mobile:
             ua = _mobile_user_agent_default()
+        elif browser_key in ("chromium", "chrome"):
+            # Chromium từ chối UA Firefox → Protocol error Emulation.setUserAgentOverride.
+            ua = default_desktop_chrome_user_agent()
         else:
             ua = default_desktop_firefox_user_agent()
 
@@ -1222,10 +1257,24 @@ class BrowserFactory:
 
         exe = str(acc.get("browser_exe_path", "")).strip()
         has_exe = False
+        # Profile trong data/profiles → luôn Playwright; không đụng firefox.exe ổ D:/Via.
+        if exe and not _env_bool("FB_FORCE_ACCOUNT_BROWSER_EXE", False):
+            try:
+                from src.utils.account_browser_profile import is_foreign_browser_exe_path
+
+                if is_foreign_browser_exe_path(exe, project_root_dir=_project_root()):
+                    logger.info(
+                        "Bỏ browser_exe_path ngoài ToolFB (Via/ổ D) — dùng Playwright. account={} | exe={}",
+                        account_id,
+                        exe,
+                    )
+                    exe = ""
+            except Exception:  # noqa: BLE001
+                pass
         if exe:
             from src.utils.account_browser_profile import resolve_firefox_executable_for_playwright
 
-            resolved_exe = resolve_firefox_executable_for_playwright(exe)
+            resolved_exe = resolve_firefox_executable_for_playwright(exe) if browser_key == "firefox" else ""
             if resolved_exe:
                 launch_kwargs["executable_path"] = resolved_exe
                 has_exe = True
@@ -1303,21 +1352,23 @@ class BrowserFactory:
                 except Exception as exc:
                     msg = str(exc).lower()
                     if browser_key == "firefox" and _firefox_launch_timed_out(exc):
+                        to_ms = int(launch_kwargs.get("timeout") or 90_000)
                         logger.warning(
-                            "Firefox mở quá 90 giây (account={}) — đóng tiến trình cũ và thử lại 1 lần.",
+                            "Firefox mở quá {} giây (account={}) — đóng tiến trình cũ và thử lại 1 lần.",
+                            max(1, to_ms // 1000),
                             account_id,
                         )
                         _release_stale_firefox_profile(user_data_dir)
                         _cleanup_firefox_profile_lock_files(user_data_dir)
-                        time.sleep(0.4)
+                        time.sleep(0.8)
                         try:
                             context = browser_type.launch_persistent_context(**launch_kwargs)
                         except Exception as exc_retry:
                             if not _firefox_launch_timed_out(exc_retry):
                                 raise
                             raise RuntimeError(
-                                "Firefox không mở được (quá 90 giây, đã thử lại). "
-                                "Giảm số luồng rồi chạy lại tài khoản này."
+                                f"Firefox không mở được (quá {max(1, to_ms // 1000)} giây, đã thử lại). "
+                                "Đóng Firefox orphan / xóa browser_exe_path Via ngoài, rồi chạy lại."
                             ) from exc_retry
                         msg = ""
                     if msg and ("executable doesn't exist" in msg or "executable does not exist" in msg):

@@ -134,6 +134,57 @@ def relativize_account_storage_path(
         return str(p.resolve())
 
 
+def is_foreign_browser_exe_path(
+    raw: str,
+    *,
+    project_root_dir: Path | None = None,
+) -> bool:
+    """
+    True nếu ``browser_exe_path`` trỏ Firefox/Chrome Via/GPM hoặc ngoài thư mục ToolFB.
+
+    Sau khi import, profile đã nằm ``data/profiles/…`` — exe Via không cần và hay làm treo.
+    Layout ``App/Firefox`` / ``App/Chrome-bin`` / ``FirefoxPortable.exe`` luôn bỏ.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return False
+    root = (project_root_dir or project_root()).resolve()
+    p = Path(s).expanduser()
+    parts = [part.casefold() for part in p.parts]
+    name = Path(s).name.casefold()
+    via_layout = (
+        ("app" in parts and ("firefox" in parts or "chrome-bin" in parts))
+        or name == "firefoxportable.exe"
+        or ("portable" in name and "firefox" in name and name.endswith(".exe"))
+    )
+    if via_layout:
+        return True
+    try:
+        resolved = p.resolve() if p.is_absolute() else (root / p).resolve()
+    except OSError:
+        return True
+    try:
+        resolved.relative_to(root)
+        return False
+    except ValueError:
+        # Ngoài project (ổ D:, máy khác…).
+        return True
+
+
+def strip_foreign_browser_exe_path(
+    raw: str,
+    *,
+    project_root_dir: Path | None = None,
+) -> str:
+    """Trả ``\"\"`` nếu exe ngoài ToolFB; giữ nguyên nếu rỗng hoặc nằm trong project."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if is_foreign_browser_exe_path(s, project_root_dir=project_root_dir):
+        return ""
+    return s
+
+
 def resolve_account_path(project_root_dir: Path, raw: str) -> Path | None:
     s = str(raw or "").strip()
     if not s:

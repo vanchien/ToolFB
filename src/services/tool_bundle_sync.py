@@ -109,10 +109,12 @@ def page_match_key(row: dict[str, Any]) -> str:
 
 
 def _drop_foreign_browser_exe(row: dict[str, Any]) -> None:
-    """Bỏ firefox.exe/chrome.exe gắn cứng ổ đĩa máy cũ."""
-    exe = str(row.get("browser_exe_path") or "").strip()
-    if len(exe) > 2 and exe[1] == ":":
-        row["browser_exe_path"] = ""
+    """Bỏ firefox.exe/chrome.exe gắn cứng ổ đĩa máy cũ / Via."""
+    from src.utils.account_browser_profile import strip_foreign_browser_exe_path
+
+    row["browser_exe_path"] = strip_foreign_browser_exe_path(
+        str(row.get("browser_exe_path") or "")
+    )
 
 
 def _rewrite_paths_for_this_app(payload: Any) -> None:

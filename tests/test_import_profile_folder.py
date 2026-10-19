@@ -196,11 +196,13 @@ def test_upsert_folder_rewrites_portable_to_project_copy(
             "proxy": {"host": "", "port": 0, "user": "", "pass": ""},
             "use_proxy": False,
             "import_type": "folder",
+            "browser_exe_path": str(tmp_path / "via" / "App" / "Firefox" / "firefox.exe"),
         }
     )
     rec = mgr.get_by_id("UID_999")
     assert rec is not None
     assert str(rec["portable_path"]).replace("\\", "/") == "data/profiles/firefox/UID_999"
+    assert rec.get("browser_exe_path") == ""
     assert (tmp_path / "data/profiles/firefox/UID_999/cookies.sqlite").is_file()
     # Nguồn vẫn còn sau upsert (chưa xóa) — nhưng TK không phụ thuộc nó.
     assert external.is_dir()

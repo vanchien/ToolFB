@@ -2090,9 +2090,49 @@ def facebook_display_name_from_page_bits(
     return ""
 
 
+def _profile_name_from_embedded_json(html: str) -> str:
+    """Tên trong payload HTML Facebook (``\"NAME\":\"…\"``) khi DOM chưa hydrate."""
+    raw = str(html or "")
+    if not raw:
+        return ""
+    patterns = (
+        r'"NAME"\s*:\s*"([^"\\]{2,80})"',
+        r'"name"\s*:\s*"([^"\\]{2,80})"',
+        r'"full_name"\s*:\s*"([^"\\]{2,80})"',
+        r'"profile_owner_name"\s*:\s*"([^"\\]{2,80})"',
+    )
+    skip = _FACEBOOK_UI_NAMES | {
+        "facebook",
+        "user",
+        "viewer",
+        "page",
+        "profile",
+        "home",
+        "feed",
+    }
+    for pattern in patterns:
+        for match in re.finditer(pattern, raw):
+            candidate = " ".join(_decode_profile_text(match.group(1)).split())
+            low = candidate.casefold()
+            if not candidate or low in skip or candidate.isdigit():
+                continue
+            # Bỏ chuỗi kỹ thuật / camelCase một từ toàn ASCII thường gặp trong JSON.
+            if re.fullmatch(r"[A-Za-z0-9_]+", candidate) and "_" in candidate:
+                continue
+            if _profile_name_is_usable(candidate) and " " in candidate:
+                return candidate[:80]
+            if _profile_name_is_usable(candidate) and not re.fullmatch(r"[a-z0-9]+", low):
+                return candidate[:80]
+    return ""
+
+
 def name_from_profile_html(html: str) -> str:
-    """Lấy tên người từ title hoặc og:title. Bỏ trang đăng nhập và trang lỗi."""
-    for candidate in (_profile_meta_name(html), _profile_title(html)):
+    """Lấy tên người từ title, og:title hoặc JSON nhúng trong HTML."""
+    for candidate in (
+        _profile_meta_name(html),
+        _profile_title(html),
+        _profile_name_from_embedded_json(html),
+    ):
         if _profile_name_is_usable(candidate):
             return candidate[:80]
     return ""

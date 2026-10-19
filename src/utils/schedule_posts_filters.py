@@ -64,13 +64,22 @@ def format_page_filter_label(page_id: str, page_name: str = "") -> str:
 
 
 def account_name_is_placeholder(name: str, account_id: str = "") -> bool:
-    """Tên chưa phải tên người dùng: trống, trùng mã nội bộ, hoặc nhãn mặc định."""
+    """Tên chưa phải tên người dùng: trống, UID số, mã nội bộ, hoặc nhãn mặc định."""
     raw = " ".join(str(name or "").split())
     aid = str(account_id or "").strip()
     if not raw:
         return True
     if aid and raw.casefold() == aid.casefold():
         return True
+    # Import thư mục / cookie thường để tên = UID số (vd. 550708732) — coi như chưa có tên.
+    if raw.isdigit() and len(raw) >= 5:
+        return True
+    if re.fullmatch(r"UID_\d+", raw, re.IGNORECASE):
+        return True
+    if aid:
+        aid_digits = "".join(ch for ch in aid if ch.isdigit())
+        if aid_digits and raw == aid_digits and len(aid_digits) >= 5:
+            return True
     if raw.casefold() in _PLACEHOLDER_ACCOUNT_NAMES:
         return True
     if _GENERIC_ACCOUNT_LABEL.fullmatch(raw):

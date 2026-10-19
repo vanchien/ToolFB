@@ -1,8 +1,8 @@
 """
-Tự động tối ưu đa tác vụ: download + video editor + lịch đăng + browser.
+Tự động tối ưu đa tác vụ: download + video editor + lịch đăng + browser (chia sẻ/tương tác).
 
 - ``apply_multi_task_defaults()`` — mức cơ sở theo CPU khi khởi động.
-- ``workload_begin`` / ``workload_end`` — theo dõi hoạt động nền.
+- ``workload_begin`` / ``workload_end`` — theo dõi hoạt động nền (share/human dùng KIND_BROWSER_POST).
 - ``reconcile_multi_task_limits()`` — hạ slot browser/FFmpeg khi nhiều chức năng cùng chạy.
 """
 

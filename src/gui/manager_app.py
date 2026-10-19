@@ -126,7 +126,6 @@ from src.utils.schedule_batch_preview import (
 )
 from src.utils.schedule_job_content import build_schedule_slot_hhmm, internal_post_title_from_body
 from src.utils.schedule_posts_filters import (
-    account_ids_for_name_refresh,
     account_name_is_placeholder,
     account_name_should_take_facebook_name,
     format_account_filter_label,
@@ -10056,31 +10055,132 @@ class _ManagerWindow:
             return ""
         return facebook_uid_from_cookie_export(raw)
 
-    def _read_facebook_name_from_profile(self, account_id: str) -> tuple[str, str]:
-        """
-        Mở đúng 1 browser của tài khoản → vào facebook.com ngay → đọc tên → đóng.
+    def _uid_hint_for_account(self, acc: dict[str, Any]) -> str:
+        """UID số từ cookie / facebook_uid / id UID_… — dùng khi file cookie rỗng."""
+        uid = self._cookie_uid_for_account(acc)
+        if uid:
+            return uid
+        raw = str(acc.get("facebook_uid") or "").strip()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if 6 <= len(digits) <= 20:
+            return digits
+        aid = str(acc.get("id") or "").strip()
+        if aid.upper().startswith("UID_"):
+            digits = "".join(ch for ch in aid if ch.isdigit())
+            if 6 <= len(digits) <= 20:
+                return digits
+        if aid.isdigit() and 6 <= len(aid) <= 20:
+            return aid
+        return ""
 
-        Chạy tuần tự (không song song) để tránh treo Firefox/Chromium.
+    def _prepare_profiles_for_name_refresh(self, account_ids: list[str]) -> None:
         """
-        aid = str(account_id or "").strip()
-        for sess in list(getattr(self, "_manual_profile_sessions", []) or []):
-            thread = sess.get("thread")
+        Trước đợt cập nhật tên: đóng «Mở profile», kill Firefox orphan, xóa parent.lock.
+
+        Không dọn thì launch treo 90s / cửa sổ mở rồi đứng — đúng lỗi user báo.
+        """
+        want = [str(a).strip() for a in account_ids if str(a).strip()]
+        if not want:
+            return
+        self._close_manual_profiles_for_accounts(want, wait_sec=3.0)
+        try:
+            from src.automation.browser_factory import _cleanup_firefox_profile_lock_files
+            from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
+            from src.utils.account_browser_profile import resolve_account_path
+            from src.utils.paths import project_root
+            from src.utils.win_browser_window import terminate_firefox_for_profile
+
+            root = project_root()
+            for aid in want:
+                try:
+                    FacebookGroupProvider._kill_stale_firefox(aid)
+                except Exception:  # noqa: BLE001
+                    pass
+                rec = self._record_by_id(aid) or {}
+                raw = str(rec.get("portable_path") or rec.get("profile_path") or "").strip()
+                folder = resolve_account_path(root, raw) if raw else None
+                if folder is None or not folder.is_dir():
+                    continue
+                try:
+                    terminate_firefox_for_profile(folder, grace_ms=50)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    _cleanup_firefox_profile_lock_files(folder)
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(1.2)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chưa dọn xong profile trước cập nhật tên: {}", exc)
+
+    def _close_manual_profiles_for_accounts(self, account_ids: list[str], *, wait_sec: float = 6.0) -> None:
+        """Đóng phiên «Mở profile» + ép kill Firefox của các TK sắp cập nhật tên."""
+        want = {str(a).strip() for a in account_ids if str(a).strip()}
+        if not want:
+            return
+        sessions = [
+            s
+            for s in list(getattr(self, "_manual_profile_sessions", []) or [])
+            if str(s.get("account_id") or "").strip() in want
+        ]
+        for sess in sessions:
             try:
-                alive = thread is not None and thread.is_alive()
+                sess["shutdown"].set()
             except Exception:
-                alive = False
-            if alive and str(sess.get("account_id") or "") == aid:
-                return "", "profile đang mở — đóng rồi bấm lại"
+                pass
         try:
             from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
 
-            FacebookGroupProvider._kill_stale_firefox(aid)
+            for aid in want:
+                FacebookGroupProvider._kill_stale_firefox(aid)
         except Exception:  # noqa: BLE001
             pass
+        deadline = time.monotonic() + max(1.0, float(wait_sec))
+        while time.monotonic() < deadline:
+            alive = False
+            for sess in sessions:
+                th = sess.get("thread")
+                try:
+                    if th is not None and th.is_alive():
+                        alive = True
+                        break
+                except Exception:
+                    continue
+            if not alive:
+                break
+            time.sleep(0.2)
+        kept: list[dict[str, Any]] = []
+        for sess in list(getattr(self, "_manual_profile_sessions", []) or []):
+            aid = str(sess.get("account_id") or "").strip()
+            th = sess.get("thread")
+            try:
+                still = th is not None and th.is_alive()
+            except Exception:
+                still = False
+            if aid in want and not still:
+                continue
+            if still:
+                kept.append(sess)
+        self._manual_profile_sessions = kept
+
+    def _read_facebook_name_from_profile(self, account_id: str) -> tuple[str, str]:
+        """
+        Mở đúng 1 browser → vào trang cá nhân → đọc tên → đóng.
+
+        Timeout launch ngắn (35s). Kill + xóa lock trước khi mở — tránh treo orphan.
+        """
+        aid = str(account_id or "").strip()
+        prev_ff_to = os.environ.get("FB_FIREFOX_LAUNCH_TIMEOUT_MS")
+        os.environ["FB_FIREFOX_LAUNCH_TIMEOUT_MS"] = "35000"
         factory: BrowserFactory | None = None
         ctx = None
         try:
+            from src.automation.browser_factory import _cleanup_firefox_profile_lock_files
             from src.services.device_browse import facebook_uid_on_page, read_account_display_name
+            from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
+            from src.utils.account_browser_profile import resolve_account_path
+            from src.utils.paths import project_root
+            from src.utils.win_browser_window import terminate_firefox_for_profile
 
             row = self._accounts.get_by_id(aid) if hasattr(self._accounts, "get_by_id") else None
             if row is None:
@@ -10089,9 +10189,35 @@ class _ManagerWindow:
             if not isinstance(row, dict):
                 return "", "không tìm thấy tài khoản"
 
-            # Mỗi lần một Playwright riêng — tránh lỗi Emulation/UA khi chạy song song.
+            # Dọn orphan + lock của đúng profile này trước khi launch.
+            try:
+                FacebookGroupProvider._kill_stale_firefox(aid)
+                raw = str(row.get("portable_path") or row.get("profile_path") or "").strip()
+                folder = resolve_account_path(project_root(), raw) if raw else None
+                if folder is not None and folder.is_dir():
+                    terminate_firefox_for_profile(folder, grace_ms=80)
+                    _cleanup_firefox_profile_lock_files(folder)
+                    time.sleep(0.8)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Dọn profile trước đọc tên {}: {}", aid, exc)
+
+            from src.automation.browser_factory import _playwright_firefox_binary_ready
+
+            # Ép path Firefox Playwright (tránh cache sandbox rỗng / Via treo).
+            _playwright_firefox_binary_ready()
+            acc_launch = dict(row)
+            # Cập nhật tên: ưu tiên Playwright Firefox (Via exe hay treo juggler).
+            if str(acc_launch.get("browser_type") or "firefox").lower() == "firefox":
+                if _playwright_firefox_binary_ready():
+                    acc_launch["browser_exe_path"] = ""
             factory = BrowserFactory(accounts=self._accounts, headless=False, playwright_shared=False)
-            ctx = factory.get_browser_context(aid, headless=False)
+            ctx = factory.launch_persistent_context_from_account_dict(
+                acc_launch,
+                headless=False,
+                launch_slot_timeout_sec=20.0,
+                skip_geo_lookup=True,
+                force_desktop_facebook=True,
+            )
             pages = list(ctx.pages) if ctx.pages else []
             page = pages[0] if pages else ctx.new_page()
             for extra in pages[1:]:
@@ -10104,7 +10230,7 @@ class _ManagerWindow:
             except Exception:  # noqa: BLE001
                 pass
 
-            uid = self._cookie_uid_for_account(dict(row))
+            uid = self._uid_hint_for_account(dict(row))
             if not uid:
                 try:
                     for item in ctx.cookies("https://www.facebook.com") or []:
@@ -10114,34 +10240,61 @@ class _ManagerWindow:
                 except Exception:  # noqa: BLE001
                     uid = ""
 
-            # Luôn goto facebook.com trước (user thấy đang cập nhật), rồi vào profile.
-            logger.info("Cập nhật tên {}: mở https://www.facebook.com/", aid)
-            page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(500)
-            if not uid:
+            # Có UID (từ id UID_…) → vào thẳng trang cá nhân; không vòng facebook.com /me.
+            if uid:
+                target = f"https://www.facebook.com/profile.php?id={uid}"
+                logger.info("Cập nhật tên {}: mở {}", aid, target)
+                page.goto(target, wait_until="domcontentloaded", timeout=35_000)
+            else:
+                logger.info("Cập nhật tên {}: mở https://www.facebook.com/", aid)
+                page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=35_000)
+                page.wait_for_timeout(400)
                 uid = facebook_uid_on_page(page)
-            if not uid:
-                page.goto("https://www.facebook.com/me", wait_until="domcontentloaded", timeout=45_000)
-                page.wait_for_timeout(700)
-                uid = facebook_uid_on_page(page)
-            if not uid:
-                return "", "profile chưa đăng nhập Facebook"
-
-            target = f"https://www.facebook.com/profile.php?id={uid}"
-            logger.info("Cập nhật tên {}: mở {}", aid, target)
-            page.goto(target, wait_until="domcontentloaded", timeout=45_000)
+                if not uid:
+                    page.goto("https://www.facebook.com/me", wait_until="domcontentloaded", timeout=35_000)
+                    page.wait_for_timeout(500)
+                    uid = facebook_uid_on_page(page)
+                if not uid:
+                    return "", "profile chưa đăng nhập Facebook"
+                target = f"https://www.facebook.com/profile.php?id={uid}"
+                logger.info("Cập nhật tên {}: mở {}", aid, target)
+                page.goto(target, wait_until="domcontentloaded", timeout=35_000)
 
             found = ""
-            for _ in range(8):
+            for _ in range(10):
                 found = read_account_display_name(page, visit_profile=False)
                 if found and not account_name_is_placeholder(found, aid):
-                    return found, ""
-                page.wait_for_timeout(500)
+                    break
+                page.wait_for_timeout(400)
+            if not found or account_name_is_placeholder(found, aid):
+                # DOM trống nhưng HTML vẫn có \"NAME\":\"…\" — đọc thẳng từ content.
+                try:
+                    from src.utils.account_proxy_mapper import name_from_profile_html
+
+                    found = name_from_profile_html(page.content() or "")
+                except Exception:  # noqa: BLE001
+                    pass
+            if found and not account_name_is_placeholder(found, aid):
+                try:
+                    cookie_rel = str(row.get("cookie_path") or "").strip()
+                    if cookie_rel:
+                        cookie_path = Path(cookie_rel)
+                        if not cookie_path.is_absolute():
+                            cookie_path = project_root() / cookie_rel
+                        cookie_path.parent.mkdir(parents=True, exist_ok=True)
+                        ctx.storage_state(path=str(cookie_path))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Chưa ghi lại cookie sau cập nhật tên {}: {}", aid, exc)
+                return found, ""
             return "", "đã mở trang cá nhân nhưng chưa thấy tên người dùng"
         except Exception as exc:  # noqa: BLE001
             logger.warning("Không đọc tên từ profile {}: {}", aid, exc)
             return "", f"không mở được trình duyệt ({exc.__class__.__name__})"
         finally:
+            if prev_ff_to is None:
+                os.environ.pop("FB_FIREFOX_LAUNCH_TIMEOUT_MS", None)
+            else:
+                os.environ["FB_FIREFOX_LAUNCH_TIMEOUT_MS"] = prev_ff_to
             try:
                 sync_close_persistent_context(
                     ctx, log_label=f"account_name:{aid}", force_kill_firefox=True
@@ -10164,7 +10317,9 @@ class _ManagerWindow:
             messagebox.showerror("Cập nhật tên", f"Không đọc được danh sách tài khoản:\n{exc}", parent=self._root)
             return
         ticked = [aid for aid in self._profile_ids_for_bulk() if self._account_tick.get(aid, False)]
-        ids, forced = account_ids_for_name_refresh(rows, ticked)
+        from src.services.account_name_refresh import plan_name_refresh_ids, run_name_refresh_sequential
+
+        ids, forced = plan_name_refresh_ids(rows, ticked)
         if not ids:
             messagebox.showinfo(
                 "Cập nhật tên",
@@ -10172,65 +10327,62 @@ class _ManagerWindow:
                 parent=self._root,
             )
             return
-        by_id = {str(row.get("id") or "").strip(): row for row in rows}
         self._account_name_refresh_busy = True
         self._btn_refresh_account_names.configure(state=tk.DISABLED)
         self._set_ui_busy("Cập nhật tên")
         total = len(ids)
 
         def _worker() -> None:
-            updated: list[tuple[str, str]] = []
-            skipped: list[str] = []
-
-            for index, aid in enumerate(ids, start=1):
+            def _on_progress(index: int, tot: int, aid: str, phase: str) -> None:
+                if phase == "browser":
+                    text = f"Mở browser đọc tên {index}/{tot}: {aid}"
+                elif phase == "done":
+                    text = f"Đã lấy tên {index}/{tot}: {aid}"
+                else:
+                    text = f"Đang cập nhật tên {index}/{tot}: {aid} (lần lượt)"
                 schedule_on_main_thread(
                     self._root,
-                    lambda n=index, a=aid: self._lbl_state.configure(
-                        text=f"Đang cập nhật tên {n}/{total}: {a} (lần lượt)"
-                    ),
+                    lambda t=text: self._lbl_state.configure(text=t),
                 )
-                acc = by_id.get(aid)
-                if not isinstance(acc, dict):
-                    skipped.append(f"{aid}: không tìm thấy bản ghi")
-                    continue
-                # Cookie HTTP ngắn; thất bại → mở 1 browser vào facebook.com.
-                found, reason = self._lookup_account_facebook_name(acc, timeout=4.0)
-                if not found:
-                    schedule_on_main_thread(
-                        self._root,
-                        lambda n=index, a=aid: self._lbl_state.configure(
-                            text=f"Mở browser đọc tên {n}/{total}: {a}"
-                        ),
-                    )
-                    found, reason = self._read_facebook_name_from_profile(aid)
-                current = str(acc.get("name") or "")
-                take = bool(found) and (
-                    account_name_should_take_facebook_name(current, found, aid)
-                    or (
-                        forced
-                        and not account_name_is_placeholder(found, aid)
-                        and found.casefold() != current.casefold()
-                    )
-                )
-                if not take:
-                    skipped.append(f"{aid}: {reason or 'giữ tên hiện tại'}")
-                    continue
-                try:
-                    self._accounts.update_account_fields(aid, {"name": found})
-                except Exception as exc:  # noqa: BLE001
-                    skipped.append(f"{aid}: không lưu được ({exc})")
-                    continue
-                updated.append((aid, found))
-                # Cập nhật bảng ngay sau mỗi TK — user thấy tên hiện dần.
-                def _paint_one(a: str = aid, name: str = found, n: int = index) -> None:
-                    self._job_account_name_by_id[a] = name
-                    self._lbl_state.configure(text=f"Đã lấy tên {n}/{total}: {name}")
+
+            def _lookup(acc: dict[str, Any]) -> tuple[str, str]:
+                return self._lookup_account_facebook_name(acc, timeout=4.0)
+
+            def _browser(aid: str) -> tuple[str, str]:
+                return self._read_facebook_name_from_profile(aid)
+
+            def _save(aid: str, name: str) -> None:
+                self._accounts.update_account_fields(aid, {"name": name})
+
+                def _paint() -> None:
+                    self._job_account_name_by_id[aid] = name
+                    self._lbl_state.configure(text=f"Đã lấy tên: {name}")
                     try:
                         self._fill_tree(self._accounts.load_all())
                     except Exception:
                         pass
 
-                schedule_on_main_thread(self._root, _paint_one)
+                schedule_on_main_thread(self._root, _paint)
+
+            def _session_ready(acc: dict[str, Any]) -> bool:
+                from src.utils.account_browser_profile import portable_profile_likely_has_session
+
+                raw = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+                return portable_profile_likely_has_session(raw)
+
+            result = run_name_refresh_sequential(
+                rows,
+                ids,
+                forced=forced,
+                lookup_cookie=_lookup,
+                read_browser=_browser,
+                save_name=_save,
+                on_progress=_on_progress,
+                close_open_profiles=self._prepare_profiles_for_name_refresh,
+                session_ready=_session_ready,
+            )
+            updated = result.updated
+            skipped = result.skipped
 
             def _done() -> None:
                 self._account_name_refresh_busy = False
@@ -10260,8 +10412,6 @@ class _ManagerWindow:
                 self._lbl_state.configure(text=f"Cập nhật tên: {len(updated)}/{total}")
                 if updated and not skipped:
                     messagebox.showinfo("Cập nhật tên", "\n".join(lines), parent=self._root)
-                elif updated:
-                    messagebox.showwarning("Cập nhật tên", "\n".join(lines), parent=self._root)
                 else:
                     messagebox.showwarning("Cập nhật tên", "\n".join(lines), parent=self._root)
 
@@ -10892,7 +11042,8 @@ class _ManagerWindow:
             f"Đã lưu {n} tài khoản (đã copy profile vào ToolFB):\n"
             + "\n".join(lines)
             + "\n\nThư mục nguồn bên ngoài có thể xóa — tài khoản dùng bản copy trong data/profiles.\n"
-            "Chọn dòng → «Mở thư mục profile» để xem bản copy, hoặc «Mở profile» để kiểm tra đăng nhập.",
+            "Chọn dòng → «Mở thư mục profile» để xem bản copy, hoặc «Mở profile» để kiểm tra đăng nhập.\n"
+            "Không còn dùng firefox.exe/chrome.exe trên ổ nguồn — có thể xóa thư mục Via/GPM.",
             parent=self._root,
         )
 

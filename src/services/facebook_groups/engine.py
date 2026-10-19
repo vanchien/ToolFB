@@ -875,16 +875,38 @@ class GroupEngine:
         Số tài khoản chia sẻ song song tối đa (mỗi TK một browser).
 
         Ưu tiên ``SHARE_PARALLEL_ACCOUNTS``, không thì ``BROWSER_CONCURRENCY`` (mặc định 3).
-        Tránh mở hàng chục Firefox cùng lúc khi wave lớn.
+        Reconcile đa tác vụ chỉ được **hạ** slot (download/VE/lịch bận) — không nâng
+        vượt mức đã cấu hình (tránh wave 24/7 mở thêm Firefox ngoài ý muốn).
         """
-        for key in ("SHARE_PARALLEL_ACCOUNTS", "BROWSER_CONCURRENCY"):
+
+        def _parse(key: str) -> int | None:
             raw = str(os.environ.get(key) or "").strip()
             if not raw:
-                continue
+                return None
             try:
                 return max(1, int(raw))
             except ValueError:
-                logger.warning("{}={!r} không hợp lệ — dùng mặc định 3.", key, raw)
+                logger.warning("{}={!r} không hợp lệ — bỏ qua.", key, raw)
+                return None
+
+        configured = _parse("SHARE_PARALLEL_ACCOUNTS")
+        if configured is None:
+            configured = _parse("BROWSER_CONCURRENCY")
+        try:
+            from src.utils.concurrency_runtime import reconcile_multi_task_limits
+
+            reconcile_multi_task_limits()
+        except Exception:  # noqa: BLE001
+            pass
+        after = _parse("SHARE_PARALLEL_ACCOUNTS")
+        if after is None:
+            after = _parse("BROWSER_CONCURRENCY")
+        if configured is not None and after is not None:
+            return max(1, min(configured, after))
+        if configured is not None:
+            return configured
+        if after is not None:
+            return after
         return 3
 
     def _pending_share_batch_ids(self, batch_ids: list[str]) -> list[str]:
@@ -1976,17 +1998,40 @@ class GroupEngine:
             callback(text)
 
     def _begin(self, account_id: str) -> None:
+        """Mở slot TK + đăng ký tải browser để tự hạ concurrency khi 24/7 đa tab."""
+        try:
+            from src.utils.concurrency_runtime import KIND_BROWSER_POST, workload_begin
+
+            workload_begin(KIND_BROWSER_POST)
+            tls = getattr(self, "_tls", None)
+            if tls is not None:
+                n = int(getattr(tls, "workload_units", 0) or 0)
+                tls.workload_units = n + 1
+        except Exception:  # noqa: BLE001
+            pass
         provider = self._active_provider()
         if account_id and hasattr(provider, "begin_account"):
             provider.begin_account(account_id)
 
     def _end(self, account_id: str) -> None:
+        """Nhả slot TK + workload browser (luôn gọi dù provider lỗi)."""
         provider = self._active_provider()
         if account_id and hasattr(provider, "end_account"):
             try:
                 provider.end_account(account_id)
             except Exception:  # noqa: BLE001
-                return
+                pass
+        try:
+            tls = getattr(self, "_tls", None)
+            units = int(getattr(tls, "workload_units", 0) or 0) if tls is not None else 0
+            if units > 0:
+                from src.utils.concurrency_runtime import KIND_BROWSER_POST, workload_end
+
+                workload_end(KIND_BROWSER_POST)
+                if tls is not None:
+                    tls.workload_units = units - 1
+        except Exception:  # noqa: BLE001
+            return
 
     def _session_block(self, account_id: str) -> str:
         provider = self._active_provider()

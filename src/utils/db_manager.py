@@ -143,15 +143,20 @@ class AccountsDatabaseManager:
         from src.utils.proxy_check import proxy_dict_from_accounts_json
 
         d["proxy"] = proxy_dict_from_accounts_json(d.get("proxy"))
-        from src.utils.account_browser_profile import relativize_account_storage_path
+        from src.utils.account_browser_profile import (
+            relativize_account_storage_path,
+            strip_foreign_browser_exe_path,
+        )
 
         root = project_root()
         for key in ("portable_path", "profile_path", "cookie_path"):
             if d.get(key):
                 d[key] = relativize_account_storage_path(str(d[key]), project_root_dir=root)
-        exe = str(d.get("browser_exe_path") or "").strip()
-        if exe:
-            d["browser_exe_path"] = relativize_account_storage_path(exe, project_root_dir=root)
+        # Profile đã copy vào data/profiles — không giữ firefox.exe/chrome.exe ổ D:/Via.
+        d["browser_exe_path"] = strip_foreign_browser_exe_path(
+            str(d.get("browser_exe_path") or ""),
+            project_root_dir=root,
+        )
         return d
 
     def _validate_account_shape(self, record: dict[str, Any]) -> None:
@@ -434,11 +439,16 @@ class AccountsDatabaseManager:
                     )
                     normalized["portable_path"] = dest_rel
                     normalized["profile_path"] = dest_rel
+                    # Chỉ dùng bản copy trong ToolFB + Playwright — có thể xóa thư mục nguồn / ổ D.
+                    normalized["browser_exe_path"] = ""
                     ck = str(normalized.get("cookie_path") or "").strip()
                     if not ck:
                         normalized["cookie_path"] = default_cookie_path(str(acc_id))
                     note = str(normalized.get("notes") or "").strip()
-                    extra = f"Đã copy profile từ: {portable_raw}"
+                    extra = (
+                        f"Đã copy profile vào {dest_rel} — không còn phụ thuộc thư mục nguồn "
+                        f"({portable_raw})."
+                    )
                     normalized["notes"] = f"{note}\n{extra}".strip() if note else extra
                 else:
                     portable_raw = str(

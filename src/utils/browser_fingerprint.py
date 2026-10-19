@@ -80,6 +80,30 @@ def default_desktop_firefox_user_agent() -> str:
     )
 
 
+def default_desktop_chrome_user_agent() -> str:
+    """User-Agent Chrome/Chromium desktop — không dùng UA Firefox (Emulation.setUserAgent lỗi)."""
+    override = os.environ.get("PLAYWRIGHT_USER_AGENT", "").strip() or os.environ.get(
+        "FB_CHROME_UA", ""
+    ).strip()
+    if override:
+        return override
+    sys_name = platform.system()
+    if sys_name == "Windows":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        )
+    if sys_name == "Darwin":
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    )
+
+
 def firefox_anti_detection_user_prefs(*, webrtc_block: bool = True) -> dict[str, Any]:
     """
     ``firefox_user_prefs`` giảm tín hiệu bot / rò IP WebRTC.

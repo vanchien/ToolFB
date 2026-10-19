@@ -213,10 +213,18 @@ def validate_browser_bundle(
         except Exception:
             local_v = ""
         if local_v and exp_app != local_v:
-            errors.append(
-                f"Manifest trình duyệt gắn app {exp_app} nhưng đang chạy {local_v} — "
-                f"cần cài đúng bản release khớp bundle."
-            )
+            # Dev / source tree: chỉ cảnh báo — không chặn mở Firefox (cập nhật tên / mở profile).
+            if not getattr(sys, "frozen", False):
+                logger.warning(
+                    "Manifest trình duyệt gắn app {} nhưng đang chạy {} — bỏ qua khi chạy source.",
+                    exp_app,
+                    local_v,
+                )
+            else:
+                errors.append(
+                    f"Manifest trình duyệt gắn app {exp_app} nhưng đang chạy {local_v} — "
+                    f"cần cài đúng bản release khớp bundle."
+                )
     return errors
 
 

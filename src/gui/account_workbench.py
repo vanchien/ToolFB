@@ -2380,29 +2380,34 @@ class AccountFormDialog:
             if not ck_abs.is_file() and auto_ck:
                 ck_abs.parent.mkdir(parents=True, exist_ok=True)
                 ck_abs.write_text("[]\n", encoding="utf-8")
-            exe_one = str(row.get("browser_exe_path", "")).strip()
-            if exe_one and not Path(exe_one).is_file():
-                exe_one = ""
+            # Exe Via/GPM chỉ để quét — sau copy vào data/profiles không lưu (xóa ổ D được).
             self._refresh_folder_row_validity(row)
             if not row.get("valid"):
                 continue
             fb_uid = str(row.get("suggest_facebook_uid") or "").strip()
             if not fb_uid and self._looks_like_facebook_uid(str(row.get("folder_name") or "")):
                 fb_uid = str(row["folder_name"]).strip()
+            # Tên thư mục = UID số → lưu «Tài khoản mới» để «Cập nhật tên» tự nhận placeholder.
+            folder_label = str(row.get("folder_name") or "").strip()
+            display_name = folder_label
+            if folder_label.isdigit() and len(folder_label) >= 5:
+                display_name = "Tài khoản mới"
+            elif re.fullmatch(r"UID_\d+", folder_label, re.IGNORECASE):
+                display_name = "Tài khoản mới"
             note_bits = [self._collect_notes()]
             if row.get("has_history"):
                 note_bits.append("Import profile có lịch sử/phiên sẵn.")
             notes_joined = "\n".join(x for x in note_bits if x).strip()
             rec = self._build_account_dict_core(
                 aid=aid,
-                name=row["folder_name"],
+                name=display_name,
                 portable=portable,
                 cookie=Path(ck).as_posix(),
                 browser_type=row["browser_type"],
                 proxy=px_row,
                 use_px=row_uses,
                 import_type="folder",
-                browser_exe_path=exe_one,
+                browser_exe_path="",
                 facebook_uid=fb_uid or self._form_facebook_uid(),
             )
             if notes_joined:
