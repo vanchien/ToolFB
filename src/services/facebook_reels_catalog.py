@@ -21,14 +21,14 @@ from playwright_stealth import Stealth
 
 StatusFn = Callable[[str], None]
 
-_REEL_ID_RE = re.compile(r"/reel/(\d{8,})", re.IGNORECASE)
-_VIDEOS_ID_RE = re.compile(r"/videos/(?:[^/?#]+/)?(\d{8,})", re.IGNORECASE)
+_REEL_ID_RE = re.compile(r"/reel/(\d{10,17})(?!\d)", re.IGNORECASE)
+_VIDEOS_ID_RE = re.compile(r"/videos/(?:[^/?#]+/)?(\d{10,17})(?!\d)", re.IGNORECASE)
 # Facebook nhúng trong JSON / query (DOM đôi khi không có href đầy đủ)
 _FB_WATCH_V_RE = re.compile(
-    r"(?:facebook\.com|fb\.watch)[^\"'\s<>]*[?&]v=(\d{10,})",
+    r"(?:facebook\.com|fb\.watch)[^\"'\s<>]*[?&]v=(\d{10,17})(?!\d)",
     re.IGNORECASE,
 )
-_FB_PLAYABLE_ID_RE = re.compile(r'"playable_id"\s*:\s*"(\d{11,})"', re.IGNORECASE)
+_FB_PLAYABLE_ID_RE = re.compile(r'"playable_id"\s*:\s*"(\d{10,17})(?!\d)"', re.IGNORECASE)
 
 # Ưu tiên vùng [role=main] / feed cuộn được — Facebook thường không cuộn document.
 _JS_PICK_SCROLL_EL = """
@@ -94,6 +94,71 @@ _JS_SCROLL_DEEP = (
 }
 """
 )
+
+# Ô video/reel trên lưới Page: ô lớn, sắp theo Y. Bỏ chip gợi ý nhỏ / link trang khác.
+_JS_COLLECT_PAGE_VIDEO_TILES = """
+(args) => {
+  const vanity = String((args && args.vanity) || "").toLowerCase();
+  const pageId = String((args && args.pageId) || "");
+  const main = document.querySelector("[role='main']") || document.body;
+  const rx = /\\/reel\\/(\\d{10,17})(?!\\d)|\\/videos\\/(?:[^/?#]+\\/)?(\\d{10,17})(?!\\d)|[?&]v=(\\d{10,17})(?!\\d)/i;
+  const reserved = new Set(["reel", "reels", "watch", "video", "videos", "photo", "photos"]);
+  const rows = [];
+  const seen = new Set();
+
+  function ownerKind(href) {
+    const h = String(href || "");
+    try {
+      const u = new URL(h, location.origin);
+      const parts = u.pathname.split("/").filter(Boolean);
+      const host = (u.hostname || "").toLowerCase();
+      if (!host.includes("facebook.com") && !host.includes("fb.watch") && h.startsWith("/")) {
+        /* relative */
+      } else if (host && !host.includes("facebook.com") && !host.includes("fb.watch")) {
+        return "other";
+      }
+      if (!parts.length) {
+        if (u.searchParams.get("v")) return "bare";
+        return "other";
+      }
+      const head = String(parts[0] || "").toLowerCase();
+      if (head === "reel" || head === "watch" || head === "videos") return "bare";
+      if (head === "profile.php") {
+        const id = u.searchParams.get("id") || "";
+        if (pageId && id === pageId) return "page";
+        return id ? "other" : "bare";
+      }
+      if (reserved.has(head)) return "bare";
+      if (vanity && head === vanity) return "page";
+      if (pageId && head === pageId) return "page";
+      if (/^\\d{8,}$/.test(head) || /^[a-z0-9.]+$/i.test(head)) return "other";
+    } catch (_e) {}
+    return "bare";
+  }
+
+  for (const a of main.querySelectorAll("a[href]")) {
+    const href = a.href || a.getAttribute("href") || "";
+    if (!href || !rx.test(href) || seen.has(href)) continue;
+    const r = a.getBoundingClientRect();
+    const w = r.width || 0;
+    const hgt = r.height || 0;
+    if (w < 72 || hgt < 72) continue;
+    const kind = ownerKind(href);
+    if (kind === "other") continue;
+    seen.add(href);
+    rows.push({
+      href,
+      y: (r.top || 0) + (window.scrollY || 0),
+      x: r.left || 0,
+      kind,
+    });
+  }
+  // Giữ cả ô «bare» (/reel/id) — tab Reels của Page gần như luôn dùng link trần.
+  // Chỉ loại «other» (vanity trang khác). Không ưu tiên owned-only (sẽ mất video mới nhất).
+  rows.sort((a, b) => a.y - b.y || a.x - b.x);
+  return rows.map((x) => x.href);
+}
+"""
 
 
 def _noop_status(_: str) -> None:
@@ -214,6 +279,9 @@ _FB_RESERVED_SEGMENTS = frozenset(
         "messages",
         "settings",
         "help",
+        "professional_dashboard",
+        "latest",
+        "business",
     }
 )
 
@@ -237,6 +305,8 @@ def facebook_page_identity(url: str) -> str:
     seg = m.group(1).strip().casefold()
     if not seg or seg in _FB_RESERVED_SEGMENTS:
         return ""
+    if seg.isdigit() and len(seg) >= 8:
+        return f"id:{seg}"
     return f"vanity:{seg}"
 
 
@@ -247,6 +317,172 @@ def url_matches_facebook_page(current_url: str, expected_page_url: str) -> bool:
     if not want or not got:
         return False
     return want == got
+
+
+def href_belongs_to_source_page(
+    href: str,
+    expected_page_url: str,
+    *,
+    allow_bare: bool = True,
+) -> bool:
+    """
+    True nếu link video thuộc Page nguồn.
+
+    ``allow_bare=True``: ``/reel/<id>`` / ``watch?v=`` (không gắn vanity) vẫn giữ.
+    ``allow_bare=False``: chỉ href có vanity/id trùng Page — loại reel gợi ý.
+    """
+    want = facebook_page_identity(expected_page_url)
+    got = facebook_page_identity(href)
+    if got and want:
+        return got == want
+    if got:
+        return False
+    return bool(allow_bare)
+
+
+def extract_facebook_page_id_from_page(page: Any) -> str:
+    """Meta Page ID từ URL hoặc JSON nhúng trên trang đang mở."""
+    try:
+        ident = facebook_page_identity(str(getattr(page, "url", "") or ""))
+        if ident.startswith("id:"):
+            return ident.split(":", 1)[1]
+    except Exception:
+        pass
+    try:
+        html = str(page.content() or "")
+    except Exception:
+        html = ""
+    if not html:
+        return ""
+    m = re.search(
+        r'"(?:pageID|delegate_page_id|page_id)"\s*:\s*"(\d{8,})"',
+        html[:900_000],
+        re.I,
+    )
+    return str(m.group(1) or "") if m else ""
+
+
+def split_owned_and_bare_video_ids(
+    hrefs: list[str],
+    expected_page_url: str,
+) -> tuple[list[str], list[str]]:
+    """Tách ID từ href: gắn đúng Page vs ``/reel/id`` trần (gợi ý)."""
+    owned: list[str] = []
+    bare: list[str] = []
+    seen: set[str] = set()
+    for href in hrefs or []:
+        ids = _extract_watchable_ids_from_hrefs([href])
+        if not ids:
+            continue
+        vid = ids[0]
+        if vid in seen:
+            continue
+        if href_belongs_to_source_page(href, expected_page_url, allow_bare=False):
+            seen.add(vid)
+            owned.append(vid)
+        elif not facebook_page_identity(href):
+            seen.add(vid)
+            bare.append(vid)
+    return owned, bare
+
+
+def resolve_newest_page_video_ids(
+    *,
+    visual_ids: list[str],
+    harvest_ids: list[str] | None = None,
+    max_ids: int = 24,
+) -> list[str]:
+    """
+    Link reel mới nhất của Page — thứ tự lưới trên → dưới là chuẩn tuyệt đối.
+
+    - Không GraphQL: tin lưới (đã loại vanity trang khác).
+    - Có GraphQL: giữ ô lưới đã xác nhận chủ; thêm tối đa 2 ô đầu nằm *trên*
+      video đã xác nhận (video vừa publish, GraphQL thường chậm hơn DOM).
+    - Không đẩy ID chỉ có trong GraphQL lên đầu (tránh video cũ giả «mới»).
+    - Lưới trống: mới dùng GraphQL (đã sắp mới → cũ).
+    """
+    limit = max(1, int(max_ids or 24))
+    visual = [str(x).strip() for x in (visual_ids or []) if _ok_scan_video_id(x)]
+    harvest = [str(x).strip() for x in (harvest_ids or []) if _ok_scan_video_id(x)]
+    harvest_set = set(harvest)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(vid: str) -> bool:
+        if not vid or vid in seen:
+            return len(out) >= limit
+        seen.add(vid)
+        out.append(vid)
+        return len(out) >= limit
+
+    if not visual:
+        for vid in harvest:
+            if _push(vid):
+                break
+        return out
+
+    if not harvest_set:
+        for vid in visual:
+            if _push(vid):
+                break
+        return out
+
+    first_confirmed = next((i for i, vid in enumerate(visual) if vid in harvest_set), None)
+    for index, vid in enumerate(visual):
+        if len(out) >= limit:
+            break
+        if vid in harvest_set:
+            _push(vid)
+            continue
+        # Video mới trên đầu lưới, GraphQL chưa kịp ghi owner — giữ tối đa 2 ô.
+        if first_confirmed is None and index < 2:
+            _push(vid)
+        elif first_confirmed is not None and index < first_confirmed and index < 2:
+            _push(vid)
+    return out
+
+
+def merge_owner_verified_video_ids(
+    *,
+    harvest_ids: list[str],
+    owned_ids: list[str],
+    video_tab_ids: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Gộp lưới Page (mới trên) ∩ GraphQL owner; tab Videos riêng.
+
+    ``owned_ids`` = ID theo thứ tự ô trên lưới (gồm /reel/ trần trên đúng Page).
+    """
+    reel = resolve_newest_page_video_ids(
+        visual_ids=owned_ids,
+        harvest_ids=harvest_ids,
+        max_ids=max(1, len(owned_ids) + len(harvest_ids) + 4),
+    )
+    harvest_set = {str(x).strip() for x in (harvest_ids or []) if _ok_scan_video_id(x)}
+    video: list[str] = []
+    seen = set(reel)
+    for vid in video_tab_ids or []:
+        s = str(vid or "").strip()
+        if not s or s in seen or not _ok_scan_video_id(s):
+            continue
+        # Có GraphQL: chỉ giữ video đã xác nhận chủ; không thì tin lưới tab Videos.
+        if harvest_set and s not in harvest_set:
+            continue
+        seen.add(s)
+        video.append(s)
+    return reel, video
+
+
+def _ok_scan_video_id(raw: object) -> bool:
+    """ID video Facebook thật — cùng quy tắc với harvest/source_watch."""
+    from src.services.page_video_harvest import is_real_facebook_video_id
+
+    return is_real_facebook_video_id(raw)
+
+
+def _goto_scan(page: Any, url: str, *, timeout_ms: int = 45_000) -> None:
+    """Mở URL quét nhanh (domcontentloaded) — không chờ ``load`` 90–120s."""
+    page.goto(str(url), wait_until="domcontentloaded", timeout=int(timeout_ms))
 
 
 def normalize_facebook_reels_tab_url(url: str) -> str:
@@ -297,7 +533,7 @@ def _extract_reel_ids_from_text(text: str) -> list[str]:
 
     def _add_many(ids: list[str]) -> None:
         for rid in ids:
-            if rid in seen or len(rid) < 8:
+            if rid in seen or not _ok_scan_video_id(rid):
                 continue
             seen.add(rid)
             out.append(rid)
@@ -319,7 +555,7 @@ def _extract_reel_ids_from_hrefs(hrefs: list[str]) -> list[str]:
         if not m:
             continue
         rid = str(m.group(1) or "").strip()
-        if not rid or rid in seen:
+        if not rid or rid in seen or not _ok_scan_video_id(rid):
             continue
         seen.add(rid)
         out.append(rid)
@@ -337,7 +573,28 @@ def _extract_video_ids_from_hrefs(hrefs: list[str]) -> list[str]:
         if not m:
             continue
         vid = str(m.group(1) or "").strip()
-        if not vid or vid in seen:
+        if not vid or vid in seen or not _ok_scan_video_id(vid):
+            continue
+        seen.add(vid)
+        out.append(vid)
+    return out
+
+
+def _extract_watchable_ids_from_hrefs(hrefs: list[str]) -> list[str]:
+    """ID reel + video + watch?v= theo thứ tự href (đã lọc ID nhiễu)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for href in hrefs or []:
+        s = str(href or "").strip()
+        if not s:
+            continue
+        vid = ""
+        for rx in (_REEL_ID_RE, _VIDEOS_ID_RE, _FB_WATCH_V_RE):
+            m = rx.search(s)
+            if m:
+                vid = str(m.group(1) or "").strip()
+                break
+        if not vid or vid in seen or not _ok_scan_video_id(vid):
             continue
         seen.add(vid)
         out.append(vid)
@@ -345,24 +602,34 @@ def _extract_video_ids_from_hrefs(hrefs: list[str]) -> list[str]:
 
 
 def _collect_main_hrefs(page: Any) -> list[str]:
-    """Chỉ lấy ``a[href]`` trong ``[role=main]`` — bỏ sidebar / Reels toàn cục / gợi ý."""
+    """Chỉ lấy ``a[href]`` trong ``[role=main]`` — không fallback ra toàn trang (sidebar/gợi ý)."""
     try:
         hrefs = page.eval_on_selector_all(
             "[role='main'] a[href]",
             "els => els.map(a => a.getAttribute('href') || a.href || '')",
         )
-        if hrefs:
-            return [str(h) for h in hrefs]
-    except Exception:
-        pass
-    try:
-        hrefs = page.eval_on_selector_all(
-            "a[href]",
-            "els => els.map(a => a.getAttribute('href') || a.href || '')",
-        )
         return [str(h) for h in (hrefs or [])]
     except Exception:
         return []
+
+
+def _collect_visual_page_video_hrefs(page: Any, expected_page_url: str) -> list[str]:
+    """Href ô video/reel lớn trên lưới Page, trên → dưới; loại link trang khác."""
+    ident = facebook_page_identity(expected_page_url) or facebook_page_identity(
+        str(getattr(page, "url", "") or "")
+    )
+    vanity = ident.split(":", 1)[1] if ident.startswith("vanity:") else ""
+    page_id = ident.split(":", 1)[1] if ident.startswith("id:") else ""
+    hrefs: list[str] = []
+    try:
+        raw = page.evaluate(_JS_COLLECT_PAGE_VIDEO_TILES, {"vanity": vanity, "pageId": page_id})
+        hrefs = [str(h) for h in (raw or []) if str(h).strip()]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("collect visual tiles: {}", exc)
+        hrefs = _collect_main_hrefs(page)
+    if expected_page_url:
+        hrefs = [h for h in hrefs if href_belongs_to_source_page(h, expected_page_url)]
+    return hrefs
 
 
 def _profile_videos_tab_url(page_url: str) -> str:
@@ -391,16 +658,26 @@ def scan_facebook_profile_reels_page(
     on_partial: Optional[Callable[[list[str]], None]] = None,
     include_html_ids: bool = True,
     scan_videos_tab: bool = True,
+    scan_videos_tab_top: bool = False,
+    require_page_owner: bool = False,
+    use_graphql_harvest: bool = False,
+    newest_only: bool = False,
 ) -> dict[str, Any]:
     """
     Mở tab Reels, cuộn tải thêm nội dung, trả về danh sách URL ``https://www.facebook.com/reel/<id>``.
 
-    ``include_html_ids=False``: chỉ lấy ``a[href]`` trên trang (theo dõi chia sẻ — tránh ID
-    trong JSON gợi ý / related bị nhận nhầm là video mới của Page).
-    ``scan_videos_tab=False``: không sang tab Videos (tránh video cũ ID cao đẩy mốc sai).
+    ``include_html_ids=False``: chỉ lấy ô video/reel trên lưới Page (theo dõi chia sẻ —
+    tránh ID trong JSON gợi ý / related bị nhận nhầm là video mới).
+    ``scan_videos_tab=False``: không sang tab Videos đầy đủ (tránh video cũ ID cao).
+    ``scan_videos_tab_top=True``: lấy thêm vài video mới nhất trên tab Videos (feed riêng).
+    ``require_page_owner=True``: chỉ giữ video chứng minh được thuộc Page (GraphQL owner
+    hoặc href gắn vanity/id) — không lấy reel gợi ý.
+    ``use_graphql_harvest=True``: nghe JSON GraphQL lúc tải trang (cách lấy chính xác nhất).
+    ``newest_only=True``: chế độ theo dõi chia sẻ — chỉ đầu trang, dừng sớm khi đủ ô,
+    bỏ tab Videos nếu đã có đủ reel (nhanh + ít lẫn).
 
     Returns:
-        ``{ "ok": bool, "items": [{"video_id", "url"}], "message": str }``
+        ``{ "ok": bool, "items": [{"video_id", "url"}], "video_urls": [...], "message": str }``
     """
     st = status or _noop_status
     url = normalize_facebook_reels_tab_url(page_url.strip())
@@ -421,6 +698,11 @@ def scan_facebook_profile_reels_page(
     max_scan_minutes = max(1.0, min(180.0, float(max_scan_minutes or 30.0)))
     started_at = time.monotonic()
     hard_deadline = started_at + (max_scan_minutes * 60.0)
+    if newest_only:
+        scroll_until_end = False
+        max_scroll_rounds = min(int(max_scroll_rounds), 2)
+        max_reels = min(int(max_reels), 12)
+        scroll_pause_sec = min(float(scroll_pause_sec), 0.65)
     if scroll_until_end:
         max_scroll_rounds = max(220, int(max_scroll_rounds))
     if cookie_path:
@@ -430,6 +712,11 @@ def scan_facebook_profile_reels_page(
     seen: set[str] = set()
     ordered_urls: list[str] = []
     seen_urls: set[str] = set()
+    video_ordered_urls: list[str] = []
+    owned_ids: list[str] = []
+    video_tab_ids: list[str] = []
+    harvest_box: dict[str, Any] = {"obj": None}
+    page_meta: dict[str, str] = {"name": "", "id": ""}
 
     def _add_url(u: str) -> None:
         s = str(u or "").strip()
@@ -446,6 +733,26 @@ def scan_facebook_profile_reels_page(
                 continue
             if len(seen) >= max_reels:
                 return
+            seen.add(rid)
+            ordered_ids.append(rid)
+            _add_url(f"https://www.facebook.com/reel/{rid}")
+
+    def _ingest_page_tiles(page_obj: Any) -> None:
+        """Thu ô video/reel đúng Page (thứ tự trên → dưới), gồm /reel/ trần và /videos/."""
+        hrefs = _collect_visual_page_video_hrefs(page_obj, page_url or url)
+        # Trên đúng tab Page: ô lớn /reel/id là video của Page (FB ít gắn vanity).
+        # Chỉ bỏ href vanity trang khác (đã lọc trong collect). Thứ tự Y = mới → cũ.
+        for rid in _extract_watchable_ids_from_hrefs(hrefs):
+            if rid in seen:
+                continue
+            if require_page_owner:
+                if len(owned_ids) >= max_reels:
+                    break
+                seen.add(rid)
+                owned_ids.append(rid)
+                continue
+            if len(seen) >= max_reels:
+                break
             seen.add(rid)
             ordered_ids.append(rid)
             _add_url(f"https://www.facebook.com/reel/{rid}")
@@ -535,8 +842,22 @@ def scan_facebook_profile_reels_page(
                         logger.debug("stealth.apply_stealth_sync: {}", exc)
 
                     expected_identity = facebook_page_identity(url) or facebook_page_identity(page_url)
-                    st("Đang tải tab Reels bằng tài khoản đã login (có thể 30–90s)…")
-                    page.goto(url, wait_until="load", timeout=120_000)
+                    vanity = expected_identity.split(":", 1)[1] if expected_identity.startswith("vanity:") else ""
+                    page_id = expected_identity.split(":", 1)[1] if expected_identity.startswith("id:") else ""
+                    harvest = None
+                    if use_graphql_harvest or require_page_owner:
+                        from src.services.page_video_harvest import NetworkVideoHarvest
+
+                        harvest = NetworkVideoHarvest(
+                            fb_page_id=page_id,
+                            fb_page_vanity=vanity,
+                            require_owner=True,
+                            rewrite_lifetime=False,
+                        )
+                        harvest.attach(page)
+                        harvest_box["obj"] = harvest
+                    st("Đang tải tab Reels của đúng Page nguồn…")
+                    _goto_scan(page, url)
                     time.sleep(min(1.35, scroll_pause_sec + 0.35))
                     # Chờ lưới video/reel hiện — session login thường render chậm hơn public.
                     try:
@@ -573,7 +894,7 @@ def scan_facebook_profile_reels_page(
                     # Chỉ mở tab Reels của đúng Page nguồn (href chứa vanity/id của Page).
                     if not url_matches_facebook_page(page.url, url):
                         st(f"URL lệch Page nguồn ({page.url}) — điều hướng lại…")
-                        page.goto(url, wait_until="load", timeout=120_000)
+                        _goto_scan(page, url)
                         time.sleep(min(1.0, scroll_pause_sec + 0.2))
                     if expected_identity and not url_matches_facebook_page(page.url, url):
                         return {
@@ -610,32 +931,86 @@ def scan_facebook_profile_reels_page(
                                 time.sleep(0.8)
                                 if expected_identity and not url_matches_facebook_page(page.url, url):
                                     st("Click tab Reels lệch trang — quay lại URL Page nguồn.")
-                                    page.goto(url, wait_until="load", timeout=90_000)
+                                    _goto_scan(page, url)
                                     time.sleep(0.8)
                         except Exception:
                             pass
-                    hrefs = _collect_main_hrefs(page)
-                    for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
-                        if rid in seen:
-                            continue
-                        if len(seen) >= max_reels:
-                            break
-                        seen.add(rid)
-                        ordered_ids.append(rid)
-                        _add_url(f"https://www.facebook.com/reel/{rid}")
-                    if include_html_ids:
+                    if harvest is not None and not harvest.fb_page_id:
+                        found_id = extract_facebook_page_id_from_page(page)
+                        if found_id:
+                            harvest.fb_page_id = found_id
+                            page_id = found_id
+                    # Tên + Meta ID Page — hiện trên Hàng chờ (Tên (id)).
+                    try:
+                        title = str(page.title() or "").strip()
+                        name = re.sub(
+                            r"\s*[|\-–—]\s*Facebook.*$",
+                            "",
+                            title,
+                            flags=re.I,
+                        ).strip()
+                        if not name or name.casefold() in {"facebook", "reels", "watch"}:
+                            try:
+                                og = page.locator('meta[property="og:title"]').first
+                                if og.count():
+                                    name = str(og.get_attribute("content") or "").strip()
+                                    name = re.sub(
+                                        r"\s*[|\-–—]\s*Facebook.*$",
+                                        "",
+                                        name,
+                                        flags=re.I,
+                                    ).strip()
+                            except Exception:
+                                pass
+                        if not name or name.casefold() in {"facebook", "reels", "watch"}:
+                            try:
+                                h1 = page.locator("[role='main'] h1").first
+                                if h1.count():
+                                    name = str(h1.inner_text(timeout=1500) or "").strip()
+                            except Exception:
+                                pass
+                        if name and name.casefold() not in {"facebook", "reels", "watch"}:
+                            page_meta["name"] = name[:120]
+                    except Exception:
+                        pass
+                    try:
+                        found_id = page_id or extract_facebook_page_id_from_page(page)
+                        if found_id:
+                            page_meta["id"] = str(found_id)
+                            page_id = str(found_id)
+                    except Exception:
+                        if page_id:
+                            page_meta["id"] = str(page_id)
+                    if harvest is not None:
+                        try:
+                            harvest.ingest_text(page.content(), trusted_surface=False)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("harvest html: {}", exc)
+                    _ingest_page_tiles(page)
+                    if include_html_ids and not require_page_owner:
                         _add_from_text(page.content())
                     _emit_partial()
+
+                    def _grid_count() -> int:
+                        return len(owned_ids) if require_page_owner else len(ordered_ids)
+
+                    # Theo dõi chia sẻ: đủ ô đầu trang → không cuộn sâu (tránh gợi ý + chậm).
+                    skip_scroll = bool(newest_only and _grid_count() >= min(6, max_reels))
+                    if skip_scroll:
+                        st(f"Đã đủ {_grid_count()} video đầu trang — bỏ cuộn sâu.")
 
                     stable = 0
                     prev_count = 0
                     prev_scroll_h = 0
                     idle_at_bottom = 0
-                    for i in range(max_scroll_rounds):
+                    for i in range(0 if skip_scroll else max_scroll_rounds):
                         if time.monotonic() >= hard_deadline:
                             st(f"Đã chạm giới hạn thời gian quét ({max_scan_minutes:.0f} phút) — dừng.")
                             break
-                        if len(ordered_ids) >= max_reels:
+                        if _grid_count() >= max_reels:
+                            break
+                        if newest_only and _grid_count() >= min(8, max_reels) and i >= 1:
+                            st("Đã đủ video mới nhất trên đầu trang — dừng cuộn.")
                             break
                         elapsed = int(max(0.0, time.monotonic() - started_at))
                         before = page.evaluate(_JS_SCROLL_SNAP)
@@ -643,7 +1018,7 @@ def scan_facebook_profile_reels_page(
                             prev_scroll_h = int(before.get("sh") or 0)
                         st(
                             f"Đang cuộn {i + 1}/{max_scroll_rounds} — "
-                            f"{len(ordered_ids)} reel — cao trang ~{before.get('sh', 0)}px — {elapsed}s…"
+                            f"{_grid_count()} reel — cao trang ~{before.get('sh', 0)}px — {elapsed}s…"
                         )
                         try:
                             # Public page đôi khi có nút tải thêm nội dung.
@@ -704,16 +1079,14 @@ def scan_facebook_profile_reels_page(
                         if expected_identity and not url_matches_facebook_page(page.url, url):
                             st("Đã lệch khỏi Page nguồn khi cuộn — dừng để tránh lấy nhầm trang.")
                             break
-                        hrefs = _collect_main_hrefs(page)
-                        for rid in _extract_reel_ids_from_hrefs([str(h) for h in hrefs]):
-                            if rid in seen:
-                                continue
-                            if len(seen) >= max_reels:
-                                break
-                            seen.add(rid)
-                            ordered_ids.append(rid)
-                            _add_url(f"https://www.facebook.com/reel/{rid}")
-                        if include_html_ids:
+                        _ingest_page_tiles(page)
+                        # newest_only: không đọc lại HTML mỗi vòng (chậm); GraphQL listener vẫn chạy.
+                        if harvest is not None and not newest_only and i % 2 == 1:
+                            try:
+                                harvest.ingest_text(page.content(), trusted_surface=False)
+                            except Exception:
+                                pass
+                        if include_html_ids and not require_page_owner:
                             _add_from_text(page.content())
                         _emit_partial()
                         after = page.evaluate(_JS_SCROLL_SNAP)
@@ -727,13 +1100,13 @@ def scan_facebook_profile_reels_page(
                         else:
                             idle_at_bottom = 0
 
-                        if len(ordered_ids) == prev_count:
+                        if _grid_count() == prev_count:
                             stable += 1
-                            if stable >= 22 and not scroll_until_end:
+                            if stable >= (3 if newest_only else 22) and not scroll_until_end:
                                 st("Không còn reel mới sau nhiều lần cuộn — dừng.")
                                 break
                             # Ít reel trên trang: dừng sớm khi đã ở đáy và không tăng count (tránh chờ >40 vòng).
-                            n_found = len(ordered_ids)
+                            n_found = _grid_count()
                             if n_found <= 25 and i >= 10 and stable >= 7 and idle_at_bottom >= 5:
                                 st("Đã thu đủ reel hiển thị (ít mục) — dừng quét.")
                                 break
@@ -743,14 +1116,67 @@ def scan_facebook_profile_reels_page(
                                 break
                         else:
                             stable = 0
-                        prev_count = len(ordered_ids)
+                        prev_count = _grid_count()
+
+                    # Tab Videos — chỉ khi Reels mỏng (video đăng dạng Video, không phải Reel).
+                    need_videos_top = bool(scan_videos_tab_top and not scan_videos_tab)
+                    if newest_only and _grid_count() >= 6:
+                        need_videos_top = False
+                        st("Đã đủ reel đầu trang — bỏ tab Videos (nhanh hơn).")
+                    if need_videos_top:
+                        try:
+                            vurl = _profile_videos_tab_url(page_url or url)
+                            st("Đang lấy video mới nhất trên tab Videos của cùng Page…")
+                            _goto_scan(page, vurl)
+                            time.sleep(min(1.0, scroll_pause_sec + 0.15))
+                            try:
+                                page.wait_for_selector(
+                                    "a[href*='/videos/'], a[href*='/reel/'], [role='main']",
+                                    timeout=8_000,
+                                )
+                            except Exception:
+                                pass
+                            if expected_identity and not url_matches_facebook_page(page.url, url):
+                                st("Tab Videos lệch Page nguồn — bỏ qua.")
+                                raise RuntimeError("videos_tab_wrong_page")
+                            v_seen: set[str] = set()
+                            for j in range(3):
+                                hrefs_v = _collect_visual_page_video_hrefs(page, page_url or url)
+                                # Tab Videos: lấy ô trên → dưới (gồm /videos/ và /reel/ trần).
+                                take = _extract_watchable_ids_from_hrefs(hrefs_v)
+                                for vid in take:
+                                    if vid in v_seen:
+                                        continue
+                                    v_seen.add(vid)
+                                    video_tab_ids.append(vid)
+                                    video_ordered_urls.append(f"https://www.facebook.com/reel/{vid}")
+                                    if len(video_ordered_urls) >= 12:
+                                        break
+                                if harvest is not None:
+                                    try:
+                                        harvest.ingest_text(page.content(), trusted_surface=False)
+                                    except Exception:
+                                        pass
+                                if len(video_ordered_urls) >= 12:
+                                    break
+                                try:
+                                    page.evaluate(_JS_SCROLL_DEEP)
+                                except Exception:
+                                    pass
+                                time.sleep(scroll_pause_sec)
+                                st(
+                                    f"Tab Videos (đầu trang) — cuộn {j + 1}/3 — "
+                                    f"{len(video_ordered_urls)} video của Page."
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("videos tab top scan: {}", exc)
 
                     # Tab Videos: chỉ khi thu thập catalog đầy đủ — theo dõi chia sẻ tắt để tránh video cũ.
                     if scan_videos_tab and len(ordered_ids) < max_reels:
                         try:
                             vurl = _profile_videos_tab_url(url)
                             st("Đang quét bổ sung tab Videos (cùng tài khoản đã login)…")
-                            page.goto(vurl, wait_until="load", timeout=90_000)
+                            _goto_scan(page, vurl, timeout_ms=60_000)
                             time.sleep(min(1.15, scroll_pause_sec + 0.15))
                             try:
                                 page.wait_for_selector(
@@ -794,6 +1220,12 @@ def scan_facebook_profile_reels_page(
                         except Exception as exc:  # noqa: BLE001
                             logger.debug("videos fallback scan: {}", exc)
                 finally:
+                    hv = harvest_box.get("obj")
+                    if hv is not None:
+                        try:
+                            hv.detach(page)
+                        except Exception:
+                            pass
                     if context:
                         context.close()
                     if temp_profile_root is not None:
@@ -806,19 +1238,58 @@ def scan_facebook_profile_reels_page(
         return {"ok": False, "items": [], "message": str(exc)}
 
     elapsed_sec = int(max(0.0, time.monotonic() - started_at))
-    items = [{"video_id": str(i + 1), "url": u} for i, u in enumerate(ordered_urls)]
-    if not items:
+    harvest_ids: list[str] = []
+    hv = harvest_box.get("obj")
+    if hv is not None:
+        try:
+            from src.services.page_video_harvest import sort_videos_by_published
+
+            harvest_ids = [
+                str(r.get("video_id") or "")
+                for r in sort_videos_by_published(list(hv.items()), newest_first=True)
+                if r.get("video_id")
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("harvest sort: {}", exc)
+            harvest_ids = [str(r.get("video_id") or "") for r in hv.items() if r.get("video_id")]
+    if require_page_owner or use_graphql_harvest:
+        reel_ids, vid_ids = merge_owner_verified_video_ids(
+            harvest_ids=harvest_ids[:max_reels],
+            owned_ids=owned_ids,
+            video_tab_ids=video_tab_ids,
+        )
+        ordered_urls = [f"https://www.facebook.com/reel/{i}" for i in reel_ids[:max_reels]]
+        video_ordered_urls = [f"https://www.facebook.com/reel/{i}" for i in vid_ids]
+    items = []
+    for u in ordered_urls:
+        ids = _extract_watchable_ids_from_hrefs([u])
+        if not ids:
+            continue
+        items.append({"video_id": ids[0], "url": u})
+    if not items and not video_ordered_urls:
         return {
             "ok": False,
             "items": [],
+            "video_urls": [],
             "message": (
-                "Không trích được link reel/video nào. Thử: (1) mở profile tài khoản Page nhận "
-                "và đăng nhập Facebook, (2) đặt TOOLFB_FB_REELS_HEADLESS=0 để xem cửa sổ quét, "
-                "(3) dán đúng link Page nguồn (có tab Reels/Videos)."
+                "Không trích được video thuộc đúng Page nguồn (GraphQL owner / href gắn Page). "
+                "Thử: (1) mở profile tài khoản Page nhận và đăng nhập Facebook, "
+                "(2) dán đúng link Page (facebook.com/TenPage)."
             ),
         }
+    n_vid = len(video_ordered_urls)
+    extra = f", {n_vid} video tab Videos" if n_vid else ""
+    n_h = len(harvest_ids)
+    via = f", GraphQL {n_h}" if n_h else ""
     return {
         "ok": True,
         "items": items,
-        "message": f"Thu được {len(items)} reel sau {elapsed_sec}s (giới hạn {max_reels}).",
+        "video_urls": list(video_ordered_urls),
+        "harvest_urls": [f"https://www.facebook.com/reel/{i}" for i in harvest_ids[:max_reels]],
+        "page_name": str(page_meta.get("name") or ""),
+        "fb_page_id": str(page_meta.get("id") or ""),
+        "message": (
+            f"Thu được {len(items)} video của Page{extra}{via} sau {elapsed_sec}s "
+            f"(giới hạn {max_reels})."
+        ),
     }

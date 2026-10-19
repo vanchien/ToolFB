@@ -20,12 +20,73 @@ def test_page_identity_vanity_and_id() -> None:
         facebook_page_identity("https://www.facebook.com/profile.php?id=123456789")
         == "id:123456789"
     )
+    assert facebook_page_identity("https://www.facebook.com/310447015484122") == "id:310447015484122"
+    assert facebook_page_identity("https://www.facebook.com/310447015484122/videos/") == "id:310447015484122"
 
 
 def test_global_reels_has_no_page_identity() -> None:
     assert facebook_page_identity("https://www.facebook.com/reels/") == ""
     assert facebook_page_identity("https://www.facebook.com/reel/999") == ""
     assert facebook_page_identity("https://www.facebook.com/watch") == ""
+
+
+def test_href_belongs_to_source_page_rejects_other_vanity() -> None:
+    from src.services.facebook_reels_catalog import href_belongs_to_source_page
+
+    src = "https://www.facebook.com/healthylifehub2026"
+    assert href_belongs_to_source_page(
+        "https://www.facebook.com/healthylifehub2026/videos/2482358802253174", src
+    )
+    assert href_belongs_to_source_page("https://www.facebook.com/reel/2482358802253174", src)
+    assert not href_belongs_to_source_page(
+        "https://www.facebook.com/reel/2482358802253174", src, allow_bare=False
+    )
+    assert not href_belongs_to_source_page(
+        "https://www.facebook.com/OtherPage/videos/2482358802253174", src
+    )
+
+
+def test_merge_owner_verified_drops_bare_suggestion_ids() -> None:
+    from src.services.facebook_reels_catalog import (
+        merge_owner_verified_video_ids,
+        resolve_newest_page_video_ids,
+    )
+
+    # Lưới: mới → cũ; harvest xác nhận chủ — bỏ ID gợi ý giữa các ô đã xác nhận.
+    reel, video = merge_owner_verified_video_ids(
+        harvest_ids=["2482358802253174", "1156958673946775"],
+        owned_ids=["2482358802253174", "999999999999999", "1156958673946775"],
+        video_tab_ids=["2230774414426929", "1156958673946775"],
+    )
+    assert reel[0] == "2482358802253174"
+    assert reel[1] == "1156958673946775"
+    assert "999999999999999" not in reel
+    assert "2230774414426929" not in video
+    assert "650496281688565899" not in reel
+
+    only_grid = resolve_newest_page_video_ids(
+        visual_ids=["2482358802253174", "1156958673946775"],
+        harvest_ids=[],
+        max_ids=5,
+    )
+    assert only_grid == ["2482358802253174", "1156958673946775"]
+
+    # GraphQL-only không được đội lên đầu (tránh video cũ giả mới).
+    mixed = resolve_newest_page_video_ids(
+        visual_ids=["1156958673946775"],
+        harvest_ids=["2482358802253174", "1156958673946775"],
+        max_ids=5,
+    )
+    assert mixed == ["1156958673946775"]
+
+    # Video mới trên đầu lưới, GraphQL chưa kịp — vẫn lấy.
+    fresh_top = resolve_newest_page_video_ids(
+        visual_ids=["27741558852187173", "2482358802253174", "1156958673946775"],
+        harvest_ids=["2482358802253174", "1156958673946775"],
+        max_ids=5,
+    )
+    assert fresh_top[0] == "27741558852187173"
+    assert fresh_top[1] == "2482358802253174"
 
 
 def test_url_matches_same_page_only() -> None:

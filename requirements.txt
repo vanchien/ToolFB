@@ -11,3 +11,4 @@ APScheduler>=3.10.0
 streamlit>=1.32.0
 requests>=2.31.0
 PySocks>=1.7.1
+Pillow>=10.0.0

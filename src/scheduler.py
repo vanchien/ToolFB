@@ -173,12 +173,15 @@ def _run_dispatched_post_job(
 
 
 def _job_max_minutes() -> float:
-    """Một job đăng quá số phút này coi là treo — giải phóng tài khoản cho Page tiếp theo."""
-    raw = os.environ.get("SCHEDULE_JOB_MAX_MINUTES", "40").strip()
+    """Một job đăng quá số phút này coi là treo — giải phóng tài khoản cho Page tiếp theo.
+
+    Mặc định 20 phút (trước 40): treo lâu làm cả hàng ``ready_queue`` chờ account rảnh.
+    """
+    raw = os.environ.get("SCHEDULE_JOB_MAX_MINUTES", "20").strip()
     try:
-        return max(10.0, min(240.0, float(raw)))
+        return max(8.0, min(240.0, float(raw)))
     except ValueError:
-        return 40.0
+        return 20.0
 
 
 def _track_dispatch(job_id: str, account_id: str) -> None:
@@ -190,11 +193,57 @@ def _track_dispatch(job_id: str, account_id: str) -> None:
         _dispatch_tracked[jid] = (str(account_id or "").strip(), time.monotonic())
 
 
+def _refresh_dispatch_timer(job_id: str) -> None:
+    """Đặt lại đồng hồ treo sau khi đã giữ được FeatureBusy / mở browser (không tính lúc chờ chia sẻ)."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+    with _dispatch_track_lock:
+        cur = _dispatch_tracked.get(jid)
+        if not cur:
+            return
+        aid, _t0 = cur
+        _dispatch_tracked[jid] = (aid, time.monotonic())
+
+
 def _untrack_dispatch(job_id: str) -> None:
     """Bỏ giữ chỗ khi job xong (hoặc đã bị watchdog giải phóng)."""
     jid = str(job_id or "").strip()
     with _dispatch_track_lock:
         _dispatch_tracked.pop(jid, None)
+
+
+def _kill_hung_schedule_browser(account_id: str, *, job_id: str = "") -> None:
+    """Ép đóng Firefox profile của TK treo — nếu không, Page sau vẫn chờ khóa profile."""
+    aid = str(account_id or "").strip()
+    jid = str(job_id or "").strip()
+    if not aid:
+        return
+    try:
+        from src.utils.account_proxy_mapper import prepare_account_dict_for_browser_run
+        from src.utils.db_manager import AccountsDatabaseManager
+        from src.utils.feature_busy import force_clear_account_feature
+        from src.utils.win_browser_window import terminate_firefox_for_profile
+
+        row = AccountsDatabaseManager().get_by_id(aid)
+        if row is None:
+            return
+        try:
+            acc = prepare_account_dict_for_browser_run(dict(row), require_proxy_live=False)
+        except Exception:  # noqa: BLE001
+            acc = dict(row)
+        prof = str(acc.get("portable_path") or acc.get("profile_path") or "").strip()
+        if prof:
+            killed = terminate_firefox_for_profile(prof, grace_ms=150)
+            if killed:
+                logger.warning(
+                    "[Watchdog] Đã ép đóng {} Firefox profile của account {} (job treo).",
+                    killed,
+                    aid,
+                )
+        force_clear_account_feature(aid, feature=FEATURE_SCHEDULE, detail_substr=jid)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Watchdog] Không ép đóng browser account {}: {}", aid, exc)
 
 
 def _dispatch_is_abandoned(job_id: str | None) -> bool:
@@ -245,12 +294,13 @@ def _watchdog_hung_and_orphan_jobs(sp: Any) -> None:
         tracked_ids = set(_dispatch_tracked)
     for jid, aid in hung:
         logger.error(
-            "[Watchdog] Job {} (account {}) quá {:.0f} phút chưa xong — nhả tài khoản, chuyển Page tiếp theo.",
+            "[Watchdog] Job {} (account {}) quá {:.0f} phút chưa xong — nhả tài khoản, đóng browser, chạy Page tiếp.",
             jid,
             aid,
             limit_sec / 60,
         )
         _release_account_run_slot(aid)
+        _kill_hung_schedule_browser(aid, job_id=jid)
         try:
             sp.update_job_fields(
                 jid,
@@ -2123,11 +2173,12 @@ def run_scheduled_post_for_account(
                     schedule_post_job_id or "—",
                     reason,
                 )
+            # Chờ chia sẻ tối đa 90s — trước đây 300s làm job «treo» sớm và chặn cả hàng TK.
             feature_lease = acquire_schedule_preferring(
                 account_id=account_id,
                 page_keys=page_busy_keys,
                 detail=str(schedule_post_job_id or "")[:40],
-                timeout=300.0,
+                timeout=90.0,
                 poll=2.0,
             )
             if feature_lease is None:
@@ -2141,6 +2192,9 @@ def run_scheduled_post_for_account(
                 if schedule_post_job_id:
                     _return_job_to_ready_queue(str(schedule_post_job_id))
                 return False
+            # Đã giữ chỗ đăng — reset đồng hồ treo (không tính thời gian chờ chia sẻ).
+            if schedule_post_job_id:
+                _refresh_dispatch_timer(str(schedule_post_job_id))
         if page_slot_id:
             page_run_slot = _acquire_page_run_slot(page_slot_id)
             logger.info(

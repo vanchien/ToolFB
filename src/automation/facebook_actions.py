@@ -2757,9 +2757,11 @@ def _switch_profiles_dialog_scope(page: Page) -> Locator:
     """Modal «Switch profiles» / «Switch to … for more features»."""
     for pat in (
         r"Switch profiles",
-        r"Switch to",
         r"Chuyển hồ sơ",
+        r"Switch to .+ for more features",
+        r"Chuyển sang .+ để",
         r"for more features, tools and settings",
+        r"Switch to",
     ):
         try:
             dlg = page.get_by_role("dialog").filter(has_text=re.compile(pat, re.I)).last
@@ -2782,27 +2784,52 @@ def _switch_profiles_dialog_visible(page: Page, *, timeout_ms: int = 1200) -> bo
 
 _PAGE_SWITCH_POPUP_CONFIRM_JS = """
 () => {
-  const dlg = document.querySelector('[role="dialog"]');
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+  const dlg = dialogs.find((d) => {
+    const low = (d.innerText || '').toLowerCase();
+    return (
+      low.includes('switch profiles') ||
+      low.includes('switch to') ||
+      low.includes('chuyển hồ sơ') ||
+      low.includes('chuyển sang') ||
+      (low.includes('for more features') && low.includes('switch'))
+    );
+  }) || dialogs[dialogs.length - 1];
   if (!dlg) return false;
-  const low = (dlg.innerText || '').toLowerCase();
-  if (!low.includes('switch profiles') && !low.includes('switch to') && !low.includes('chuyển')) {
-    if (!low.includes('switch')) return false;
-  }
   for (const ov of dlg.querySelectorAll('[data-visualcompletion="ignore"]')) {
-    ov.style.pointerEvents = 'none';
+    try { ov.style.pointerEvents = 'none'; } catch (_) {}
   }
+  const labelOk = (raw) => {
+    const t = (raw || '').replace(/\\s+/g, ' ').trim();
+    if (!t) return false;
+    if (/^(switch|chuyển|chuyen)$/i.test(t)) return true;
+    // Accessible name đôi khi dài hơn «Switch».
+    if (/^switch\\b/i.test(t) && t.length <= 24) return true;
+    if (/^chuyển\\b/i.test(t) && t.length <= 28) return true;
+    return false;
+  };
   const hits = [];
-  for (const el of dlg.querySelectorAll('[role="button"], div[role="none"], span, a')) {
-    const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-    if (!/^switch$/i.test(t)) continue;
+  for (const el of dlg.querySelectorAll('[role="button"], div[role="none"], span, a, div[tabindex="0"]')) {
+    const own = (el.childNodes && el.childNodes.length)
+      ? Array.from(el.childNodes).filter((n) => n.nodeType === 3).map((n) => n.textContent || '').join('')
+      : '';
+    const aria = el.getAttribute('aria-label') || '';
+    const t = (own || el.textContent || aria || '').replace(/\\s+/g, ' ').trim();
+    if (!labelOk(t) && !labelOk(aria)) continue;
+    // Span chỉ chứa đúng Switch — ưu tiên; bỏ nút X / See all.
+    if (/see all|xem tất cả|close|đóng/i.test(t)) continue;
     const r = el.getBoundingClientRect();
-    if (r.width < 36 || r.height < 16) continue;
+    if (r.width < 28 || r.height < 14 || r.bottom < 0) continue;
     const role = (el.getAttribute('role') || '').toLowerCase();
-    hits.push({ el, bottom: r.bottom, left: r.left, role });
+    const exact = /^(switch|chuyển|chuyen)$/i.test(t) || /^(switch|chuyển|chuyen)$/i.test(aria);
+    hits.push({ el, bottom: r.bottom, left: r.left, role, exact, w: r.width });
   }
   if (!hits.length) return false;
   hits.sort((a, b) => {
-    const score = (h) => (h.role === 'button' ? 1_000_000 : h.role === 'none' ? 100_000 : 0) + h.bottom * 100 + h.left;
+    const score = (h) =>
+      (h.exact ? 5_000_000 : 0) +
+      (h.role === 'button' ? 1_000_000 : h.role === 'none' ? 100_000 : 0) +
+      h.bottom * 100 + h.left + Math.min(h.w, 200);
     return score(b) - score(a);
   });
   const fire = (node) => {
@@ -2811,8 +2838,19 @@ _PAGE_SWITCH_POPUP_CONFIRM_JS = """
       const r = node.getBoundingClientRect();
       const x = r.left + r.width / 2;
       const y = r.top + r.height / 2;
-      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-        node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+      try { node.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+      try { if (typeof node.focus === 'function') node.focus({ preventScroll: true }); } catch (_) {}
+      for (const type of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+        try {
+          node.dispatchEvent(new Ctor(type, {
+            bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, buttons: 1, pointerId: 1, pointerType: 'mouse'
+          }));
+        } catch (_) {
+          node.dispatchEvent(new MouseEvent(type.replace('pointer', 'mouse'), {
+            bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, buttons: 1
+          }));
+        }
       }
       if (typeof node.click === 'function') node.click();
       return true;
@@ -2820,8 +2858,9 @@ _PAGE_SWITCH_POPUP_CONFIRM_JS = """
   };
   for (const h of hits) {
     let node = h.el;
-    for (let i = 0; i < 8 && node; i++) {
-      if (node.getAttribute && (node.getAttribute('role') === 'button' || node.getAttribute('role') === 'none')) {
+    for (let i = 0; i < 10 && node; i++) {
+      const role = (node.getAttribute && node.getAttribute('role') || '').toLowerCase();
+      if (role === 'button' || role === 'none' || (node.tagName || '').toLowerCase() === 'button') {
         if (fire(node)) return true;
       }
       node = node.parentElement;
@@ -2831,6 +2870,22 @@ _PAGE_SWITCH_POPUP_CONFIRM_JS = """
   return false;
 }
 """
+
+# Nhãn nút xác nhận trong popup (EN + VI); accessible name có thể dài hơn một từ.
+_SWITCH_POPUP_CONFIRM_RE = re.compile(
+    r"^\s*(Switch|Chuyển|Chuyen)\s*$|^\s*Switch\b.{0,20}$|^\s*Chuyển\b.{0,24}$",
+    re.I,
+)
+
+
+def _wait_switch_profiles_popup_closed(page: Page, *, timeout_ms: int = 5_000) -> bool:
+    """Chờ popup Switch profiles đóng (FB đôi khi chậm 2–4s sau click)."""
+    deadline = time.time() + max(1.0, timeout_ms / 1000.0)
+    while time.time() < deadline:
+        if not _switch_profiles_dialog_visible(page, timeout_ms=280):
+            return True
+        page.wait_for_timeout(280)
+    return not _switch_profiles_dialog_visible(page, timeout_ms=350)
 
 
 def _click_switch_profiles_popup_confirm(
@@ -2871,17 +2926,16 @@ def _click_switch_profiles_popup_confirm(
     def _popup_closed() -> bool:
         return not _switch_profiles_dialog_visible(page, timeout_ms=450)
 
-    def _after_click_pause() -> bool:
-        page.wait_for_timeout(1_200)
-        return _popup_closed()
+    def _after_click_wait() -> bool:
+        return _wait_switch_profiles_popup_closed(page, timeout_ms=4_500)
 
     try:
         page.evaluate(
             """() => {
-              const dlg = document.querySelector('[role="dialog"]');
-              if (!dlg) return;
-              for (const ov of dlg.querySelectorAll('[data-visualcompletion="ignore"]')) {
-                ov.style.pointerEvents = 'none';
+              for (const dlg of document.querySelectorAll('[role="dialog"]')) {
+                for (const ov of dlg.querySelectorAll('[data-visualcompletion="ignore"]')) {
+                  ov.style.pointerEvents = 'none';
+                }
               }
             }"""
         )
@@ -2889,14 +2943,17 @@ def _click_switch_profiles_popup_confirm(
         pass
 
     locators = (
-        dlg.get_by_role("button", name=_SWITCH_EXACT_LABEL_RE).last,
-        dlg.locator("[aria-label='Switch']").last,
-        dlg.locator("[aria-label*='Switch' i]").last,
+        dlg.get_by_role("button", name=_SWITCH_EXACT_LABEL_RE),
+        dlg.get_by_role("button", name=_SWITCH_POPUP_CONFIRM_RE),
+        dlg.locator("[aria-label='Switch']"),
+        dlg.locator("[aria-label='Chuyển']"),
+        dlg.locator("[aria-label*='Switch' i]"),
         dlg.locator(
-            "xpath=.//*[@role='button'][.//span[normalize-space()='Switch'] or normalize-space()='Switch'][last()]"
+            "xpath=.//*[@role='button'][.//span[normalize-space()='Switch' or normalize-space()='Chuyển']"
+            " or normalize-space()='Switch' or normalize-space()='Chuyển'][last()]"
         ),
         dlg.locator(
-            "xpath=.//div[@role='none'][.//span[normalize-space()='Switch']][last()]"
+            "xpath=.//div[@role='none'][.//span[normalize-space()='Switch' or normalize-space()='Chuyển']][last()]"
         ),
         dlg.locator("div[role='none']").filter(
             has=dlg.locator("span").filter(has_text=_SWITCH_EXACT_LABEL_RE)
@@ -2904,35 +2961,62 @@ def _click_switch_profiles_popup_confirm(
     )
     for loc in locators:
         try:
-            if loc.count() <= 0 or not loc.is_visible(timeout=1_200):
+            target = loc.first if hasattr(loc, "first") else loc
+            if target.count() <= 0:
                 continue
-            loc.scroll_into_view_if_needed(timeout=2_000)
-            if _mouse_click_locator_center(page, loc, label="Switch popup"):
-                logger.info("[FB] Đã bấm Switch popup trong trang, không chiếm chuột.")
-                if _after_click_pause():
-                    return True
-            loc.click(timeout=min(timeout_ms, 5_000), force=True, no_wait_after=True)
-            logger.info("[FB] Đã bấm Switch popup (force, role=button).")
-            if _after_click_pause():
-                return True
+            # Ưu tiên nút cuối trong dialog (footer xanh), bỏ qua nếu không visible.
+            n = min(int(target.count()), 6)
+            candidates = [target.nth(i) for i in range(n)]
+            # Thử từ cuối → đầu (CTA Switch thường ở footer).
+            for cand in reversed(candidates):
+                try:
+                    if not cand.is_visible(timeout=900):
+                        continue
+                except Exception:
+                    continue
+                try:
+                    cand.scroll_into_view_if_needed(timeout=2_000)
+                except Exception:
+                    pass
+                if _mouse_click_locator_center(page, cand, label="Switch popup"):
+                    logger.info("[FB] Đã bấm Switch popup (DOM).")
+                    if _after_click_wait():
+                        return True
+                try:
+                    cand.click(timeout=min(timeout_ms, 4_000), force=True, no_wait_after=True)
+                    logger.info("[FB] Đã bấm Switch popup (Playwright force).")
+                    if _after_click_wait():
+                        return True
+                except Exception:
+                    pass
         except Exception:
             continue
 
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3):
         try:
             if dlg.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS):
-                logger.info("[FB] Đã bấm Switch popup (JS, attempt={}).", attempt)
-                if _after_click_pause():
+                logger.info("[FB] Đã bấm Switch popup (JS dialog, attempt={}).", attempt)
+                if _after_click_wait():
                     return True
         except Exception:
             pass
         try:
-            if page.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS) and _after_click_pause():
+            if page.evaluate(_PAGE_SWITCH_POPUP_CONFIRM_JS):
                 logger.info("[FB] Đã bấm Switch popup (JS page, attempt={}).", attempt)
-                return True
+                if _after_click_wait():
+                    return True
         except Exception:
             pass
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(400)
+
+    # Enter nếu focus đang ở nút Switch.
+    try:
+        page.keyboard.press("Enter")
+        logger.info("[FB] Thử Enter sau khi focus Switch popup.")
+        if _after_click_wait():
+            return True
+    except Exception:
+        pass
 
     return _popup_closed()
 
@@ -2948,8 +3032,8 @@ def _handle_switch_profiles_popup_if_present(
     """
     Sau khi bấm Switch sidebar: nếu có popup thì bấm Switch xanh, chờ đóng + xác nhận vai trò Page.
     """
-    _ = page_url  # giữ API; chọn Page trong popup chỉ khi cần danh sách
     pname = str(page_display_name or "").strip()
+    dest = str(page_url or "").strip()
     popup_seen = False
     appear_deadline = time.time() + max(1.2, appear_wait_ms / 1000.0)
     while time.time() < appear_deadline:
@@ -2966,29 +3050,32 @@ def _handle_switch_profiles_popup_if_present(
         logger.info("[FB] Không có popup Switch profiles (switch trực tiếp hoặc đã đóng).")
         return True
 
-    logger.info("[FB] Popup Switch profiles — bấm nút Switch xác nhận.")
-    dest = str(page_url or "").strip()
-    confirm_failures = 0
-    for popup_click_try in range(1, 3):
-        if _click_switch_profiles_popup_confirm(
+    logger.info(
+        "[FB] Popup Switch profiles — bấm nút Switch xác nhận (Page={!r}).",
+        pname or dest or "?",
+    )
+    confirm_ok = False
+    for popup_click_try in range(1, 5):
+        if not _switch_profiles_dialog_visible(page, timeout_ms=400):
+            confirm_ok = True
+            break
+        clicked = _click_switch_profiles_popup_confirm(
             page,
             page_display_name=pname,
             page_url=dest,
-        ):
-            if not _switch_profiles_dialog_visible(page, timeout_ms=450):
-                break
-        elif not _switch_profiles_dialog_visible(page, timeout_ms=350):
+        )
+        if clicked or _wait_switch_profiles_popup_closed(page, timeout_ms=2_500):
+            confirm_ok = True
+            logger.info("[FB] Popup Switch profiles đã đóng (attempt={}).", popup_click_try)
             break
-        confirm_failures += 1
-        if confirm_failures >= 2:
-            logger.warning(
-                "[FB] Popup Switch profiles — xác nhận thất bại {} lần, dừng sớm.",
-                confirm_failures,
-            )
-            break
-        page.wait_for_timeout(400)
-    if _switch_profiles_dialog_visible(page, timeout_ms=450):
+        logger.warning(
+            "[FB] Popup Switch profiles còn mở sau lần bấm {} — thử lại.",
+            popup_click_try,
+        )
+        page.wait_for_timeout(500 + popup_click_try * 200)
+    if not confirm_ok and _switch_profiles_dialog_visible(page, timeout_ms=450):
         _failure_screenshot(page, "switch_profiles_popup_confirm_fail")
+        logger.warning("[FB] Popup Switch profiles — xác nhận thất bại sau nhiều lần thử.")
         return False
 
     settle_deadline = time.time() + max(3.5, settle_ms / 1000.0)
@@ -2997,6 +3084,8 @@ def _handle_switch_profiles_popup_if_present(
             if not _click_switch_profiles_popup_confirm(
                 page, page_display_name=pname, page_url=dest
             ):
+                if _wait_switch_profiles_popup_closed(page, timeout_ms=2_000):
+                    continue
                 return False
             page.wait_for_timeout(350)
             continue

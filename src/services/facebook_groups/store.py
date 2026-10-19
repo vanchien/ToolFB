@@ -113,6 +113,7 @@ class GroupStore:
             self._doc_mtime = self._file_mtime() if mtime is None else mtime
 
     def _write(self, data: dict[str, Any]) -> None:
+        """Ghi atomic; Windows đôi khi từ chối ``os.replace`` khi nhiều luồng — thử lại."""
         text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
         fd, tmp = tempfile.mkstemp(prefix="facebook_groups_", suffix=".tmp.json", dir=str(self.path.parent))
         try:
@@ -120,12 +121,32 @@ class GroupStore:
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            last_exc: Exception | None = None
+            for attempt in range(8):
+                try:
+                    os.replace(tmp, self.path)
+                    last_exc = None
+                    break
+                except PermissionError as exc:
+                    last_exc = exc
+                    time.sleep(0.02 * (attempt + 1))
+            if last_exc is not None:
+                # Fallback: ghi đè trực tiếp nếu replace bị Windows chặn tạm.
+                try:
+                    self.path.write_text(text, encoding="utf-8")
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    tmp = ""
+                except Exception:
+                    raise last_exc from None
         except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             raise
         self._remember(data)
 
@@ -143,8 +164,22 @@ class GroupStore:
             return self._snapshot(doc)
 
     def _mutate(self, fn) -> Any:
+        """Đọc (ưu tiên cache cùng mtime) → sửa → ghi; tránh đọc disk thừa khi 24/7."""
         with json_file_lock(self.path):
-            doc = self._read()
+            mtime = self._file_mtime()
+            with self._cache_lock:
+                cached = self._doc_cache
+                cached_mtime = self._doc_mtime
+            if cached is not None and mtime is not None and cached_mtime == mtime:
+                # Deep-ish: tách list + từng dict cấp 1 trong list share_* để luồng song song
+                # không đụng chung object với cache khi mutate in-place.
+                doc = self._snapshot(cached)
+                for key in ("share_batches", "share_jobs", "discovery_jobs", "join_jobs", "groups", "memberships"):
+                    rows = doc.get(key)
+                    if isinstance(rows, list):
+                        doc[key] = [dict(item) if isinstance(item, dict) else item for item in rows]
+            else:
+                doc = self._read()
             result = fn(doc)
             self._write(doc)
             return result
@@ -427,6 +462,13 @@ class GroupStore:
                 "commented_page_ids": [],
                 "comment": str(row.get("comment") or ""),
                 "like_video": bool(row.get("like_video")),
+                "like_page_ids": [
+                    str(x).strip()
+                    for x in (row.get("like_page_ids") or [])
+                    if str(x).strip()
+                ],
+                "engage_mode": str(row.get("engage_mode") or ""),
+                "source_page": str(row.get("source_page") or ""),
                 "source_watched": False,
                 "source_commented": False,
                 "source_prepared": False,
@@ -541,21 +583,53 @@ class GroupStore:
 
         return self._mutate(_apply)
 
+    def share_settings_sidecar_path(self) -> Path:
+        """File riêng cho cài đặt/hàng chờ chia sẻ — tránh ghi lại cả ``facebook_groups.json``."""
+        return self.path.parent / "share_settings.json"
+
     def share_settings(self) -> dict[str, Any]:
-        """Cài đặt tab Chia sẻ: bình luận, thời lượng, lần chạy gần nhất."""
+        """Cài đặt tab Chia sẻ: ưu tiên sidecar; fallback trong ``facebook_groups.json``."""
+        side = self.share_settings_sidecar_path()
+        if side.is_file():
+            try:
+                with json_file_lock(side):
+                    raw = json.loads(side.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    return dict(raw)
+            except Exception:  # noqa: BLE001
+                pass
         raw = self.load().get("share_settings")
         return dict(raw) if isinstance(raw, dict) else {}
 
     def save_share_settings(self, settings: dict[str, Any]) -> None:
-        """Ghi cài đặt tab Chia sẻ, giữ lại kết quả lần chạy để mở lại còn xem được."""
+        """
+        Ghi cài đặt tab Chia sẻ vào sidecar (nhanh, 24/7).
 
-        def _apply(doc: dict[str, Any]) -> None:
-            current = doc.get("share_settings") if isinstance(doc.get("share_settings"), dict) else {}
-            merged = dict(current)
-            merged.update(settings if isinstance(settings, dict) else {})
-            doc["share_settings"] = merged
-
-        self._mutate(_apply)
+        Lần đầu còn dữ liệu cũ trong ``facebook_groups.json`` thì gộp rồi chuyển sang sidecar.
+        """
+        side = self.share_settings_sidecar_path()
+        current = self.share_settings()
+        merged = dict(current)
+        merged.update(settings if isinstance(settings, dict) else {})
+        text = json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
+        side.parent.mkdir(parents=True, exist_ok=True)
+        with json_file_lock(side):
+            fd, tmp = tempfile.mkstemp(
+                prefix="share_settings_", suffix=".tmp.json", dir=str(side.parent)
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, side)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        # Không mirror sang facebook_groups.json mỗi lần — tránh nghẽn disk khi 24/7.
 
     def recent_share_batch_ids(self, limit: int = 20) -> list[str]:
         """Mã batch mới nhất, để bảng kết quả còn hiện sau khi đóng app."""

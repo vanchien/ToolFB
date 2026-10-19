@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 import tkinter as tk
@@ -21,6 +22,7 @@ from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
 from src.services.facebook_groups.fingerprint import normalize_share_images
 from src.services.facebook_groups.share_schedule import (
     PlannedShareLink,
+    as_local_naive,
     compose_stamp,
     date_choice_is_today,
     date_choices,
@@ -40,9 +42,16 @@ from src.services.facebook_groups.source_watch import (
     next_share_time,
     parse_minute_range,
     parse_source_urls,
+    source_page_display,
+    source_state_key,
     video_id_from_url,
 )
-from src.utils.feature_busy import parse_conflict_gap_minutes, set_conflict_gap_minutes
+from src.utils.feature_busy import (
+    describe_conflict_gap,
+    parse_conflict_gap_minutes,
+    set_conflict_gap_auto,
+    set_conflict_gap_minutes,
+)
 from src.services.facebook_groups.store import GroupStore
 from src.gui.page_category_filter import PageCategoryFilter
 from src.utils.page_categories import normalize_page_category, page_category_label
@@ -76,6 +85,32 @@ def dedupe_receiving_pages(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return unique
 
 
+def interleave_pages_by_account(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """
+    Xếp Page luân phiên theo tài khoản (A1, B1, A2, B2…).
+
+    Khi chọn «Tất cả tài khoản», bảng không còn toàn một TK ở đầu —
+    dễ thấy cả hai đang chạy song song.
+    """
+    buckets: dict[str, list[dict[str, str]]] = {}
+    order: list[str] = []
+    for row in rows:
+        aid = str(row.get("account_id") or "")
+        if aid not in buckets:
+            order.append(aid)
+            buckets[aid] = []
+        buckets[aid].append(row)
+    if len(order) <= 1:
+        return list(rows)
+    queues = [list(buckets[aid]) for aid in order]
+    out: list[dict[str, str]] = []
+    while any(queues):
+        for queue in queues:
+            if queue:
+                out.append(queue.pop(0))
+    return out
+
+
 def describe_page_jobs(
     jobs: list[dict[str, Any]],
     paused_note: str = "",
@@ -103,6 +138,9 @@ def describe_page_jobs(
     if active:
         return "Đang gửi", live_step or "Đang chia sẻ link", "run"
     if pending and live_step:
+        # Cùng TK đang xử lý Page khác → vẫn hiện rõ, không để cột trống.
+        if live_step.startswith("Chờ trong TK"):
+            return "Chờ TK", live_step, "wait"
         return "Đang chạy", live_step, "run"
     if pending and paused_note:
         return "Lỗi", paused_note, "fail"
@@ -143,12 +181,23 @@ class ShareTab:
         self._watch_targets: list[str] = []
         self._watch_states: dict[str, SourceState] = {}
         self._watch_last_planned: datetime | None = None
+        # Dấu vân tay plan chờ (share_now + gap) — đổi → xếp lại giờ waiting.
+        self._live_plan_key: tuple[Any, ...] | None = None
         self._build()
         self._load_share_settings()
         self.reload_pages()
         self._fill_results()
-        self.root.after(2500, self._watch_resume_saved)
-        self.root.after(4000, self._resume_queue_if_needed)
+        try:
+            recovered = self.engine.recover()
+            if int(recovered.get("share_batches") or 0) or int(recovered.get("share") or 0):
+                self.status.set(
+                    f"Khôi phục chia sẻ: {recovered.get('share_batches', 0)} batch dở, "
+                    f"{recovered.get('share', 0)} job — sẽ chạy tiếp."
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.after(2200, self._watch_resume_saved)
+        self.root.after(3500, self._resume_queue_if_needed)
 
     def _build(self) -> None:
         """
@@ -177,6 +226,7 @@ class ShareTab:
         self.watch_gap_max = tk.StringVar(value="3")
         self.conflict_gap_min = tk.StringVar(value="2")
         self.conflict_gap_max = tk.StringVar(value="5")
+        self.conflict_gap_auto = tk.BooleanVar(value=True)
         self.source_url = tk.StringVar()
         self.caption = tk.StringVar()
         self.destination = tk.StringVar(value="page")
@@ -185,6 +235,7 @@ class ShareTab:
         self.watch_seconds = tk.StringVar(value="20")
         self.watch_until = tk.StringVar(value="60")
         self.like_video = tk.BooleanVar(value=True)
+        self.engage_rate_percent = tk.StringVar(value="65")
         self.cooldown = tk.StringVar(value="30")
         self.clock_date = tk.StringVar()
         self.clock_hour = tk.StringVar()
@@ -201,6 +252,7 @@ class ShareTab:
         self._build_bottom_notebook(parent)
         self._sync_clock_to_machine()
         self._sync_gap_widgets()
+        self._sync_conflict_gap_widgets()
         self._refresh_conflict_gap_hint()
         self._refresh_watch_stats()
 
@@ -213,7 +265,10 @@ class ShareTab:
 
         ttk.Label(
             box,
-            text="Dán link Page cần theo dõi (mỗi dòng một link). Lần quét đầu chỉ ghi mốc — video cũ bỏ qua.",
+            text=(
+                "Dán link Page nguồn (mỗi dòng một). Bật theo dõi / Quét ngay lần đầu "
+                "ghi nhớ video mới nhất trên Page — lần sau chỉ lấy video đăng sau mốc đó."
+            ),
             foreground="gray",
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
@@ -222,7 +277,11 @@ class ShareTab:
         self.watch_sources_box.grid(row=1, column=1, columnspan=2, sticky="ew")
         self.watch_sources_box.bind(
             "<KeyRelease>",
-            lambda _event: (self._refresh_watch_stats(), self._schedule_save_settings()),
+            lambda _event: (
+                self._refresh_watch_stats(),
+                self._sync_watcher_sources_from_box(),
+                self._schedule_save_settings(),
+            ),
         )
 
         stats_row = ttk.Frame(box)
@@ -260,23 +319,33 @@ class ShareTab:
 
         gap_box = ttk.LabelFrame(
             box,
-            text="Giãn cách đăng lịch → chia sẻ (tự cài)",
+            text="Giãn cách đăng lịch → chia sẻ",
             padding=(8, 4),
         )
         gap_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         gap_row = ttk.Frame(gap_box)
         gap_row.pack(side=tk.LEFT, fill=tk.X)
-        ttk.Label(gap_row, text="Nghỉ sau khi đăng xong").pack(side=tk.LEFT)
-        ttk.Entry(gap_row, textvariable=self.conflict_gap_min, width=4).pack(side=tk.LEFT, padx=(6, 2))
+        self.conflict_gap_auto_cb = ttk.Checkbutton(
+            gap_row,
+            text="Tự động theo tải lịch",
+            variable=self.conflict_gap_auto,
+            command=self._on_conflict_gap_auto_toggled,
+        )
+        self.conflict_gap_auto_cb.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(gap_row, text="Hoặc chỉnh tay").pack(side=tk.LEFT)
+        self._conflict_gap_min_entry = ttk.Entry(gap_row, textvariable=self.conflict_gap_min, width=4)
+        self._conflict_gap_min_entry.pack(side=tk.LEFT, padx=(6, 2))
         ttk.Label(gap_row, text="–").pack(side=tk.LEFT)
-        ttk.Entry(gap_row, textvariable=self.conflict_gap_max, width=4).pack(side=tk.LEFT, padx=(2, 2))
-        ttk.Label(gap_row, text="phút (ngẫu nhiên), rồi mới chia sẻ").pack(side=tk.LEFT, padx=(4, 0))
+        self._conflict_gap_max_entry = ttk.Entry(gap_row, textvariable=self.conflict_gap_max, width=4)
+        self._conflict_gap_max_entry.pack(side=tk.LEFT, padx=(2, 2))
+        ttk.Label(gap_row, text="phút").pack(side=tk.LEFT, padx=(4, 0))
         self.conflict_gap_hint = tk.StringVar(value="")
         ttk.Label(gap_box, textvariable=self.conflict_gap_hint, foreground="#0b5394").pack(
             side=tk.RIGHT, padx=(8, 0)
         )
         for var in (self.conflict_gap_min, self.conflict_gap_max):
             var.trace_add("write", lambda *_args: self._on_conflict_gap_changed())
+        self._sync_conflict_gap_widgets()
 
         actions = ttk.Frame(box)
         actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -361,33 +430,64 @@ class ShareTab:
         tab_queue.rowconfigure(1, weight=1)
         ttk.Label(
             tab_queue,
-            text="Video mới từ theo dõi và link thêm tay. «Chạy list chờ» / theo dõi bật sẽ tự xử lý.",
+            text=(
+                "Video mới từ theo dõi và link thêm tay. Cột «Page nguồn» cho biết video thuộc Page nào. "
+                "Chọn dòng → Ctrl+C / chuột phải «Copy link» để chép link video. "
+                "«Chạy list chờ» / theo dõi bật sẽ tự xử lý."
+            ),
             foreground="gray",
         ).grid(row=0, column=0, sticky="w", pady=(0, 4))
         self.queue_tree = ttk.Treeview(
-            tab_queue, columns=("stt", "when", "url", "state"), show="headings", height=5
+            tab_queue,
+            columns=("stt", "when", "source", "url", "state"),
+            show="headings",
+            height=5,
+            selectmode="extended",
         )
         for key, title, width in (
             ("stt", "STT", 44),
-            ("when", "Ngày giờ", 130),
-            ("url", "Link chờ", 480),
-            ("state", "Trạng thái", 110),
+            ("when", "Ngày giờ", 110),
+            ("source", "Page nguồn", 220),
+            ("url", "Link video", 320),
+            ("state", "Trạng thái", 100),
         ):
             self.queue_tree.heading(key, text=title)
-            self.queue_tree.column(key, width=width, stretch=(key == "url"))
+            self.queue_tree.column(key, width=width, stretch=(key in {"url", "source"}))
         self.queue_tree.grid(row=1, column=0, sticky="nsew")
         q_scroll = ttk.Scrollbar(tab_queue, orient=tk.VERTICAL, command=self.queue_tree.yview)
         self.queue_tree.configure(yscrollcommand=q_scroll.set)
         q_scroll.grid(row=1, column=1, sticky="ns")
         q_actions = ttk.Frame(tab_queue)
         q_actions.grid(row=2, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(q_actions, text="Xóa / bỏ qua đã chọn", command=self._remove_queued).pack(side=tk.LEFT)
+        ttk.Button(q_actions, text="Copy link đã chọn", command=self._copy_queued_video_links).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(q_actions, text="Xóa / bỏ qua đã chọn", command=self._remove_queued).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
         ttk.Label(
             q_actions,
-            text="Xóa video → bỏ lượt đó; video còn trong list vẫn chạy tiếp.",
+            text="Ctrl+C / chuột phải = copy link · Delete = bỏ qua.",
             foreground="gray",
         ).pack(side=tk.LEFT, padx=(8, 0))
         self.queue_tree.bind("<Delete>", lambda _e: self._remove_queued())
+        self.queue_tree.bind("<Control-c>", lambda _e: self._copy_queued_video_links())
+        self.queue_tree.bind("<Control-C>", lambda _e: self._copy_queued_video_links())
+        self.queue_tree.bind("<Double-1>", self._on_queue_double_click_copy)
+        try:
+            from src.gui.treeview_shortcuts import install_treeview_shortcuts
+
+            install_treeview_shortcuts(
+                self.queue_tree,
+                owner=self.root,
+                info_callback=lambda msg: self.status.set(msg),
+                extra_context_items=lambda menu: menu.add_command(
+                    label="Copy link video đã chọn",
+                    command=self._copy_queued_video_links,
+                ),
+            )
+        except Exception:
+            pass
 
         tab_result.columnconfigure(0, weight=1)
         tab_result.rowconfigure(1, weight=1)
@@ -499,44 +599,89 @@ class ShareTab:
         ttk.Label(timing, text="đến").pack(side=tk.LEFT)
         ttk.Entry(timing, textvariable=self.watch_until, width=5).pack(side=tk.LEFT, padx=(4, 10))
         ttk.Checkbutton(
-            timing, text="Like video", variable=self.like_video, command=self._schedule_save_settings
-        ).pack(side=tk.LEFT, padx=(0, 10))
+            timing,
+            text="Cho phép Like",
+            variable=self.like_video,
+            command=self._schedule_save_settings,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(timing, text="Tỷ lệ Like/comment ≥").pack(side=tk.LEFT)
+        ttk.Entry(timing, textvariable=self.engage_rate_percent, width=4).pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(timing, text="%").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(timing, text="Nghỉ (giây)").pack(side=tk.LEFT)
         ttk.Entry(timing, textvariable=self.cooldown, width=5).pack(side=tk.LEFT, padx=4)
-        for var in (self.reel_seconds, self.watch_seconds, self.watch_until, self.cooldown):
+        for var in (
+            self.reel_seconds,
+            self.watch_seconds,
+            self.watch_until,
+            self.cooldown,
+            self.engage_rate_percent,
+        ):
             var.trace_add("write", lambda *_args: self._schedule_save_settings())
         conflict = ttk.Frame(tab_settings)
         conflict.grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        ttk.Label(conflict, text="Giãn sau đăng lịch").pack(side=tk.LEFT)
-        ttk.Entry(conflict, textvariable=self.conflict_gap_min, width=4).pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Checkbutton(
+            conflict,
+            text="Tự động giãn sau đăng lịch",
+            variable=self.conflict_gap_auto,
+            command=self._on_conflict_gap_auto_toggled,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(conflict, text="Tay").pack(side=tk.LEFT)
+        self._conflict_gap_min_entry_s = ttk.Entry(conflict, textvariable=self.conflict_gap_min, width=4)
+        self._conflict_gap_min_entry_s.pack(side=tk.LEFT, padx=(6, 2))
         ttk.Label(conflict, text="–").pack(side=tk.LEFT)
-        ttk.Entry(conflict, textvariable=self.conflict_gap_max, width=4).pack(side=tk.LEFT, padx=(2, 2))
+        self._conflict_gap_max_entry_s = ttk.Entry(conflict, textvariable=self.conflict_gap_max, width=4)
+        self._conflict_gap_max_entry_s.pack(side=tk.LEFT, padx=(2, 2))
         ttk.Label(
             conflict,
-            text="phút rồi mới chia sẻ (trùng Page/TK — ưu tiên đăng trước)",
+            text="phút (TK khác vẫn chạy; ưu tiên đăng lịch)",
             foreground="gray",
         ).pack(side=tk.LEFT, padx=(6, 0))
 
+    def _on_conflict_gap_auto_toggled(self) -> None:
+        """Bật/tắt giãn tự động — đồng bộ FeatureBusy + UI."""
+        set_conflict_gap_auto(bool(self.conflict_gap_auto.get()))
+        self._sync_conflict_gap_widgets()
+        self._refresh_conflict_gap_hint()
+        self._schedule_save_settings()
+
+    def _sync_conflict_gap_widgets(self) -> None:
+        """Khóa ô chỉnh tay khi đang dùng chế độ tự động."""
+        auto = bool(self.conflict_gap_auto.get())
+        state = tk.DISABLED if auto else tk.NORMAL
+        for entry in (
+            getattr(self, "_conflict_gap_min_entry", None),
+            getattr(self, "_conflict_gap_max_entry", None),
+            getattr(self, "_conflict_gap_min_entry_s", None),
+            getattr(self, "_conflict_gap_max_entry_s", None),
+        ):
+            if entry is not None:
+                try:
+                    entry.configure(state=state)
+                except tk.TclError:
+                    pass
+
     def _on_conflict_gap_changed(self) -> None:
         """Cập nhật gợi ý + lưu khi người dùng đổi khoảng giãn cách."""
+        if not self.conflict_gap_auto.get():
+            try:
+                parse_conflict_gap_minutes(self.conflict_gap_min.get(), self.conflict_gap_max.get())
+            except Exception:
+                pass
         self._refresh_conflict_gap_hint()
         self._schedule_save_settings()
 
     def _refresh_conflict_gap_hint(self) -> None:
-        """Hiện khoảng đang dùng (đã chuẩn hóa)."""
+        """Hiện khoảng đang dùng (auto theo tải hoặc chỉnh tay)."""
         if not hasattr(self, "conflict_gap_hint"):
             return
-        try:
-            lo = float(str(self.conflict_gap_min.get()).strip() or "2")
-            hi = float(str(self.conflict_gap_max.get()).strip() or "5")
-        except ValueError:
-            self.conflict_gap_hint.set("Nhập số phút hợp lệ")
-            return
-        lo, hi = sorted((max(0.0, lo), max(0.0, hi)))
-        if lo == hi:
-            self.conflict_gap_hint.set(f"Đang dùng: đúng {lo:g} phút")
-        else:
-            self.conflict_gap_hint.set(f"Đang dùng: {lo:g}–{hi:g} phút")
+        set_conflict_gap_auto(bool(self.conflict_gap_auto.get()))
+        if not self.conflict_gap_auto.get():
+            try:
+                parse_conflict_gap_minutes(self.conflict_gap_min.get(), self.conflict_gap_max.get())
+            except Exception:
+                self.conflict_gap_hint.set("Nhập số phút hợp lệ")
+                return
+        self.conflict_gap_hint.set(describe_conflict_gap())
 
     def _sync_gap_widgets(self) -> None:
         """Ẩn khoảng cách lượt khi đang chọn «chia sẻ ngay»."""
@@ -556,13 +701,62 @@ class ShareTab:
         if self._watcher is not None and self._watcher.running:
             self._watch_disable()
         else:
-            self._watch_enable(interactive=True)
+            # Tắt→bật lại: quét sớm + chạy list chờ ngay (không chờ vài phút).
+            self._cancel_schedule.clear()
+            try:
+                self.engine.recover()
+            except Exception:  # noqa: BLE001
+                pass
+            self._watch_enable(interactive=True, delay_first_scan=False)
+
+    def _sync_watcher_sources_from_box(self) -> None:
+        """Đang theo dõi: cập nhật list Page nguồn từ ô dán (tránh watcher còn list cũ/rỗng)."""
+        if self._loading_settings or self._watcher is None or not self._watcher.running:
+            return
+        sources = self._safe_parse_sources()
+        if not sources:
+            return
+        try:
+            scan_min, scan_max = parse_minute_range(
+                self.watch_scan_min.get(), self.watch_scan_max.get(), label="Quét lại mỗi", floor=1
+            )
+        except ValueError:
+            return
+        self._watch_states = merge_source_states(self._watch_states, sources)
+        self._watcher.update_settings(sources=sources, scan_min=scan_min, scan_max=scan_max)
 
     def _watch_scan_now(self) -> None:
-        """Quét Page nguồn ngay, không chờ hết thời gian nghỉ."""
-        if self._watcher is None or not self._watcher.running:
-            self.watch_status.set("Bật theo dõi trước rồi mới quét ngay.")
+        """
+        Quét Page nguồn ngay: ghi mốc video mới nhất (lần đầu) hoặc phát hiện video mới.
+
+        Chưa bật theo dõi thì tự bật (cần đã tích Page nhận), rồi quét.
+        """
+        sources = self._safe_parse_sources()
+        if not sources:
+            self.watch_status.set("Dán ít nhất một link Page nguồn rồi bấm Quét ngay.")
+            messagebox.showwarning(
+                "Quét Page nguồn",
+                "Dán link Page nguồn (mỗi dòng một link) trước khi quét.",
+                parent=self.root,
+            )
             return
+        if self._watcher is None or not self._watcher.running:
+            self.watch_status.set("Đang bật theo dõi để ghi mốc video cuối trên Page nguồn…")
+            if not self._watch_enable(interactive=True, delay_first_scan=False):
+                return
+            # Bật xong đã quét ngay (scan_immediately=True) — ghi mốc / lấy mới.
+            return
+        try:
+            scan_min, scan_max = parse_minute_range(
+                self.watch_scan_min.get(), self.watch_scan_max.get(), label="Quét lại mỗi", floor=1
+            )
+        except ValueError as exc:
+            self.watch_status.set(str(exc))
+            return
+        # Đồng bộ list nguồn trên ô dán → watcher (tránh quét list cũ / rỗng).
+        self._watch_states = merge_source_states(self._watch_states, sources)
+        self._watcher.update_settings(sources=sources, scan_min=scan_min, scan_max=scan_max)
+        self.watch_status.set(f"Đang quét {len(sources)} Page nguồn — ghi mốc / tìm video mới…")
         self._watcher.scan_now()
 
     def _watch_enable(self, *, interactive: bool, delay_first_scan: bool = False) -> bool:
@@ -628,7 +822,13 @@ class ShareTab:
                 self.root, lambda src=src, urls=urls: self._enqueue_watch_videos(src, urls)
             ),
             on_state=lambda: schedule_on_main_thread(
-                self.root, lambda: self._schedule_save_settings(delay_ms=8000)
+                self.root,
+                lambda: (
+                    self._enrich_queue_source_labels(),
+                    self._schedule_refresh_queue(),
+                    # Debounce dài hơn — tránh ghi disk mỗi Page nguồn khi quét wave lớn.
+                    self._schedule_save_settings(delay_ms=2000),
+                ),
             ),
             on_status=self._watch_set_status,
         )
@@ -640,13 +840,15 @@ class ShareTab:
         if delay_first_scan:
             self.watch_status.set(
                 f"Đang theo dõi {len(sources)} nguồn → {len(target_rows)} Page nhận ({mode}). "
-                "Chờ lịch đăng ổn định rồi mới quét (tránh đụng profile)."
+                "Chờ ngắn nhường lịch đăng rồi quét (tránh đụng cùng profile)."
             )
         else:
             self.watch_status.set(
                 f"Đang theo dõi {len(sources)} nguồn → {len(target_rows)} Page nhận ({mode}). Đang quét…"
             )
         self._refresh_watch_stats()
+        self._remember_share_watch_wanted(True)
+        self._live_plan_key = self._current_plan_key()
         self._schedule_save_settings()
         self._ensure_queue_worker()
         return True
@@ -660,10 +862,30 @@ class ShareTab:
         self.watch_toggle_btn.configure(text="Bật theo dõi")
         self.watch_status.set("Đã tắt theo dõi. Video mới đã vào list chờ vẫn được giữ.")
         self._refresh_watch_stats()
+        self._remember_share_watch_wanted(False)
         self._schedule_save_settings()
+
+    def _remember_share_watch_wanted(self, wanted: bool) -> None:
+        """Ghi app_runtime để mở lại máy vẫn biết có nên tự bật theo dõi."""
+        try:
+            from src.utils.app_runtime_prefs import set_share_watch_wanted
+
+            set_share_watch_wanted(bool(wanted))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _watch_resume_saved(self) -> None:
         """Mở lại app: lần trước đang bật theo dõi thì bật lại; hoãn quét để khỏi đụng lịch đăng."""
+        try:
+            from src.utils.app_runtime_prefs import load_runtime_prefs, should_auto_start_share_watch
+
+            hint = should_auto_start_share_watch(load_runtime_prefs())
+            if hint is True:
+                self._watch_enabled = True
+            elif hint is False:
+                self._watch_enabled = False
+        except Exception:  # noqa: BLE001
+            pass
         if not self._watch_enabled:
             return
         if not self._watch_targets and self._checked:
@@ -674,6 +896,7 @@ class ShareTab:
             self.watch_status.set(
                 "Lần trước đang theo dõi nhưng mất list Page nhận — tích lại Page rồi bấm Bật theo dõi."
             )
+            self._remember_share_watch_wanted(False)
             self._schedule_save_settings()
             return
         self.watch_toggle_btn.configure(text="Đang khôi phục…")
@@ -681,15 +904,41 @@ class ShareTab:
         if not ok:
             self._watch_enabled = False
             self.watch_toggle_btn.configure(text="Bật theo dõi")
+            self._remember_share_watch_wanted(False)
             self._schedule_save_settings()
             return
 
     def _resume_queue_if_needed(self) -> None:
-        """Mở lại app: nếu còn link chờ thì chạy tiếp (kể cả khi chưa bật theo dõi)."""
+        """Mở lại app: chạy tiếp batch dở + list chờ (kể cả khi chưa bật theo dõi)."""
         if self._running or self._cancel_schedule.is_set():
             return
         if any(item.state == "waiting" for item in self._queue):
+            overdue = self._promote_overdue_queue()
+            waiting_n = sum(1 for i in self._queue if i.state == "waiting")
+            extra = f" · {overdue} video quá giờ xếp chạy ngay" if overdue else ""
+            self.status.set(f"Mở lại app — tiếp tục {waiting_n} video trong hàng chờ{extra}.")
             self._ensure_queue_worker()
+            return
+        # Không còn waiting nhưng còn batch READY sau recover — bấm Tiếp tục giúp.
+        orphan_ids: list[str] = []
+        for batch in self.store.share_batches():
+            if batch.get("status") != "READY":
+                continue
+            bid = str(batch.get("id") or "")
+            if not bid:
+                continue
+            pending = [
+                job
+                for job in self.store.share_jobs()
+                if str(job.get("batch_id") or "") == bid
+                and str(job.get("status") or "") in {"PENDING", "VERIFY_FIRST"}
+            ]
+            if pending:
+                orphan_ids.append(bid)
+        if orphan_ids:
+            self.batch_ids = list(dict.fromkeys([*self.batch_ids, *orphan_ids]))
+            self.status.set(f"Còn {len(orphan_ids)} batch chia sẻ dở — đang chạy tiếp.")
+            self.resume()
 
     def _safe_parse_sources(self) -> list[str]:
         """Đọc Page nguồn trên form; ô trống → []; dòng lỗi bỏ qua (đang sửa)."""
@@ -729,7 +978,11 @@ class ShareTab:
         return dropped
 
     def _enqueue_watch_videos(self, source: str, urls: list[str]) -> None:
-        """Đưa video mới vào hàng chờ — chia sẻ ngay hoặc cách lượt trước một khoảng ngẫu nhiên."""
+        """Đưa video mới vào hàng chờ — chia sẻ ngay hoặc cách lượt trước một khoảng ngẫu nhiên.
+
+        Nhiều video cùng đợt: xáo thứ tự (không luôn chạy từ trên xuống),
+        «chia sẻ ngay» cách nhau ~1–2s để chạy nhanh hơn.
+        """
         if not self._watch_enabled:
             return
         active = self._safe_parse_sources()
@@ -750,32 +1003,41 @@ class ShareTab:
                 gap_min, gap_max = 0, 3
         known = {video_id_from_url(item.url) for item in self._queue}
         known |= set(self._cancelled_video_ids)
-        added: list[PlannedShareLink] = []
-        now = datetime.now().replace(microsecond=0)
+        pending_urls: list[str] = []
         for url in urls:
             vid = video_id_from_url(url)
             if not vid or vid in known:
                 continue
             known.add(vid)
+            pending_urls.append(url)
+        # Chia đều / không kẹt luôn video đầu list — xáo thứ tự đợt mới.
+        random.shuffle(pending_urls)
+        added: list[PlannedShareLink] = []
+        now = datetime.now().replace(microsecond=0)
+        for url in pending_urls:
             with self._queue_lock:
                 planned = [
                     row.when for row in self._queue if row.source and row.state in {"waiting", "running"}
                 ]
             last = max([*planned, *([self._watch_last_planned] if self._watch_last_planned else [])], default=None)
             if share_now:
-                # Chạy ngay; nhiều video cùng đợt cách nhau vài giây để worker xếp hàng.
-                when = (now + timedelta(seconds=5 * len(added))).replace(microsecond=0)
+                # Nhiều video: cách 1–2s (không 5s) — worker chạy liên tiếp nhanh hơn.
+                stagger = random.randint(1, 2) if added else 0
+                when = (now + timedelta(seconds=stagger * len(added))).replace(microsecond=0)
             else:
                 when = next_share_time(now=now, last_planned=last, gap_min=gap_min, gap_max=gap_max)
             label = "Ngay" if share_now else (
                 when.strftime("%H:%M") if when.date() == now.date() else when.strftime("%d/%m %H:%M")
             )
+            src_name, src_id = self._source_page_meta(source)
             item = PlannedShareLink(
                 when=when,
                 url=url,
                 label=f"Mới {label}",
                 targets=list(self._watch_targets),
                 source=source,
+                source_name=src_name,
+                source_id=src_id,
             )
             self._remember_queue_item(item)
             self._watch_last_planned = when
@@ -785,14 +1047,21 @@ class ShareTab:
         self._schedule_refresh_queue()
         self._save_share_settings()
         if share_now:
-            self.status.set(f"Có {len(added)} video mới — đang chia sẻ ngay lên Page nhận.")
+            self.status.set(
+                f"Có {len(added)} video mới từ Page nguồn — lần lượt chia sẻ hết lên Page nhận."
+            )
             try:
                 self._share_nb.select(1)
             except Exception:
                 pass
         else:
-            times = ", ".join(item.label.replace("Mới ", "") for item in added)
-            self.status.set(f"Page nguồn có {len(added)} video mới — xếp lịch lúc {times}.")
+            times = ", ".join(item.label.replace("Mới ", "") for item in added[:5])
+            more = f" (+{len(added) - 5})" if len(added) > 5 else ""
+            self.status.set(
+                f"Page nguồn có {len(added)} video mới — xếp lịch {times}{more}; "
+                "tự chạy lần lượt khi tới giờ."
+            )
+        # Đảm bảo worker đang chạy; nếu đang bận wave trước thì video mới vào hàng chờ.
         self._ensure_queue_worker()
 
     def reload_pages(self) -> None:
@@ -900,7 +1169,10 @@ class ShareTab:
 
     def _visible_pages(self) -> list[dict[str, str]]:
         """Page đang được lọc theo tài khoản, ô tìm và phân loại."""
-        return [row for row in self.pages if self._row_visible(row)]
+        rows = [row for row in self.pages if self._row_visible(row)]
+        if self.filter_account.get().strip() == "Tất cả tài khoản":
+            return interleave_pages_by_account(rows)
+        return rows
 
     def _account_scope_pages(self) -> list[dict[str, str]]:
         """Page của tài khoản đang chọn, chưa lọc phân loại — để đếm số trên ô Phân loại."""
@@ -1063,7 +1335,8 @@ class ShareTab:
 
     def _selected_pages(self) -> list[dict[str, str]]:
         """Các page đang được tích — mỗi Page Facebook chỉ một tài khoản."""
-        return dedupe_receiving_pages([row for row in self.pages if row["iid"] in self._checked])
+        rows = dedupe_receiving_pages([row for row in self.pages if row["iid"] in self._checked])
+        return interleave_pages_by_account(rows)
 
     def _select_all(self) -> None:
         """Tích mọi Page đang hiện (theo tài khoản đang lọc); giữ tick của tài khoản khác."""
@@ -1161,13 +1434,16 @@ class ShareTab:
         else:
             mode = "chưa cấu hình"
         acc = f" · {accounts} tài khoản" if recv_n else ""
-        try:
-            glo = float(str(self.conflict_gap_min.get()).strip() or "2")
-            ghi = float(str(self.conflict_gap_max.get()).strip() or "5")
-            glo, ghi = sorted((max(0.0, glo), max(0.0, ghi)))
-            gap = f" · giãn sau đăng {glo:g}–{ghi:g} phút"
-        except ValueError:
-            gap = ""
+        if self.conflict_gap_auto.get():
+            gap = " · giãn sau đăng: tự động"
+        else:
+            try:
+                glo = float(str(self.conflict_gap_min.get()).strip() or "2")
+                ghi = float(str(self.conflict_gap_max.get()).strip() or "5")
+                glo, ghi = sorted((max(0.0, glo), max(0.0, ghi)))
+                gap = f" · giãn sau đăng {glo:g}–{ghi:g} phút"
+            except ValueError:
+                gap = ""
         self.watch_stats.set(
             f"Thống kê: {sources} Page nguồn · {recv_n} Page nhận{acc}{gap} — {mode}"
         )
@@ -1281,6 +1557,55 @@ class ShareTab:
         waiting = sum(1 for row in self._queue if row.state == "waiting")
         self.status.set(f"Đã thêm vào list chờ. Còn {waiting} link.")
 
+    def _queued_links_from_selection(self) -> list[str]:
+        """Link video của các dòng đang chọn trên Hàng chờ (theo thứ tự bảng)."""
+        picked = list(self.queue_tree.selection())
+        if not picked:
+            return []
+        links: list[str] = []
+        for iid in picked:
+            vals = list(self.queue_tree.item(iid, "values") or ())
+            # Cột: stt, when, source, url, state
+            url = str(vals[3] if len(vals) > 3 else "").strip()
+            if url.startswith("http"):
+                links.append(url)
+                continue
+            # Fallback: tìm URL trong mọi cột.
+            for raw in vals:
+                text = str(raw or "").strip()
+                if text.startswith("http://") or text.startswith("https://"):
+                    links.append(text)
+                    break
+        return list(dict.fromkeys(links))
+
+    def _copy_queued_video_links(self, _event: object | None = None) -> str:
+        """Copy link video đã chọn vào clipboard (Ctrl+C / nút / chuột phải)."""
+        links = self._queued_links_from_selection()
+        if not links:
+            self.status.set("Chọn ít nhất một dòng trên Hàng chờ để copy link video.")
+            return "break"
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(links))
+        except Exception as exc:  # noqa: BLE001
+            self.status.set(f"Không copy được link: {exc}")
+            return "break"
+        n = len(links)
+        self.status.set(f"Đã copy {n} link video vào clipboard.")
+        return "break"
+
+    def _on_queue_double_click_copy(self, event: object) -> None:
+        """Double-click dòng → copy link video của dòng đó."""
+        try:
+            row = self.queue_tree.identify_row(getattr(event, "y", 0))
+        except Exception:
+            return
+        if not row:
+            return
+        self.queue_tree.selection_set((row,))
+        self.queue_tree.focus(row)
+        self._copy_queued_video_links()
+
     def _remove_queued(self) -> None:
         """
         Xóa / bỏ qua video đã chọn trong hàng chờ.
@@ -1335,8 +1660,79 @@ class ShareTab:
             self._queue_refresh_after = None
             self._refresh_queue()
 
+    def _source_page_meta(self, source: str) -> tuple[str, str]:
+        """Tên + Meta ID Page nguồn từ mốc quét / bảng Page đã lưu."""
+        raw = str(source or "").strip()
+        if not raw:
+            return "", ""
+        key = source_state_key(raw)
+        st = self._watch_states.get(key)
+        name = str(getattr(st, "page_name", "") or "").strip() if st else ""
+        pid = str(getattr(st, "page_id", "") or "").strip() if st else ""
+        if name and pid:
+            return name, pid
+        # Tra bảng Page nhận / PagesManager (nếu nguồn cũng là Page đã lưu).
+        try:
+            from src.services.facebook_reels_catalog import facebook_page_identity
+
+            want = facebook_page_identity(raw)
+        except Exception:
+            want = ""
+        want_id = want.split(":", 1)[1] if want.startswith("id:") else ""
+        for row in self.pages:
+            try:
+                from src.services.facebook_reels_catalog import facebook_page_identity
+
+                got = facebook_page_identity(str(row.get("target_url") or ""))
+            except Exception:
+                got = ""
+            row_fb = str(row.get("fb_page_id") or "").strip()
+            row_id = row_fb if row_fb.isdigit() else str(row.get("page_id") or "").strip()
+            row_name = str(row.get("page_name") or "").strip()
+            if want and got and want == got:
+                return name or row_name, pid or (row_fb if row_fb.isdigit() else row_id)
+            if want_id and (
+                row_fb == want_id
+                or (str(row.get("page_id") or "").strip() == want_id and want_id.isdigit())
+            ):
+                return name or row_name, pid or want_id
+        if not pid and want_id:
+            pid = want_id
+        return name, pid
+
+    def _enrich_queue_source_labels(self) -> None:
+        """Điền thiếu source_name / source_id trên hàng chờ từ mốc quét."""
+        with self._queue_lock:
+            rows = list(self._queue)
+        for item in rows:
+            if not item.source:
+                continue
+            if item.source_name and item.source_id:
+                continue
+            n2, i2 = self._source_page_meta(item.source)
+            if n2:
+                item.source_name = item.source_name or n2
+            if i2:
+                item.source_id = item.source_id or i2
+
+    def _queue_source_label(self, item: PlannedShareLink) -> str:
+        """Nhãn cột Page nguồn: ``Tên (id)``."""
+        if not item.source:
+            return "— (tay)"
+        name = str(item.source_name or "").strip()
+        pid = str(item.source_id or "").strip()
+        if not name or not pid:
+            n2, i2 = self._source_page_meta(item.source)
+            name = name or n2
+            pid = pid or i2
+            if n2 or i2:
+                item.source_name = name
+                item.source_id = pid
+        return source_page_display(item.source, page_name=name, page_id=pid) or item.source
+
     def _refresh_queue(self) -> None:
-        """Vẽ lại list chờ: giờ, link và trạng thái."""
+        """Vẽ lại list chờ: giờ, Page nguồn, link video và trạng thái."""
+        self._enrich_queue_source_labels()
         labels = {
             "waiting": "Đang chờ",
             "running": "Đang chia sẻ",
@@ -1356,6 +1752,7 @@ class ShareTab:
                 "values": (
                     index,
                     item.label or item.when.strftime("%H:%M"),
+                    self._queue_source_label(item),
                     item.url,
                     labels.get(item.state, item.state),
                 ),
@@ -1379,6 +1776,8 @@ class ShareTab:
 
     def _share_params(self) -> dict[str, Any]:
         """Đọc cài đặt chia sẻ trên form (ảnh, nghỉ, thời gian xem, nơi đăng, UID nhóm)."""
+        from src.services.facebook_groups.video_engage import clamp_engage_rate_percent
+
         watch_low, watch_high = optional_watch_bounds(self.watch_seconds.get(), self.watch_until.get())
         return {
             "images": normalize_share_images(self.image_paths) if self.image_paths else [],
@@ -1388,6 +1787,7 @@ class ShareTab:
             "watch_high": watch_high,
             "place": self.destination.get(),
             "group_ids": parse_group_uids(self._group_uid_raw()),
+            "engage_rate_percent": clamp_engage_rate_percent(self.engage_rate_percent.get()),
         }
 
     def _pages_for_item(self, item: PlannedShareLink, selected: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1455,6 +1855,56 @@ class ShareTab:
             return
         self._launch_queue_worker(selected, params)
 
+    def _promote_overdue_queue(self) -> int:
+        """
+        Video đã quá giờ vẫn ``waiting`` → xếp chạy lần lượt ngay (cách 2–4 giây).
+
+        Tránh kẹt cả đống «Đang chờ» khi worker từng dừng giữa chừng hoặc gap 5–30 phút
+        đẩy lịch quá xa trong khi Page nhận chỉ mới chia sẻ 1 video.
+        """
+        now = as_local_naive(datetime.now())
+        promoted = 0
+        with self._queue_lock:
+            overdue = [
+                item
+                for item in self._queue
+                if item.state == "waiting" and as_local_naive(item.when) <= now
+            ]
+            if not overdue:
+                return 0
+            overdue.sort(key=lambda item: as_local_naive(item.when))
+            for index, item in enumerate(overdue):
+                item.when = as_local_naive(now + timedelta(seconds=2 + index * 3))
+                stamp = "Ngay" if index == 0 else item.when.strftime("%H:%M:%S")
+                # Giữ tiền tố «Mới» nếu có — dễ nhận video từ theo dõi.
+                base = item.label.replace("Mới ", "", 1) if item.label.startswith("Mới ") else item.label
+                if not base or base in {"Ngay"} or ":" in base or "/" in base:
+                    item.label = f"Mới {stamp}"
+                promoted += 1
+            self._queue.sort(key=lambda row: as_local_naive(row.when))
+        if promoted:
+            self._schedule_refresh_queue()
+        return promoted
+
+    def _kick_queue_after_worker(self) -> None:
+        """Worker vừa dừng: nếu còn video chờ và không bị Dừng tay → tự chạy tiếp (trễ 1.5s)."""
+        if self._running or self._cancel_schedule.is_set():
+            return
+        if not any(item.state == "waiting" for item in self._queue):
+            return
+
+        def _go() -> None:
+            if self._running or self._cancel_schedule.is_set():
+                return
+            if not any(item.state == "waiting" for item in self._queue):
+                return
+            n = self._promote_overdue_queue()
+            if n:
+                self.status.set(f"Còn video chờ — xếp lại {n} video quá giờ và chạy tiếp.")
+            self._ensure_queue_worker()
+
+        self.root.after(1500, _go)
+
     def _ensure_queue_worker(self) -> None:
         """Theo dõi nguồn vừa thêm link: tự chạy list chờ nếu đang nghỉ (trừ khi người dùng đã bấm Dừng)."""
         if self._running:
@@ -1472,14 +1922,17 @@ class ShareTab:
     def _launch_queue_worker(self, selected: list[dict[str, str]], params: dict[str, Any]) -> None:
         """Chạy list chờ ở luồng nền: tới giờ link nào thì chia sẻ link đó lên Page nhận của nó."""
         del params  # Mỗi lượt đọc lại form — thay đổi nút/ô cài đặt áp dụng ngay cho link kế tiếp.
-        self.batch_ids = []
+        # Giữ batch_ids cũ để cột Kết quả còn đếm bài đã chia; chỉ thêm id wave mới.
         self._cancel_schedule.clear()
+        overdue = self._promote_overdue_queue()
         waiting = [item for item in self._queue if item.state == "waiting"]
         if not waiting:
             return
-        first = min(waiting, key=lambda item: item.when)
+        first = min(waiting, key=lambda item: as_local_naive(item.when))
         self._running = True
-        self.status.set(f"List chờ {len(waiting)} link. Link tới lượt lúc {first.label}.")
+        due_n = sum(1 for item in waiting if as_local_naive(item.when) <= as_local_naive(datetime.now()))
+        hint = f" · {overdue or due_n} video tới lượt" if (overdue or due_n) else f" · tới lượt lúc {first.label}"
+        self.status.set(f"List chờ {len(waiting)} link{hint} — lần lượt chia sẻ hết lên Page nhận.")
 
         def _set_status(text: str) -> None:
             schedule_on_main_thread(self.root, lambda text=text: self.status.set(text))
@@ -1488,11 +1941,12 @@ class ShareTab:
             schedule_on_main_thread(self.root, self._schedule_refresh_queue)
 
         def _next_waiting() -> PlannedShareLink | None:
+            """Video đã tới giờ: chọn ngẫu nhiên — không luôn chạy từ trên xuống."""
+            from src.services.facebook_groups.video_engage import shuffle_due_queue_items
+
             with self._queue_lock:
                 pending = [item for item in self._queue if item.state == "waiting"]
-            if not pending:
-                return None
-            return min(pending, key=lambda item: item.when)
+            return shuffle_due_queue_items(pending, now=datetime.now())
 
         def _item_still_pending(item: PlannedShareLink) -> bool:
             """Còn trong list và đang chờ — False nếu user đã xóa / bỏ qua."""
@@ -1518,7 +1972,7 @@ class ShareTab:
                 sooner = _next_waiting()
                 if sooner is not item:
                     return False
-                left = (item.when - datetime.now()).total_seconds()
+                left = (as_local_naive(item.when) - as_local_naive(datetime.now())).total_seconds()
                 if left <= 0:
                     with self._queue_lock:
                         if item not in self._queue or item.state != "waiting":
@@ -1595,27 +2049,77 @@ class ShareTab:
                         _set_status(f"{item.label} — bỏ qua: không còn Page nhận nào (Page đã bị xóa?).")
                         continue
                     pending_left = sum(1 for row in self._queue if row.state == "waiting")
-                    _set_status(f"{item.label} — đang chia sẻ. Còn {pending_left} link trong list.")
-                    result = self.engine.create_share_wave(
-                        pages=targets,
-                        source_url=item.url,
-                        text=self.caption.get().strip(),
-                        image_paths=live["images"],
-                        destination=live["place"],
-                        group_ids=live["group_ids"],
-                        cooldown_fixed=live["cooldown"],
-                        watch_seconds=live["watch_low"],
-                        watch_max_seconds=live["watch_high"],
-                        reel_seconds=live["reel_seconds"],
-                        comment=self._comment_raw(),
-                        like_video=bool(self.like_video.get()),
-                    )
-                    ids = list(result.get("batch_ids") or [])
-                    self.batch_ids.extend(ids)
-                    # Không ghi settings giữa wave — giảm I/O khi nhiều Page.
-                    schedule_on_main_thread(self.root, self._fill_results)
-                    if ids and not self._cancel_schedule.is_set():
-                        self.engine.run_share_wave(ids)
+                    # Ưu tiên chạy tiếp batch dở cùng video (sau tắt/mở) — tránh tạo wave trùng.
+                    resume_ids = self.engine.incomplete_share_batch_ids_for_url(item.url)
+                    if resume_ids:
+                        ids = list(resume_ids)
+                        self.batch_ids = list(dict.fromkeys([*self.batch_ids, *ids]))
+                        _set_status(
+                            f"{item.label} — chạy tiếp {len(ids)} batch dở "
+                            f"(nhường lịch đăng nếu trùng TK). Còn {pending_left} link chờ."
+                        )
+                        schedule_on_main_thread(self.root, self._fill_results)
+                        if not self._cancel_schedule.is_set():
+                            self.engine.resume_share_wave(ids)
+                        # Đếm job thật — tránh created=0 → đánh skipped nhầm.
+                        result = {
+                            "created": max(
+                                1,
+                                sum(
+                                    1
+                                    for row in self.store.share_jobs()
+                                    if str(row.get("batch_id") or "") in set(ids)
+                                ),
+                            ),
+                            "batch_ids": ids,
+                        }
+                    else:
+                        _set_status(
+                            f"{item.label} — đang chia sẻ lần lượt lên Page nhận "
+                            f"({len(targets)} Page). Còn {pending_left} video chờ."
+                        )
+                        from src.services.facebook_groups.video_engage import (
+                            clamp_engage_rate_percent,
+                            parse_comment_lines,
+                            plan_share_engage_for_video,
+                        )
+
+                        comment_raw = self._comment_raw()
+                        engage_pct = clamp_engage_rate_percent(self.engage_rate_percent.get())
+                        engage = plan_share_engage_for_video(
+                            source=str(item.source or ""),
+                            video_url=item.url,
+                            allow_like=bool(self.like_video.get()),
+                            allow_comment=bool(parse_comment_lines(comment_raw)),
+                            engage_rate_percent=engage_pct,
+                        )
+                        result = self.engine.create_share_wave(
+                            pages=targets,
+                            source_url=item.url,
+                            text=self.caption.get().strip(),
+                            image_paths=live["images"],
+                            destination=live["place"],
+                            group_ids=live["group_ids"],
+                            cooldown_fixed=live["cooldown"],
+                            watch_seconds=live["watch_low"],
+                            watch_max_seconds=live["watch_high"],
+                            reel_seconds=live["reel_seconds"],
+                            comment=comment_raw if engage.do_comment else "",
+                            like_video=bool(engage.do_like),
+                            engage_mode=engage.mode,
+                            source_page=str(item.source or ""),
+                        )
+                        ids = list(result.get("batch_ids") or [])
+                        self.batch_ids = list(dict.fromkeys([*self.batch_ids, *ids]))
+                        # Không ghi settings giữa wave — giảm I/O khi nhiều Page.
+                        schedule_on_main_thread(self.root, self._fill_results)
+                        if ids and not self._cancel_schedule.is_set():
+                            self.engine.run_share_wave(ids)
+                        elif not ids:
+                            _set_status(
+                                f"{item.label} — không tạo được batch (trùng / thiếu Page). "
+                                f"Bỏ qua, chạy video kế. Còn {pending_left} chờ."
+                            )
                     jobs = [
                         str(row.get("status") or "")
                         for row in self.store.share_jobs()
@@ -1632,6 +2136,12 @@ class ShareTab:
                         paused=paused,
                         cancelled=self._cancel_schedule.is_set(),
                     )
+                    # Wave lỗi / skipped nhưng còn video khác → không kẹt.
+                    if item.state in {"error", "skipped"} and not self._cancel_schedule.is_set():
+                        left = sum(1 for row in self._queue if row.state == "waiting")
+                        _set_status(
+                            f"{item.label} — {item.state}. Tiếp tục {left} video còn lại trong hàng chờ."
+                        )
                     _paint_queue()
                     if self._cancel_schedule.is_set():
                         _set_status("Đã dừng. Link chưa tới giờ vẫn nằm trong list chờ.")
@@ -1642,12 +2152,14 @@ class ShareTab:
                         queued.state = "waiting"
                 _paint_queue()
                 message = str(exc)
-                _set_status(f"Lỗi chia sẻ: {message}")
+                _set_status(f"Lỗi chia sẻ: {message} — sẽ thử chạy tiếp hàng chờ.")
             finally:
                 self._running = False
                 schedule_on_main_thread(self.root, self._fill_results)
                 schedule_on_main_thread(self.root, self._save_share_settings)
-                schedule_on_main_thread(self.root, lambda: self._finish_status())
+                schedule_on_main_thread(self.root, self._finish_status)
+                # Quan trọng: tự chạy lại nếu còn video chờ (worker từng crash / hết lượt sớm).
+                schedule_on_main_thread(self.root, self._kick_queue_after_worker)
 
         threading.Thread(target=_work, name="share-wave", daemon=True).start()
 
@@ -1682,21 +2194,68 @@ class ShareTab:
         self.status.set(self.outcome.get())
 
     def _on_progress(self, text: str) -> None:
-        """Hiện bước của từng tài khoản ngay. Bảng kết quả gom lại để nhiều Page không làm treo giao diện."""
+        """Hiện bước từng TK/Page ngay trên thanh trạng thái + cột Kết quả."""
 
         def _apply() -> None:
-            self.status.set(text)
-            if text.strip():
-                self.outcome.set(text)
+            board = (text or "").strip() or self.engine.live_board()
+            if board:
+                # Nhiều TK: gộp một dòng dễ đọc trên thanh status.
+                self.status.set(" | ".join(line.strip() for line in board.splitlines() if line.strip()))
+                self.outcome.set(board)
+            self._paint_live_result_column()
 
         schedule_on_main_thread(self.root, _apply)
         schedule_on_main_thread(self.root, self._schedule_results)
 
-    def _schedule_results(self) -> None:
-        if self._results_after:
+    def _paint_live_result_column(self) -> None:
+        """
+        Cập nhật nhanh cột «Kết quả» từ live_steps (không đợi flush 0.4s).
+
+        Khi 2+ TK chạy song song, người dùng thấy ngay Page nào của TK nào đang xử lý.
+        """
+        live = self.engine.live_steps_snapshot()
+        if not live and not self._outcomes:
             return
-        # 1.2s — nhiều Page không rebuild UI quá dày.
-        self._results_after = self.root.after(1200, self._flush_results)
+        # Gộp bước live vào outcomes hiện có (hoặc tạo tạm nếu chưa có job).
+        for row in self._visible_pages():
+            aid = row["account_id"]
+            pid = row["page_id"]
+            step = self.engine.live_step_for(aid, pid)
+            key = (aid, pid)
+            prev = self._outcomes.get(key, ("", "", ""))
+            if step:
+                if step.startswith("Chờ trong TK"):
+                    self._outcomes[key] = ("Chờ TK", step, "wait")
+                else:
+                    self._outcomes[key] = ("Đang chạy", step, "run")
+            elif prev[2] == "run" and key[0] not in live:
+                # TK vừa xong bước — giữ nhãn cũ đến khi _fill_results đọc store.
+                pass
+            iid = row["iid"]
+            if not self.tree.exists(iid):
+                continue
+            # STT lấy từ values hiện tại nếu có.
+            try:
+                old = self.tree.item(iid, "values") or ()
+                index = int(old[0]) if old else 0
+            except (TypeError, ValueError, IndexError):
+                index = 0
+            self.tree.item(
+                iid,
+                values=self._page_values(row, index),
+                tags=self._page_tags(row),
+            )
+
+    def _schedule_results(self) -> None:
+        """Trailing debounce — luôn lấy bước mới nhất, không bỏ cập nhật khi nhiều luồng."""
+        if self._results_after:
+            try:
+                self.root.after_cancel(self._results_after)
+            except Exception:
+                pass
+            self._results_after = None
+        # 0.4s: đủ mượt, vẫn thấy Page đang chạy kịp thời.
+        self._results_after = self.root.after(400, self._flush_results)
 
     def _flush_results(self) -> None:
         self._results_after = None
@@ -1754,13 +2313,66 @@ class ShareTab:
             return dedupe_receiving_pages([row for row in self.pages if row["iid"] in wanted])
         return []
 
+    def _current_plan_key(self) -> tuple[Any, ...]:
+        """Khóa so sánh chế độ xếp hàng chờ (chia sẻ ngay / khoảng cách)."""
+        share_now = bool(self.watch_share_now.get())
+        if share_now:
+            return (True, 0, 0)
+        try:
+            gap_min, gap_max = parse_minute_range(
+                self.watch_gap_min.get(), self.watch_gap_max.get(), label="Cách nhau mỗi lượt", floor=0
+            )
+        except ValueError:
+            gap_min, gap_max = 0, 3
+        return (False, int(gap_min), int(gap_max))
+
+    def _replan_waiting_queue(self) -> int:
+        """
+        Xếp lại giờ các link ``waiting`` khi đổi «chia sẻ ngay» / khoảng cách lượt.
+
+        Trả về số mục đã chỉnh — không đụng link đang ``running``.
+        """
+        plan = self._current_plan_key()
+        share_now = bool(plan[0])
+        gap_min, gap_max = int(plan[1]), int(plan[2])
+        now = datetime.now().replace(microsecond=0)
+        changed = 0
+        with self._queue_lock:
+            waiting = [row for row in self._queue if row.state == "waiting"]
+            if not waiting:
+                self._live_plan_key = plan
+                return 0
+            waiting.sort(key=lambda row: row.when)
+            last: datetime | None = None
+            for index, item in enumerate(waiting):
+                if share_now:
+                    when = (now + timedelta(seconds=1 * index)).replace(microsecond=0)
+                    label = "Mới Ngay"
+                else:
+                    when = next_share_time(now=now, last_planned=last, gap_min=gap_min, gap_max=gap_max)
+                    stamp = when.strftime("%H:%M") if when.date() == now.date() else when.strftime("%d/%m %H:%M")
+                    label = f"Mới {stamp}"
+                if item.when != when or item.label != label:
+                    item.when = when
+                    item.label = label
+                    changed += 1
+                last = when
+                self._watch_last_planned = when
+        self._live_plan_key = plan
+        if changed:
+            self._queue.sort(key=lambda row: row.when)
+            self._schedule_refresh_queue()
+            self._ensure_queue_worker()
+        return changed
+
     def _apply_live_share_settings(self) -> None:
         """
         Áp dụng thay đổi nút / ô cài đặt vào luồng đang chạy — không cần tắt theo dõi.
 
-        - Cập nhật list Page nguồn + khoảng quét của watcher
+        - Cập nhật list Page nguồn + khoảng quét của watcher (đánh thức nếu mau hơn)
         - Xóa Page nguồn → tắt theo dõi + bỏ hàng chờ tới từ nguồn đó
-        - Đồng bộ Page nhận (đang tích) cho video mới và link chờ còn waiting
+        - Đồng bộ Page nhận; xếp lại hàng chờ khi đổi share_now / gap
+        - Giãn đăng lịch→chia sẻ (auto/tay) áp dụng ngay
         """
         if self._loading_settings:
             return
@@ -1780,11 +2392,21 @@ class ShareTab:
                         if is_watch_source_active(item.source, sources):
                             item.targets = list(self._watch_targets)
         # Giãn cách đăng lịch → chia sẻ: áp dụng ngay cho lượt chờ kế tiếp.
+        set_conflict_gap_auto(bool(self.conflict_gap_auto.get()))
         try:
             parse_conflict_gap_minutes(self.conflict_gap_min.get(), self.conflict_gap_max.get())
         except Exception:
             set_conflict_gap_minutes(2, 5)
+        plan_key = self._current_plan_key()
+        replanned = 0
+        if self._live_plan_key is not None and plan_key != self._live_plan_key:
+            replanned = self._replan_waiting_queue()
+        else:
+            self._live_plan_key = plan_key
         if not self._watch_enabled or self._watcher is None:
+            if replanned:
+                mode = "chia sẻ ngay" if self.watch_share_now.get() else "xếp lịch cách lượt"
+                self.status.set(f"Đã xếp lại {replanned} link chờ ({mode}).")
             return
         if not sources:
             # Xóa hết Page nguồn → dừng quét, không chia sẻ tiếp từ theo dõi.
@@ -1797,19 +2419,16 @@ class ShareTab:
             )
         except ValueError:
             return
-        changed = (
-            list(self._watcher.sources) != sources
-            or self._watcher.scan_min != scan_min
-            or self._watcher.scan_max != scan_max
+        watch_changed = self._watcher.update_settings(
+            sources=sources, scan_min=scan_min, scan_max=scan_max, wake=True
         )
-        if not changed:
-            return
-        self._watcher.update_settings(sources=sources, scan_min=scan_min, scan_max=scan_max)
-        mode = "chia sẻ ngay" if self.watch_share_now.get() else "xếp lịch cách lượt"
-        recv_n = len(selected) if selected else len(self._watch_targets)
-        self.status.set(
-            f"Đã nhận cài đặt mới: {len(sources)} nguồn → {recv_n} Page nhận ({mode})."
-        )
+        if watch_changed or replanned or dropped:
+            mode = "chia sẻ ngay" if self.watch_share_now.get() else "xếp lịch cách lượt"
+            recv_n = len(selected) if selected else len(self._watch_targets)
+            extra = f" · xếp lại {replanned} link chờ" if replanned else ""
+            self.status.set(
+                f"Đã nhận cài đặt mới: {len(sources)} nguồn → {recv_n} Page nhận ({mode}){extra}."
+            )
 
     def _collect_share_settings(self) -> dict[str, Any]:
         return {
@@ -1822,11 +2441,13 @@ class ShareTab:
             "watch_until": self.watch_until.get(),
             "cooldown": self.cooldown.get(),
             "like_video": bool(self.like_video.get()),
+            "engage_rate_percent": self.engage_rate_percent.get(),
             "last_batch_ids": list(self.batch_ids),
             "queue": queue_to_settings(self._queue),
             "cancelled_video_ids": list(self._cancelled_video_ids)[-500:],
             "conflict_gap_min": self.conflict_gap_min.get(),
             "conflict_gap_max": self.conflict_gap_max.get(),
+            "conflict_gap_auto": bool(self.conflict_gap_auto.get()),
             "watch": {
                 "sources": self.watch_sources_box.get("1.0", tk.END).strip(),
                 "scan_min": self.watch_scan_min.get(),
@@ -1876,12 +2497,19 @@ class ShareTab:
                 ("cooldown", self.cooldown),
                 ("conflict_gap_min", self.conflict_gap_min),
                 ("conflict_gap_max", self.conflict_gap_max),
+                ("engage_rate_percent", self.engage_rate_percent),
             ):
                 if data.get(key) not in (None, ""):
                     var.set(str(data.get(key)))
             if "like_video" in data:
                 self.like_video.set(bool(data.get("like_video")))
+            # Mặc định bật auto nếu chưa có key (bản cũ).
+            auto_raw = data.get("conflict_gap_auto")
+            self.conflict_gap_auto.set(True if auto_raw is None else bool(auto_raw))
+            set_conflict_gap_auto(bool(self.conflict_gap_auto.get()))
             parse_conflict_gap_minutes(self.conflict_gap_min.get(), self.conflict_gap_max.get())
+            self._sync_conflict_gap_widgets()
+            self._refresh_conflict_gap_hint()
             saved_ids = [str(item).strip() for item in (data.get("last_batch_ids") or []) if str(item).strip()]
             self.batch_ids = saved_ids or self.store.recent_share_batch_ids()
             if "queue" in data:
@@ -1932,6 +2560,7 @@ class ShareTab:
                 except ValueError:
                     source_urls = []
                 self._watch_states = merge_source_states(loaded_states, source_urls)
+                self._enrich_queue_source_labels()
                 raw_last = str(watch.get("last_planned") or "").strip()
                 try:
                     self._watch_last_planned = datetime.fromisoformat(raw_last) if raw_last else None
@@ -2008,8 +2637,8 @@ def _scan_source_page(
     """
     Quét Page nguồn bằng browser profile tài khoản Page nhận (đã login).
 
-    Chỉ lấy ``a[href]`` trên tab Reels (đầu trang) — không lấy ID trong HTML gợi ý /
-    tab Videos để tránh nhận nhầm video cũ / video related thành «mới publish».
+    Lấy ô video/reel đúng Page trên tab Reels (đầu trang) và vài video mới nhất
+    trên tab Videos. Không lấy ID trong HTML gợi ý / không cuộn hết tab Videos.
     """
     from src.services.facebook_reels_catalog import scan_facebook_profile_reels_page
 
@@ -2023,14 +2652,19 @@ def _scan_source_page(
     return scan_facebook_profile_reels_page(
         page_url=url,
         account=account,
-        max_reels=24,
-        max_scroll_rounds=6,
+        # Chế độ chia sẻ: đầu trang đủ sâu để nhớ lịch sử + đối chiếu video mới.
+        max_reels=12,
+        max_scroll_rounds=3,
         scroll_until_end=False,
-        max_scan_minutes=4.0,
-        scroll_pause_sec=1.0,
+        max_scan_minutes=2.5,
+        scroll_pause_sec=0.55,
         status=on_status,
         include_html_ids=False,
         scan_videos_tab=False,
+        scan_videos_tab_top=True,
+        require_page_owner=True,
+        use_graphql_harvest=True,
+        newest_only=True,
     )
 
 

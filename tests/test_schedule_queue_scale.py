@@ -117,6 +117,12 @@ def test_watchdog_frees_account_of_hung_job(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setenv("SCHEDULE_JOB_MAX_MINUTES", "10")
     sch._account_run_inflight["acc1"] = 1
     sch._dispatch_tracked["hung"] = ("acc1", time.monotonic() - 11 * 60)
+    killed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        sch,
+        "_kill_hung_schedule_browser",
+        lambda aid, job_id="": killed.append((aid, job_id)),
+    )
 
     assert sch._account_busy_count("acc1") == 1
     sch._watchdog_hung_and_orphan_jobs(sp)
@@ -124,6 +130,19 @@ def test_watchdog_frees_account_of_hung_job(tmp_path: Path, monkeypatch: pytest.
     assert sp.get_by_id("hung")["status"] == "failed"
     assert sch._account_busy_count("acc1") == 0
     assert sch._dispatch_is_abandoned("hung")
+    assert killed == [("acc1", "hung")]
+    note = str(sp.get_by_id("hung").get("error_note") or "")
+    assert "treo" in note
+    assert "10" in note
+
+
+def test_refresh_dispatch_timer_extends_hang_deadline() -> None:
+    """Sau khi giữ FeatureBusy — reset đồng hồ để không tính thời gian chờ chia sẻ."""
+    sch._dispatch_tracked["j1"] = ("acc1", time.monotonic() - 600)
+    sch._refresh_dispatch_timer("j1")
+    _aid, t0 = sch._dispatch_tracked["j1"]
+    assert _aid == "acc1"
+    assert time.monotonic() - t0 < 2.0
 
 
 def test_watchdog_marks_orphan_running_failed(tmp_path: Path) -> None:

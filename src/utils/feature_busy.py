@@ -1,8 +1,9 @@
 """
 Khóa tài khoản / Page dùng chung giữa **lịch đăng** và **chia sẻ**.
 
-Ưu tiên: **đăng lịch xong → mới chia sẻ**. Trùng giờ thì chia sẻ chờ + giãn cách 2–5 phút.
-Cả hai luồng đều chờ tới lượt — không bỏ job vì xung đột.
+Ưu tiên: **đăng lịch xong → mới chia sẻ**. Trùng giờ thì chia sẻ chờ + giãn cách
+(tự động theo tải lịch, hoặc khoảng người dùng cài). Cả hai luồng đều chờ tới lượt —
+không bỏ job vì xung đột.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
 from loguru import logger
@@ -21,6 +23,8 @@ FEATURE_SHARE = "share"
 # Giãn cách mặc định sau khi đăng lịch xong rồi mới chia sẻ (phút) — người dùng đổi được.
 CONFLICT_GAP_MIN_MINUTES = 2
 CONFLICT_GAP_MAX_MINUTES = 5
+# Trần khi chỉnh tay — tránh 8–30 phút làm một TK đứng im quá lâu.
+CONFLICT_GAP_MANUAL_CAP_MINUTES = 10.0
 
 _FEATURE_LABEL = {
     FEATURE_SCHEDULE: "đăng lịch",
@@ -33,12 +37,34 @@ _pages: dict[str, "_Holder"] = {}
 _rng = random.Random()
 _conflict_gap_min = float(CONFLICT_GAP_MIN_MINUTES)
 _conflict_gap_max = float(CONFLICT_GAP_MAX_MINUTES)
+_conflict_gap_auto = True  # Mặc định: tự chọn giãn theo tải lịch đăng.
 
 
 def get_conflict_gap_minutes() -> tuple[float, float]:
-    """Khoảng giãn cách hiện tại (phút) giữa đăng lịch và chia sẻ."""
+    """Khoảng giãn cách thủ công hiện tại (phút) giữa đăng lịch và chia sẻ."""
     with _gate:
         return (_conflict_gap_min, _conflict_gap_max)
+
+
+def get_conflict_gap_auto() -> bool:
+    """True nếu đang dùng giãn cách tự động theo tải lịch đăng."""
+    with _gate:
+        return bool(_conflict_gap_auto)
+
+
+def set_conflict_gap_auto(enabled: bool) -> bool:
+    """Bật/tắt chế độ giãn cách tự động."""
+    global _conflict_gap_auto
+    flag = bool(enabled)
+    with _gate:
+        changed = _conflict_gap_auto != flag
+        _conflict_gap_auto = flag
+    if changed:
+        logger.info(
+            "[FeatureBusy] Giãn đăng→chia sẻ: {}",
+            "TỰ ĐỘNG theo tải lịch" if flag else "CHỈNH TAY",
+        )
+    return flag
 
 
 def set_conflict_gap_minutes(lo: float, hi: float) -> tuple[float, float]:
@@ -61,7 +87,7 @@ def set_conflict_gap_minutes(lo: float, hi: float) -> tuple[float, float]:
         same = (_conflict_gap_min, _conflict_gap_max) == (a, b)
         _conflict_gap_min, _conflict_gap_max = a, b
     if not same:
-        logger.info("[FeatureBusy] Giãn cách đăng→chia sẻ: {}–{} phút", a, b)
+        logger.info("[FeatureBusy] Giãn cách đăng→chia sẻ (tay): {}–{} phút", a, b)
     return (a, b)
 
 
@@ -73,6 +99,68 @@ def parse_conflict_gap_minutes(low: object, high: object) -> tuple[float, float]
     except (TypeError, ValueError):
         return (float(CONFLICT_GAP_MIN_MINUTES), float(CONFLICT_GAP_MAX_MINUTES))
     return set_conflict_gap_minutes(a, b)
+
+
+def recommend_conflict_gap_minutes(account_id: str = "") -> tuple[float, float]:
+    """
+    Giãn cách thông minh theo tải lịch đăng của tài khoản (phút).
+
+    - Không có job sẵn sàng/đang chạy: 0.2–0.6 phút (~12–36 giây) — chia sẻ gần như liền.
+    - Tải nhẹ (1–2): 0.8–1.5 phút.
+    - Tải vừa (3–5): 1.5–3 phút.
+    - Tải nặng (≥6): 2.5–4.5 phút.
+    """
+    aid = str(account_id or "").strip()
+    ready, running, due_soon = schedule_load_for_account(aid)
+    load = int(ready) + int(running) + min(3, int(due_soon))
+    if load <= 0:
+        return (0.2, 0.6)
+    if load <= 2:
+        return (0.8, 1.5)
+    if load <= 5:
+        return (1.5, 3.0)
+    return (2.5, 4.5)
+
+
+def effective_conflict_gap_minutes(account_id: str = "") -> tuple[float, float]:
+    """
+    Khoảng giãn thực tế dùng lúc chia sẻ: auto theo tải, hoặc tay (có trần 10 phút).
+    """
+    if get_conflict_gap_auto():
+        return recommend_conflict_gap_minutes(account_id)
+    lo, hi = get_conflict_gap_minutes()
+    if hi > CONFLICT_GAP_MANUAL_CAP_MINUTES:
+        logger.info(
+            "[FeatureBusy] Giãn tay {:.0f}–{:.0f} phút — trần {:.0f} phút để tránh nghẽn TK.",
+            lo,
+            hi,
+            CONFLICT_GAP_MANUAL_CAP_MINUTES,
+        )
+        hi = CONFLICT_GAP_MANUAL_CAP_MINUTES
+        lo = min(lo, hi)
+    return (lo, hi)
+
+
+def describe_conflict_gap(account_id: str = "") -> str:
+    """Chuỗi gợi ý UI: chế độ + khoảng đang áp dụng."""
+    lo, hi = effective_conflict_gap_minutes(account_id)
+    if get_conflict_gap_auto():
+        ready, running, due = schedule_load_for_account(account_id)
+        load = ready + running + min(3, due)
+        if load <= 0:
+            load_txt = "lịch trống"
+        elif load <= 2:
+            load_txt = f"tải nhẹ ({load})"
+        elif load <= 5:
+            load_txt = f"tải vừa ({load})"
+        else:
+            load_txt = f"tải nặng ({load})"
+        if hi < 1.0:
+            return f"Tự động ({load_txt}): ~{int(lo * 60)}–{int(hi * 60)} giây"
+        return f"Tự động ({load_txt}): {lo:g}–{hi:g} phút"
+    if lo == hi:
+        return f"Chỉnh tay: đúng {lo:g} phút"
+    return f"Chỉnh tay: {lo:g}–{hi:g} phút"
 
 
 @dataclass
@@ -154,6 +242,15 @@ def busy_reason(*, account_id: str = "", page_keys: Iterable[str] = ()) -> str:
     """Mô tả ngắn vì sao chưa chạy được (rỗng nếu không bận chéo feature)."""
     aid = str(account_id or "").strip()
     keys = {str(k).strip() for k in page_keys if str(k).strip()}
+    # Lịch đăng ready/running cũng hiện rõ — UI bảng 2 TK không bị ghi đè mơ hồ.
+    if schedule_queue_blocks_share(account_id=aid, page_keys=keys):
+        busy_accounts, busy_pages = _schedule_busy_index()
+        if aid and aid in busy_accounts:
+            return f"TK {aid} đang/ chờ đăng lịch"
+        hit = sorted(keys.intersection(busy_pages))
+        if hit:
+            return f"Page {hit[0]} đang/ chờ đăng lịch"
+        return "đang ưu tiên đăng lịch"
     with _gate:
         if aid:
             holder = _accounts.get(aid)
@@ -193,8 +290,12 @@ def is_cross_busy(
 
 
 _schedule_busy_lock = threading.Lock()
-_schedule_busy_snap: tuple[float, set[str], set[str]] | None = None
-_SCHEDULE_BUSY_TTL_SEC = 2.5
+# (monotonic, busy_accounts, busy_pages, ready_by_acc, running_by_acc, due_soon_by_acc)
+_schedule_busy_snap: tuple[
+    float, set[str], set[str], dict[str, int], dict[str, int], dict[str, int]
+] | None = None
+_SCHEDULE_BUSY_TTL_SEC = 4.0  # Cache lâu hơn → ít đọc schedule_posts khi nhiều TK chờ.
+_DUE_SOON_MINUTES = 15.0
 
 
 def _page_id_aliases() -> dict[str, set[str]]:
@@ -215,18 +316,34 @@ def _page_id_aliases() -> dict[str, set[str]]:
     return aliases
 
 
-def _schedule_busy_index() -> tuple[set[str], set[str]]:
-    """
-    Tập account / page đang sẵn sàng hoặc đang đăng — TTL ngắn để poll chờ không đọc lại cả queue.
-    """
+def _parse_job_when(raw: object) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc)
+
+
+def _refresh_schedule_busy_snap() -> tuple[
+    set[str], set[str], dict[str, int], dict[str, int], dict[str, int]
+]:
+    """Đọc schedule_posts → busy sets + tải theo tài khoản (TTL ngắn)."""
     global _schedule_busy_snap
-    now = time.monotonic()
+    now_mono = time.monotonic()
     with _schedule_busy_lock:
         snap = _schedule_busy_snap
-        if snap is not None and (now - snap[0]) < _SCHEDULE_BUSY_TTL_SEC:
-            return snap[1], snap[2]
+        if snap is not None and (now_mono - snap[0]) < _SCHEDULE_BUSY_TTL_SEC:
+            return snap[1], snap[2], snap[3], snap[4], snap[5]
     accounts: set[str] = set()
     pages: set[str] = set()
+    ready_by: dict[str, int] = {}
+    running_by: dict[str, int] = {}
+    due_by: dict[str, int] = {}
     try:
         from src.utils.schedule_posts_manager import get_default_schedule_posts_manager
 
@@ -234,20 +351,51 @@ def _schedule_busy_index() -> tuple[set[str], set[str]]:
     except Exception:  # noqa: BLE001
         jobs = []
     aliases = _page_id_aliases()
+    now_utc = datetime.now(timezone.utc)
+    soon = now_utc + timedelta(minutes=_DUE_SOON_MINUTES)
     for job in jobs:
         status = str(job.get("status") or "").strip().lower()
-        if status not in {"ready_queue", "running"}:
-            continue
         job_aid = str(job.get("account_id") or "").strip()
-        if job_aid:
-            accounts.add(job_aid)
         job_pid = str(job.get("page_id") or "").strip()
-        if job_pid:
-            pages.add(job_pid)
-            pages.update(aliases.get(job_pid) or ())
+        when = _parse_job_when(job.get("scheduled_at"))
+        if status in {"ready_queue", "running"}:
+            if job_aid:
+                accounts.add(job_aid)
+                bucket = ready_by if status == "ready_queue" else running_by
+                bucket[job_aid] = bucket.get(job_aid, 0) + 1
+            if job_pid:
+                pages.add(job_pid)
+                pages.update(aliases.get(job_pid) or ())
+        elif status == "pending" and job_aid and when is not None and now_utc <= when <= soon:
+            due_by[job_aid] = due_by.get(job_aid, 0) + 1
     with _schedule_busy_lock:
-        _schedule_busy_snap = (now, accounts, pages)
+        _schedule_busy_snap = (now_mono, accounts, pages, ready_by, running_by, due_by)
+    return accounts, pages, ready_by, running_by, due_by
+
+
+def _schedule_busy_index() -> tuple[set[str], set[str]]:
+    """
+    Tập account / page đang sẵn sàng hoặc đang đăng — TTL ngắn để poll chờ không đọc lại cả queue.
+    """
+    accounts, pages, _r, _u, _d = _refresh_schedule_busy_snap()
     return accounts, pages
+
+
+def schedule_load_for_account(account_id: str = "") -> tuple[int, int, int]:
+    """
+    Tải lịch đăng của một tài khoản: ``(ready_queue, running, pending_due_soon)``.
+
+    ``account_id`` rỗng → tổng mọi tài khoản.
+    """
+    _acc, _pages, ready_by, running_by, due_by = _refresh_schedule_busy_snap()
+    aid = str(account_id or "").strip()
+    if aid:
+        return (
+            int(ready_by.get(aid, 0)),
+            int(running_by.get(aid, 0)),
+            int(due_by.get(aid, 0)),
+        )
+    return (sum(ready_by.values()), sum(running_by.values()), sum(due_by.values()))
 
 
 def schedule_queue_blocks_share(*, account_id: str = "", page_keys: Iterable[str] = ()) -> bool:
@@ -365,13 +513,19 @@ def acquire_share_after_schedule(
     """
     aid = str(account_id or "").strip()
     keys = frozenset(str(k).strip() for k in page_keys if str(k).strip())
-    interval = max(0.5, float(poll))
+    base_interval = max(0.4, float(poll))
     stop = should_stop or (lambda: False)
     notify = on_wait or (lambda _msg: None)
     saw_schedule = False
-    cfg_lo, cfg_hi = get_conflict_gap_minutes()
-    gap_lo = cfg_lo if gap_min_minutes is None else float(gap_min_minutes)
-    gap_hi = cfg_hi if gap_max_minutes is None else float(gap_max_minutes)
+    # gap_* truyền vào = chỉnh tay tạm thời; không truyền → auto hoặc cấu hình toàn cục.
+    if gap_min_minutes is None and gap_max_minutes is None:
+        gap_lo, gap_hi = effective_conflict_gap_minutes(aid)
+        gap_mode = "auto" if get_conflict_gap_auto() else "tay"
+    else:
+        cfg_lo, cfg_hi = get_conflict_gap_minutes()
+        gap_lo = cfg_lo if gap_min_minutes is None else float(gap_min_minutes)
+        gap_hi = cfg_hi if gap_max_minutes is None else float(gap_max_minutes)
+        gap_mode = "tay"
 
     while not stop():
         # Ưu tiên lịch: còn job ready/running hoặc đang giữ khóa schedule → chờ.
@@ -381,17 +535,30 @@ def acquire_share_after_schedule(
             saw_schedule = True
             reason = busy_reason(account_id=aid, page_keys=keys) or "đang ưu tiên đăng lịch"
             notify(f"Chờ đăng lịch xong — {reason}")
-            time.sleep(interval)
+            # Poll nhanh hơn khi đang chờ lịch — phản ứng mau khi lịch xong.
+            time.sleep(min(1.2, base_interval))
             continue
 
         if saw_schedule:
+            # Tính lại gap lúc vừa hết lịch — tải có thể đã đổi.
+            if gap_mode == "auto":
+                gap_lo, gap_hi = effective_conflict_gap_minutes(aid)
+                ready, running, due = schedule_load_for_account(aid)
+                if ready + running + due <= 0:
+                    gap_lo, gap_hi = (0.05, 0.15)  # ~3–9 giây khi lịch trống
             gap = conflict_gap_seconds(lo_minutes=gap_lo, hi_minutes=gap_hi, rng=rng)
-            minutes = max(1, int(round(gap / 60.0))) if gap >= 30 else max(1, int(round(gap)))
-            unit = "phút" if gap >= 30 else "giây"
-            notify(f"Đăng lịch xong — nghỉ giãn cách ~{minutes} {unit} rồi mới chia sẻ")
+            if gap >= 30:
+                shown = max(1, int(round(gap / 60.0)))
+                unit = "phút"
+            else:
+                shown = max(1, int(round(gap)))
+                unit = "giây"
+            mode_tag = "tự động" if gap_mode == "auto" else "chỉnh tay"
+            notify(f"Đăng lịch xong — nghỉ giãn cách ~{shown} {unit} ({mode_tag}) rồi mới chia sẻ")
             logger.info(
-                "[FeatureBusy] Chia sẻ chờ giãn cách {:.0f}s sau đăng lịch | account={} | pages={}",
+                "[FeatureBusy] Chia sẻ chờ giãn cách {:.0f}s ({}) sau đăng lịch | account={} | pages={}",
                 gap,
+                mode_tag,
                 aid or "—",
                 ",".join(sorted(keys)) or "—",
             )
@@ -403,7 +570,7 @@ def acquire_share_after_schedule(
                 ):
                     saw_schedule = True
                     break
-                time.sleep(min(interval, max(0.2, deadline - time.monotonic())))
+                time.sleep(min(min(1.0, base_interval), max(0.15, deadline - time.monotonic())))
             else:
                 if stop():
                     return None
@@ -427,7 +594,7 @@ def acquire_share_after_schedule(
         )
         if lease is not None:
             return lease
-        time.sleep(interval)
+        time.sleep(min(0.8, base_interval))
 
     return None
 
@@ -475,13 +642,62 @@ def _release_lease(lease: BusyLease) -> None:
     )
 
 
+def force_clear_account_feature(
+    account_id: str,
+    *,
+    feature: str = "",
+    detail_substr: str = "",
+) -> int:
+    """
+    Ép nhả chỗ FeatureBusy của một tài khoản (+ Page có ``detail`` khớp nếu có).
+
+    Dùng khi watchdog lịch đăng treo — tránh TK/Page bị khóa mãi dù browser đã kill.
+    Trả về số holder đã xóa.
+    """
+    aid = str(account_id or "").strip()
+    want = str(feature or "").strip()
+    needle = str(detail_substr or "").strip()
+    if not aid and not needle:
+        return 0
+    cleared = 0
+    with _gate:
+        if aid:
+            holder = _accounts.get(aid)
+            if holder and (not want or holder.feature == want):
+                _accounts.pop(aid, None)
+                cleared += 1
+        if needle or want:
+            for key, page_holder in list(_pages.items()):
+                if want and page_holder.feature != want:
+                    continue
+                detail = str(page_holder.detail or "")
+                if needle and needle not in detail:
+                    continue
+                if not needle and want and page_holder.feature != want:
+                    continue
+                # Chỉ xóa Page khi có needle (job id) — tránh quét nhầm Page TK khác.
+                if needle:
+                    _pages.pop(key, None)
+                    cleared += 1
+    if cleared:
+        logger.info(
+            "[FeatureBusy] Ép nhả {} | account={} | detail~{} | n={}",
+            want or "mọi feature",
+            aid or "—",
+            needle or "—",
+            cleared,
+        )
+    return cleared
+
+
 def reset_for_tests() -> None:
     """Xóa toàn bộ chỗ đang giữ — chỉ dùng trong unit test."""
-    global _conflict_gap_min, _conflict_gap_max, _schedule_busy_snap
+    global _conflict_gap_min, _conflict_gap_max, _conflict_gap_auto, _schedule_busy_snap
     with _gate:
         _accounts.clear()
         _pages.clear()
         _conflict_gap_min = float(CONFLICT_GAP_MIN_MINUTES)
         _conflict_gap_max = float(CONFLICT_GAP_MAX_MINUTES)
+        _conflict_gap_auto = True
     with _schedule_busy_lock:
         _schedule_busy_snap = None

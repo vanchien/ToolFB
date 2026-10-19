@@ -1223,10 +1223,31 @@ class BrowserFactory:
         exe = str(acc.get("browser_exe_path", "")).strip()
         has_exe = False
         if exe:
-            pexe = Path(exe)
-            if pexe.is_file():
-                launch_kwargs["executable_path"] = str(pexe.resolve())
+            from src.utils.account_browser_profile import resolve_firefox_executable_for_playwright
+
+            resolved_exe = resolve_firefox_executable_for_playwright(exe)
+            if resolved_exe:
+                launch_kwargs["executable_path"] = resolved_exe
                 has_exe = True
+                if resolved_exe.replace("\\", "/").lower() != exe.replace("\\", "/").lower():
+                    logger.info(
+                        "browser_exe_path: {} → {} (tránh FirefoxPortable multi-instance) account={}",
+                        exe,
+                        resolved_exe,
+                        account_id,
+                    )
+            elif Path(exe).is_file():
+                # Chromium / exe thường — giữ nguyên nếu không phải wrapper portable Firefox.
+                low = Path(exe).name.casefold()
+                if "portable" in low and "firefox" in low:
+                    logger.warning(
+                        "Bỏ browser_exe_path={} (FirefoxPortable chặn multi-instance) — dùng Firefox Playwright. account={}",
+                        exe,
+                        account_id,
+                    )
+                else:
+                    launch_kwargs["executable_path"] = str(Path(exe).resolve())
+                    has_exe = True
             else:
                 logger.warning("browser_exe_path không tồn tại: {} (account={})", exe, account_id)
         ch = _playwright_chromium_channel(browser_key=browser_key, has_executable_path=has_exe)

@@ -652,7 +652,8 @@ def sync_firefox_profile_before_close(
             bootstrap_cookies_into_context(context, ck)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[FB session] flush bootstrap ({}): {}", log_label, exc)
-    flush_ms = max(1500, int(float(os.environ.get("FB_PROFILE_FLUSH_MS", "3000"))))
+    # Flush ngắn — chờ quá lâu trên trang checkpoint/CDN treo làm worker không đóng browser.
+    flush_ms = max(400, int(float(os.environ.get("FB_PROFILE_FLUSH_MS", "1200"))))
     try:
         page.wait_for_timeout(flush_ms)
     except Exception as exc:  # noqa: BLE001

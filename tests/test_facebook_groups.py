@@ -276,6 +276,38 @@ def test_14_restart_verifies_before_repost(tmp_path) -> None:
     assert store.share_jobs()[0]["post_id"] == "found-1"
 
 
+def test_recover_orphan_running_batch_becomes_ready(tmp_path) -> None:
+    """Tắt app giữa chừng: batch RUNNING mồ côi → READY, không khóa tài khoản."""
+    store, engine, fake = _engine(tmp_path)
+    wave = engine.create_share_wave(
+        pages=[
+            {"account_id": "acc-a", "page_id": "p1", "page_name": "P1", "target_url": "https://www.facebook.com/p1"},
+            {"account_id": "acc-a", "page_id": "p2", "page_name": "P2", "target_url": "https://www.facebook.com/p2"},
+        ],
+        source_url="https://www.facebook.com/reel/999",
+        text="x",
+        destination="page",
+        cooldown_fixed=0,
+    )
+    batch_id = wave["batch_ids"][0]
+    batch = next(b for b in store.share_batches() if str(b.get("id")) == batch_id)
+    batch["status"] = "RUNNING"
+    store.save_share_batch(batch)
+    jobs = [j for j in store.share_jobs() if str(j.get("batch_id")) == batch_id]
+    jobs[0]["status"] = "COMPLETED"
+    store.save_share_job(jobs[0])
+    reloaded = GroupEngine(GroupStore(store.path), fake, sleep=lambda _s: None)
+    counts = reloaded.recover()
+    assert counts["share_batches"] == 1
+    restored = next(b for b in reloaded.store.share_batches() if str(b.get("id")) == batch_id)
+    assert restored["status"] == "READY"
+    assert reloaded.incomplete_share_batch_ids_for_url("https://www.facebook.com/reel/999") == [batch_id]
+    # Batch mồ côi không làm _publish_busy khóa tài khoản.
+    assert reloaded._publish_busy("acc-a", "", except_batch="other") is False
+    reloaded.run_share_wave([batch_id])
+    assert any(c["page_id"] == "p2" for c in fake.publish_calls)
+
+
 def test_15_queue_persists_progress_cooldown_and_recovery(tmp_path) -> None:
     store, engine, fake = _engine(tmp_path)
     ids = [f"g{i}" for i in range(50)]
@@ -654,6 +686,67 @@ def test_share_wave_many_pages_one_browser_per_account(tmp_path) -> None:
     assert joined_only["accounts"] == 1
 
 
+def test_share_two_batches_same_account_never_concurrent_browser(tmp_path) -> None:
+    """Resume nhiều batch cùng TK: chỉ 1 begin tại một thời điểm (không 2 Firefox)."""
+    store, engine, fake = _engine(tmp_path)
+    open_accounts: set[str] = set()
+    peak: dict[str, int] = {"n": 0}
+    guard = threading.Lock()
+    hold = threading.Event()
+    entered = threading.Event()
+
+    def begin(account_id: str) -> None:
+        with guard:
+            assert account_id not in open_accounts, f"TK {account_id} mở 2 browser cùng lúc"
+            open_accounts.add(account_id)
+            peak["n"] = max(peak["n"], len(open_accounts))
+        entered.set()
+        # Giữ browser một lúc để luồng kia cố chen nếu thiếu khóa.
+        hold.wait(timeout=0.4)
+
+    def end(account_id: str) -> None:
+        with guard:
+            open_accounts.discard(account_id)
+
+    fake.begin_account = begin
+    fake.end_account = end
+    wave1 = engine.create_share_wave(
+        pages=[{"account_id": "acc-a", "page_id": "page-1", "target_url": "https://www.facebook.com/p1"}],
+        source_url="https://www.facebook.com/reel/111",
+        text="A",
+        destination="page",
+        cooldown_fixed=0,
+    )
+    wave2 = engine.create_share_wave(
+        pages=[{"account_id": "acc-a", "page_id": "page-2", "target_url": "https://www.facebook.com/p2"}],
+        source_url="https://www.facebook.com/reel/222",
+        text="B",
+        destination="page",
+        cooldown_fixed=0,
+    )
+    ids = list(wave1["batch_ids"]) + list(wave2["batch_ids"])
+    assert len(ids) == 2
+
+    def _run() -> None:
+        engine.run_share_wave(ids)
+
+    # Hai wave song song cùng TK (giống resume + chạy list trùng).
+    t1 = threading.Thread(target=_run, daemon=True)
+    t2 = threading.Thread(
+        target=lambda: (entered.wait(timeout=2), engine.run_share_batch(ids[1])),
+        daemon=True,
+    )
+    t1.start()
+    t2.start()
+    time.sleep(0.15)
+    hold.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert peak["n"] == 1
+    assert open_accounts == set()
+    assert len(fake.publish_calls) >= 2
+
+
 def test_share_wave_watches_once_then_shares_with_page_text(tmp_path) -> None:
     _store, engine, fake = _engine(tmp_path)
     order: list[str] = []
@@ -768,6 +861,83 @@ def test_two_accounts_share_one_page_each_then_their_next_page(tmp_path) -> None
     assert any("Share now" in line for line in together)
 
 
+def test_second_wave_waits_when_account_still_delaying(tmp_path) -> None:
+    """
+    Batch DELAYING vẫn chiếm tài khoản — video sau không bỏ lượt (READY mãi).
+
+    Trước đây chỉ nhìn job ACTIVE nên lúc nghỉ giữa bài tài khoản bị coi là rảnh,
+    video mới chạy 1 TK còn TK kia bỏ qua.
+    """
+    _store, engine, fake = _engine(tmp_path)
+    gate = threading.Event()
+    started_second = threading.Event()
+    order: list[str] = []
+
+    def publish_link(**kwargs):
+        account_id = str(kwargs["account_id"])
+        page_id = str(kwargs["page_id"])
+        order.append(f"{account_id}:{page_id}")
+        fake.publish_calls.append(dict(kwargs))
+        if account_id == "acc-a" and page_id == "a1":
+            # Giữ batch 1 ở DELAYING đủ lâu để wave 2 thử chiếm cùng TK.
+            gate.wait(timeout=2.0)
+        return {"post_id": f"post-{page_id}", "post_url": kwargs["source_url"]}
+
+    fake.publish_link = publish_link
+    wave1 = engine.create_share_wave(
+        pages=[
+            {"account_id": "acc-a", "account_name": "Andy", "page_id": "a1", "page_name": "A1", "target_url": "https://www.facebook.com/a1"},
+            {"account_id": "acc-b", "account_name": "Minh", "page_id": "b1", "page_name": "B1", "target_url": "https://www.facebook.com/b1"},
+        ],
+        source_url="https://www.facebook.com/reel/111",
+        text="Video 1",
+        destination="page",
+        cooldown_fixed=1,
+    )
+    wave2 = engine.create_share_wave(
+        pages=[
+            {"account_id": "acc-a", "account_name": "Andy", "page_id": "a2", "page_name": "A2", "target_url": "https://www.facebook.com/a2"},
+            {"account_id": "acc-b", "account_name": "Minh", "page_id": "b2", "page_name": "B2", "target_url": "https://www.facebook.com/b2"},
+        ],
+        source_url="https://www.facebook.com/reel/222",
+        text="Video 2",
+        destination="page",
+        cooldown_fixed=0,
+    )
+
+    def _run_first() -> None:
+        engine.run_share_wave(wave1["batch_ids"])
+
+    def _run_second() -> None:
+        started_second.set()
+        engine.run_share_wave(wave2["batch_ids"])
+
+    t1 = threading.Thread(target=_run_first, daemon=True)
+    t2 = threading.Thread(target=_run_second, daemon=True)
+    t1.start()
+    # Đợi Andy bắt đầu bài đầu (batch đang chạy / sắp DELAYING).
+    for _ in range(50):
+        if any(x.startswith("acc-a:a1") for x in order):
+            break
+        time.sleep(0.02)
+    t2.start()
+    assert started_second.wait(timeout=2.0)
+    # Wave 2 đã vào nhưng acc-a chưa được share a2 khi a1 còn giữ chỗ.
+    time.sleep(0.2)
+    assert "acc-a:a2" not in order
+    gate.set()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+    assert "acc-a:a1" in order
+    assert "acc-a:a2" in order
+    assert "acc-b:b1" in order
+    assert "acc-b:b2" in order
+    # Cả hai batch video 2 phải hoàn tất — không còn READY bỏ sót.
+    for batch_id in wave2["batch_ids"]:
+        batch = next(b for b in engine.store.share_batches() if str(b.get("id")) == batch_id)
+        assert batch.get("status") == "COMPLETED"
+
+
 def test_share_switches_to_each_page_before_reel_watch_and_share(tmp_path) -> None:
     _store, engine, fake = _engine(tmp_path)
     order: list[str] = []
@@ -826,16 +996,15 @@ def test_share_switches_to_each_page_before_reel_watch_and_share(tmp_path) -> No
         cooldown_fixed=0,
     )
     engine.run_share_wave(wave["batch_ids"])
-    assert order == [
+    # Like/comment phân bổ thưa — chỉ kiểm tra thứ tự chuyển Page → xem → chia sẻ.
+    assert [step for step in order if step.startswith("switch:") or step.startswith("share:")] == [
         "switch:page-1",
-        "reel:5",
-        "watch:4+like+comment",
         "share:page-1",
         "switch:page-2",
-        "reel:5",
-        "watch:4+like",
         "share:page-2",
     ]
+    assert order.count("reel:5") == 2
+    assert any(step.startswith("watch:4") for step in order)
     assert [call["page_id"] for call in fake.publish_calls] == ["page-1", "page-2"]
     assert all(call["like_video"] is False for call in fake.publish_calls)
 
@@ -875,33 +1044,53 @@ def test_share_continues_to_the_next_page_when_one_page_crashes(tmp_path) -> Non
     assert [call["page_id"] for call in fake.publish_calls] == ["page-2"]
 
 
-def test_share_wave_likes_the_source_video_once(tmp_path) -> None:
+def test_share_wave_likes_sparse_pages_not_every_share(tmp_path) -> None:
+    """13 Page chia sẻ → chỉ ~2–3 Page được Like (không Like hết)."""
     _store, engine, fake = _engine(tmp_path)
-    likes: list[bool] = []
+    prepare_likes: list[bool] = []
 
-    def publish_link(**kwargs):
-        likes.append(bool(kwargs.get("like_video")))
-        fake.publish_calls.append(dict(kwargs))
-        return {"post_id": f"post-{kwargs['page_id']}", "post_url": kwargs["source_url"]}
+    def prepare_source_video(**kwargs):
+        prepare_likes.append(bool(kwargs.get("like")))
+        return {
+            "error_code": "",
+            "watched_seconds": kwargs.get("watch_seconds") or 0,
+            "liked": bool(kwargs.get("like")),
+            "commented": False,
+        }
 
-    fake.publish_link = publish_link
+    fake.prepare_source_video = prepare_source_video
+    fake.publish_link = lambda **kwargs: {
+        "post_id": f"post-{kwargs['page_id']}",
+        "post_url": kwargs["source_url"],
+    }
+    pages = [
+        {
+            "account_id": "acc-a",
+            "page_id": f"page-{i}",
+            "target_url": f"https://www.facebook.com/page-{i}",
+        }
+        for i in range(1, 14)
+    ]
     wave = engine.create_share_wave(
-        pages=[
-            {"account_id": "acc-a", "page_id": "page-1", "target_url": "https://www.facebook.com/page-1"},
-            {"account_id": "acc-a", "page_id": "page-2", "target_url": "https://www.facebook.com/page-2"},
-            {"account_id": "acc-a", "page_id": "page-3", "target_url": "https://www.facebook.com/page-3"},
-        ],
+        pages=pages,
         source_url="https://www.facebook.com/reel/9",
         text="Lên page",
         destination="page",
         like_video=True,
+        engage_mode="like",
         cooldown_fixed=0,
     )
+    batch = engine.store.share_batches()[0]
+    like_ids = [str(x) for x in (batch.get("like_page_ids") or [])]
+    assert 2 <= len(like_ids) <= 3
     engine.run_share_wave(wave["batch_ids"])
-    assert likes == [True, True, True]
+    # Không xem video (0s) → chỉ Page được chọn Like mới gọi prepare.
+    assert 2 <= len(prepare_likes) <= 3
+    assert all(prepare_likes)
 
 
 def test_share_wave_comments_again_when_pages_draw_different_lines(tmp_path) -> None:
+    """Page được chọn bình luận dùng câu khác nhau; phần còn lại chỉ chia sẻ."""
     store = GroupStore(tmp_path / "facebook_groups.json")
     fake = FakeGroups()
     engine = GroupEngine(store, fake, rng=random.Random(1))
@@ -913,21 +1102,30 @@ def test_share_wave_comments_again_when_pages_draw_different_lines(tmp_path) -> 
 
     fake.prepare_source_video = prepare_source_video
     fake.publish_link = lambda **kwargs: {"post_id": f"post-{kwargs['page_id']}", "post_url": kwargs["source_url"]}
+    pages = [
+        {
+            "account_id": "acc-a",
+            "page_id": f"page-{i}",
+            "target_url": f"https://www.facebook.com/page-{i}",
+        }
+        for i in range(1, 14)
+    ]
     engine.create_share_wave(
-        pages=[
-            {"account_id": "acc-a", "page_id": "page-1", "target_url": "https://www.facebook.com/page-1"},
-            {"account_id": "acc-a", "page_id": "page-2", "target_url": "https://www.facebook.com/page-2"},
-        ],
+        pages=pages,
         source_url="https://www.facebook.com/other/videos/9",
         text="Lên tường",
         destination="page",
         watch_seconds=8,
-        comment="Câu một\nCâu hai",
+        comment="Câu một\nCâu hai\nCâu ba\nCâu bốn",
+        engage_mode="comment",
         cooldown_fixed=0,
     )
     engine.run_share_wave([str(row.get("id") or "") for row in engine.store.share_batches()])
     posted = [item for item in comments if item]
-    assert posted == ["Câu một", "Câu hai"] or posted == ["Câu hai", "Câu một"]
+    assert 3 <= len(posted) <= 4
+    assert len(comments) == 13
+    assert sum(1 for c in comments if not c) >= 9
+    assert len(set(posted)) >= 2
 
 
 def test_share_wave_browses_reels_then_watches_each_page(tmp_path) -> None:
@@ -1062,46 +1260,64 @@ def test_share_wave_still_shares_when_comment_box_is_missing(tmp_path) -> None:
 
 
 def test_share_wave_gives_each_account_a_different_comment(tmp_path) -> None:
+    """Nhiều account / Page: chỉ một phần Page có comment; các câu không trùng khi đủ pool."""
     store = GroupStore(tmp_path / "facebook_groups.json")
     engine = GroupEngine(store, FakeGroups(), rng=random.Random(1))
+    pages = []
+    for i in range(1, 14):
+        pages.append(
+            {
+                "account_id": "acc-a" if i <= 7 else "acc-b",
+                "page_id": f"page-{i}",
+                "target_url": f"https://www.facebook.com/page-{i}",
+            }
+        )
     wave = engine.create_share_wave(
-        pages=[
-            {"account_id": "acc-a", "page_id": "page-1", "target_url": "https://www.facebook.com/page-1"},
-            {"account_id": "acc-b", "page_id": "page-2", "target_url": "https://www.facebook.com/page-2"},
-        ],
+        pages=pages,
         source_url="https://www.facebook.com/other/videos/9",
         text="Lên tường",
         destination="page",
         watch_seconds=10,
-        comment="Câu một\nCâu hai",
+        comment="Câu một\nCâu hai\nCâu ba\nCâu bốn",
+        engage_mode="comment",
         cooldown_fixed=0,
     )
     assert wave["accounts"] == 2
-    chosen = [str(batch.get("comment") or "") for batch in engine.store.share_batches()]
-    assert sorted(chosen) == ["Câu hai", "Câu một"]
-    job_comments = {str(job.get("page_id")): str(job.get("comment") or "") for job in engine.store.share_jobs()}
-    assert sorted(job_comments.values()) == ["Câu hai", "Câu một"]
+    job_comments = [str(job.get("comment") or "") for job in engine.store.share_jobs()]
+    posted = [c for c in job_comments if c]
+    assert 3 <= len(posted) <= 4
+    assert len(job_comments) == 13
+    assert len(set(posted)) >= 2
 
 
 def test_share_wave_gives_each_page_a_different_comment(tmp_path) -> None:
     store = GroupStore(tmp_path / "facebook_groups.json")
     engine = GroupEngine(store, FakeGroups(), rng=random.Random(1))
+    pages = [
+        {
+            "account_id": "acc-a",
+            "page_id": f"page-{i}",
+            "page_name": f"Page {i}",
+            "target_url": f"https://www.facebook.com/page-{i}",
+        }
+        for i in range(1, 14)
+    ]
     wave = engine.create_share_wave(
-        pages=[
-            {"account_id": "acc-a", "page_id": "page-1", "page_name": "Page 1", "target_url": "https://www.facebook.com/page-1"},
-            {"account_id": "acc-a", "page_id": "page-2", "page_name": "Page 2", "target_url": "https://www.facebook.com/page-2"},
-        ],
+        pages=pages,
         source_url="https://www.facebook.com/other/videos/9",
         text="Lên tường",
         destination="page",
         watch_seconds=10,
-        comment="Câu một\nCâu hai",
+        comment="Câu một\nCâu hai\nCâu ba\nCâu bốn",
+        engage_mode="comment",
         cooldown_fixed=0,
     )
-    assert wave["created"] == 2
+    assert wave["created"] == 13
     comments = {str(job.get("page_id")): str(job.get("comment") or "") for job in engine.store.share_jobs()}
-    assert comments["page-1"] != comments["page-2"]
-    assert set(comments.values()) == {"Câu một", "Câu hai"}
+    posted = {pid: text for pid, text in comments.items() if text}
+    assert 3 <= len(posted) <= 4
+    assert len(set(posted.values())) >= 2
+    assert sum(1 for text in comments.values() if not text) >= 9
 
 
 def test_waiting_links_round_trip() -> None:
@@ -1240,14 +1456,15 @@ def test_switch_opens_target_page_first_and_retries_once(monkeypatch) -> None:
 
 
 def test_switch_failure_leaves_browser_on_clean_home(monkeypatch) -> None:
-    """Hai lần đều hụt: báo lỗi và về trang chủ để Page sau không bị kẹt theo."""
+    """Ba lần đều hụt: báo lỗi và về trang chủ để Page sau không bị kẹt theo."""
     provider = FacebookGroupProvider()
     provider._page = _SwitchPage()
     provider._account_id = "acc-a"
-    calls = _patch_switch(monkeypatch, [False, False])
+    calls = _patch_switch(monkeypatch, [False, False, False])
     result = provider.switch_to_page(
         account_id="acc-a", page_id="111", page_name="Một", page_url="https://www.facebook.com/111"
     )
     assert result["error_code"] == "TEMPORARY_ERROR"
-    assert calls.count("switch") == 2
+    assert "đã thử 3 lần" in str(result.get("error_message") or "")
+    assert calls.count("switch") == 3
     assert calls[-1] == "home"

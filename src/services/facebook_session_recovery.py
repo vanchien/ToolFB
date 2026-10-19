@@ -388,21 +388,60 @@ def facebook_checkpoint_blocks_retries(detail: str, url: str = "") -> bool:
 
 
 def _checkpoint_page_text(page: Page) -> str:
+    """
+    Đọc chữ trên trang checkpoint — timeout ngắn, không gọi ``page.content()``
+    (CDN treo / skeleton có thể làm ``content()`` kẹt vô hạn → worker không đóng browser).
+    """
     try:
-        return (page.locator("body").inner_text(timeout=2_000) or "").lower()
+        return (page.locator("body").inner_text(timeout=1_800) or "").lower()
     except Exception:
+        pass
+    try:
+        blob = page.evaluate(
+            """() => {
+                try {
+                  const b = document.body;
+                  if (!b) return '';
+                  return (b.innerText || b.textContent || '').slice(0, 4000);
+                } catch (e) { return ''; }
+            }"""
+        )
+        return str(blob or "").lower()
+    except Exception:
+        return ""
+
+
+def facebook_page_looks_like_stuck_checkpoint(page: Page, *, wait_ms: int = 2_000) -> bool:
+    """
+    URL ``/checkpoint`` nhưng trang skeleton / chưa tải xong (gần như không chữ).
+
+    Thường kèm status bar «Read static.xx.fbcdn.net» — không nên chờ vô hạn.
+    """
+    u = _url_lower(page)
+    if "checkpoint" not in u and "captcha" not in u:
+        return False
+    text = " ".join(_checkpoint_page_text(page).split())
+    if len(text) >= 48:
+        return False
+    if wait_ms > 0:
         try:
-            return (page.content() or "").lower()
+            page.wait_for_timeout(int(wait_ms))
         except Exception:
-            return ""
+            time.sleep(min(1.5, wait_ms / 1000.0))
+        text = " ".join(_checkpoint_page_text(page).split())
+    return len(text) < 48
 
 
 def facebook_checkpoint_is_blocking(page: Page) -> bool:
-    """Checkpoint không bỏ qua được (giấy tờ / khóa nick / recover)."""
+    """Checkpoint không bỏ qua được (giấy tờ / khóa nick / recover / skeleton trống)."""
     u = _url_lower(page)
     if any(m in u for m in ("accountquality", "suspended", "confirm_identity", "/recover/")):
         return True
-    return facebook_checkpoint_body_is_hard(_checkpoint_page_text(page))
+    text = _checkpoint_page_text(page)
+    # Không chờ thêm — chỉ coi skeleton gần trống là chặn (tránh worker kẹt).
+    if ("checkpoint" in u or "captcha" in u) and len(" ".join(text.split())) < 24:
+        return True
+    return facebook_checkpoint_body_is_hard(text)
 
 
 def try_skip_soft_facebook_checkpoint(page: Page, *, max_clicks: int = 4) -> bool:
@@ -418,6 +457,13 @@ def try_skip_soft_facebook_checkpoint(page: Page, *, max_clicks: int = 4) -> boo
     if not facebook_page_is_hard_checkpoint(u):
         return _session_logged_in(page)
     if not facebook_checkpoint_may_skip_url(u):
+        return False
+    # Skeleton / CDN treo: không bấm, báo thất bại nhanh để đóng browser.
+    if facebook_page_looks_like_stuck_checkpoint(page, wait_ms=2_000):
+        logger.warning(
+            "[FB recovery] Checkpoint treo (skeleton/CDN) — bỏ qua TK url={}",
+            (page.url or "")[:160],
+        )
         return False
     if facebook_page_looks_like_totp_prompt(page):
         return False

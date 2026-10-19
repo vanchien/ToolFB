@@ -129,7 +129,7 @@ def test_deferred_bat_runs_on_windows_even_for_source_install(tmp_path: Path) ->
 
 
 def test_disk_full_error_mentions_updates_folder() -> None:
-    from src.services.app_updater import _disk_full_error
+    from src.services.app_updater import _disk_full_error, format_update_error
 
     err = OSError(28, "No space left on device")
     err.winerror = 112  # type: ignore[attr-defined]
@@ -137,6 +137,55 @@ def test_disk_full_error_mentions_updates_folder() -> None:
     assert mapped is not None
     assert "data\\updates" in str(mapped)
     assert _disk_full_error(OSError(13, "denied"), Path("x")) is None
+    text = format_update_error(err, target=Path("C:/ToolFB/data/updates"))
+    assert "không đủ chỗ" in text.lower()
+    assert "No space left" not in text or "ổ đĩa" in text.lower()
+    # Errno 28 bọc trong RuntimeError vẫn phải dịch (máy cũ hay hiện raw errno).
+    wrapped = RuntimeError("Cập nhật thất bại")
+    wrapped.__cause__ = err
+    wrapped_text = format_update_error(wrapped, target=Path("C:/ToolFB/data/updates"))
+    assert "không đủ chỗ" in wrapped_text.lower()
+    assert "[Errno 28]" not in wrapped_text
+
+
+def test_ensure_disk_space_raises_when_short(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.services import app_updater as au
+
+    monkeypatch.setattr(au, "_free_bytes", lambda _p: 50 * 1024 * 1024)
+    with pytest.raises(RuntimeError, match="không đủ chỗ"):
+        au._ensure_disk_space(tmp_path, 900 * 1024 * 1024, label="test")
+
+
+def test_extract_root_prefers_updates_dir_same_volume(tmp_path: Path) -> None:
+    """Giải nén ưu tiên data/updates — tránh đổ đầy ổ C: khi app nằm ổ khác."""
+    from src.services.app_updater import _make_short_extract_root
+
+    updates = tmp_path / "data" / "updates"
+    updates.mkdir(parents=True)
+    root = _make_short_extract_root(project_root=tmp_path, updates_dir=updates)
+    assert root.is_dir()
+    assert updates in root.parents or root.parent == updates
+    shutil_rm = __import__("shutil")
+    shutil_rm.rmtree(root, ignore_errors=True)
+
+
+def test_purge_stale_removes_old_zip(tmp_path: Path) -> None:
+    from src.services.app_updater import _purge_stale_update_files
+
+    project = tmp_path / "app"
+    updates = project / "data" / "updates"
+    updates.mkdir(parents=True)
+    (updates / "update_1.0.0.zip").write_bytes(b"PK\x03\x04junk")
+    old_stage = updates / "staged_apply_abc"
+    old_stage.mkdir()
+    (old_stage / "x.txt").write_text("x", encoding="utf-8")
+    extract_tmp = updates / "eabcdef123456"
+    extract_tmp.mkdir()
+    (extract_tmp / "a.txt").write_text("a", encoding="utf-8")
+    _purge_stale_update_files(project, updates)
+    assert not (updates / "update_1.0.0.zip").exists()
+    assert not old_stage.exists()
+    assert not extract_tmp.exists()
 
 
 def test_download_url_is_pinned_to_the_manifest_version() -> None:

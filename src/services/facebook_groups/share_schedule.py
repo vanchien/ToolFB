@@ -13,6 +13,21 @@ _DATE_TIME = re.compile(
 _CLOCK = re.compile(r"^(\d{1,2}):(\d{2})(?:\s+(.*))?$")
 
 
+def as_local_naive(value: datetime | None) -> datetime:
+    """
+    Chuẩn hóa giờ về naive local — tránh so sánh naive/aware làm worker hàng chờ chết TypeError.
+    """
+    if value is None:
+        return datetime.now().replace(microsecond=0)
+    when = value
+    if when.tzinfo is not None:
+        try:
+            when = when.astimezone().replace(tzinfo=None)
+        except Exception:  # noqa: BLE001
+            when = when.replace(tzinfo=None)
+    return when.replace(microsecond=0)
+
+
 @dataclass
 class PlannedShareLink:
     """Một link trong list chờ và thời điểm được phép bắt đầu."""
@@ -25,6 +40,9 @@ class PlannedShareLink:
     # Page nhận riêng (iid trong bảng Page) — dòng do «Theo dõi Page nguồn» thêm; rỗng = Page đang tích.
     targets: list[str] = field(default_factory=list)
     source: str = ""
+    # Tên / Meta ID Page nguồn (hiển thị Hàng chờ) — lấy lúc quét hoặc tra cứu.
+    source_name: str = ""
+    source_id: str = ""
 
 
 def make_queue_item(
@@ -65,6 +83,10 @@ def queue_to_settings(items: list[PlannedShareLink]) -> list[dict[str, Any]]:
             row["targets"] = list(item.targets)
         if item.source:
             row["source"] = item.source
+        if item.source_name:
+            row["source_name"] = item.source_name
+        if item.source_id:
+            row["source_id"] = item.source_id
         rows.append(row)
     return rows
 
@@ -82,7 +104,7 @@ def queue_from_settings(rows: object) -> list[PlannedShareLink]:
         if not url or not raw_when:
             continue
         try:
-            when = datetime.fromisoformat(raw_when)
+            when = as_local_naive(datetime.fromisoformat(raw_when))
         except ValueError:
             continue
         found.append(
@@ -93,6 +115,8 @@ def queue_from_settings(rows: object) -> list[PlannedShareLink]:
                 state="waiting",
                 targets=[str(x) for x in (row.get("targets") or []) if str(x).strip()],
                 source=str(row.get("source") or ""),
+                source_name=str(row.get("source_name") or ""),
+                source_id=str(row.get("source_id") or ""),
             )
         )
     return found
@@ -110,10 +134,20 @@ def queue_state_from_results(
         return "waiting"
     if paused:
         return "error"
-    if int(created) <= 0:
-        return "skipped"
     done = sum(status == "COMPLETED" for status in job_statuses)
     failed = sum(status in {"FAILED", "SKIPPED"} for status in job_statuses)
+    # Resume batch dở: created=0 nhưng vẫn có job COMPLETED / đang chạy.
+    if int(created) <= 0 and not job_statuses:
+        return "skipped"
+    if int(created) <= 0 and done and not failed:
+        return "done"
+    if int(created) <= 0 and done:
+        return "partial"
+    if int(created) <= 0 and failed and not done:
+        return "error"
+    if int(created) <= 0:
+        # Có job nhưng chưa xong (resume) — giữ waiting để vòng sau chạy tiếp.
+        return "waiting"
     if done and not failed:
         return "done"
     if done:

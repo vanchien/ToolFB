@@ -990,10 +990,17 @@ def run_human_interaction_worker(
         from src.services.facebook_session_recovery import (
             facebook_checkpoint_is_blocking,
             facebook_page_is_hard_checkpoint,
+            facebook_page_looks_like_stuck_checkpoint,
             try_skip_soft_facebook_checkpoint,
         )
 
         if facebook_page_is_hard_checkpoint(page.url or ""):
+            if facebook_page_looks_like_stuck_checkpoint(page, wait_ms=1_500):
+                _status(
+                    "login_failed",
+                    "Checkpoint treo (không tải xong) — bỏ qua, đóng browser, chạy TK tiếp",
+                )
+                return _finish("login_failed")
             if try_skip_soft_facebook_checkpoint(page) and not facebook_page_is_hard_checkpoint(
                 page.url or ""
             ):
@@ -1091,38 +1098,59 @@ def run_human_interaction_worker(
         ck_path = cookie_path
         acc_ref = acc
         already_saved = session_persisted
+        pending = _pending_pool_result[0]
+        # Lỗi / dừng / checkpoint: ép kill Firefox — tránh cửa sổ treo CDN không đóng.
+        force_kill = pending in {
+            "cancelled",
+            "interrupted",
+            "error",
+            "login_failed",
+            "proxy_error",
+            "browser_closed",
+        } or _user_stopped() or _pool_abort()
 
         # Playwright Sync API: mở/đóng bắt buộc trên cùng worker thread (không spawn thread phụ).
         if ctx is not None:
+            skip_flush = force_kill
             try:
-                from src.services.facebook_session_persist import (
-                    apply_saved_cookie_path_to_mapped,
-                    sync_firefox_profile_before_close,
-                )
+                pg0 = ctx.pages[0] if ctx.pages else None
+                if pg0 is not None and not pg0.is_closed():
+                    from src.services.facebook_session_recovery import (
+                        facebook_page_is_hard_checkpoint,
+                    )
 
-                pg = ctx.pages[0] if ctx.pages else None
-                if pg is not None and not pg.is_closed():
-                    if not already_saved:
+                    if facebook_page_is_hard_checkpoint(str(pg0.url or "")):
+                        skip_flush = True
+                        force_kill = True
+            except Exception:
+                pass
+            if not skip_flush:
+                try:
+                    from src.services.facebook_session_persist import (
+                        sync_firefox_profile_before_close,
+                    )
+
+                    pg = ctx.pages[0] if ctx.pages else None
+                    if pg is not None and not pg.is_closed():
                         sync_firefox_profile_before_close(
                             ctx,
                             pg,
                             acc_ref,
                             cookie_path=ck_path,
                             mapped=mapped,
-                            log_label="on_close",
+                            log_label="after_success" if already_saved else "on_close",
                         )
-                    else:
-                        sync_firefox_profile_before_close(
-                            ctx,
-                            pg,
-                            acc_ref,
-                            cookie_path=ck_path,
-                            mapped=mapped,
-                            log_label="after_success",
-                        )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("[Human] Lưu cookie khi đóng: {}", exc)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[Human] Lưu cookie khi đóng: {}", exc)
+            else:
+                logger.info(
+                    "[Human] Bỏ flush profile khi đóng (result={}) account={} — đóng nhanh",
+                    pending or "abort",
+                    acc_id,
+                )
             try:
+                from src.services.facebook_session_persist import apply_saved_cookie_path_to_mapped
+
                 apply_saved_cookie_path_to_mapped(mapped, acc_ref)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[Human] Sync mapped sau đóng: {}", exc)
@@ -1137,16 +1165,26 @@ def run_human_interaction_worker(
                     ctx,
                     log_label=acc_id,
                     same_thread=True,
-                    force_kill_firefox=False,
+                    force_kill_firefox=force_kill,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Human] Đóng context: {}", exc)
+                # context.close() kẹt / lỗi — vẫn thử kill Firefox theo profile.
+                if not force_kill:
+                    try:
+                        sync_close_persistent_context(
+                            ctx,
+                            log_label=f"{acc_id}:retry_kill",
+                            same_thread=True,
+                            force_kill_firefox=True,
+                        )
+                    except Exception as kill_exc:  # noqa: BLE001
+                        logger.warning("[Human] Ép kill Firefox: {}", kill_exc)
         if fac is not None:
             try:
                 fac.close()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Human] Đóng factory: {}", exc)
-        pending = _pending_pool_result[0]
         if pending is not None:
             _notify_pool_done(pending)
             _pending_pool_result[0] = None

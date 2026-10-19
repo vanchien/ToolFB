@@ -224,8 +224,9 @@ def test_checkpoint_stops_before_watch() -> None:
     page = _Page("https://www.facebook.com/checkpoint/1")
     result = engage_source_video(page, watch_seconds=10, comment="Không gửi")
     assert result["error_code"] == "CHECKPOINT"
-    assert page.waits == []
+    # Có thể chờ ngắn nhận skeleton checkpoint — không Like/comment.
     assert page.comment.typed == ""
+    assert all(w <= 2500 for w in page.waits)
 
 
 def test_pick_share_comment_skips_lines_already_used() -> None:
@@ -666,5 +667,202 @@ def test_browse_reels_stops_on_checkpoint() -> None:
     page = _Page("https://www.facebook.com/checkpoint/1")
     result = browse_reels_feed(page, seconds=10)
     assert result["error_code"] == "CHECKPOINT"
-    assert page.waits == []
     assert page.keyboard.keys == []
+    assert all(w <= 2500 for w in page.waits)
+
+
+def test_clamp_engage_rate_percent() -> None:
+    from src.services.facebook_groups.video_engage import clamp_engage_rate_percent
+
+    assert clamp_engage_rate_percent("") == 65
+    assert clamp_engage_rate_percent("80") == 80
+    assert clamp_engage_rate_percent("80%") == 80
+    with pytest.raises(ValueError):
+        clamp_engage_rate_percent("101")
+    with pytest.raises(ValueError):
+        clamp_engage_rate_percent("abc")
+
+
+def test_share_engage_plan_balances_like_and_comment_across_source_videos() -> None:
+    """Cùng Page nguồn trong ngày: ≥65% có tương tác, Like/comment ~50/50, ít khi cả hai."""
+    from src.services.facebook_groups.video_engage import (
+        MIN_SHARE_ENGAGE_RATE,
+        append_share_engage_history,
+        pick_share_engage_plan,
+    )
+
+    rng = random.Random(7)
+    history: list[dict] = []
+    plans = []
+    for i in range(20):
+        vid = str(1000000100 + i)
+        plan = pick_share_engage_plan(
+            source="https://www.facebook.com/SrcPage",
+            video_id=vid,
+            allow_like=True,
+            allow_comment=True,
+            history=history,
+            rng=rng,
+            min_engage_rate=0.65,
+        )
+        plans.append(plan)
+        history = append_share_engage_history(history, video_id=vid, plan=plan)
+
+    engaged = [p for p in plans if p.do_like or p.do_comment]
+    assert len(engaged) / len(plans) >= MIN_SHARE_ENGAGE_RATE
+    like_only = sum(1 for p in plans if p.do_like and not p.do_comment)
+    comment_only = sum(1 for p in plans if p.do_comment and not p.do_like)
+    both = sum(1 for p in plans if p.do_like and p.do_comment)
+    assert like_only >= 1 and comment_only >= 1
+    assert abs(like_only - comment_only) <= 4
+    assert both <= 3
+
+
+def test_share_engage_respects_user_min_rate_100() -> None:
+    """Người dùng đặt 100% → mọi video đều có Like hoặc comment."""
+    from src.services.facebook_groups.video_engage import (
+        append_share_engage_history,
+        pick_share_engage_plan,
+    )
+
+    rng = random.Random(3)
+    history: list[dict] = []
+    for i in range(12):
+        vid = str(2000000100 + i)
+        plan = pick_share_engage_plan(
+            video_id=vid,
+            allow_like=True,
+            allow_comment=True,
+            history=history,
+            rng=rng,
+            min_engage_rate=1.0,
+        )
+        assert plan.do_like or plan.do_comment
+        history = append_share_engage_history(history, video_id=vid, plan=plan)
+
+
+def test_share_engage_plan_reuses_same_video_decision() -> None:
+    from src.services.facebook_groups.video_engage import (
+        append_share_engage_history,
+        pick_share_engage_plan,
+    )
+
+    rng = random.Random(1)
+    first = pick_share_engage_plan(
+        video_id="2482358802253174",
+        allow_like=True,
+        allow_comment=True,
+        history=[],
+        rng=rng,
+    )
+    hist = append_share_engage_history([], video_id="2482358802253174", plan=first)
+    second = pick_share_engage_plan(
+        video_id="2482358802253174",
+        allow_like=True,
+        allow_comment=True,
+        history=hist,
+        rng=random.Random(99),
+    )
+    assert second.do_like == first.do_like
+    assert second.do_comment == first.do_comment
+
+
+def test_share_engage_respects_disabled_like_or_empty_comments() -> None:
+    from src.services.facebook_groups.video_engage import pick_share_engage_plan
+
+    plan = pick_share_engage_plan(
+        video_id="2482358802253174",
+        allow_like=False,
+        allow_comment=True,
+        history=[],
+        rng=random.Random(2),
+    )
+    assert plan.do_like is False
+    assert plan.mode in {"comment", "none"}
+    plan2 = pick_share_engage_plan(
+        video_id="1156958673946775",
+        allow_like=True,
+        allow_comment=False,
+        history=[],
+        rng=random.Random(2),
+    )
+    assert plan2.do_comment is False
+    assert plan2.mode in {"like", "none"}
+
+
+def test_allocate_wave_page_engage_sparse_for_13_shares() -> None:
+    """13 Page chia sẻ → khoảng 2–3 Like và 3–4 comment, không trùng Page."""
+    from src.services.facebook_groups.video_engage import allocate_wave_page_engage
+
+    pages = [f"page_{i}" for i in range(13)]
+    likes, comments = allocate_wave_page_engage(
+        pages,
+        want_like=True,
+        want_comment=True,
+        rng=random.Random(42),
+    )
+    assert 2 <= len(likes) <= 3
+    assert 3 <= len(comments) <= 4
+    assert likes.isdisjoint(comments)
+    assert likes | comments <= set(pages)
+
+
+def test_allocate_wave_none_when_video_skips_engage() -> None:
+    from src.services.facebook_groups.video_engage import allocate_wave_page_engage
+
+    likes, comments = allocate_wave_page_engage(
+        [f"p{i}" for i in range(10)],
+        want_like=False,
+        want_comment=False,
+        rng=random.Random(1),
+    )
+    assert likes == set() and comments == set()
+
+
+def test_shuffle_due_queue_picks_among_ready() -> None:
+    from datetime import datetime, timedelta
+
+    from src.services.facebook_groups.share_schedule import PlannedShareLink
+    from src.services.facebook_groups.video_engage import shuffle_due_queue_items
+
+    now = datetime(2026, 10, 18, 21, 0, 0)
+    rows = [
+        PlannedShareLink(when=now - timedelta(seconds=10), url="https://www.facebook.com/reel/1", state="waiting"),
+        PlannedShareLink(when=now - timedelta(seconds=5), url="https://www.facebook.com/reel/2", state="waiting"),
+        PlannedShareLink(when=now + timedelta(minutes=5), url="https://www.facebook.com/reel/3", state="waiting"),
+    ]
+    picked = {shuffle_due_queue_items(rows, now=now, rng=random.Random(i)).url for i in range(40)}
+    assert "https://www.facebook.com/reel/1" in picked
+    assert "https://www.facebook.com/reel/2" in picked
+    assert "https://www.facebook.com/reel/3" not in picked
+
+
+def test_share_engage_day_persist_roundtrip(tmp_path) -> None:
+    from src.services.facebook_groups.video_engage import (
+        ShareEngagePlan,
+        load_share_engage_day,
+        plan_share_engage_for_video,
+        remember_share_engage_plan,
+        save_share_engage_day,
+    )
+
+    path = tmp_path / "engage.json"
+    plan = ShareEngagePlan(True, False, "like")
+    remember_share_engage_plan(
+        source="https://www.facebook.com/SrcPage",
+        video_url="https://www.facebook.com/reel/2482358802253174",
+        plan=plan,
+        path=path,
+    )
+    day = load_share_engage_day(path)
+    assert any(r.get("video_id") == "2482358802253174" for rows in day.values() for r in rows)
+    again = plan_share_engage_for_video(
+        source="https://www.facebook.com/SrcPage",
+        video_url="https://www.facebook.com/reel/2482358802253174",
+        allow_like=True,
+        allow_comment=True,
+        path=path,
+        persist=True,
+    )
+    assert again.do_like is True and again.do_comment is False
+    save_share_engage_day(day, path)

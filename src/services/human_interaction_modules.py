@@ -804,10 +804,17 @@ def run_shuffled_interaction_modules(
             from src.services.facebook_session_recovery import (
                 facebook_checkpoint_is_blocking,
                 facebook_page_is_hard_checkpoint,
+                facebook_page_looks_like_stuck_checkpoint,
                 try_skip_soft_facebook_checkpoint,
             )
 
             if facebook_page_is_hard_checkpoint(str(page.url or "")):
+                if facebook_page_looks_like_stuck_checkpoint(page, wait_ms=1_200):
+                    logger.warning(
+                        "[Human] Checkpoint treo skeleton — dừng tương tác (module {})",
+                        name,
+                    )
+                    break
                 if try_skip_soft_facebook_checkpoint(page):
                     logger.info("[Human] Đã bỏ qua checkpoint nhẹ trước module {}", name)
                 elif facebook_checkpoint_is_blocking(page):

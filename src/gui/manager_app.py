@@ -59,6 +59,7 @@ from src.services.app_updater import (
     apply_git_pull_ff,
     apply_update_package,
     check_git_updates,
+    format_update_error,
     git_working_tree_clean,
     github_latest_manifest_url,
     is_newer_version,
@@ -629,11 +630,24 @@ class _ManagerWindow:
         acc_line = ttk.Frame(acc_bar)
         acc_line.pack(fill=tk.X)
         ttk.Button(acc_line, text="Thêm", command=self._on_add_account).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acc_line, text="Thêm từ thư mục", command=self._on_add_account_from_folder).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
         ttk.Button(acc_line, text="Sửa", command=self._on_edit_account).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(acc_line, text="Xóa", command=self._on_delete_account).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(acc_line, text="Nhân bản", command=self._on_duplicate_account).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Separator(acc_line, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(acc_line, text="Mở profile", command=self._on_open_profile_browser).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            acc_line,
+            text="Mở thư mục profile",
+            command=self._on_open_account_profile_folder,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            acc_line,
+            text="Xuất Firefox portable",
+            command=self._on_export_firefox_portable,
+        ).pack(side=tk.LEFT, padx=(0, 4))
         self._btn_close_open_profiles = ttk.Button(
             acc_line,
             text="Đóng profile",
@@ -725,6 +739,7 @@ class _ManagerWindow:
         ttk.Button(pg_line, text="Tạo nhiều Page", command=self._on_open_page_creator).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_line, text="Nhóm", command=self._on_open_group_manager).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_line, text="Chia sẻ", command=self._on_open_share_tab).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(pg_line, text="Xóa video", command=self._on_delete_page_videos).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_line, text="Lịch đăng", command=self._on_goto_jobs_for_page).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_line, text="Job lỗi", command=self._on_pages_open_failed_jobs).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(pg_line, text="Lọc lỗi đăng", command=self._on_pages_filter_failing).pack(side=tk.LEFT, padx=(0, 4))
@@ -9780,6 +9795,31 @@ class _ManagerWindow:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Không mở popup nạp job chờ đăng tự động: {}", exc)
 
+    def _on_delete_page_videos(self) -> None:
+        """Mở hộp thoại quét/lọc/xóa video đã đăng trên đúng Page đang chọn."""
+        ids = self._selected_page_ids()
+        if not ids:
+            messagebox.showwarning(
+                "Chưa chọn Page",
+                "Chọn một Page trên bảng rồi bấm «Xóa video».",
+                parent=self._root,
+            )
+            return
+        pid = ids[0]
+        rec = self._record_page_by_id(pid)
+        if rec is None:
+            messagebox.showwarning("Không thấy Page", f"Không đọc được bản ghi {pid}.", parent=self._root)
+            return
+        if len(ids) > 1:
+            messagebox.showinfo(
+                "Một Page",
+                f"Đang chọn {len(ids)} Page — chỉ vào «{rec.get('page_name') or pid}» (dòng đang chọn đầu tiên).",
+                parent=self._root,
+            )
+        from src.gui.page_video_cleanup_dialog import open_page_video_cleanup_dialog
+
+        open_page_video_cleanup_dialog(self._root, dict(rec))
+
     def _on_delete_page(self) -> None:
         pids = self._selected_page_ids()
         if not pids:
@@ -10163,61 +10203,65 @@ class _ManagerWindow:
         if hasattr(self, "_lbl_state"):
             self._lbl_state.configure(text=f"Đã cập nhật tên: {found}")
 
-    def _on_open_profile_browser(self) -> None:
-        """Mở profile browser thật của 1 tài khoản (giữ phiên login hiện có)."""
-        ids = self._profile_ids_for_bulk()
-        if not ids:
-            messagebox.showwarning(
-                "Chưa chọn",
-                "Tick một ô «Chọn» (☑) hoặc chọn đúng một dòng tài khoản.",
-                parent=self._root,
-            )
-            return
-        if len(ids) > 1:
-            messagebox.showwarning(
-                "Mở profile",
-                "Chỉ mở 1 profile/lần. Hãy chọn đúng một tài khoản.",
-                parent=self._root,
-            )
-            return
-        aid = ids[0]
-        if self._record_by_id(aid) is None:
-            messagebox.showerror("Mở profile", f"Không tìm thấy id={aid!r}.", parent=self._root)
-            return
-        # Tránh mở trùng cùng 1 profile khi phiên manual trước vẫn đang sống:
-        # Firefox thường sẽ thoát sớm (exitCode=0) nếu profile đang bị giữ bởi phiên khác.
-        alive_sessions: list[dict[str, Any]] = []
-        already_open = False
+    def _alive_manual_profile_ids(self) -> set[str]:
+        """Tập account_id đang có phiên «Mở profile» còn sống."""
+        alive: set[str] = set()
+        kept: list[dict[str, Any]] = []
         for sess in list(self._manual_profile_sessions):
             try:
                 th = sess.get("thread")
                 if th is not None and th.is_alive():
-                    alive_sessions.append(sess)
-                    if str(sess.get("account_id", "")).strip() == aid:
-                        already_open = True
+                    kept.append(sess)
+                    aid = str(sess.get("account_id") or "").strip()
+                    if aid:
+                        alive.add(aid)
             except Exception:
                 continue
-        self._manual_profile_sessions = alive_sessions
-        if already_open:
-            messagebox.showinfo(
-                "Profile đang mở",
-                (
-                    f"Profile của tài khoản {aid} đã được mở ở phiên trước.\n"
-                    "Hãy dùng lại cửa sổ đó hoặc bấm «Đóng profile đang mở» để reset phiên manual profile."
-                ),
-                parent=self._root,
-            )
-            return
-        # Playwright Sync API phải mở/đóng trên cùng một worker thread (không đóng từ luồng Tk).
+        self._manual_profile_sessions = kept
+        return alive
+
+    def _start_one_manual_profile(
+        self,
+        aid: str,
+        *,
+        window_position: tuple[int, int] | None = None,
+        stagger_ms: int = 0,
+    ) -> dict[str, Any]:
+        """
+        Mở 1 Firefox/Playwright cho ``aid`` trên thread riêng (không chờ pool BROWSER_CONCURRENCY).
+
+        Returns:
+            Dict session: account_id, thread, shutdown, state (ready/err).
+        """
         shutdown_evt = threading.Event()
-        state: dict[str, Any] = {"factory": None, "ctx": None, "err": None, "ready": threading.Event()}
+        state: dict[str, Any] = {
+            "factory": None,
+            "ctx": None,
+            "err": None,
+            "ready": threading.Event(),
+        }
+        headless = not bool(getattr(self, "_show_browser", True))
+        win_pos = window_position
 
         def _open_worker() -> None:
+            if stagger_ms > 0:
+                time.sleep(max(0, stagger_ms) / 1000.0)
             factory: BrowserFactory | None = None
             ctx_hold = None
             try:
-                factory = BrowserFactory(accounts=self._accounts, headless=not self._show_browser)
-                ctx_hold = factory.get_browser_context(aid, headless=not self._show_browser)
+                factory = BrowserFactory(accounts=self._accounts, headless=headless)
+                acc = self._accounts.get_by_id(aid)
+                if acc is None:
+                    raise ValueError(f"Không tìm thấy tài khoản: {aid}")
+                acc_d = dict(acc)
+                # launch_slot_timeout_sec is not None → manual_open: không chiếm semaphore pool.
+                ctx_hold = factory.launch_persistent_context_from_account_dict(
+                    acc_d,
+                    headless=headless,
+                    launch_slot_timeout_sec=0.0,
+                    window_position=win_pos,
+                    force_desktop_facebook=True,
+                )
                 page = ctx_hold.pages[0] if ctx_hold.pages else ctx_hold.new_page()
                 start_url = os.environ.get("FB_OPEN_PROFILE_START_URL", "about:blank").strip() or "about:blank"
                 page.goto(start_url, wait_until="domcontentloaded", timeout=60_000)
@@ -10244,7 +10288,9 @@ class _ManagerWindow:
                             continue
                         from src.services.device_browse import read_account_display_name
 
-                        found = read_account_display_name(pg, visit_profile=not state.get("tried_profile_name"))
+                        found = read_account_display_name(
+                            pg, visit_profile=not state.get("tried_profile_name")
+                        )
                         state["tried_profile_name"] = True
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("Chưa đọc được tên khi mở profile {}: {}", aid, exc)
@@ -10253,22 +10299,27 @@ class _ManagerWindow:
                         state["display_name"] = found
             except Exception as exc:  # noqa: BLE001
                 state["err"] = exc
+                state["ready"].set()
             finally:
                 ctx_f = state.get("ctx") or ctx_hold
                 fac_f = state.get("factory") or factory
                 try:
-                    if ctx_f is not None and ctx_f.pages:
-                        pg = ctx_f.pages[0]
-                        if not pg.is_closed():
-                            from src.services.facebook_session_persist import sync_firefox_profile_before_close
+                    if ctx_f is not None and getattr(ctx_f, "pages", None):
+                        pages = list(ctx_f.pages)
+                        if pages:
+                            pg = pages[0]
+                            if not pg.is_closed():
+                                from src.services.facebook_session_persist import (
+                                    sync_firefox_profile_before_close,
+                                )
 
-                            acc_row = self._accounts.get_by_id(aid) or {"id": aid}
-                            sync_firefox_profile_before_close(
-                                ctx_f,
-                                pg,
-                                dict(acc_row),
-                                log_label=f"manual_profile:{aid}",
-                            )
+                                acc_row = self._accounts.get_by_id(aid) or {"id": aid}
+                                sync_firefox_profile_before_close(
+                                    ctx_f,
+                                    pg,
+                                    dict(acc_row),
+                                    log_label=f"manual_profile:{aid}",
+                                )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Flush profile manual {}: {}", aid, exc)
                 try:
@@ -10287,55 +10338,148 @@ class _ManagerWindow:
                 state["ctx"] = None
                 state["factory"] = None
 
+        th = threading.Thread(
+            target=_open_worker,
+            name=f"open_profile_{aid[:24]}",
+            daemon=True,
+        )
+        th.start()
+        sess = {"account_id": aid, "thread": th, "shutdown": shutdown_evt, "state": state}
+        self._manual_profile_sessions.append(sess)
+        return sess
+
+    def _on_open_profile_browser(self) -> None:
+        """
+        Mở một hoặc nhiều profile Firefox cùng lúc (mỗi tài khoản một cửa sổ / thread).
+
+        Tick nhiều ô «Chọn» rồi bấm «Mở profile». Profile đã mở thì bỏ qua.
+        Dùng ``firefox.exe -no-remote`` qua Playwright — không dùng FirefoxPortable.exe.
+        """
+        ids = self._profile_ids_for_bulk()
+        if not ids:
+            messagebox.showwarning(
+                "Chưa chọn",
+                "Tick một hoặc nhiều ô «Chọn» (☑), hoặc chọn dòng trong bảng tài khoản.",
+                parent=self._root,
+            )
+            return
+        already = self._alive_manual_profile_ids()
+        to_open: list[str] = []
+        skip_open: list[str] = []
+        missing: list[str] = []
+        for aid in ids:
+            if self._record_by_id(aid) is None:
+                missing.append(aid)
+                continue
+            if aid in already:
+                skip_open.append(aid)
+                continue
+            to_open.append(aid)
+
+        if missing and not to_open:
+            messagebox.showerror(
+                "Mở profile",
+                "Không tìm thấy tài khoản:\n" + ", ".join(missing[:12]),
+                parent=self._root,
+            )
+            return
+        if not to_open:
+            messagebox.showinfo(
+                "Profile đang mở",
+                "Tất cả tài khoản đã chọn đều đang mở cửa sổ profile.\n"
+                "Dùng lại cửa sổ đó hoặc bấm «Đóng profile».",
+                parent=self._root,
+            )
+            return
+
+        max_batch = 12
+        if len(to_open) > max_batch:
+            if not messagebox.askyesno(
+                "Mở nhiều profile",
+                f"Bạn chọn {len(to_open)} tài khoản. Mở tối đa {max_batch} lần này?\n"
+                "(Máy yếu nên mở ít hơn.)",
+                parent=self._root,
+            ):
+                return
+            to_open = to_open[:max_batch]
+
+        # Lệch cửa sổ để không chồng khít lên nhau.
+        sessions: list[dict[str, Any]] = []
+        for i, aid in enumerate(to_open):
+            wx = 40 + (i % 4) * 48
+            wy = 40 + (i // 4) * 56 + (i % 4) * 28
+            sess = self._start_one_manual_profile(
+                aid,
+                window_position=(wx, wy),
+                stagger_ms=i * 450,
+            )
+            sessions.append(sess)
+
         self._set_ui_busy("open_profile_browser")
         self._root.configure(cursor="watch")
-        th = threading.Thread(target=_open_worker, name="open_profile_playwright", daemon=True)
-        th.start()
+        if hasattr(self, "_lbl_state"):
+            self._lbl_state.configure(text=f"Profile: đang mở {len(to_open)} cửa sổ…")
         t0 = time.monotonic()
-        timeout_sec = 120.0
+        timeout_sec = 90.0 + 25.0 * len(to_open)
 
-        def _poll_open_profile() -> None:
-            if state["ready"].is_set():
-                self._root.configure(cursor="")
-                self._clear_ui_busy()
-                self._manual_profile_sessions.append({"account_id": aid, "thread": th, "shutdown": shutdown_evt})
-                self._watch_open_profile_name(aid, state, th)
-                messagebox.showinfo(
-                    "Đã mở profile",
-                    f"Đã mở profile browser cho tài khoản {aid}.\nBạn có thể thao tác/login trực tiếp trên cửa sổ này.",
-                    parent=self._root,
-                )
+        def _poll_batch() -> None:
+            pending = [s for s in sessions if not s["state"]["ready"].is_set()]
+            if pending and time.monotonic() - t0 < timeout_sec:
+                self._root.after(200, _poll_batch)
                 return
-            if state.get("err") is not None:
-                self._root.configure(cursor="")
-                self._clear_ui_busy()
-                shutdown_evt.set()
-                th.join(timeout=15.0)
-                messagebox.showerror("Mở profile thất bại", str(state["err"]), parent=self._root)
-                return
-            if not th.is_alive() and not state["ready"].is_set():
-                self._root.configure(cursor="")
-                self._clear_ui_busy()
-                messagebox.showerror(
-                    "Mở profile thất bại",
-                    "Luồng mở trình duyệt đã kết thúc sớm.",
-                    parent=self._root,
-                )
-                return
-            if time.monotonic() - t0 >= timeout_sec:
-                self._root.configure(cursor="")
-                self._clear_ui_busy()
-                shutdown_evt.set()
-                th.join(timeout=15.0)
-                messagebox.showerror(
-                    "Mở profile",
-                    "Hết thời gian chờ (120s) — luồng mở trình duyệt chưa xong.",
-                    parent=self._root,
-                )
-                return
-            self._root.after(100, _poll_open_profile)
+            self._root.configure(cursor="")
+            self._clear_ui_busy()
+            ok_ids: list[str] = []
+            err_lines: list[str] = []
+            for s in sessions:
+                aid = str(s.get("account_id") or "")
+                st = s["state"]
+                err = st.get("err")
+                if err is not None:
+                    err_lines.append(f"• {aid}: {err}")
+                    try:
+                        s["shutdown"].set()
+                    except Exception:
+                        pass
+                    continue
+                if st["ready"].is_set() and s["thread"].is_alive():
+                    ok_ids.append(aid)
+                    self._watch_open_profile_name(aid, st, s["thread"])
+                elif st["ready"].is_set():
+                    err_lines.append(f"• {aid}: luồng mở kết thúc sớm")
+                else:
+                    err_lines.append(f"• {aid}: hết thời gian chờ mở")
+                    try:
+                        s["shutdown"].set()
+                    except Exception:
+                        pass
 
-        self._root.after(100, _poll_open_profile)
+            parts: list[str] = []
+            if ok_ids:
+                parts.append(
+                    f"Đã mở {len(ok_ids)} profile cùng lúc:\n"
+                    + ", ".join(ok_ids[:16])
+                    + ("…" if len(ok_ids) > 16 else "")
+                )
+            if skip_open:
+                parts.append("Đã mở sẵn (bỏ qua): " + ", ".join(skip_open[:12]))
+            if err_lines:
+                parts.append("Lỗi:\n" + "\n".join(err_lines[:10]))
+            msg = "\n\n".join(parts) or "Không mở được profile nào."
+            if ok_ids and not err_lines:
+                messagebox.showinfo("Đã mở profile", msg, parent=self._root)
+            elif ok_ids:
+                messagebox.showwarning("Mở profile (một phần)", msg, parent=self._root)
+            else:
+                messagebox.showerror("Mở profile thất bại", msg, parent=self._root)
+            if hasattr(self, "_lbl_state"):
+                self._lbl_state.configure(
+                    text=f"Profile: đang mở {len(self._alive_manual_profile_ids())} cửa sổ"
+                    if self._alive_manual_profile_ids()
+                    else "Profile: sẵn sàng"
+                )
+
+        self._root.after(200, _poll_batch)
 
     def _watch_open_profile_name(self, account_id: str, state: dict[str, Any], thread: threading.Thread) -> None:
         """Khi Facebook hiện tên, ghi vào bảng tài khoản một lần."""
@@ -10355,13 +10499,44 @@ class _ManagerWindow:
     def _on_close_open_profiles(self) -> None:
         """
         Đóng các phiên manual profile đang mở (không cần thoát app).
+
+        Đồng thời ép đóng firefox.exe còn giữ profile — tránh hộp thoại
+        Firefox Portable «Another instance of Firefox is already running».
         """
         self._set_ui_busy("close_open_profiles")
         sessions = [s for s in list(self._manual_profile_sessions) if s.get("thread") is not None]
+        # Ép đóng Firefox theo portable_path (kể cả khi không còn session Tk).
+        try:
+            from src.utils.account_browser_profile import resolve_account_path
+            from src.utils.paths import project_root
+            from src.utils.win_browser_window import terminate_firefox_for_profile
+
+            root = project_root()
+            ids_kill = {str(s.get("account_id") or "").strip() for s in sessions}
+            for aid in list(ids_kill) or self._profile_ids_for_bulk():
+                if not aid:
+                    continue
+                rec = self._record_by_id(aid)
+                if not rec:
+                    continue
+                raw = str(rec.get("portable_path") or rec.get("profile_path") or "").strip()
+                folder = resolve_account_path(root, raw) if raw else None
+                if folder is not None and folder.is_dir():
+                    terminate_firefox_for_profile(folder, grace_ms=100)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("terminate firefox khi Đóng profile: {}", exc)
+
         if not sessions:
             self._manual_profile_sessions = []
             self._clear_ui_busy()
-            messagebox.showinfo("Profile", "Hiện không có profile manual nào đang mở.", parent=self._root)
+            messagebox.showinfo(
+                "Profile",
+                "Đã thử đóng Firefox gắn profile (nếu còn).\n"
+                "Nếu vẫn thấy «Another instance…» khi mở FirefoxPortable.exe:\n"
+                "• Dùng «Mở profile» trong ToolFB, hoặc Mo_Firefox.bat\n"
+                "• Không double-click FirefoxPortable.exe khi ToolFB đang chạy.",
+                parent=self._root,
+            )
             return
 
         for sess in sessions:
@@ -10406,7 +10581,8 @@ class _ManagerWindow:
                 self._clear_ui_busy()
                 messagebox.showwarning(
                     "Profile",
-                    "Một số profile chưa đóng kịp. Hãy đợi thêm vài giây rồi bấm lại.",
+                    "Một số profile chưa đóng kịp. Hãy đợi thêm vài giây rồi bấm lại «Đóng profile».\n"
+                    "Tránh mở FirefoxPortable.exe song song với ToolFB.",
                     parent=self._root,
                 )
                 return
@@ -10575,6 +10751,215 @@ class _ManagerWindow:
             self._warn_if_scheduler_running_after_config_change()
             n = len(dlg.result) if isinstance(dlg.result, list) else 1
             logger.info("Đã lưu {} tài khoản từ form thêm.", n)
+
+    def _on_add_account_from_folder(self) -> None:
+        """
+        Thêm tài khoản từ thư mục Firefox/Chromium có sẵn.
+
+        Copy profile vào ``data/profiles/...`` — sau đó có thể xóa thư mục nguồn.
+        """
+        from tkinter import filedialog
+
+        from src.gui.account_workbench import AccountFormDialog, template_new_account
+
+        start = filedialog.askdirectory(
+            parent=self._root,
+            title="Chọn thư mục profile Firefox (hoặc thư mục cha chứa nhiều profile)",
+        )
+        init = template_new_account()
+        init["import_type"] = "folder"
+        init["use_proxy"] = False
+        if start:
+            init["_folder_import_root"] = start
+            init["portable_path"] = start
+            init["profile_path"] = start
+        dlg = AccountFormDialog(
+            self._root,
+            self._accounts,
+            title="Thêm tài khoản từ thư mục Firefox",
+            initial=init,
+            id_readonly=False,
+        )
+        if not dlg.result:
+            return
+        try:
+            rows = dlg.result if isinstance(dlg.result, list) else [dlg.result]
+            saved: list[dict] = []
+            for row in rows:
+                self._accounts.upsert(row)  # type: ignore[arg-type]
+                rec = self._accounts.get_by_id(str(row.get("id") or ""))
+                saved.append(dict(rec) if rec else dict(row))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Lỗi lưu", str(exc), parent=self._root)
+            return
+        self._refresh_tree()
+        self._warn_if_scheduler_running_after_config_change()
+        n = len(saved)
+        logger.info("Đã import {} tài khoản từ thư mục profile (đã copy vào data/profiles).", n)
+        lines: list[str] = []
+        for r in saved[:8]:
+            lines.append(f"• {r.get('id')} → {r.get('portable_path')}")
+        if n > 8:
+            lines.append(f"… (+{n - 8})")
+        messagebox.showinfo(
+            "Đã thêm từ thư mục",
+            f"Đã lưu {n} tài khoản (đã copy profile vào ToolFB):\n"
+            + "\n".join(lines)
+            + "\n\nThư mục nguồn bên ngoài có thể xóa — tài khoản dùng bản copy trong data/profiles.\n"
+            "Chọn dòng → «Mở thư mục profile» để xem bản copy, hoặc «Mở profile» để kiểm tra đăng nhập.",
+            parent=self._root,
+        )
+
+    def _selected_single_account_record(self, *, action_title: str) -> dict | None:
+        """Lấy đúng 1 bản ghi tài khoản đang chọn; hiện cảnh báo nếu không đủ điều kiện."""
+        ids = self._profile_ids_for_bulk()
+        if not ids:
+            messagebox.showwarning(
+                action_title,
+                "Tick một ô «Chọn» (☑) hoặc chọn một dòng trong bảng tài khoản.",
+                parent=self._root,
+            )
+            return None
+        if len(ids) > 1:
+            messagebox.showwarning(
+                action_title,
+                "Chỉ chọn một tài khoản — chỉ tick một ô, hoặc bỏ tick và chọn một dòng.",
+                parent=self._root,
+            )
+            return None
+        rec = self._record_by_id(ids[0])
+        if rec is None:
+            messagebox.showerror(action_title, f"Không tìm thấy id={ids[0]!r}", parent=self._root)
+            return None
+        return dict(rec)
+
+    def _resolve_selected_profile_dir(self, rec: dict, *, action_title: str):
+        """Resolve ``portable_path`` của bản ghi → Path thư mục profile."""
+        from src.utils.account_browser_profile import resolve_account_path
+        from src.utils.paths import project_root
+
+        raw = str(rec.get("portable_path") or rec.get("profile_path") or "").strip()
+        if not raw:
+            messagebox.showwarning(
+                action_title,
+                f"Tài khoản {rec.get('id')!r} chưa có portable_path.",
+                parent=self._root,
+            )
+            return None
+        folder = resolve_account_path(project_root(), raw)
+        if folder is None:
+            messagebox.showerror(action_title, f"Đường dẫn không hợp lệ:\n{raw}", parent=self._root)
+            return None
+        if not folder.is_dir():
+            messagebox.showerror(
+                action_title,
+                f"Thư mục chưa tồn tại:\n{folder}",
+                parent=self._root,
+            )
+            return None
+        return folder
+
+    def _on_open_account_profile_folder(self) -> None:
+        """Mở Explorer tại thư mục profile; ghi ``Mo_Firefox.bat`` để copy ra ngoài vẫn mở được."""
+        import os
+        import subprocess
+        import sys
+
+        rec = self._selected_single_account_record(action_title="Mở thư mục profile")
+        if rec is None:
+            return
+        folder = self._resolve_selected_profile_dir(rec, action_title="Mở thư mục profile")
+        if folder is None:
+            return
+        bt = str(rec.get("browser_type") or "firefox").strip().lower()
+        if bt in ("firefox", ""):
+            try:
+                from src.utils.firefox_portable_profile import ensure_firefox_portable_launcher
+
+                ensure_firefox_portable_launcher(folder)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Không ghi Mo_Firefox.bat: {}", exc)
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)], check=False)  # noqa: S603
+            else:
+                subprocess.Popen(["xdg-open", str(folder)], check=False)  # noqa: S603
+        except OSError as exc:
+            messagebox.showerror("Mở thư mục profile", str(exc), parent=self._root)
+            return
+        logger.info("Đã mở thư mục profile account={} → {}", rec.get("id"), folder)
+
+    def _on_export_firefox_portable(self) -> None:
+        """
+        Xuất bản copy profile ra thư mục ngoài + ``Mo_Firefox.bat``;
+        hỏi có kèm ``FirefoxApp`` (firefox.exe) để máy khác mở được không cần cài Firefox.
+        """
+        from tkinter import filedialog
+
+        rec = self._selected_single_account_record(action_title="Xuất Firefox portable")
+        if rec is None:
+            return
+        folder = self._resolve_selected_profile_dir(rec, action_title="Xuất Firefox portable")
+        if folder is None:
+            return
+        bt = str(rec.get("browser_type") or "firefox").strip().lower()
+        if bt not in ("firefox", ""):
+            messagebox.showwarning(
+                "Xuất Firefox portable",
+                "Chức năng này dành cho tài khoản Firefox.",
+                parent=self._root,
+            )
+            return
+        aid = str(rec.get("id") or "profile").strip()
+        dest_parent = filedialog.askdirectory(
+            parent=self._root,
+            title="Chọn thư mục đích để xuất profile Firefox portable",
+        )
+        if not dest_parent:
+            return
+        dest = Path(dest_parent) / aid
+        include_ff = messagebox.askyesno(
+            "Kèm Firefox?",
+            "Copy kèm thư mục FirefoxApp (firefox.exe + DLL) vào bản xuất?\n\n"
+            "• Có — máy khác / USB mở được bằng Mo_Firefox.bat (dung lượng ~100–200 MB).\n"
+            "• Không — chỉ profile + Mo_Firefox.bat (máy đích cần đã cài Firefox).",
+            parent=self._root,
+        )
+        try:
+            from src.utils.firefox_portable_profile import export_firefox_profile_portable
+
+            info = export_firefox_profile_portable(
+                folder,
+                dest,
+                include_firefox_app=bool(include_ff),
+                browser_exe_hint=str(rec.get("browser_exe_path") or "").strip() or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Xuất Firefox portable", str(exc), parent=self._root)
+            return
+        # Đồng thời đảm bảo launcher trong profile gốc ToolFB.
+        try:
+            from src.utils.firefox_portable_profile import ensure_firefox_portable_launcher
+
+            ensure_firefox_portable_launcher(folder)
+        except Exception:
+            pass
+        ff_line = (
+            f"\nĐã kèm: {info.get('firefox_exe')}"
+            if info.get("firefox_copied")
+            else "\n(Không kèm firefox.exe — máy đích cần cài Firefox.)"
+        )
+        messagebox.showinfo(
+            "Xuất xong",
+            f"Đã xuất profile portable:\n{info.get('dest')}\n\n"
+            f"Mở bằng double-click:\n{info.get('bat')}"
+            f"{ff_line}\n\n"
+            "Có thể copy cả thư mục này sang máy khác / USB.",
+            parent=self._root,
+        )
+        logger.info("Xuất Firefox portable account={} → {}", aid, info.get("dest"))
 
     def _on_edit_account(self) -> None:
         """
@@ -11507,24 +11892,32 @@ class _ManagerWindow:
                     else:
                         self._btn_check_updates.configure(state=tk.NORMAL)
                         self._btn_apply_update.configure(state=tk.NORMAL)
-                        self._lbl_state.configure(text="Update (git): lỗi")
-                        self._clear_ui_busy()
-                        messagebox.showerror(
-                            "Cập nhật (git)",
-                            msg[:8000] or "git pull thất bại.",
-                            parent=self._root,
+                        fail_text = format_update_error(
+                            RuntimeError(msg[:8000] or "git pull thất bại."),
+                            target=root / "data" / "updates",
                         )
+                        self._lbl_state.configure(
+                            text="Update (git): hết chỗ ổ đĩa"
+                            if "không đủ chỗ" in fail_text.lower()
+                            else "Update (git): lỗi"
+                        )
+                        self._clear_ui_busy()
+                        self._show_update_failure_dialog(fail_text)
 
                 schedule_on_main_thread(self._root, done_pull)
             except Exception as exc:
-                err_text = str(exc)
+                err_text = format_update_error(exc, target=project_root() / "data" / "updates")
 
                 def done_err() -> None:
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
-                    self._lbl_state.configure(text="Update (git): lỗi")
+                    self._lbl_state.configure(
+                        text="Update (git): hết chỗ ổ đĩa"
+                        if "không đủ chỗ" in err_text.lower()
+                        else "Update (git): lỗi"
+                    )
                     self._clear_ui_busy()
-                    messagebox.showerror("Cập nhật (git)", err_text, parent=self._root)
+                    self._show_update_failure_dialog(err_text)
 
                 schedule_on_main_thread(self._root, done_err)
 
@@ -11557,14 +11950,14 @@ class _ManagerWindow:
 
                 schedule_on_main_thread(self._root, done_ok)
             except Exception as exc:  # noqa: BLE001
-                err_text = str(exc)
+                err_text = format_update_error(exc, target=project_root() / "data" / "updates")
 
                 def done_err() -> None:
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
-                    self._lbl_state.configure(text="Update: lỗi")
+                    self._lbl_state.configure(text="Update: lỗi — hết chỗ ổ đĩa" if "không đủ chỗ" in err_text.lower() else "Update: lỗi")
                     self._clear_ui_busy()
-                    messagebox.showerror("Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root)
+                    self._show_update_failure_dialog(err_text)
 
                 schedule_on_main_thread(self._root, done_err)
 
@@ -11624,14 +12017,14 @@ class _ManagerWindow:
 
                     schedule_on_main_thread(self._root, done_git)
                 except Exception as exc:  # noqa: BLE001
-                    err_text = str(exc)
+                    err_text = format_update_error(exc, target=root / "data" / "updates")
 
                     def done_err() -> None:
                         self._hide_apply_update_button()
                         self._btn_check_updates.configure(state=tk.NORMAL)
                         self._btn_apply_update.configure(state=tk.NORMAL)
                         self._clear_ui_busy()
-                        messagebox.showerror("Cập nhật (git)", f"Lỗi:\n{err_text}", parent=self._root)
+                        self._show_update_failure_dialog(err_text)
 
                     schedule_on_main_thread(self._root, done_err)
 
@@ -11716,18 +12109,55 @@ class _ManagerWindow:
 
                 schedule_on_main_thread(self._root, done_ok)
             except Exception as exc:  # noqa: BLE001
-                err_text = str(exc)
+                err_text = format_update_error(exc, target=project_root() / "data" / "updates")
 
                 def done_err() -> None:
                     self._hide_apply_update_button()
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
                     self._clear_ui_busy()
-                    messagebox.showerror("Cập nhật", f"Kiểm tra bản mới thất bại:\n{err_text}", parent=self._root)
+                    self._show_update_failure_dialog(err_text)
 
                 schedule_on_main_thread(self._root, done_err)
 
         threading.Thread(target=worker, name="check_updates", daemon=True).start()
+
+    def _show_update_failure_dialog(self, err_text: str) -> None:
+        """Hiện lỗi cập nhật (Errno 28 / hết ổ đĩa) — cửa sổ đủ rộng, copy được hướng dẫn."""
+        text = (err_text or "").strip() or "Lỗi không xác định."
+        top = tk.Toplevel(self._root)
+        top.title("Cập nhật thất bại")
+        top.transient(self._root)
+        top.geometry("640x420")
+        top.minsize(480, 280)
+        try:
+            top.grab_set()
+        except Exception:
+            pass
+        fr = ttk.Frame(top, padding=16)
+        fr.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            fr,
+            text="Cập nhật thất bại — xem hướng dẫn bên dưới:",
+            wraplength=580,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+        box = tk.Text(fr, wrap=tk.WORD, height=14, width=72)
+        box.pack(fill=tk.BOTH, expand=True)
+        box.insert("1.0", text)
+        box.configure(state=tk.DISABLED)
+        btns = ttk.Frame(fr)
+        btns.pack(fill=tk.X, pady=(12, 0))
+
+        def _copy() -> None:
+            try:
+                self._root.clipboard_clear()
+                self._root.clipboard_append(text)
+            except Exception:
+                pass
+
+        ttk.Button(btns, text="Sao chép", command=_copy).pack(side=tk.LEFT)
+        ttk.Button(btns, text="OK", command=top.destroy).pack(side=tk.RIGHT)
 
     def _show_update_success_restart_dialog(
         self,
@@ -11928,25 +12358,33 @@ class _ManagerWindow:
                         else:
                             self._btn_check_updates.configure(state=tk.NORMAL)
                             self._btn_apply_update.configure(state=tk.NORMAL)
-                            self._lbl_state.configure(text="Update (git): lỗi")
-                            self._clear_ui_busy()
-                            messagebox.showerror(
-                                "Cập nhật (git)",
-                                msg[:8000] or "git pull thất bại.",
-                                parent=self._root,
+                            fail_text = format_update_error(
+                                RuntimeError(msg[:8000] or "git pull thất bại."),
+                                target=root / "data" / "updates",
                             )
+                            self._lbl_state.configure(
+                                text="Update (git): hết chỗ ổ đĩa"
+                                if "không đủ chỗ" in fail_text.lower()
+                                else "Update (git): lỗi"
+                            )
+                            self._clear_ui_busy()
+                            self._show_update_failure_dialog(fail_text)
 
                     schedule_on_main_thread(self._root, done_pull)
                 except Exception as exc:  # noqa: BLE001
-                    err_text = str(exc)
+                    err_text = format_update_error(exc, target=root / "data" / "updates")
 
                     def done_err() -> None:
                         self._hide_apply_update_button()
                         self._btn_check_updates.configure(state=tk.NORMAL)
                         self._btn_apply_update.configure(state=tk.NORMAL)
-                        self._lbl_state.configure(text="")
+                        self._lbl_state.configure(
+                            text="Update (git): hết chỗ ổ đĩa"
+                            if "không đủ chỗ" in err_text.lower()
+                            else "Update (git): lỗi"
+                        )
                         self._clear_ui_busy()
-                        messagebox.showerror("Cập nhật (git)", err_text, parent=self._root)
+                        self._show_update_failure_dialog(err_text)
 
                     schedule_on_main_thread(self._root, done_err)
 
@@ -12025,14 +12463,16 @@ class _ManagerWindow:
 
                 schedule_on_main_thread(self._root, on_done)
             except Exception as exc:  # noqa: BLE001
-                err_text = str(exc)
+                err_text = format_update_error(exc, target=project_root() / "data" / "updates")
 
                 def on_err() -> None:
                     self._btn_check_updates.configure(state=tk.NORMAL)
                     self._btn_apply_update.configure(state=tk.NORMAL)
-                    self._lbl_state.configure(text="Update: lỗi")
+                    self._lbl_state.configure(
+                        text="Update: lỗi — hết chỗ ổ đĩa" if "không đủ chỗ" in err_text.lower() else "Update: lỗi"
+                    )
                     self._clear_ui_busy()
-                    messagebox.showerror("Cập nhật", f"Cập nhật thất bại:\n{err_text}", parent=self._root)
+                    self._show_update_failure_dialog(err_text)
 
                 schedule_on_main_thread(self._root, on_err)
 

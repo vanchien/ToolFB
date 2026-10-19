@@ -7,6 +7,9 @@ Mỗi tài khoản: ``data/profiles/<browser>/<id>`` + ``data/cookies/<id>.json`
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,74 @@ from src.utils.safe_delete import safe_delete_path
 _BROWSER_DIRS = frozenset({"chromium", "chrome", "firefox", "webkit"})
 
 _EMPTY_STORAGE_STATE = json.dumps({"cookies": [], "origins": []}, ensure_ascii=False, indent=2) + "\n"
+
+# Marker nhận diện profile Firefox / Chromium khi import từ thư mục ngoài dự án.
+_FIREFOX_PROFILE_MARKERS = (
+    "prefs.js",
+    "cookies.sqlite",
+    "places.sqlite",
+    "cert9.db",
+    "key4.db",
+    "handlers.json",
+    "compatibility.ini",
+)
+_CHROMIUM_PROFILE_MARKERS = (
+    "Local State",
+    "Preferences",
+    "Default/Preferences",
+    "Default/Cookies",
+    "Default/Network/Cookies",
+)
+# Thư mục con thường gặp trong Firefox — không phải profile độc lập khi quét cha.
+_PROFILE_SCAN_SKIP_NAMES = frozenset(
+    {
+        "cache2",
+        "startupcache",
+        "thumbnails",
+        "safebrowsing",
+        "crashes",
+        "minidumps",
+        "datareporting",
+        "saved-telemetry-pings",
+        "shader-cache",
+        "gpu-cache",
+        "jumplistcache",
+        "storage",
+        "sessionstore-backups",
+        "bookmarkbackups",
+        "chrome",
+        "extensions",
+        "features",
+        "gmp-gmpopenh264",
+        "gmp-widevinecdm",
+        "browser-extension-data",
+        "weave",
+        "default",
+        "system",
+        "tmp",
+        "temp",
+        "__pycache__",
+        # Firefox Portable wrapper — không phải 1 tài khoản riêng.
+        "app",
+        "data",
+        "other",
+        "firefox",
+        "firefox64",
+        "firefox32",
+        "settings",
+        "profile",
+        "profiles",
+    }
+)
+
+# Tên exe / thư mục đặc trưng Firefox Portable (PortableApps).
+_FIREFOX_PORTABLE_EXE_NAMES = frozenset(
+    {
+        "firefoxportable.exe",
+        "firefox portable.exe",
+        "firefox_portable.exe",
+    }
+)
 
 
 def normalize_browser_storage(browser_type: str) -> str:
@@ -133,6 +204,13 @@ def provision_fresh_browser_profile(
         safe_delete_path(profile_dir, allowed_roots=[profiles_root], kind="dir", missing_ok=True)
     profile_dir.mkdir(parents=True, exist_ok=True)
     _write_profile_owner_marker(profile_dir, aid)
+    if normalize_browser_storage(browser_type) == "firefox":
+        try:
+            from src.utils.firefox_portable_profile import ensure_firefox_portable_launcher
+
+            ensure_firefox_portable_launcher(profile_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Không ghi Mo_Firefox.bat (profile mới): {}", exc)
 
     if cookie_file.exists():
         safe_delete_path(cookie_file, allowed_roots=[cookies_root], kind="file", missing_ok=True)
@@ -175,6 +253,575 @@ def ensure_profile_directory_exists(
         raise ValueError(f"portable_path không hợp lệ: {portable_path!r}")
     profile_dir.mkdir(parents=True, exist_ok=True)
     _write_profile_owner_marker(profile_dir, account_id)
+
+
+# Bỏ cache/lock khi copy profile ngoài → data/profiles (giữ cookie + lịch sử).
+_IMPORT_SKIP_DIRS = frozenset(
+    {
+        "cache2",
+        "startupcache",
+        "thumbnails",
+        "safebrowsing",
+        "crashes",
+        "minidumps",
+        "datareporting",
+        "saved-telemetry-pings",
+        "shader-cache",
+        "gpu-cache",
+        "jumplistcache",
+        "offlinecache",
+        "__pycache__",
+    }
+)
+_IMPORT_SKIP_FILES = frozenset({"parent.lock", "lock", ".parentlock"})
+
+
+def _ignore_import_profile_junk(_directory: str, names: list[str]) -> set[str]:
+    """Ignore callback cho ``shutil.copytree`` khi import profile ngoài."""
+    skipped: set[str] = set()
+    for name in names:
+        folded = name.casefold()
+        if folded in _IMPORT_SKIP_DIRS or folded in _IMPORT_SKIP_FILES:
+            skipped.add(name)
+    return skipped
+
+
+def _cleanup_imported_firefox_locks(profile_dir: Path) -> None:
+    """Xóa file khóa / session crash sau khi copy — tránh Firefox không mở được bản copy."""
+    for name in (
+        "parent.lock",
+        "lock",
+        ".parentlock",
+        "compatibility.ini",
+        "sessionstore.jsonlz4",
+        "sessionstore.js",
+        "sessionCheckpoints.json",
+    ):
+        target = profile_dir / name
+        if target.is_file() or target.is_symlink():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+
+def import_external_profile_into_account(
+    account_id: str,
+    source_portable: str,
+    browser_type: str = "firefox",
+    *,
+    project_root_dir: Path | None = None,
+) -> str:
+    """
+    Copy thư mục profile ngoài (vd. ``D:\\…\\543677287``) vào ``data/profiles/<browser>/<id>``.
+
+    Sau bước này tài khoản độc lập với thư mục nguồn — có thể xóa nguồn mà không mất phiên.
+
+    Returns:
+        ``portable_path`` relative trong dự án (vd. ``data/profiles/firefox/UID_543677287``).
+    """
+    root = (project_root_dir or project_root()).resolve()
+    aid = str(account_id or "").strip()
+    if not aid:
+        raise ValueError("account_id rỗng — không import profile.")
+    src = resolve_account_path(root, str(source_portable or "").strip())
+    if src is None or not src.is_dir():
+        raise ValueError(f"Thư mục profile nguồn không tồn tại: {source_portable!r}")
+
+    # Firefox Portable: chỉ copy Data/profile (không copy cả App/).
+    try:
+        _display_root, profile_src, _exe = resolve_import_profile_source(src)
+        src = profile_src
+        logger.info(
+            "Import profile: nguồn portable={} → profile thật={}",
+            _display_root,
+            src,
+        )
+    except ValueError:
+        # Giữ src nếu đã là profile thuần / không phải layout portable.
+        if not detect_browser_profile_kind(src):
+            nested = resolve_firefox_portable_profile_dir(src)
+            if nested is not None:
+                src = nested
+
+    dest_rel = default_portable_path(aid, browser_type)
+    dest = resolve_account_path(root, dest_rel)
+    if dest is None:
+        raise ValueError(f"Không tạo được đường dẫn profile đích: {dest_rel!r}")
+
+    profiles_root = (root / "data" / "profiles").resolve()
+    try:
+        dest.relative_to(profiles_root)
+    except ValueError as exc:
+        raise ValueError(f"Đích profile phải nằm trong data/profiles: {dest}") from exc
+
+    src_res = src.resolve()
+    dest_res = dest.resolve()
+    if src_res == dest_res:
+        ensure_profile_directory_exists(aid, dest_rel, project_root_dir=root)
+        logger.info(
+            "Import profile: nguồn đã nằm đúng đích account={} → {}",
+            aid,
+            dest_rel,
+        )
+        return dest_rel
+
+    # Nguồn đã là profile trong project của cùng máy nhưng path khác id → vẫn copy.
+    if dest.exists():
+        logger.info("Import profile: xóa đích cũ trước khi copy | account={} | {}", aid, dest_res)
+        safe_delete_path(dest, allowed_roots=[profiles_root], kind="dir", missing_ok=True)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Import profile: copy {} → {} (account={})",
+        src_res,
+        dest_res,
+        aid,
+    )
+    try:
+        shutil.copytree(
+            src_res,
+            dest_res,
+            ignore=_ignore_import_profile_junk,
+            dirs_exist_ok=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"Không copy được profile từ:\n{src_res}\nsang:\n{dest_res}\n{exc}"
+        ) from exc
+
+    _cleanup_imported_firefox_locks(dest_res)
+    _write_profile_owner_marker(dest_res, aid)
+    if normalize_browser_storage(browser_type) == "firefox":
+        try:
+            from src.utils.firefox_portable_profile import ensure_firefox_portable_launcher
+
+            ensure_firefox_portable_launcher(dest_res)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Không ghi Mo_Firefox.bat (import): {}", exc)
+    logger.info(
+        "Import profile xong | account={} | portable={} | nguồn gốc có thể xóa an toàn: {}",
+        aid,
+        dest_rel,
+        src_res,
+    )
+    return dest_rel
+
+
+def detect_browser_profile_kind(profile_dir: Path | str) -> str:
+    """
+    Nhận loại profile trình duyệt từ nội dung thư mục.
+
+    Returns:
+        ``\"firefox\"`` | ``\"chromium\"`` | ``\"\"`` (không nhận ra).
+    """
+    pdir = Path(profile_dir)
+    if not pdir.is_dir():
+        return ""
+    ff_hits = 0
+    for name in _FIREFOX_PROFILE_MARKERS:
+        try:
+            if (pdir / name).is_file():
+                ff_hits += 1
+        except OSError:
+            continue
+    # profiles.ini / times.json cũng hay gặp ở root Firefox portable.
+    try:
+        if (pdir / "times.json").is_file():
+            ff_hits += 1
+    except OSError:
+        pass
+    if ff_hits >= 2:
+        return "firefox"
+    if ff_hits == 1 and any(
+        (pdir / n).is_file() for n in ("prefs.js", "cookies.sqlite", "places.sqlite")
+    ):
+        return "firefox"
+
+    cr_hits = 0
+    for name in _CHROMIUM_PROFILE_MARKERS:
+        try:
+            if (pdir / name).is_file():
+                cr_hits += 1
+        except OSError:
+            continue
+    if cr_hits >= 1:
+        return "chromium"
+    return ""
+
+
+def profile_dir_looks_importable(profile_dir: Path | str) -> bool:
+    """True nếu thư mục giống profile Firefox/Chromium (có hoặc chưa có phiên)."""
+    p = Path(profile_dir)
+    if detect_browser_profile_kind(p):
+        return True
+    return resolve_firefox_portable_profile_dir(p) is not None
+
+
+def is_firefox_portable_root(folder: Path | str) -> bool:
+    """
+    True nếu thư mục là bản Firefox Portable (PortableApps).
+
+    Dấu hiệu: ``FirefoxPortable.exe`` và/hoặc cặp ``App`` + ``Data``.
+    """
+    root = Path(folder)
+    if not root.is_dir():
+        return False
+    try:
+        names = {p.name.casefold() for p in root.iterdir()}
+    except OSError:
+        return False
+    has_exe = False
+    try:
+        for p in root.iterdir():
+            if p.is_file() and p.name.casefold() in _FIREFOX_PORTABLE_EXE_NAMES:
+                has_exe = True
+                break
+            if p.is_file() and p.suffix.casefold() == ".exe" and "firefox" in p.stem.casefold() and "portable" in p.stem.casefold():
+                has_exe = True
+                break
+    except OSError:
+        pass
+    has_app = "app" in names
+    has_data = "data" in names
+    if has_exe and (has_app or has_data):
+        return True
+    if has_app and has_data:
+        # Đủ App+Data kể cả thiếu .exe (đã bị xóa).
+        return True
+    return False
+
+
+def _read_profiles_ini_path(ini_path: Path, *, base: Path) -> Path | None:
+    """Đọc ``Path=`` / ``Default=1`` từ profiles.ini → thư mục profile tuyệt đối."""
+    try:
+        text = ini_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    blocks: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(";") or s.startswith("#"):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            if cur:
+                blocks.append(cur)
+            cur = {"_section": s[1:-1]}
+            continue
+        if "=" in s:
+            k, v = s.split("=", 1)
+            cur[k.strip().lower()] = v.strip()
+    if cur:
+        blocks.append(cur)
+    # Ưu tiên Default=1, rồi IsRelative + Path.
+    ordered = sorted(
+        blocks,
+        key=lambda b: (
+            0 if str(b.get("default", "")).strip() in ("1", "true", "yes") else 1,
+            0 if "path" in b else 1,
+        ),
+    )
+    for b in ordered:
+        raw = str(b.get("path") or "").strip()
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute():
+            # Path trong profiles.ini thường relative tới thư mục chứa ini (Data/).
+            p = (base / raw).resolve()
+        else:
+            p = p.resolve()
+        if p.is_dir() and detect_browser_profile_kind(p):
+            return p
+        # Một số bản: Path=profile → file nằm trong Data/profile
+        if (base / raw).is_dir() and detect_browser_profile_kind(base / raw):
+            return (base / raw).resolve()
+    return None
+
+
+def resolve_firefox_portable_profile_dir(folder: Path | str) -> Path | None:
+    """
+    Từ root Firefox Portable (vd. ``…\\543677287``) → thư mục profile thật
+    (thường ``Data\\profile`` hoặc path trong ``Data\\profiles.ini``).
+
+    Returns:
+        Path profile Firefox, hoặc None nếu không phải portable / không tìm thấy.
+    """
+    root = Path(folder)
+    if not root.is_dir():
+        return None
+    # Đã là profile thuần → trả về chính nó.
+    if detect_browser_profile_kind(root):
+        return root.resolve()
+    if not is_firefox_portable_root(root):
+        # Có thể user chọn nhầm Data/ — thử lên cha hoặc xuống profile.
+        data_guess = root / "profile"
+        if detect_browser_profile_kind(data_guess):
+            return data_guess.resolve()
+        ini = root / "profiles.ini"
+        if ini.is_file():
+            hit = _read_profiles_ini_path(ini, base=root)
+            if hit is not None:
+                return hit
+        return None
+
+    data_dir = root / "Data"
+    if not data_dir.is_dir():
+        # Một số bản dùng data thường.
+        for alt in ("data", "DATA"):
+            if (root / alt).is_dir():
+                data_dir = root / alt
+                break
+        else:
+            return None
+
+    # 1) profiles.ini
+    for ini_name in ("profiles.ini", "Profiles.ini"):
+        ini = data_dir / ini_name
+        if ini.is_file():
+            hit = _read_profiles_ini_path(ini, base=data_dir)
+            if hit is not None:
+                return hit
+
+    # 2) Data/profile hoặc Data/profiles/<id>
+    for cand in (
+        data_dir / "profile",
+        data_dir / "Profile",
+        data_dir / "profiles" / "profile",
+    ):
+        if cand.is_dir() and detect_browser_profile_kind(cand):
+            return cand.resolve()
+    profiles_root = data_dir / "profiles"
+    if profiles_root.is_dir():
+        try:
+            subs = sorted([p for p in profiles_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+        except OSError:
+            subs = []
+        for sub in subs:
+            if detect_browser_profile_kind(sub):
+                return sub.resolve()
+
+    # 3) Quét nông trong Data tìm prefs.js / cookies.sqlite
+    try:
+        for child in data_dir.iterdir():
+            if not child.is_dir():
+                continue
+            if detect_browser_profile_kind(child):
+                return child.resolve()
+            for nested in child.iterdir() if child.is_dir() else []:
+                if nested.is_dir() and detect_browser_profile_kind(nested):
+                    return nested.resolve()
+    except OSError:
+        pass
+    return None
+
+
+def resolve_firefox_executable_for_playwright(raw_exe: str | Path | None) -> str:
+    """
+    Chuẩn hóa ``browser_exe_path`` trước khi đưa vào Playwright.
+
+    ``FirefoxPortable.exe`` (PortableApps) → tìm ``App/**/firefox.exe`` cạnh nó;
+    nếu không có thì trả ``\"\"`` để Playwright dùng Firefox bundle (hỗ trợ nhiều instance).
+    """
+    s = str(raw_exe or "").strip()
+    if not s:
+        return ""
+    p = Path(s)
+    try:
+        if not p.is_file():
+            return ""
+    except OSError:
+        return ""
+    name = p.name.casefold()
+    is_wrapper = name in _FIREFOX_PORTABLE_EXE_NAMES or (
+        name.endswith(".exe") and "firefox" in name and "portable" in name
+    )
+    if not is_wrapper:
+        # firefox.exe thật — OK cho multi-instance với -no-remote / Playwright.
+        if name == "firefox.exe":
+            return str(p.resolve())
+        return str(p.resolve())
+
+    # Wrapper PortableApps: đổi sang App/.../firefox.exe
+    root = p.parent
+    from_app = find_firefox_portable_exe(root)
+    if from_app and Path(from_app).name.casefold() == "firefox.exe":
+        return from_app
+    # Tìm sâu hơn một chút trong App/
+    app = root / "App"
+    if app.is_dir():
+        from src.utils.browser_exe_discover import find_browser_exe_in_directory
+
+        found = find_browser_exe_in_directory(app, max_subdirs=200)
+        if found and Path(found).name.casefold() == "firefox.exe":
+            return found
+    logger.warning(
+        "FirefoxPortable.exe không có App\\\\firefox.exe kèm theo — bỏ exe, dùng Playwright Firefox."
+    )
+    return ""
+
+
+def find_firefox_portable_exe(folder: Path | str) -> str:
+    """
+    Tìm ``firefox.exe`` trong root Firefox Portable.
+
+    Ưu tiên ``App/**/firefox.exe`` — **không** ưu tiên ``FirefoxPortable.exe``
+    (wrapper PortableApps chặn «Another instance of Firefox is already running»
+    kể cả khi ToolFB/Playwright đang mở profile khác).
+    """
+    root = Path(folder)
+    if not root.is_dir():
+        return ""
+    app = root / "App"
+    if app.is_dir():
+        from src.utils.browser_exe_discover import find_browser_exe_in_directory
+
+        found = find_browser_exe_in_directory(app)
+        if found and Path(found).name.casefold() == "firefox.exe":
+            return found
+        if found and "portable" not in Path(found).stem.casefold():
+            return found
+    # Chỉ dùng FirefoxPortable.exe khi không có firefox.exe thật.
+    try:
+        for p in root.iterdir():
+            if p.is_file() and (
+                p.name.casefold() in _FIREFOX_PORTABLE_EXE_NAMES
+                or (
+                    p.suffix.casefold() == ".exe"
+                    and "firefox" in p.stem.casefold()
+                    and "portable" in p.stem.casefold()
+                )
+            ):
+                logger.warning(
+                    "Chỉ thấy {} — dễ bị chặn multi-instance. Nên dùng App\\\\…\\\\firefox.exe.",
+                    p.name,
+                )
+                return str(p.resolve())
+    except OSError:
+        pass
+    return ""
+
+
+def resolve_import_profile_source(folder: Path | str) -> tuple[Path, Path, str]:
+    """
+    Chuẩn hóa thư mục user chọn → (display_root, profile_dir, browser_exe).
+
+    - Firefox Portable ``543677287`` → display=543677287, profile=Data/profile, exe=FirefoxPortable.exe
+    - Profile thuần → cả hai cùng path
+    """
+    root = Path(folder).resolve()
+    exe = ""
+    if is_firefox_portable_root(root):
+        prof = resolve_firefox_portable_profile_dir(root)
+        exe = find_firefox_portable_exe(root)
+        if prof is None:
+            raise ValueError(
+                f"Thư mục giống Firefox Portable nhưng không tìm thấy profile trong Data\\:\n{root}\n"
+                "Kiểm tra Data\\profile hoặc Data\\profiles.ini."
+            )
+        return root, prof, exe
+    # User chọn nhầm App/ hoặc Data/ trong portable → leo lên root portable.
+    parent = root.parent
+    if root.name.casefold() in {"app", "data", "other", "profile", "profiles"} and is_firefox_portable_root(parent):
+        prof = resolve_firefox_portable_profile_dir(parent)
+        exe = find_firefox_portable_exe(parent)
+        if prof is not None:
+            return parent, prof, exe
+    if detect_browser_profile_kind(root):
+        return root, root, find_firefox_portable_exe(root) or find_firefox_portable_exe(parent)
+    # Portable lồng: cha là portable
+    if is_firefox_portable_root(parent):
+        prof = resolve_firefox_portable_profile_dir(parent)
+        if prof is not None:
+            return parent, prof, find_firefox_portable_exe(parent)
+    raise ValueError(
+        f"Không nhận ra profile Firefox/Chromium hoặc Firefox Portable tại:\n{root}"
+    )
+
+
+def list_importable_profile_dirs(selected: Path | str) -> list[Path]:
+    """
+    Chọn thư mục profile để import.
+
+    - Firefox Portable (``App``+``Data``+``FirefoxPortable.exe``) → **1** mục = root portable
+      (không tách App/Data thành 2 tài khoản).
+    - Profile Firefox/Chromium thuần → [selected].
+    - Thư mục cha chứa nhiều UID/portable → các thư mục con hợp lệ.
+    """
+    root = Path(selected)
+    if not root.is_dir():
+        return []
+    try:
+        root = root.resolve()
+    except OSError:
+        return []
+
+    # 1) Chính selected là Firefox Portable hoặc profile thuần.
+    if is_firefox_portable_root(root) or detect_browser_profile_kind(root):
+        return [root]
+
+    # 2) Selected là App/Data nhầm → trả về root portable cha.
+    if root.name.casefold() in {"app", "data", "other", "profile"} and is_firefox_portable_root(root.parent):
+        return [root.parent.resolve()]
+
+    found: list[Path] = []
+    try:
+        children = sorted(
+            [p for p in root.iterdir() if p.is_dir()],
+            key=lambda p: p.name.lower(),
+        )
+    except OSError:
+        return []
+    for child in children:
+        name_l = child.name.strip().lower()
+        if name_l in _PROFILE_SCAN_SKIP_NAMES or name_l.startswith("."):
+            continue
+        if is_firefox_portable_root(child) or detect_browser_profile_kind(child):
+            found.append(child.resolve())
+            continue
+        # Con là Data/profile sâu hơn một cấp (hiếm).
+        nested = resolve_firefox_portable_profile_dir(child)
+        if nested is not None and is_firefox_portable_root(child):
+            found.append(child.resolve())
+    return found
+
+
+def suggest_account_id_from_profile_dir(profile_dir: Path | str) -> tuple[str, str]:
+    """
+    Gợi ý ``(account_id, facebook_uid)`` từ tên thư mục profile.
+
+    Thư mục toàn số (UID FB) → id ``UID_<số>``, facebook_uid = số.
+    Với Firefox Portable: dùng tên root (``543677287``), không dùng ``App``/``Data``.
+    """
+    p = Path(profile_dir)
+    name = p.name.strip()
+    # Nếu đang trỏ Data/profile → lấy tên portable root (UID).
+    if name.casefold() in {"profile", "profiles", "data", "app"} or detect_browser_profile_kind(p):
+        for up in (p, p.parent, p.parent.parent, p.parent.parent.parent):
+            try:
+                if is_firefox_portable_root(up):
+                    name = up.name.strip()
+                    break
+                if up.name.isdigit() and len(up.name) >= 5:
+                    name = up.name.strip()
+                    break
+            except Exception:
+                continue
+    digits = name if name.isdigit() and len(name) >= 5 else ""
+    if digits:
+        return f"UID_{digits}", digits
+    # Không lấy App/Data làm id.
+    if name.casefold() in {"app", "data", "other", "profile", "profiles"}:
+        name = p.parent.name.strip() if p.parent else name
+        if name.isdigit() and len(name) >= 5:
+            return f"UID_{name}", name
+    safe = re.sub(r"[^\w\-]+", "_", name)[:48].strip("_") if name else ""
+    if not safe or safe.casefold() in {"app", "data", "other"}:
+        safe = f"acc_{uuid.uuid4().hex[:10]}"
+    elif safe[0].isdigit():
+        safe = f"acc_{safe}"
+    return safe, ""
 
 
 def portable_profile_likely_has_session(

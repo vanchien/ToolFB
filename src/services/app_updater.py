@@ -944,29 +944,141 @@ def _open_write_long_path(path: Path):
     return path.open("wb")
 
 
+def _free_bytes(path: Path) -> int:
+    """Dung lượng trống (byte) trên ổ chứa ``path``; ``-1`` nếu không đọc được."""
+    try:
+        probe = path if path.exists() else path.parent
+        if not probe.exists():
+            probe = path.anchor or path
+        return int(shutil.disk_usage(str(probe)).free)
+    except OSError:
+        return -1
+
+
+def _format_bytes(n: int) -> str:
+    """Hiển thị dung lượng kiểu người dùng (MB/GB)."""
+    if n < 0:
+        return "?"
+    mb = n / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb:.0f} MB"
+
+
+def _ensure_disk_space(target: Path, need_bytes: int, *, label: str = "cập nhật") -> None:
+    """
+    Chặn sớm nếu ổ đích không đủ chỗ (tránh tải zip rồi mới Errno 28).
+
+    ``need_bytes``: ước lượng tối thiểu cần trống (zip + giải nén + stage).
+    """
+    need = max(0, int(need_bytes))
+    if need <= 0:
+        return
+    free = _free_bytes(target)
+    # Chừa ~200 MB đệm hệ thống / antivirus.
+    pad = 200 * 1024 * 1024
+    if free < 0:
+        return
+    if free >= need + pad:
+        return
+    raise RuntimeError(
+        f"Ổ đĩa không đủ chỗ để {label}.\n"
+        f"Cần khoảng {_format_bytes(need + pad)} trống, hiện còn {_format_bytes(free)}.\n"
+        "Trên máy lỗi: đóng ToolFB → xóa thư mục data\\updates trong thư mục cài "
+        "→ xóa C:\\tfe và %LOCALAPPDATA%\\tfe nếu có → dọn Thùng rác / file tạm "
+        "→ mở lại app rồi bấm Cập nhật.\n"
+        f"Ổ đang ghi: {target}"
+    )
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    """Gộp message + cause/context — bắt Errno 28 bị bọc trong RuntimeError/URLError."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(str(cur))
+        nxt = cur.__cause__ or cur.__context__
+        cur = nxt if isinstance(nxt, BaseException) else None
+    return "\n".join(parts)
+
+
+def format_update_error(exc: BaseException, *, target: Path | None = None) -> str:
+    """Thông báo lỗi cập nhật cho GUI — luôn dịch Errno 28 / WinError 112."""
+    dest = target or Path(".")
+    mapped = _disk_full_error(exc, dest)
+    if mapped is not None:
+        return str(mapped)
+    text = _exception_chain_text(exc).strip() or exc.__class__.__name__
+    low = text.lower()
+    # Đã có hướng dẫn tiếng Việt (ví dụ từ ``_ensure_disk_space``) — giữ nguyên.
+    if "không đủ chỗ" in low:
+        return text
+    if (
+        "no space left" in low
+        or "errno 28" in low
+        or "winerror 112" in low
+        or "not enough space" in low
+        or "disk full" in low
+    ):
+        return str(
+            _disk_full_error(OSError(28, "No space left on device"), dest) or text
+        )
+    return text
+
+
 def _make_short_extract_root(*, project_root: Path, updates_dir: Path) -> Path:
     """
-    Thư mục giải nén tạm càng ngắn càng tốt (Windows) để tránh vượt MAX_PATH trong zip sâu.
+    Thư mục giải nén tạm: ưu tiên **cùng ổ với app** (tránh đổ đầy ổ C: khi app nằm ổ khác),
+    đường dẫn ngắn để giảm lỗi MAX_PATH trên Windows.
 
-    Thử lần lượt: ``%SystemDrive%\\tfe\\``, ``%LOCALAPPDATA%\\tfe\\``, ``data/updates/``.
+    Thứ tự: ``data/updates`` → ``%LOCALAPPDATA%\\tfe`` (cùng ổ) → ``%SystemDrive%\\tfe``
+    (chỉ khi updates cũng trên ổ hệ thống).
     """
+    del project_root  # giữ chữ ký cũ cho caller
     token = uuid.uuid4().hex[:12]
-    bases: list[Path] = []
+    bases: list[Path] = [updates_dir]
     if os.name == "nt":
-        drv = (os.environ.get("SystemDrive") or "C:").rstrip("\\/") + "\\"
-        bases.append(Path(drv) / "tfe")
         lad = os.environ.get("LOCALAPPDATA", "").strip()
         if lad:
-            bases.append(Path(lad) / "tfe")
-    bases.append(updates_dir)
+            lad_p = Path(lad) / "tfe"
+            if _same_volume(updates_dir, lad_p) or _free_bytes(lad_p) >= _free_bytes(updates_dir):
+                bases.append(lad_p)
+        drv = (os.environ.get("SystemDrive") or "C:").rstrip("\\/") + "\\"
+        sys_tfe = Path(drv) / "tfe"
+        # Chỉ dùng C:\\tfe khi updates cũng trên ổ hệ thống — tránh nhân đôi dung lượng sang C: đầy.
+        if _same_volume(updates_dir, sys_tfe):
+            bases.append(sys_tfe)
+        elif sys_tfe not in bases:
+            # Còn chỗ trên C: nhiều hơn updates → vẫn thử (máy app ổ D: nhỏ).
+            if _free_bytes(sys_tfe) > _free_bytes(updates_dir) + 500 * 1024 * 1024:
+                bases.append(sys_tfe)
+    seen: set[str] = set()
+    errors: list[str] = []
     for b in bases:
+        key = str(b).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             root = (b / f"e{token}").resolve()
             _mkdir_for_long_path(root)
+            logger.info("Updater: giải nén tạm tại {}", root)
             return root
         except OSError as exc:
+            errors.append(f"{b}: {exc}")
             logger.warning("Updater: không dùng thư mục giải nén {}, thử tiếp: {}", b, exc)
-    raise RuntimeError("Không tạo được thư mục giải nén tạm (hết chỗ ghi hoặc quyền).")
+            mapped = _disk_full_error(exc, b)
+            if mapped is not None:
+                # Thử base khác trước khi báo hết chỗ.
+                continue
+    detail = "; ".join(errors[:3]) if errors else "không ghi được"
+    raise RuntimeError(
+        "Không tạo được thư mục giải nén tạm (hết chỗ hoặc quyền).\n"
+        "Xóa data\\updates, C:\\tfe, %LOCALAPPDATA%\\tfe rồi thử lại.\n"
+        f"Chi tiết: {detail}"
+    )
 
 
 def _zip_member_should_skip_extract(member_name: str) -> bool:
@@ -1023,6 +1135,9 @@ def _zip_extract_resilient(zip_path: Path, dest_dir: Path) -> tuple[int, int]:
                     shutil.copyfileobj(src, out, length=1024 * 1024)
                 written += 1
             except OSError as exc:
+                mapped = _disk_full_error(exc, target)
+                if mapped is not None:
+                    raise mapped from exc
                 win_e = int(getattr(exc, "winerror", 0) or 0)
                 en = int(getattr(exc, "errno", 0) or 0)
                 longish = len(_windows_long_path_str(target)) > 300 if os.name == "nt" else len(str(target)) > 240
@@ -1406,35 +1521,76 @@ def apply_update_package(
     updates_dir = project_root / "data" / "updates"
     _purge_stale_update_files(project_root, updates_dir)
     updates_dir.mkdir(parents=True, exist_ok=True)
+    # Tối thiểu ~800 MB trống trước khi tải (gói lớn + giải nén + stage).
+    _ensure_disk_space(updates_dir, 800 * 1024 * 1024, label="bắt đầu cập nhật")
     tmp_zip = updates_dir / f"update_{manifest.version}.zip"
     download_url = _pin_release_download_url(manifest.download_url, manifest.version)
     logger.info("Updater: tải gói cập nhật từ {}", download_url)
     req = urllib.request.Request(download_url, headers={"User-Agent": "ToolFB-Updater/1.0"})
     final_url: str | None = None
-    with urllib.request.urlopen(req, timeout=900) as resp, tmp_zip.open("wb") as fh:
-        try:
-            final_url = resp.geturl()
-        except Exception:
-            final_url = None
-        if final_url:
-            logger.info("Updater: URL sau redirect: {}", final_url)
-        shutil.copyfileobj(resp, fh, length=4 * 1024 * 1024)
-
-    _validate_downloaded_zip(
-        tmp_zip,
-        declared_url=download_url,
-        final_url=final_url,
-    )
-
-    if manifest.sha256:
-        got = _sha256_file(tmp_zip)
-        if got.lower() != manifest.sha256.lower():
-            raise RuntimeError(f"Sai checksum update package. expected={manifest.sha256} got={got}")
-
-    # Giải nén ra thư mục tạm đường dẫn ngắn + extract thủ công (Windows path dài / bỏ cache Prisma).
-    extract_root = _make_short_extract_root(project_root=project_root, updates_dir=updates_dir)
+    extract_root: Path | None = None
     try:
-        _zip_extract_resilient(tmp_zip, extract_root)
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            try:
+                final_url = resp.geturl()
+            except Exception:
+                final_url = None
+            if final_url:
+                logger.info("Updater: URL sau redirect: {}", final_url)
+            try:
+                headers = getattr(resp, "headers", None)
+                raw_len = headers.get("Content-Length") if headers is not None else None
+                declared = int(raw_len or 0)
+            except (TypeError, ValueError, AttributeError):
+                declared = 0
+            if declared > 0:
+                # Zip + giải nén (~2×) + stage cùng ổ (~1× nếu rename; chừa 2.5× an toàn).
+                _ensure_disk_space(
+                    updates_dir,
+                    int(declared * 2.5) + 200 * 1024 * 1024,
+                    label="tải và giải nén gói cập nhật",
+                )
+            try:
+                with tmp_zip.open("wb") as fh:
+                    shutil.copyfileobj(resp, fh, length=4 * 1024 * 1024)
+            except OSError as exc:
+                mapped = _disk_full_error(exc, tmp_zip)
+                try:
+                    tmp_zip.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if mapped is not None:
+                    raise mapped from exc
+                raise
+
+        _validate_downloaded_zip(
+            tmp_zip,
+            declared_url=download_url,
+            final_url=final_url,
+        )
+
+        if manifest.sha256:
+            got = _sha256_file(tmp_zip)
+            if got.lower() != manifest.sha256.lower():
+                raise RuntimeError(f"Sai checksum update package. expected={manifest.sha256} got={got}")
+
+        zip_size = tmp_zip.stat().st_size if tmp_zip.is_file() else 0
+        if zip_size > 0:
+            _ensure_disk_space(
+                updates_dir,
+                int(zip_size * 2.2) + 150 * 1024 * 1024,
+                label="giải nén gói cập nhật",
+            )
+
+        # Giải nén ra thư mục tạm (ưu tiên cùng ổ app) + extract thủ công.
+        extract_root = _make_short_extract_root(project_root=project_root, updates_dir=updates_dir)
+        try:
+            _zip_extract_resilient(tmp_zip, extract_root)
+        except OSError as exc:
+            mapped = _disk_full_error(exc, extract_root)
+            if mapped is not None:
+                raise mapped from exc
+            raise
         try:
             tmp_zip.unlink(missing_ok=True)
         except OSError as exc:
@@ -1485,9 +1641,6 @@ def apply_update_package(
             else:
                 shutil.copy2(item, target)
 
-        # copy payload sang project root, bỏ qua data/venv/logs/config...
-        # Riêng "tools" dùng copy resilient để luôn giữ Veo3Studio chạy được,
-        # kể cả khi gặp file lẻ/symlink cache không còn tồn tại trong gói.
         preserve = set(preserve_on_apply_dirs)
         for item in payload_root.iterdir():
             if item.name in preserve:
@@ -1514,8 +1667,23 @@ def apply_update_package(
 
         logger.info("Updater: áp dụng update {} thành công.", manifest.version)
         return ApplyUpdateResult(backup_dir=backup_dir, deferred=False)
+    except OSError as exc:
+        mapped = _disk_full_error(exc, updates_dir)
+        if mapped is not None:
+            raise mapped from exc
+        raise
     finally:
-        shutil.rmtree(extract_root, ignore_errors=True)
+        if extract_root is not None:
+            shutil.rmtree(extract_root, ignore_errors=True)
+        # Zip dở / thất bại — không giữ chiếm ổ.
+        if tmp_zip.exists() and not (updates_dir / DEFERRED_GUI_BAT_NAME).is_file():
+            try:
+                # Chỉ xóa zip nếu chưa stage xong (deferred bat chưa có) hoặc lỗi giữa chừng.
+                # Khi deferred thành công, zip đã unlink ở trên.
+                if not any(updates_dir.glob("staged_apply_*")):
+                    tmp_zip.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _same_volume(left: Path, right: Path) -> bool:
@@ -1531,16 +1699,33 @@ def _same_volume(left: Path, right: Path) -> bool:
 
 
 def _disk_full_error(exc: BaseException, target: Path) -> RuntimeError | None:
-    """Đổi WinError 112 thành câu tiếng Việt, kèm chỗ cần xóa."""
+    """Đổi Errno 28 / WinError 112 thành câu tiếng Việt, kèm chỗ cần xóa."""
     win_e = int(getattr(exc, "winerror", 0) or 0)
     en = int(getattr(exc, "errno", 0) or 0)
-    if win_e != 112 and en != 28:
+    msg = _exception_chain_text(exc).lower()
+    if (
+        win_e != 112
+        and en != 28
+        and "no space left" not in msg
+        and "winerror 112" not in msg
+        and "not enough space" not in msg
+        and "disk full" not in msg
+        and "errno 28" not in msg
+    ):
         return None
+    free = _free_bytes(target)
+    free_hint = f" (còn {_format_bytes(free)})" if free >= 0 else ""
     return RuntimeError(
-        "Ổ đĩa không đủ chỗ để cập nhật.\n"
-        "Đóng ToolFB, xóa thư mục data\\updates trong thư mục cài, xóa C:\\tfe nếu có, "
-        "dọn Thùng rác, rồi bấm cập nhật lại.\n"
-        f"Không ghi được: {target}"
+        "Ổ đĩa không đủ chỗ để cập nhật"
+        f"{free_hint}.\n\n"
+        "Cần khoảng 1–2 GB trống. Trên máy lỗi làm lần lượt:\n"
+        "1) Đóng hết ToolFB / Firefox portable của tool\n"
+        "2) Xóa thư mục data\\updates trong thư mục cài app\n"
+        "3) Xóa C:\\tfe và %LOCALAPPDATA%\\tfe (nếu có)\n"
+        "4) (Tuỳ chọn) xóa cache Firefox: data\\profiles\\firefox\\...\\cache2\n"
+        "5) Dọn Thùng rác → Disk Cleanup ổ C: (và ổ chứa app)\n"
+        "6) Mở lại app → bấm Cập nhật\n\n"
+        f"Ổ đang ghi: {target}"
     )
 
 
@@ -1568,10 +1753,43 @@ def _relocate_tree(src: Path, dst: Path) -> None:
         raise
 
 
+def _purge_tfe_temp_roots() -> None:
+    """Xóa thư mục giải nén tạm ``tfe\\e*`` trên ổ hệ thống và LOCALAPPDATA."""
+    roots: list[Path] = []
+    if os.name == "nt":
+        drv = (os.environ.get("SystemDrive") or "C:").rstrip("\\/") + "\\"
+        roots.append(Path(drv) / "tfe")
+        lad = os.environ.get("LOCALAPPDATA", "").strip()
+        if lad:
+            roots.append(Path(lad) / "tfe")
+    for tfe in roots:
+        if not tfe.is_dir():
+            continue
+        try:
+            children = list(tfe.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_dir() and (child.name.startswith("e") or child.name == "stage"):
+                shutil.rmtree(child, ignore_errors=True)
+        # Xóa luôn ``tfe`` nếu đã trống — nhường chỗ ổ đĩa.
+        try:
+            if tfe.is_dir() and not any(tfe.iterdir()):
+                tfe.rmdir()
+        except OSError:
+            pass
+
+
 def _purge_stale_update_files(project_root: Path, updates_dir: Path) -> None:
-    """Xóa zip, bản stage dở và thư mục giải nén cũ trước khi tải gói mới."""
+    """Xóa zip, bản stage dở, backup cũ và thư mục giải nén tạm trước khi tải gói mới."""
+    freed_hint = _free_bytes(updates_dir)
     if updates_dir.is_dir():
-        for pattern in ("update_*.zip", "staged_apply_*", "staged_gui_*", "backup_before_*"):
+        for pattern in (
+            "update_*.zip",
+            "staged_apply_*",
+            "staged_gui_*",
+            "backup_before_*",
+        ):
             for old in updates_dir.glob(pattern):
                 try:
                     if old.is_dir():
@@ -1580,23 +1798,34 @@ def _purge_stale_update_files(project_root: Path, updates_dir: Path) -> None:
                         old.unlink(missing_ok=True)
                 except OSError as exc:
                     logger.warning("Updater: không xóa được {}: {}", old, exc)
+        # Thư mục giải nén tạm ``e`` + token hex trong data/updates.
+        for old in updates_dir.iterdir():
+            name = old.name
+            if not (
+                old.is_dir()
+                and name.startswith("e")
+                and 9 <= len(name) <= 20
+                and all(c in "0123456789abcdef" for c in name[1:].lower())
+            ):
+                continue
+            shutil.rmtree(old, ignore_errors=True)
+        # Log apply cũ — không cần giữ.
+        for old in updates_dir.glob("deferred_apply*.log"):
+            try:
+                old.unlink(missing_ok=True)
+            except OSError:
+                pass
     for name in ("_internal.old", "_internal.new"):
         stale = project_root / name
         if stale.exists():
             shutil.rmtree(stale, ignore_errors=True)
-    if os.name != "nt":
-        return
-    drv = (os.environ.get("SystemDrive") or "C:").rstrip("\\/") + "\\"
-    tfe = Path(drv) / "tfe"
-    if not tfe.is_dir():
-        return
-    try:
-        children = list(tfe.iterdir())
-    except OSError:
-        return
-    for child in children:
-        if child.is_dir() and (child.name.startswith("e") or child.name == "stage"):
-            shutil.rmtree(child, ignore_errors=True)
+    _purge_tfe_temp_roots()
+    after = _free_bytes(updates_dir)
+    if freed_hint >= 0 and after >= 0 and after > freed_hint:
+        logger.info(
+            "Updater: đã dọn file cập nhật cũ — thêm ~{} trống.",
+            _format_bytes(after - freed_hint),
+        )
 
 
 def _copytree_resilient(src: Path, dst: Path) -> None:

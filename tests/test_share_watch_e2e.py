@@ -154,6 +154,123 @@ def test_e2e_deleted_queue_video_not_reenqueued() -> None:
     assert kept == _reels(1000000888)
 
 
+def test_e2e_empty_first_scan_does_not_baseline() -> None:
+    """Quét rỗng lần đầu không ghi baseline — tránh lần sau lấy nhầm hết video cũ."""
+    source = "https://www.facebook.com/EmptyThenReady"
+    calls = {"n": 0}
+    got: list[list[str]] = []
+
+    def scan_fn(_url: str, _acc: dict) -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"ok": True, "items": []}
+        return {"ok": True, "items": [{"url": u} for u in _reels(1000000300, 1000000200)]}
+
+    watcher = SourceWatcher(
+        sources=[source],
+        account={"id": "acc"},
+        states={},
+        scan_min=5,
+        scan_max=5,
+        scan_fn=scan_fn,
+        on_new=lambda _s, urls: got.append(list(urls)),
+    )
+    assert watcher.scan_once() == 0
+    st = watcher.states[source_state_key(source)]
+    assert not st.baseline
+    assert st.seen == []
+    assert watcher.scan_once() == 0  # lần này mới ghi mốc
+    assert got == []
+    assert st.baseline and st.latest_id == "1000000300"
+    assert watcher.scan_once() == 0
+
+
+def test_e2e_many_new_videos_not_lost_across_scans() -> None:
+    """Nhiều video mới hơn MAX_NEW_PER_SCAN: lần sau vẫn lấy phần còn lại (không bỏ sót)."""
+    from src.services.facebook_groups.source_watch import MAX_NEW_PER_SCAN
+
+    source = "https://www.facebook.com/BusyPage"
+    # 3 cũ + 10 mới trên đầu
+    old = [1000000300, 1000000200, 1000000100]
+    new_ids = [1000001000 + i for i in range(10)]  # 1000..1009 mới nhất trước
+    top = list(reversed(new_ids)) + old  # 1009, 1008, … 1000, rồi cũ
+    got: list[str] = []
+
+    def scan_fn(_url: str, _acc: dict) -> dict:
+        return {"ok": True, "items": [{"url": u} for u in _reels(*top)]}
+
+    watcher = SourceWatcher(
+        sources=[source],
+        account={"id": "acc"},
+        states={},
+        scan_min=5,
+        scan_max=5,
+        scan_fn=scan_fn,
+        on_new=lambda _s, urls: got.extend(urls),
+    )
+    # Baseline với chỉ 3 video cũ
+    detect_new_videos(watcher.states.setdefault(source_state_key(source), SourceState()), _reels(*old))
+    assert watcher.scan_once() == MAX_NEW_PER_SCAN
+    assert len(got) == MAX_NEW_PER_SCAN
+    # Phần còn lại vẫn được lấy ở vòng sau
+    n2 = watcher.scan_once()
+    assert n2 == 10 - MAX_NEW_PER_SCAN
+    assert len(got) == 10
+    assert set(got) == set(_reels(*reversed(new_ids)))
+    assert watcher.scan_once() == 0
+
+
+def test_e2e_sequential_list_remembers_each_page_history() -> None:
+    """Quét lần lượt theo list: mỗi Page nhớ lịch sử riêng, video mới đúng Page."""
+    pages = [
+        "https://www.facebook.com/Healthylifehub2026",
+        "https://www.facebook.com/NiceGiftShops",
+        "https://www.facebook.com/Arad.ASMR",
+    ]
+    order: list[str] = []
+    feeds = {
+        pages[0]: _reels(1100000300, 1100000200),
+        pages[1]: _reels(2200000300, 2200000200),
+        pages[2]: _reels(3300000300, 3300000200),
+    }
+    round_n = {"n": 0}
+    got: list[tuple[str, list[str]]] = []
+
+    def scan_fn(url: str, _acc: dict) -> dict:
+        order.append(url)
+        round_n["n"] += 1
+        items = list(feeds[url])
+        # Vòng 2: chỉ Page giữa có video mới trên đầu
+        if round_n["n"] > 3 and url == pages[1]:
+            items = _reels(2200000400, 2200000300, 2200000200)
+        return {"ok": True, "items": [{"url": u} for u in items], "page_name": url.rsplit("/", 1)[-1]}
+
+    watcher = SourceWatcher(
+        sources=pages,
+        account={"id": "acc"},
+        states={},
+        scan_min=5,
+        scan_max=5,
+        scan_fn=scan_fn,
+        on_new=lambda src, urls: got.append((src, list(urls))),
+    )
+    assert watcher.scan_once() == 0
+    assert order == pages  # đúng thứ tự list
+    for p in pages:
+        st = watcher.states[source_state_key(p)]
+        assert st.baseline
+        assert st.latest_id.endswith("300")
+        assert len(st.seen) >= 2
+
+    order.clear()
+    assert watcher.scan_once() == 1
+    assert order == pages
+    assert got == [(pages[1], _reels(2200000400))]
+    # Page khác không bị nhảy mốc / không nhận nhầm video
+    assert watcher.states[source_state_key(pages[0])].latest_id == "1100000300"
+    assert watcher.states[source_state_key(pages[2])].latest_id == "3300000300"
+
+
 def test_e2e_deleted_source_stops_watcher_enqueue_path() -> None:
     """
     Xóa Page nguồn khỏi list → watcher cập nhật list rỗng/khác;

@@ -1849,6 +1849,12 @@ def build_human_interaction_tab(
         pool = state.get("pool")
         if pool is not None:
             try:
+                # Ép kill Firefox trước join ngắn — tránh chờ worker treo checkpoint.
+                if hasattr(pool, "_terminate_pool_browser_processes"):
+                    pool._terminate_pool_browser_processes(force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human GUI] force terminate browsers: {}", exc)
+            try:
                 pool.join(timeout=8.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[Human GUI] force cleanup join: {}", exc)

@@ -32,19 +32,113 @@ def _reels(*ids: int) -> list[str]:
 
 
 def test_first_scan_only_records_baseline() -> None:
-    """Lần đầu: video cũ không được chia sẻ."""
+    """Lần đầu: video cũ không được chia sẻ; nhớ video mới nhất trên đầu trang."""
     state = SourceState()
     assert detect_new_videos(state, _reels(1000000300, 1000000200, 1000000100)) == []
     assert state.baseline and state.max_id == 1000000300
+    assert state.latest_id == "1000000300"
+
+
+def test_source_page_display_short_name() -> None:
+    from src.services.facebook_groups.source_watch import source_page_display
+
+    assert source_page_display("https://www.facebook.com/healthylifehub2026") == "healthylifehub2026"
+    assert source_page_display("https://www.facebook.com/profile.php?id=111490197685020") == (
+        "111490197685020"
+    )
+    assert source_page_display("") == ""
+    assert source_page_display(
+        "https://www.facebook.com/61594991577702",
+        page_name="Healthy Life Hub",
+        page_id="61594991577702",
+    ) == "Healthy Life Hub (61594991577702)"
+    assert source_page_display(
+        "https://www.facebook.com/healthylifehub2026",
+        page_name="Healthy Life Hub",
+        page_id="61594991577702",
+    ) == "Healthy Life Hub (61594991577702)"
+
+
+def test_oldest_first_harvest_feed_is_not_treated_as_new() -> None:
+    """GraphQL cũ→mới: video cũ nhất không được chia sẻ như video mới trên đầu trang."""
+    newest = [1000000500 - i for i in range(8)]
+    state = SourceState()
+    detect_new_videos(state, _reels(*newest))
+    oldest_first = list(reversed(newest)) + [1000000010, 1000000009]
+    assert detect_new_videos(state, _reels(*oldest_first)) == []
 
 
 def test_only_newer_ids_count_as_new() -> None:
-    """Video mới (ID lớn hơn mốc) được lấy, cũ → mới; video cũ lộ ra khi cuộn sâu thì bỏ qua."""
+    """Video mới trên đầu trang được lấy, cũ → mới; video cũ lộ ra khi cuộn sâu thì bỏ qua."""
     state = SourceState()
     detect_new_videos(state, _reels(1000000300, 1000000200))
     found = detect_new_videos(state, _reels(1000000500, 1000000400, 1000000300, 1000000200, 1000000050))
-    assert found == _reels(1000000400, 1000000500)
+    # Giữ thứ tự lưới (mới nhất trước), không đảo theo ID.
+    assert found == _reels(1000000500, 1000000400)
     assert detect_new_videos(state, _reels(1000000500, 1000000400)) == [], "không chia sẻ lại"
+
+
+def test_pinned_known_suggestion_does_not_hide_new_video() -> None:
+    """Reel gợi ý đã biết đứng đầu lưới không chặn video mới ngay bên dưới."""
+    state = SourceState()
+    detect_new_videos(state, _reels(1000000300, 1000000200, 1000000100))
+    found = detect_new_videos(
+        state,
+        _reels(1000000300, 1000000450, 1000000200),
+    )
+    assert found == _reels(1000000450)
+
+
+def test_inflated_max_id_does_not_block_new_top_video() -> None:
+    """Mốc 17 số (reel gợi ý) không chặn video mới 16 số nằm trên đầu trang."""
+    state = SourceState(
+        max_id=27741558852187173,
+        seen=["2230774414426929", "27741558852187173"],
+        baseline=True,
+    )
+    found = detect_new_videos(
+        state,
+        _reels(2482358802253174, 2230774414426929),
+    )
+    assert found == _reels(2482358802253174)
+
+
+def test_eighteen_digit_junk_ignored() -> None:
+    """ID 18 số (nối chuỗi) không vào mốc / list mới."""
+    from src.services.facebook_groups.source_watch import video_id_from_url
+
+    assert video_id_from_url("https://www.facebook.com/reel/650496281688565899") == ""
+    state = SourceState()
+    assert detect_new_videos(state, ["https://www.facebook.com/reel/650496281688565899"]) == []
+    assert state.max_id == 0
+
+
+def test_videos_tab_extra_feed_detects_new() -> None:
+    """Video mới chỉ có trên tab Videos vẫn được lấy (feed riêng)."""
+    state = SourceState()
+    detect_new_videos(state, _reels(1000000300, 1000000200))
+    found = detect_new_videos(
+        state,
+        _reels(1000000300, 1000000200),
+        extra_feeds=[_reels(1000000888, 1000000300)],
+    )
+    assert found == _reels(1000000888)
+
+
+def test_saved_state_clamps_inflated_max_id() -> None:
+    """Đọc settings: max_id 17 số bị kéo về cụm 16 số đã thấy."""
+    restored = SourceState.from_dict(
+        {
+            "max_id": "27741558852187173",
+            "seen": ["2230774414426929", "1735485364124493", "27741558852187173"],
+            "baseline": True,
+            "latest_id": "2230774414426929",
+        }
+    )
+    assert restored.max_id == 2230774414426929
+    assert "27741558852187173" in restored.seen
+    assert restored.latest_id == "2230774414426929"
+    assert restored.to_dict()["latest_id"] == "2230774414426929"
 
 
 def test_deep_high_id_not_treated_as_new_publish() -> None:
@@ -52,13 +146,29 @@ def test_deep_high_id_not_treated_as_new_publish() -> None:
     from src.services.facebook_groups.source_watch import TOP_NEW_WINDOW
 
     state = SourceState()
-    head = [1000000300 - i for i in range(TOP_NEW_WINDOW)]
+    # Đầu trang cố định 12 ô (giống lưới thật) — không phụ thuộc hằng TOP_NEW_WINDOW.
+    head = [1000000300 - i for i in range(12)]
     detect_new_videos(state, _reels(*head))
     assert state.max_id == 1000000300
     # Phía dưới có ID rất cao (video cũ / related) — không vào list mới, không đẩy mốc.
     deep = [*head, 9000000999, 9000000888]
     assert detect_new_videos(state, _reels(*deep)) == []
     assert state.max_id == 1000000300
+    assert TOP_NEW_WINDOW >= 12
+
+
+def test_overflow_new_videos_remain_for_next_scan() -> None:
+    """Vượt MAX_NEW_PER_SCAN: chưa xếp thì chưa ghi seen — lần sau lấy tiếp."""
+    from src.services.facebook_groups.source_watch import MAX_NEW_PER_SCAN
+
+    state = SourceState()
+    detect_new_videos(state, _reels(1000000100, 1000000050))
+    batch = [1000000500 - i for i in range(MAX_NEW_PER_SCAN + 3)] + [1000000100]
+    first = detect_new_videos(state, _reels(*batch))
+    assert len(first) == MAX_NEW_PER_SCAN
+    second = detect_new_videos(state, _reels(*batch))
+    assert len(second) == 3
+    assert detect_new_videos(state, _reels(*batch)) == []
 
 
 def test_new_publish_at_top_is_detected() -> None:

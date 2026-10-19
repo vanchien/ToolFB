@@ -26,6 +26,15 @@ from src.gui.cookie_capture import account_cookie_path_field, cookie_storage_des
 from src.gui.ui_responsiveness import schedule_on_main_thread
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.services.totp_service import generate_totp_code
+from src.utils.account_browser_profile import (
+    detect_browser_profile_kind,
+    find_firefox_portable_exe,
+    is_firefox_portable_root,
+    list_importable_profile_dirs,
+    portable_profile_likely_has_session,
+    resolve_import_profile_source,
+    suggest_account_id_from_profile_dir,
+)
 from src.utils.browser_exe_discover import find_browser_exe_in_directory as _find_browser_exe_in_directory
 from src.utils.db_manager import AccountRecord, AccountsDatabaseManager
 from src.utils.paths import project_root
@@ -160,6 +169,19 @@ def _list_immediate_subdirs(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
     return sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+
+
+def _folder_row_is_valid(*, profile_ok: bool, exe_ok: bool, browser_type: str) -> bool:
+    """
+    Firefox/Chromium Playwright: đủ profile có sẵn (lịch sử/cookie DB) — không bắt buộc .exe.
+    Có .exe hợp lệ cũng đủ (portable tự mang trình duyệt).
+    """
+    if exe_ok:
+        return True
+    bt = str(browser_type or "").strip().lower()
+    if profile_ok and bt in ("firefox", "chromium", "chrome"):
+        return True
+    return False
 
 
 def _browser_exe_for_profile_folder(sub: Path, common_exe: str) -> str:
@@ -373,6 +395,14 @@ class AccountFormDialog:
         else:
             self._on_mode_change()
         self._top.after_idle(self._account_dialog_scroll_top)
+        # Mở từ «Thêm từ thư mục» kèm path → tự quét & nhận Firefox.
+        if (
+            not id_readonly
+            and self._var_mode.get() == _ACCOUNT_MODE_FOLDER
+            and hasattr(self, "_e_folder_root")
+            and self._e_folder_root.get().strip()
+        ):
+            self._top.after(120, lambda: self._on_scan_folder(silent=True, auto_detect=True))
         self._top.wait_window()
 
     @property
@@ -956,13 +986,19 @@ class AccountFormDialog:
             if found:
                 exe_one = found
                 row["browser_exe_path"] = exe_one
+                self._refresh_folder_row_validity(row)
                 self._fill_folder_tree()
                 self._update_save_state()
-        if not exe_one or not Path(exe_one).is_file():
+        self._refresh_folder_row_validity(row)
+        bt = str(row.get("browser_type") or "firefox").strip().lower()
+        # Firefox Playwright: không bắt buộc .exe nếu đã nhận profile.
+        if not exe_one and not (
+            row.get("profile_ok") and bt in ("firefox", "chromium", "chrome")
+        ):
             messagebox.showwarning(
                 "Cookie",
-                "Không có .exe hợp lệ — đã quét thư mục profile nhưng không thấy firefox.exe/chrome.exe… — "
-                "dùng «Tự nhận .exe» hoặc «Exe cho dòng chọn…».",
+                "Chưa nhận profile Firefox/Chromium và không có .exe — "
+                "dùng «Quét & tự nhận» hoặc «Exe cho dòng chọn…».",
                 parent=self._top,
             )
             return
@@ -976,7 +1012,8 @@ class AccountFormDialog:
         else:
             proxy = {"host": "", "port": 0, "user": "", "pass": ""}
             use_px = False
-        aid = re.sub(r"[^\w\-]+", "_", str(row.get("folder_name", "")))[:48] or f"row_{row.get('stt', 0)}"
+        sug_id = str(row.get("suggest_id") or "").strip()
+        aid = sug_id or re.sub(r"[^\w\-]+", "_", str(row.get("folder_name", "")))[:48] or f"row_{row.get('stt', 0)}"
         acc_preview: dict[str, Any] = {
             "id": aid,
             "name": str(row.get("folder_name", aid)),
@@ -987,17 +1024,14 @@ class AccountFormDialog:
             "use_proxy": use_px,
             "cookie_path": ck_rel,
             "browser_exe_path": exe_one,
+            "facebook_uid": str(row.get("suggest_facebook_uid") or ""),
         }
 
         def after_save() -> None:
             dest = cookie_storage_dest(ck_rel, project_root())
             row["cookie_path"] = account_cookie_path_field(dest)
             row["has_cookie"] = True
-            exe_ok = bool(str(row.get("browser_exe_path", "")).strip()) and Path(
-                str(row.get("browser_exe_path", "")).strip()
-            ).is_file()
-            row["exe_ok"] = exe_ok
-            row["valid"] = exe_ok
+            self._refresh_folder_row_validity(row)
             self._fill_folder_tree()
             self._sync_folder_selected_profile_path()
             self._update_save_state()
@@ -1013,9 +1047,10 @@ class AccountFormDialog:
     def _build_panel_folder(self, parent: ttk.Frame, init: dict[str, Any]) -> None:
         self._frm_folder = ttk.LabelFrame(parent, text=_ACCOUNT_MODE_FOLDER, padding=8)
         self._frm_folder.columnconfigure(1, weight=1)
-        ttk.Label(self._frm_folder, text="Thư mục chứa các profile (thư mục cha) *").grid(
-            row=0, column=0, sticky="nw", padx=(0, 6)
-        )
+        ttk.Label(
+            self._frm_folder,
+            text="Thư mục profile hoặc thư mục cha *\n(vd. D:\\…\\543677287 hoặc thư mục chứa nhiều UID)",
+        ).grid(row=0, column=0, sticky="nw", padx=(0, 6))
         fr_root = ttk.Frame(self._frm_folder)
         fr_root.columnconfigure(0, weight=1)
         self._e_folder_root = ttk.Entry(fr_root, width=42)
@@ -1024,8 +1059,12 @@ class AccountFormDialog:
             row=0, column=1, padx=(6, 0)
         )
         fr_root.grid(row=0, column=1, sticky="ew")
+        prefill = str(init.get("portable_path") or init.get("_folder_import_root") or "").strip()
+        if prefill and Path(prefill).is_dir() and str(init.get("import_type", "")).lower() == "folder":
+            self._e_folder_root.insert(0, prefill)
         bf = ttk.Frame(self._frm_folder)
         bf.grid(row=1, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Button(bf, text="Quét & tự nhận", command=self._on_scan_folder_auto).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(bf, text="Quét thư mục", command=self._on_scan_folder).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(bf, text="Tự nhận .exe (tất cả dòng)", command=self._on_autodetect_exe_all_rows).pack(
             side=tk.LEFT, padx=(0, 6)
@@ -1080,12 +1119,10 @@ class AccountFormDialog:
 
         ttk.Label(
             self._frm_folder,
-            text="1) Quét thư mục → 2) «Tự nhận .exe (tất cả dòng)» (tìm trong từng profile và thư mục cha) hoặc double-click cột Exe / «Exe cho dòng chọn» "
-            "(hộp chọn file mở sẵn trong thư mục profile đang chọn, hoặc thư mục cha đã nhập). «Chạy .exe đã gán» chỉ để thử .exe — trước khi «Lấy cookie» nên đóng Chrome đó để tránh hai tiến trình cùng một profile. "
-            "Lấy cookie từ đúng profile đó: chọn dòng → «Lấy cookie (dòng chọn)» — mở Playwright vào cùng portable_path và cùng .exe đã gán, đăng nhập Facebook rồi «Lưu cookie vào file» (JSON Playwright / storage_state). "
-            "Hoặc đặt sẵn cookies.json / cookie.json / cookies_playwright.json trong thư mục profile để quét tự nhận. "
-            "«Lưu» bật khi đã có .exe hợp lệ; thiếu file cookie trong profile vẫn có thể lưu (tạo file rỗng trong dự án). "
-            "Cột Proxy: double-click hoặc «Proxy dòng chọn» (host/port ở form khi «có»).",
+            text="1) Chọn thư mục Firefox Portable (FirefoxPortable.exe + App + Data), "
+            "vd. D:\\face bokk\\via us reels 2\\543677287 — hoặc thư mục cha nhiều UID. "
+            "Tool thêm 1 tài khoản / 1 UID (không tách App/Data), copy Data\\profile vào data/profiles. "
+            "«Quét & tự nhận» → «Lưu». Xóa dòng App/Data thêm nhầm (nếu có) rồi thêm lại.",
             foreground="gray",
             font=("Segoe UI", 8),
         ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -1194,11 +1231,49 @@ class AccountFormDialog:
         return self._e_notes.get("1.0", "end").strip()
 
     def _on_pick_folder_profile_root(self) -> None:
-        path = filedialog.askdirectory(parent=self._top, title="Thư mục chứa các profile (thư mục cha)")
+        path = filedialog.askdirectory(
+            parent=self._top,
+            title="Chọn thư mục profile Firefox hoặc thư mục cha chứa nhiều profile",
+        )
         if not path:
             return
         self._e_folder_root.delete(0, tk.END)
         self._e_folder_root.insert(0, path)
+
+    def _refresh_folder_row_validity(self, row: dict[str, Any]) -> None:
+        """Cập nhật exe_ok / profile_ok / valid / has_history cho một dòng preview."""
+        exe_p = str(row.get("browser_exe_path", "")).strip()
+        exe_ok = bool(exe_p) and Path(exe_p).is_file()
+        portable = str(row.get("portable_path", "")).strip()
+        kind = detect_browser_profile_kind(portable) if portable else ""
+        if kind and not str(row.get("browser_type") or "").strip():
+            row["browser_type"] = kind
+            row["browser"] = _browser_label_from_storage(kind)
+        bt = str(row.get("browser_type") or "firefox").strip().lower()
+        profile_ok = bool(kind) or (
+            bool(portable) and Path(portable).is_dir() and portable_profile_likely_has_session(portable)
+        )
+        has_history = bool(portable) and portable_profile_likely_has_session(portable)
+        has_ck = bool(str(row.get("cookie_path", "")).strip())
+        row["exe_ok"] = exe_ok
+        row["profile_ok"] = profile_ok
+        row["has_history"] = has_history
+        row["has_cookie"] = has_ck
+        row["valid"] = _folder_row_is_valid(profile_ok=profile_ok, exe_ok=exe_ok, browser_type=bt)
+
+    def _on_scan_folder_auto(self) -> None:
+        """Quét + tự nhận loại trình duyệt / .exe / đánh dấu hợp lệ (Firefox không cần .exe)."""
+        self._on_scan_folder(silent=True, auto_detect=True)
+        n_ok = sum(1 for r in self._folder_preview if r.get("valid"))
+        n_hist = sum(1 for r in self._folder_preview if r.get("has_history"))
+        messagebox.showinfo(
+            "Quét & tự nhận",
+            f"Tìm {len(self._folder_preview)} profile — {n_ok} hợp lệ để lưu "
+            f"({n_hist} có lịch sử/phiên).\n\n"
+            "Firefox đã nhận đủ marker (prefs.js / cookies.sqlite…) có thể «Lưu» ngay, "
+            "không cần .exe. Sau lưu hãy «Mở profile» để đồng bộ với các chức năng khác.",
+            parent=self._top,
+        )
 
     def _on_autodetect_exe_all_rows(self) -> None:
         """Sau khi «Quét thư mục»: tự gán .exe cho mọi dòng (trong profile + fallback thư mục cha)."""
@@ -1211,7 +1286,7 @@ class AccountFormDialog:
             rdir = Path(root_s)
             if rdir.is_dir():
                 common = _find_browser_exe_in_directory(rdir) or ""
-        n_ok = 0
+        n_exe = 0
         for r in self._folder_preview:
             sub = Path(str(r.get("portable_path", "")))
             new_exe = ""
@@ -1220,19 +1295,16 @@ class AccountFormDialog:
             if not new_exe or not Path(new_exe).is_file():
                 new_exe = common if common and Path(common).is_file() else ""
             r["browser_exe_path"] = new_exe
-            exe_ok = bool(new_exe) and Path(new_exe).is_file()
-            r["exe_ok"] = exe_ok
-            has_ck = bool(str(r.get("cookie_path", "")).strip())
-            r["has_cookie"] = has_ck
-            r["valid"] = exe_ok
-            if exe_ok:
-                n_ok += 1
+            self._refresh_folder_row_validity(r)
+            if r.get("exe_ok"):
+                n_exe += 1
         self._fill_folder_tree()
         self._update_save_state()
+        n_ok = sum(1 for r in self._folder_preview if r.get("valid"))
         messagebox.showinfo(
             "Tự nhận .exe",
-            f"Đã xử lý {len(self._folder_preview)} dòng — {n_ok} dòng có .exe hợp lệ.\n"
-            "Dòng còn thiếu: dùng «Exe cho dòng chọn…» hoặc double-click cột Exe.",
+            f"Đã xử lý {len(self._folder_preview)} dòng — {n_exe} có .exe, {n_ok} hợp lệ để lưu.\n"
+            "Firefox đã có profile: vẫn lưu được khi thiếu .exe (dùng Playwright Firefox).",
             parent=self._top,
         )
 
@@ -1324,66 +1396,136 @@ class AccountFormDialog:
         for r in self._folder_preview:
             if r["stt"] == stt:
                 r["browser_exe_path"] = resolved
-                exe_ok = bool(resolved) and Path(resolved).is_file()
-                r["exe_ok"] = exe_ok
-                has_ck = bool(str(r.get("cookie_path", "")).strip())
-                r["has_cookie"] = has_ck
-                r["valid"] = exe_ok
+                self._refresh_folder_row_validity(r)
                 break
         self._fill_folder_tree()
         self._sync_folder_selected_profile_path()
         self._update_save_state()
 
-    def _on_scan_folder(self) -> None:
+    def _on_scan_folder(self, *, silent: bool = False, auto_detect: bool = False) -> None:
+        """
+        Quét thư mục import.
+
+        - Chọn đúng 1 profile (vd. ``…\\543677287``) → thêm đúng thư mục đó.
+        - Chọn thư mục cha → chỉ lấy con nhận ra là Firefox/Chromium; không có thì fallback mọi thư mục con.
+        """
         root_s = self._e_folder_root.get().strip()
         if not root_s:
-            messagebox.showwarning("Thư mục", "Nhập hoặc chọn thư mục chứa profile.", parent=self._top)
+            messagebox.showwarning(
+                "Thư mục",
+                "Nhập hoặc chọn thư mục profile (vd. D:\\…\\543677287) hoặc thư mục cha.",
+                parent=self._top,
+            )
             return
         root = Path(root_s)
         if not root.is_dir():
             messagebox.showerror("Thư mục", "Thư mục không tồn tại.", parent=self._top)
             return
-        br_label = self._cb_browser_label.get()
-        br = _browser_storage_from_label(br_label)
+        form_br_label = self._cb_browser_label.get()
+        form_br = _browser_storage_from_label(form_br_label)
         use_px = bool(self._var_use_proxy.get())
         px_s = "có" if use_px else "không"
-        self._folder_preview = []
-        for i, sub in enumerate(_list_immediate_subdirs(root), start=1):
-            px, ck, _msg = _scan_profile_folder(sub)
-            portable = str(sub.resolve())
-            ck_final = ck or ""
-            chosen_exe = ""
-            exe_ok = False
-            valid = exe_ok
-            self._folder_preview.append(
-                {
-                    "stt": i,
-                    "folder_name": sub.name,
-                    "browser": br_label,
-                    "browser_type": br,
-                    "portable_path": portable,
-                    "profile_path": portable,
-                    "browser_exe_path": chosen_exe,
-                    "cookie_path": ck_final,
-                    "proxy": px,
-                    "use_proxy": use_px,
-                    "valid": valid,
-                    "exe_ok": exe_ok,
-                    "has_cookie": bool(ck_final),
-                }
+
+        candidates = list_importable_profile_dirs(root)
+        scan_mode = "children"
+        if candidates and (is_firefox_portable_root(root) or detect_browser_profile_kind(root)):
+            scan_mode = "portable" if is_firefox_portable_root(root) else "profile"
+        if not candidates:
+            # Không còn fallback liệt kê App/Data — tránh thêm 2 TK «App»/«Data».
+            messagebox.showerror(
+                "Thư mục",
+                "Không nhận ra profile Firefox / Firefox Portable tại:\n"
+                f"{root}\n\n"
+                "Chọn thư mục kiểu:\n"
+                "• …\\543677287  (có FirefoxPortable.exe + App + Data)\n"
+                "• hoặc thư mục cha chứa nhiều UID như vậy\n"
+                "• hoặc thư mục profile thuần (có prefs.js / cookies.sqlite).",
+                parent=self._top,
             )
+            self._folder_preview = []
+            self._fill_folder_tree()
+            self._update_save_state()
+            return
+
+        common_exe = ""
+        if auto_detect:
+            common_exe = _find_browser_exe_in_directory(root) or ""
+            if not common_exe and root.parent.is_dir():
+                common_exe = _find_browser_exe_in_directory(root.parent) or ""
+
+        self._folder_preview = []
+        for i, sub in enumerate(candidates, start=1):
+            display_root = sub
+            profile_dir = sub
+            portable_exe = ""
+            try:
+                display_root, profile_dir, portable_exe = resolve_import_profile_source(sub)
+            except ValueError as exc:
+                logger.warning("Bỏ qua thư mục không resolve được profile: {} | {}", sub, exc)
+                continue
+            px, ck, _msg = _scan_profile_folder(profile_dir)
+            portable = str(profile_dir.resolve())
+            ck_final = ck or ""
+            kind = detect_browser_profile_kind(profile_dir) or "firefox"
+            br = kind if kind in ("firefox", "chromium") else form_br
+            br_label = _browser_label_from_storage(br)
+            chosen_exe = ""
+            if auto_detect:
+                chosen_exe = (
+                    portable_exe
+                    or find_firefox_portable_exe(display_root)
+                    or _browser_exe_for_profile_folder(profile_dir, common_exe)
+                )
+            elif portable_exe:
+                chosen_exe = portable_exe
+            sug_id, sug_uid = suggest_account_id_from_profile_dir(display_root)
+            row: dict[str, Any] = {
+                "stt": i,
+                "folder_name": display_root.name,
+                "suggest_id": sug_id,
+                "suggest_facebook_uid": sug_uid,
+                "browser": br_label,
+                "browser_type": br,
+                "portable_path": portable,
+                "profile_path": portable,
+                "portable_display_root": str(display_root.resolve()),
+                "browser_exe_path": chosen_exe,
+                "cookie_path": ck_final,
+                "proxy": px,
+                "use_proxy": use_px,
+                "valid": False,
+                "exe_ok": False,
+                "profile_ok": False,
+                "has_history": False,
+                "has_cookie": bool(ck_final),
+            }
+            self._refresh_folder_row_validity(row)
+            self._folder_preview.append(row)
+        # Đánh số lại STT sau khi bỏ mục lỗi.
+        for i, row in enumerate(self._folder_preview, start=1):
+            row["stt"] = i
         self._fill_folder_tree()
         if self._folder_preview:
             first_iid = str(self._folder_preview[0]["stt"])
             self._tree_folder.focus(first_iid)
+            self._tree_folder.selection_set(first_iid)
             self._tree_folder.see(first_iid)
         self._update_save_state()
+        if silent:
+            return
         n = len(self._folder_preview)
+        n_ok = sum(1 for r in self._folder_preview if r.get("valid"))
+        hint = {
+            "profile": "Đã nhận đúng thư mục profile bạn chọn.",
+            "portable": "Đã nhận Firefox Portable (1 tài khoản — dùng Data\\profile, không tách App/Data).",
+            "children": "Đã lọc các thư mục con là profile / Firefox Portable.",
+        }.get(scan_mode, "")
         messagebox.showinfo(
             "Quét xong",
-            f"Tìm {n} thư mục con (proxy: {px_s}).\n\n"
-            "Bước tiếp: «Tự nhận .exe (tất cả dòng)» hoặc gán .exe từng dòng (double-click cột Exe / «Exe cho dòng chọn»).\n"
-            "Không bắt buộc có cookies.json trong profile — thiếu thì khi «Lưu» sẽ tạo file cookie rỗng ([]) theo id tài khoản.",
+            f"Tìm {n} tài khoản (hợp lệ: {n_ok}, proxy form: {px_s}).\n{hint}\n\n"
+            "Firefox Portable: id theo tên thư mục UID (vd. 543677287), "
+            "copy profile từ Data\\profile vào ToolFB.\n"
+            "Bấm «Lưu» để thêm.",
             parent=self._top,
         )
 
@@ -1454,12 +1596,23 @@ class AccountFormDialog:
             if exe_ok is None:
                 exe_p = str(row.get("browser_exe_path", "")).strip()
                 exe_ok = bool(exe_p) and Path(exe_p).is_file()
-            if not exe_ok:
+            profile_ok = bool(row.get("profile_ok"))
+            has_hist = bool(row.get("has_history"))
+            if row.get("valid"):
+                if has_hist:
+                    st_msg = "OK (có lịch sử)"
+                elif profile_ok:
+                    st_msg = "OK (profile)"
+                elif not has_ck:
+                    st_msg = "OK (chưa cookie)"
+                else:
+                    st_msg = "OK"
+            elif not profile_ok and not exe_ok:
+                st_msg = "Chưa nhận profile"
+            elif not exe_ok:
                 st_msg = "Thiếu .exe"
-            elif not has_ck:
-                st_msg = "Chưa có cookie"
             else:
-                st_msg = "OK"
+                st_msg = "Không hợp lệ"
             exe_disp = str(row.get("browser_exe_path") or "")
             if len(exe_disp) > 60:
                 exe_disp = exe_disp[:57] + "…"
@@ -1610,7 +1763,9 @@ class AccountFormDialog:
         use_px: bool,
         import_type: str,
         browser_exe_path: str = "",
+        facebook_uid: str | None = None,
     ) -> dict[str, Any]:
+        uid = str(facebook_uid).strip() if facebook_uid is not None else self._form_facebook_uid()
         rec: dict[str, Any] = {
             "id": aid,
             "name": name,
@@ -1623,7 +1778,7 @@ class AccountFormDialog:
             "import_type": import_type,
             "notes": self._collect_notes(),
             "browser_exe_path": browser_exe_path.strip(),
-            "facebook_uid": self._form_facebook_uid(),
+            "facebook_uid": uid,
             "email": self._form_email(),
             "totp_enabled": self._form_totp_enabled(),
             "password_ref": "",
@@ -2156,10 +2311,13 @@ class AccountFormDialog:
 
     def _collect_folder_batch(self) -> list[dict[str, Any]]:
         if not self._folder_preview:
-            raise ValueError("Chưa có dữ liệu — bấm «Quét thư mục».")
+            raise ValueError("Chưa có dữ liệu — bấm «Quét & tự nhận» hoặc «Quét thư mục».")
         rows_out = [r for r in self._folder_preview if r["valid"]]
         if not rows_out:
-            raise ValueError("Không có dòng hợp lệ để lưu.")
+            raise ValueError(
+                "Không có dòng hợp lệ để lưu.\n"
+                "Cần thư mục Firefox (prefs.js / cookies.sqlite…) hoặc gán .exe hợp lệ."
+            )
         p_form = self._read_proxy_dict_raw()
         any_row_proxy = any(bool(r.get("use_proxy", True)) for r in rows_out)
         if any_row_proxy and (not p_form["host"] or p_form["port"] <= 0):
@@ -2169,14 +2327,39 @@ class AccountFormDialog:
             )
         out: list[dict[str, Any]] = []
         existing = {str(a.get("id", "")) for a in self._manager.load_all()}
+        existing_paths: set[str] = set()
+        for a in self._manager.load_all():
+            for key in ("portable_path", "profile_path"):
+                raw = str(a.get(key) or "").strip()
+                if not raw:
+                    continue
+                p = Path(raw)
+                try:
+                    existing_paths.add(
+                        str(p.resolve() if p.is_absolute() else (project_root() / p).resolve())
+                    )
+                except OSError:
+                    existing_paths.add(raw.replace("\\", "/").lower())
         for row in rows_out:
-            aid = re.sub(r"[^\w\-]+", "_", row["folder_name"])[:48] or uuid.uuid4().hex[:10]
+            sug = str(row.get("suggest_id") or "").strip()
+            aid = sug or re.sub(r"[^\w\-]+", "_", row["folder_name"])[:48] or uuid.uuid4().hex[:10]
             base = aid
             n = 0
             while aid in existing:
                 n += 1
                 aid = f"{base}_{n}"
             existing.add(aid)
+            portable = str(row.get("portable_path") or "").strip()
+            try:
+                portable_key = str(Path(portable).resolve())
+            except OSError:
+                portable_key = portable.replace("\\", "/").lower()
+            if portable_key in existing_paths:
+                raise ValueError(
+                    f"Thư mục profile đã được gắn tài khoản khác:\n{portable}\n"
+                    "Mỗi tài khoản phải dùng một profile riêng."
+                )
+            existing_paths.add(portable_key)
             row_uses = bool(row.get("use_proxy", True))
             if row_uses:
                 px_row = {
@@ -2198,19 +2381,32 @@ class AccountFormDialog:
                 ck_abs.parent.mkdir(parents=True, exist_ok=True)
                 ck_abs.write_text("[]\n", encoding="utf-8")
             exe_one = str(row.get("browser_exe_path", "")).strip()
-            if not exe_one or not Path(exe_one).is_file():
+            if exe_one and not Path(exe_one).is_file():
+                exe_one = ""
+            self._refresh_folder_row_validity(row)
+            if not row.get("valid"):
                 continue
+            fb_uid = str(row.get("suggest_facebook_uid") or "").strip()
+            if not fb_uid and self._looks_like_facebook_uid(str(row.get("folder_name") or "")):
+                fb_uid = str(row["folder_name"]).strip()
+            note_bits = [self._collect_notes()]
+            if row.get("has_history"):
+                note_bits.append("Import profile có lịch sử/phiên sẵn.")
+            notes_joined = "\n".join(x for x in note_bits if x).strip()
             rec = self._build_account_dict_core(
                 aid=aid,
                 name=row["folder_name"],
-                portable=row["portable_path"],
+                portable=portable,
                 cookie=Path(ck).as_posix(),
                 browser_type=row["browser_type"],
                 proxy=px_row,
                 use_px=row_uses,
                 import_type="folder",
                 browser_exe_path=exe_one,
+                facebook_uid=fb_uid or self._form_facebook_uid(),
             )
+            if notes_joined:
+                rec["notes"] = notes_joined
             out.append(rec)
         if not out:
             raise ValueError("Không tạo được bản ghi hợp lệ.")

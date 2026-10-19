@@ -150,9 +150,7 @@ class FacebookGroupProvider:
         """
         if self._fetch_html is not None:
             return {"error_code": "", "switched": True}
-        if self._page is None:
-            self.begin_account(account_id)
-        if self._page is None:
+        if not self.ensure_browser(account_id):
             return {"error_code": "TIMEOUT", "error_message": "Không mở được trình duyệt"}
         from src.automation.facebook_actions import (
             _disable_view_only_guard,
@@ -164,20 +162,33 @@ class FacebookGroupProvider:
             navigate_to_url,
         )
 
-        page = self._page
         dest = _share_page_url(page_id, page_url)
         name = str(page_name or "").strip()
         label = name or page_id
         if not dest:
             return {"error_code": "TEMPORARY_ERROR", "error_message": f"Thiếu link Page {label}"}
 
+        def _closed(exc: BaseException) -> bool:
+            msg = str(exc or "").casefold()
+            return "has been closed" in msg or "target page" in msg or "context or browser" in msg
+
         ok = False
-        _disable_view_only_guard(page)
-        try:
-            for attempt in (1, 2):
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            if not self.ensure_browser(account_id):
+                return {"error_code": "TIMEOUT", "error_message": "Không mở được trình duyệt"}
+            page = self._page
+            if page is None:
+                return {"error_code": "TIMEOUT", "error_message": "Không mở được trình duyệt"}
+            _disable_view_only_guard(page)
+            try:
                 try:
-                    if attempt == 2:
-                        logger.info("Chuyển Page {} lần 1 chưa được — về trang chủ rồi thử lần 2.", label)
+                    if attempt >= 2:
+                        logger.info(
+                            "Chuyển Page {} lần {} — về trang chủ rồi thử lại.",
+                            label,
+                            attempt,
+                        )
                         _dismiss_open_profile_menu(page)
                         _go_facebook_personal_home(page)
                     navigate_to_url(page, dest)
@@ -190,18 +201,29 @@ class FacebookGroupProvider:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Chuyển Page {} lần {} lỗi: {}", label, attempt, exc)
                     ok = False
+                    if _closed(exc):
+                        # Xóa page chết để ensure_browser mở lại vòng sau.
+                        self._page = None
+                        continue
                 if ok:
                     break
-            if not ok:
-                try:
-                    _dismiss_open_profile_menu(page)
-                    _go_facebook_personal_home(page)
-                except Exception:  # noqa: BLE001
-                    pass
-        finally:
-            _enable_view_only_guard(page, force=True)
+            finally:
+                if self._page_is_alive():
+                    try:
+                        _enable_view_only_guard(self._page, force=True)
+                    except Exception:  # noqa: BLE001
+                        pass
         if not ok:
-            return {"error_code": "TEMPORARY_ERROR", "error_message": f"Chưa chuyển được sang Page {label} (đã thử 2 lần)"}
+            try:
+                if self._page_is_alive():
+                    _dismiss_open_profile_menu(self._page)
+                    _go_facebook_personal_home(self._page)
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "error_code": "TEMPORARY_ERROR",
+                "error_message": f"Chưa chuyển được sang Page {label} (đã thử {attempts} lần)",
+            }
         logger.info("Đã chuyển sang Page {}.", label)
         return {"error_code": "", "switched": True}
 
@@ -360,18 +382,60 @@ class FacebookGroupProvider:
             return {"post_id": f"{group_id}-link", "post_url": source_url}
         return {"error_code": "TIMEOUT", "post_id": ""}
 
+    def _page_is_alive(self) -> bool:
+        """True nếu page Playwright còn dùng được (chưa đóng context/browser)."""
+        page = self._page
+        if page is None:
+            return False
+        try:
+            _ = page.url
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def ensure_browser(self, account_id: str) -> bool:
+        """
+        Đảm bảo đang có trình duyệt sống cho account.
+
+        Giữa lượt chia sẻ Firefox đôi khi đóng — nếu vẫn giữ page chết thì
+        mọi Page sau đều lỗi «has been closed» trong tích tắc.
+        """
+        if self._fetch_html is not None:
+            return True
+        token = str(account_id or "").strip()
+        if not token:
+            return False
+        if self._page_is_alive() and self._account_id == token:
+            return True
+        logger.warning(
+            "Trình duyệt account {} đã đóng hoặc lệch session — mở lại để tiếp tục.",
+            token,
+        )
+        try:
+            self.end_account(token, force_kill_firefox=True)
+        except Exception:  # noqa: BLE001
+            self._page = None
+            self._context = None
+            self._factory = None
+            self._account_id = ""
+            self._kill_stale_firefox(token)
+        self._open_browser(token)
+        return self._page_is_alive()
+
     def begin_account(self, account_id: str) -> None:
         """Mở một profile cho cả lượt tìm, tham gia hoặc chia sẻ."""
         if self._fetch_html is not None or not str(account_id or "").strip():
             return
-        if self._page is not None and self._account_id == account_id:
+        # Page chết vẫn khác None — phải mở lại, không return sớm.
+        if self._page_is_alive() and self._account_id == account_id:
             return
-        self.end_account(account_id)
+        # Đóng context cũ + ép kill firefox còn sót (tránh 2 cửa sổ cùng profile).
+        self.end_account(account_id, force_kill_firefox=True)
         self._open_browser(account_id)
 
-    def end_account(self, account_id: str) -> None:
+    def end_account(self, account_id: str, *, force_kill_firefox: bool = False) -> None:
         """Đóng profile sau khi hàng đợi của account đó xong."""
-        del account_id
+        token = str(account_id or self._account_id or "").strip()
         context = self._context
         factory = self._factory
         self._page = None
@@ -379,15 +443,43 @@ class FacebookGroupProvider:
         self._factory = None
         self._account_id = ""
         if context is None and factory is None:
+            if force_kill_firefox and token:
+                self._kill_stale_firefox(token)
             return
         from src.automation.browser_factory import sync_close_persistent_context
 
-        sync_close_persistent_context(context, log_label="group", same_thread=True)
+        sync_close_persistent_context(
+            context,
+            log_label="group",
+            same_thread=True,
+            force_kill_firefox=force_kill_firefox,
+        )
         if factory is not None:
             try:
                 factory.close()
             except Exception:  # noqa: BLE001
                 pass
+        if force_kill_firefox and token:
+            self._kill_stale_firefox(token)
+
+    @staticmethod
+    def _kill_stale_firefox(account_id: str) -> None:
+        """Ép đóng firefox.exe còn giữ portable_path của TK (tránh mở trùng cửa sổ)."""
+        try:
+            from src.utils.account_browser_profile import resolve_account_path
+            from src.utils.db_manager import AccountsDatabaseManager
+            from src.utils.paths import project_root
+            from src.utils.win_browser_window import terminate_firefox_for_profile
+
+            row = AccountsDatabaseManager().get_by_id(account_id)
+            if not row:
+                return
+            raw = str(row.get("portable_path") or row.get("profile_path") or "").strip()
+            folder = resolve_account_path(project_root(), raw) if raw else None
+            if folder is not None and folder.is_dir():
+                terminate_firefox_for_profile(folder, grace_ms=200)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("kill stale firefox {}: {}", account_id, exc)
 
     def _scroll_group_results(
         self,
@@ -560,6 +652,8 @@ class FacebookGroupProvider:
         row = AccountsDatabaseManager().get_by_id(account_id)
         if row is None:
             return
+        # Dọn firefox sót trước khi launch — tránh 2 cửa sổ cùng profile.
+        self._kill_stale_firefox(account_id)
         prepare_playwright_sync_thread(label=f"group:{account_id}")
         acc = prepare_account_dict_for_browser_run(dict(row), require_proxy_live=True)
         factory = BrowserFactory(headless=False, playwright_shared=True)
@@ -571,7 +665,17 @@ class FacebookGroupProvider:
         )
         self._factory = factory
         self._context = context
-        self._page = context.pages[0] if context.pages else context.new_page()
+        # Chỉ giữ 1 page — đóng tab thừa từ session cũ nếu có.
+        pages = list(context.pages) if context.pages else []
+        if not pages:
+            self._page = context.new_page()
+        else:
+            self._page = pages[0]
+            for extra in pages[1:]:
+                try:
+                    extra.close()
+                except Exception:  # noqa: BLE001
+                    pass
         self._account_id = account_id
         from src.services.facebook_groups.video_engage import _lock_user
 

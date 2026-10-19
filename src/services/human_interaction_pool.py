@@ -184,6 +184,8 @@ class HumanInteractionPool:
     def stop(self) -> None:
         """
         Yêu cầu dừng — hủy tài khoản còn trong hàng đợi; worker đang chạy sẽ thoát sớm khi có thể.
+
+        Sau vài giây nếu Firefox vẫn treo (checkpoint/CDN) thì ép ``terminate`` để đóng cửa sổ.
         """
         self._shutting_down = True
         self._user_cancel.set()
@@ -205,6 +207,28 @@ class HumanInteractionPool:
             logger.info("[Human pool] Đã hủy {} tài khoản còn trong hàng đợi.", cancelled)
         for _ in range(self._max_concurrent):
             self._work_q.put(None)
+
+        def _force_kill_if_stuck() -> None:
+            delay = max(6.0, float(os.environ.get("FB_POOL_STOP_KILL_AFTER_SEC", "10")))
+            time.sleep(delay)
+            if not self._user_cancel.is_set():
+                return
+            if not self.has_live_workers():
+                return
+            logger.warning(
+                "[Human pool] Dừng — worker vẫn chạy sau {:.0f}s, ép đóng Firefox",
+                delay,
+            )
+            try:
+                self._terminate_pool_browser_processes(force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Human pool] Ép đóng Firefox khi Dừng: {}", exc)
+
+        threading.Thread(
+            target=_force_kill_if_stuck,
+            name="human-pool-stop-kill",
+            daemon=True,
+        ).start()
 
     def shutdown_gracefully(self, timeout: float | None = 60.0) -> bool:
         """

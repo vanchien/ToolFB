@@ -81,6 +81,66 @@ def test_user_can_set_conflict_gap_range() -> None:
     assert fb.set_conflict_gap_minutes(1, 4) == (1.0, 4.0)
 
 
+def test_auto_gap_empty_schedule_is_short(monkeypatch) -> None:
+    """Không có job lịch → giãn rất ngắn (~12–36s) để chia sẻ không đứng chờ."""
+    monkeypatch.setattr(fb, "schedule_load_for_account", lambda _aid="": (0, 0, 0))
+    fb.set_conflict_gap_auto(True)
+    assert fb.recommend_conflict_gap_minutes("accX") == (0.2, 0.6)
+    assert fb.effective_conflict_gap_minutes("accX") == (0.2, 0.6)
+    assert "Tự động" in fb.describe_conflict_gap("accX")
+    assert "giây" in fb.describe_conflict_gap("accX")
+
+
+def test_auto_gap_scales_with_schedule_load(monkeypatch) -> None:
+    monkeypatch.setattr(fb, "schedule_load_for_account", lambda _aid="": (2, 0, 0))
+    assert fb.recommend_conflict_gap_minutes("a") == (0.8, 1.5)
+    monkeypatch.setattr(fb, "schedule_load_for_account", lambda _aid="": (3, 1, 0))
+    assert fb.recommend_conflict_gap_minutes("a") == (1.5, 3.0)
+    monkeypatch.setattr(fb, "schedule_load_for_account", lambda _aid="": (5, 2, 2))
+    assert fb.recommend_conflict_gap_minutes("a") == (2.5, 4.5)
+
+
+def test_manual_gap_capped_at_ten_minutes() -> None:
+    fb.set_conflict_gap_auto(False)
+    fb.set_conflict_gap_minutes(8, 30)
+    lo, hi = fb.effective_conflict_gap_minutes()
+    assert lo == 8.0
+    assert hi == fb.CONFLICT_GAP_MANUAL_CAP_MINUTES
+
+
+def test_share_auto_gap_after_schedule(monkeypatch) -> None:
+    """Chế độ auto: sau đăng lịch nghỉ theo recommend, không dùng khoảng tay dài."""
+    held = try_acquire(feature=FEATURE_SCHEDULE, account_id="accAuto", page_keys={"pA"})
+    assert held is not None
+    monkeypatch.setattr(fb, "schedule_queue_blocks_share", lambda **_kwargs: False)
+    monkeypatch.setattr(fb, "schedule_load_for_account", lambda _aid="": (0, 0, 0))
+    # Giãn test ngắn — tránh chờ 12–36s thật.
+    monkeypatch.setattr(fb, "recommend_conflict_gap_minutes", lambda _aid="": (0.01, 0.02))
+    monkeypatch.setattr(fb, "effective_conflict_gap_minutes", lambda _aid="": (0.01, 0.02))
+    fb.set_conflict_gap_auto(True)
+    fb.set_conflict_gap_minutes(8, 30)  # tay dài — auto phải bỏ qua
+    waits: list[str] = []
+
+    def _release_soon() -> None:
+        def _go() -> None:
+            time.sleep(0.2)
+            held.release()
+
+        threading.Thread(target=_go, daemon=True).start()
+
+    _release_soon()
+    lease = acquire_share_after_schedule(
+        account_id="accAuto",
+        page_keys={"pA"},
+        poll=0.1,
+        rng=random.Random(0),
+        on_wait=waits.append,
+    )
+    assert lease is not None
+    assert any("tự động" in w for w in waits)
+    lease.release()
+
+
 def test_acquire_waits_then_gets_slot() -> None:
     held = try_acquire(feature=FEATURE_SCHEDULE, account_id="accW", page_keys={"px"})
     assert held is not None

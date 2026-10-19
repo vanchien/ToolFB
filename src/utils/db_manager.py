@@ -413,6 +413,33 @@ class AccountsDatabaseManager:
                     normalized["portable_path"] = portable_rel
                     normalized["profile_path"] = portable_rel
                     normalized["cookie_path"] = cookie_rel
+                elif it == "folder":
+                    # Copy profile ngoài → data/profiles/... để xóa thư mục nguồn không ảnh hưởng TK.
+                    from src.utils.account_browser_profile import (
+                        default_cookie_path,
+                        import_external_profile_into_account,
+                    )
+
+                    portable_raw = str(
+                        normalized.get("portable_path") or normalized.get("profile_path") or ""
+                    ).strip()
+                    if not portable_raw:
+                        raise ValueError(
+                            f"import_type=folder nhưng thiếu portable_path (id={acc_id})."
+                        )
+                    dest_rel = import_external_profile_into_account(
+                        str(acc_id),
+                        portable_raw,
+                        bt,
+                    )
+                    normalized["portable_path"] = dest_rel
+                    normalized["profile_path"] = dest_rel
+                    ck = str(normalized.get("cookie_path") or "").strip()
+                    if not ck:
+                        normalized["cookie_path"] = default_cookie_path(str(acc_id))
+                    note = str(normalized.get("notes") or "").strip()
+                    extra = f"Đã copy profile từ: {portable_raw}"
+                    normalized["notes"] = f"{note}\n{extra}".strip() if note else extra
                 else:
                     portable_raw = str(
                         normalized.get("portable_path") or normalized.get("profile_path") or ""

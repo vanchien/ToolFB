@@ -189,15 +189,27 @@ def test_slug_alias_matches_display_name_in_popup() -> None:
 
 def test_handle_switch_profiles_popup_confirm() -> None:
     page = MagicMock()
+    # appear → True; vòng confirm: còn mở → click OK; settle: đóng + đã là Page.
+    visible_calls = {"n": 0}
+
+    def _visible(_page, *, timeout_ms=0):  # noqa: ARG001
+        visible_calls["n"] += 1
+        # 1: appear thấy popup; 2: kiểm tra trước click (còn mở); sau đó đóng.
+        return visible_calls["n"] <= 2
+
     with (
         patch(
             "src.automation.facebook_actions._switch_profiles_dialog_visible",
-            side_effect=[True, False, False, False],
+            side_effect=_visible,
         ),
         patch(
             "src.automation.facebook_actions._click_switch_profiles_popup_confirm",
             return_value=True,
         ) as confirm,
+        patch(
+            "src.automation.facebook_actions._wait_switch_profiles_popup_closed",
+            return_value=True,
+        ),
         patch(
             "src.automation.facebook_actions._page_role_acting_as_page",
             return_value=True,
@@ -206,9 +218,9 @@ def test_handle_switch_profiles_popup_confirm() -> None:
         from src.automation.facebook_actions import _handle_switch_profiles_popup_if_present
 
         assert _handle_switch_profiles_popup_if_present(
-            page, page_display_name="G-Force Ghoul", appear_wait_ms=800, settle_ms=2000
+            page, page_display_name="Campora Wild Picnic 07", appear_wait_ms=800, settle_ms=2000
         )
-    confirm.assert_called_once()
+    assert confirm.call_count >= 1
 
 
 def test_ensure_switched_passes_page_name() -> None:

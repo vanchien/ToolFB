@@ -93,6 +93,10 @@ def main() -> int:
         status=_status,
         include_html_ids=False,
         scan_videos_tab=False,
+        scan_videos_tab_top=True,
+        require_page_owner=True,
+        use_graphql_harvest=True,
+        newest_only=True,
     )
     print(json.dumps({"ok": result.get("ok"), "message": result.get("message"), "n": len(result.get("items") or [])}, ensure_ascii=False))
 

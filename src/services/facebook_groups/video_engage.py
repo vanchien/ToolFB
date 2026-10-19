@@ -2,9 +2,44 @@
 
 from __future__ import annotations
 
+import json
 import random
 import time
+from dataclasses import dataclass
+from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Callable
+
+# Tỷ lệ tối thiểu mặc định (%) video nguồn trong ngày có Like hoặc bình luận.
+DEFAULT_ENGAGE_RATE_PERCENT = 65
+# Ít khi vừa Like vừa bình luận cùng một video (tránh mọi video đều cả hai).
+SHARE_ENGAGE_BOTH_RATE = 0.06
+# Giữ tương thích test / import cũ.
+MIN_SHARE_ENGAGE_RATE = DEFAULT_ENGAGE_RATE_PERCENT / 100.0
+SHARE_ENGAGE_ROLL = 0.78
+
+
+def clamp_engage_rate_percent(raw: object, *, default: int = DEFAULT_ENGAGE_RATE_PERCENT) -> int:
+    """
+    Phần trăm tối thiểu video trong ngày có Like hoặc bình luận (0–100).
+
+    Người dùng nhập trên form; trống / sai → mặc định.
+    """
+    text = str(raw if raw is not None else "").strip().replace("%", "")
+    if not text:
+        return int(default)
+    try:
+        value = int(float(text.replace(",", ".")))
+    except ValueError as exc:
+        raise ValueError("Tỷ lệ Like/comment phải là số từ 0 đến 100") from exc
+    if value < 0 or value > 100:
+        raise ValueError("Tỷ lệ Like/comment phải từ 0 đến 100")
+    return value
+
+
+def _engage_roll_for_rate(min_rate: float) -> float:
+    """Xác suất vẫn tương tác khi đã đủ ngưỡng — hơi cao hơn min_rate."""
+    return min(0.95, max(0.05, float(min_rate) + 0.12))
 
 _PLAY_LABELS = ("play", "phát", "play video", "phát video")
 _COMMENT_HINTS = ("comment", "bình luận", "binh luan", "viết bình luận", "write a comment")
@@ -64,6 +99,332 @@ def pick_share_comment(
     if not pool:
         return ""
     return (rng or random.Random()).choice(pool)
+
+
+@dataclass(frozen=True)
+class ShareEngagePlan:
+    """Kế hoạch Like / bình luận cho một video nguồn trước khi chia sẻ."""
+
+    do_like: bool
+    do_comment: bool
+    mode: str  # none | like | comment | both
+
+    def to_dict(self) -> dict[str, Any]:
+        """Dạng lưu lịch sử trong ngày."""
+        return {
+            "do_like": bool(self.do_like),
+            "do_comment": bool(self.do_comment),
+            "mode": str(self.mode),
+        }
+
+
+def _engage_mode(do_like: bool, do_comment: bool) -> str:
+    if do_like and do_comment:
+        return "both"
+    if do_like:
+        return "like"
+    if do_comment:
+        return "comment"
+    return "none"
+
+
+def share_engage_source_key(source: str, video_url: str = "") -> str:
+    """Khóa Page nguồn để cân bằng Like/comment trong ngày."""
+    raw = str(source or "").strip()
+    if raw:
+        try:
+            from src.services.facebook_groups.source_watch import source_state_key
+
+            return source_state_key(raw)
+        except Exception:
+            return raw.rstrip("/").casefold()
+    vid = ""
+    try:
+        from src.services.facebook_groups.source_watch import video_id_from_url
+
+        vid = video_id_from_url(video_url)
+    except Exception:
+        vid = ""
+    return f"video:{vid}" if vid else "manual"
+
+
+def pick_share_engage_plan(
+    *,
+    source: str = "",
+    video_url: str = "",
+    video_id: str = "",
+    allow_like: bool = True,
+    allow_comment: bool = True,
+    history: list[dict[str, Any]] | None = None,
+    rng: random.Random | None = None,
+    min_engage_rate: float | None = None,
+) -> ShareEngagePlan:
+    """
+    Chọn Like / bình luận cho một video nguồn.
+
+    - ≥ ``min_engage_rate`` (0–1, mặc định 65%) video trong ngày có ít nhất một tương tác.
+    - Các video đã tương tác chia ~50/50 Like-only vs comment-only.
+    - Ít khi vừa Like vừa bình luận cùng một video.
+    """
+    pick = rng or random.Random()
+    floor = (
+        MIN_SHARE_ENGAGE_RATE
+        if min_engage_rate is None
+        else max(0.0, min(1.0, float(min_engage_rate)))
+    )
+    roll = _engage_roll_for_rate(floor)
+    vid = str(video_id or "").strip()
+    if not vid and video_url:
+        try:
+            from src.services.facebook_groups.source_watch import video_id_from_url
+
+            vid = video_id_from_url(video_url)
+        except Exception:
+            vid = ""
+    prior = [dict(row) for row in (history or []) if isinstance(row, dict)]
+    if vid:
+        for row in prior:
+            if str(row.get("video_id") or "") == vid:
+                do_like = bool(row.get("do_like")) and allow_like
+                do_comment = bool(row.get("do_comment")) and allow_comment
+                return ShareEngagePlan(do_like, do_comment, _engage_mode(do_like, do_comment))
+
+    can_like = bool(allow_like)
+    can_comment = bool(allow_comment)
+    if not can_like and not can_comment:
+        return ShareEngagePlan(False, False, "none")
+
+    n_after = len(prior) + 1
+    engaged = sum(1 for row in prior if row.get("do_like") or row.get("do_comment"))
+    # Bắt buộc tương tác nếu bỏ qua sẽ kéo tỷ lệ ngày xuống dưới ngưỡng người dùng đặt.
+    must_engage = engaged / n_after < floor
+    if not must_engage and pick.random() >= roll:
+        return ShareEngagePlan(False, False, "none")
+
+    like_only = sum(1 for row in prior if row.get("do_like") and not row.get("do_comment"))
+    comment_only = sum(1 for row in prior if row.get("do_comment") and not row.get("do_like"))
+
+    if can_like and can_comment:
+        if pick.random() < SHARE_ENGAGE_BOTH_RATE:
+            return ShareEngagePlan(True, True, "both")
+        if like_only < comment_only:
+            return ShareEngagePlan(True, False, "like")
+        if comment_only < like_only:
+            return ShareEngagePlan(False, True, "comment")
+        if pick.random() < 0.5:
+            return ShareEngagePlan(True, False, "like")
+        return ShareEngagePlan(False, True, "comment")
+    if can_like:
+        return ShareEngagePlan(True, False, "like")
+    return ShareEngagePlan(False, True, "comment")
+
+
+def append_share_engage_history(
+    history: list[dict[str, Any]],
+    *,
+    video_id: str,
+    plan: ShareEngagePlan,
+    max_items: int = 80,
+) -> list[dict[str, Any]]:
+    """Ghi kế hoạch video vào lịch sử ngày (bỏ trùng theo video_id)."""
+    vid = str(video_id or "").strip()
+    out = [dict(row) for row in history if isinstance(row, dict) and str(row.get("video_id") or "") != vid]
+    row = plan.to_dict()
+    row["video_id"] = vid
+    out.append(row)
+    return out[-max(1, int(max_items)) :]
+
+
+def default_share_engage_store_path() -> Path:
+    """File lưu phân bổ Like/comment theo ngày + Page nguồn."""
+    root = Path(__file__).resolve().parents[3]
+    return root / "data" / "share_engage_day.json"
+
+
+def load_share_engage_day(
+    path: Path | None = None,
+    *,
+    day: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Đọc lịch sử ngày hiện tại: ``{ source_key: [ {video_id, do_like, do_comment, mode} ] }``."""
+    store = path or default_share_engage_store_path()
+    today = day or date.today().isoformat()
+    try:
+        raw = json.loads(store.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    block = raw.get(today)
+    if not isinstance(block, dict):
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for key, rows in block.items():
+        if isinstance(rows, list):
+            out[str(key)] = [dict(r) for r in rows if isinstance(r, dict)]
+    return out
+
+
+def save_share_engage_day(
+    by_source: dict[str, list[dict[str, Any]]],
+    path: Path | None = None,
+    *,
+    day: str | None = None,
+    keep_days: int = 5,
+) -> None:
+    """Ghi lịch sử ngày; xóa ngày cũ hơn ``keep_days``."""
+    store = path or default_share_engage_store_path()
+    today = day or date.today().isoformat()
+    doc: dict[str, Any] = {}
+    try:
+        loaded = json.loads(store.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            doc = loaded
+    except Exception:
+        doc = {}
+    doc[today] = {str(k): list(v or []) for k, v in (by_source or {}).items()}
+    cutoff = (date.today() - timedelta(days=max(1, int(keep_days)))).isoformat()
+    pruned = {k: v for k, v in doc.items() if str(k) >= cutoff and isinstance(v, dict)}
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps(pruned, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def remember_share_engage_plan(
+    *,
+    source: str,
+    video_url: str,
+    plan: ShareEngagePlan,
+    path: Path | None = None,
+) -> ShareEngagePlan:
+    """Lưu kế hoạch vào file ngày — lần chia sẻ lại cùng video giữ nguyên Like/comment."""
+    from src.services.facebook_groups.source_watch import video_id_from_url
+
+    vid = video_id_from_url(video_url)
+    key = share_engage_source_key(source, video_url)
+    day_map = load_share_engage_day(path)
+    hist = list(day_map.get(key) or [])
+    day_map[key] = append_share_engage_history(hist, video_id=vid, plan=plan)
+    save_share_engage_day(day_map, path)
+    return plan
+
+
+def plan_share_engage_for_video(
+    *,
+    source: str = "",
+    video_url: str = "",
+    allow_like: bool = True,
+    allow_comment: bool = True,
+    rng: random.Random | None = None,
+    path: Path | None = None,
+    persist: bool = True,
+    min_engage_rate: float | None = None,
+    engage_rate_percent: object = None,
+) -> ShareEngagePlan:
+    """Bốc kế hoạch Like/comment cho video (cân bằng theo Page nguồn trong ngày) rồi lưu."""
+    from src.services.facebook_groups.source_watch import video_id_from_url
+
+    floor = min_engage_rate
+    if floor is None and engage_rate_percent is not None:
+        floor = clamp_engage_rate_percent(engage_rate_percent) / 100.0
+    key = share_engage_source_key(source, video_url)
+    vid = video_id_from_url(video_url)
+    day_map = load_share_engage_day(path)
+    hist = list(day_map.get(key) or [])
+    plan = pick_share_engage_plan(
+        source=source,
+        video_url=video_url,
+        video_id=vid,
+        allow_like=allow_like,
+        allow_comment=allow_comment,
+        history=hist,
+        rng=rng,
+        min_engage_rate=floor,
+    )
+    if persist:
+        day_map[key] = append_share_engage_history(hist, video_id=vid, plan=plan)
+        save_share_engage_day(day_map, path)
+    return plan
+
+
+def allocate_wave_page_engage(
+    page_ids: list[str],
+    *,
+    want_like: bool = False,
+    want_comment: bool = False,
+    rng: random.Random | None = None,
+) -> tuple[set[str], set[str]]:
+    """
+    Phân bổ Like / comment thưa trên các Page nhận của một lượt chia sẻ.
+
+    Ví dụ 13 Page chia sẻ: khoảng 2–3 Like và 3–4 bình luận, Page khác chỉ chia sẻ.
+    Like và comment không trùng cùng một Page (trừ khi chỉ còn 1 Page).
+    """
+    pick = rng or random.Random()
+    ids = list(dict.fromkeys(str(p).strip() for p in page_ids if str(p).strip()))
+    n = len(ids)
+    if n <= 0:
+        return set(), set()
+    like_n = 0
+    comment_n = 0
+    if want_like:
+        # ~15–25% — 13 Page → 2–3
+        lo = max(1, int(round(n * 0.15))) if n >= 2 else 1
+        hi = max(lo, int(round(n * 0.25)))
+        like_n = pick.randint(lo, min(hi, n))
+    if want_comment:
+        # ~23–31% — 13 Page → 3–4
+        lo = max(1, int(round(n * 0.23))) if n >= 2 else 1
+        hi = max(lo, int(round(n * 0.31)))
+        comment_n = pick.randint(lo, min(hi, n))
+    if like_n + comment_n > n:
+        overflow = like_n + comment_n - n
+        # Ưu tiên giữ comment (user muốn comment hơi nhiều hơn like).
+        cut_like = min(like_n, (overflow + 1) // 2)
+        like_n -= cut_like
+        overflow -= cut_like
+        comment_n = max(0, comment_n - overflow)
+    shuffled = list(ids)
+    pick.shuffle(shuffled)
+    like_set = set(shuffled[:like_n])
+    comment_set = set(shuffled[like_n : like_n + comment_n])
+    return like_set, comment_set
+
+
+def shuffle_due_queue_items(items: list[Any], *, now: Any = None, rng: random.Random | None = None) -> Any | None:
+    """
+    Chọn ngẫu nhiên một video đã tới giờ trong hàng chờ (không luôn lấy dòng trên cùng).
+
+    ``items``: list ``PlannedShareLink`` (có ``.when``, ``.state``).
+    Giờ được chuẩn hóa naive local — tránh TypeError naive/aware làm worker dừng.
+    """
+    from datetime import datetime as _dt
+
+    from src.services.facebook_groups.share_schedule import as_local_naive
+
+    moment = as_local_naive(now or _dt.now())
+    pick = rng or random.Random()
+    due: list[Any] = []
+    waiting: list[Any] = []
+    for row in items:
+        if getattr(row, "state", "") != "waiting":
+            continue
+        waiting.append(row)
+        try:
+            when = as_local_naive(getattr(row, "when", moment))
+        except Exception:  # noqa: BLE001
+            when = moment
+        # Ghi lại when đã chuẩn hóa — lần sau so sánh không lỗi.
+        try:
+            row.when = when
+        except Exception:  # noqa: BLE001
+            pass
+        if when <= moment:
+            due.append(row)
+    if due:
+        return pick.choice(due)
+    if not waiting:
+        return None
+    return min(waiting, key=lambda row: as_local_naive(getattr(row, "when", moment)))
 
 
 def clamp_watch_max_minutes(raw: object) -> int:

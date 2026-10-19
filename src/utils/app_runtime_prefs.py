@@ -17,6 +17,8 @@ _DEFAULTS: dict[str, Any] = {
     # Tool chạy 24/7: mặc định mở cùng Windows; tắt bằng tick trên thanh Lịch.
     "open_on_windows_startup": True,
     "scheduler_wanted": None,
+    # Song song với watch.enabled trong share_settings — dự phòng khi file settings lệch.
+    "share_watch_wanted": None,
 }
 
 
@@ -59,6 +61,26 @@ def save_runtime_prefs(patch: dict[str, Any], *, root: Path | None = None) -> di
 def set_scheduler_wanted(wanted: bool, *, root: Path | None = None) -> None:
     """Nhớ người dùng vừa Bắt đầu / Dừng lịch — dùng để tự bật sau khi mở lại máy."""
     save_runtime_prefs({"scheduler_wanted": bool(wanted)}, root=root)
+
+
+def set_share_watch_wanted(wanted: bool, *, root: Path | None = None) -> None:
+    """Nhớ theo dõi chia sẻ đang bật — tự khôi phục sau reboot."""
+    save_runtime_prefs({"share_watch_wanted": bool(wanted)}, root=root)
+
+
+def should_auto_start_share_watch(prefs: dict[str, Any] | None = None) -> bool | None:
+    """
+    Gợi ý bật theo dõi chia sẻ khi mở app.
+
+    ``True``/``False`` theo lần trước; ``None`` nếu chưa nhớ (dùng share_settings.watch.enabled).
+    """
+    data = prefs if isinstance(prefs, dict) else load_runtime_prefs()
+    wanted = data.get("share_watch_wanted")
+    if wanted is True:
+        return True
+    if wanted is False:
+        return False
+    return None
 
 
 def set_open_on_windows_startup(enabled: bool, *, root: Path | None = None) -> dict[str, Any]:

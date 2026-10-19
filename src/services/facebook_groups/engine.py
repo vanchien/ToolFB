@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import threading
@@ -19,7 +20,12 @@ from src.utils.feature_busy import (
 )
 
 from .fingerprint import assert_link_only, classify_source_url, normalize_share_images, share_fingerprint
-from .video_engage import parse_comment_lines, pick_page_watch_seconds, pick_share_comment
+from .video_engage import (
+    allocate_wave_page_engage,
+    parse_comment_lines,
+    pick_page_watch_seconds,
+    pick_share_comment,
+)
 from .match import passes_discovery_filters, qualify_group, topic_match_score
 from .states import (
     BATCH_CANCELLED,
@@ -114,14 +120,32 @@ class GroupEngine:
         self._rng = rng or random.Random()
         self._rng_lock = threading.Lock()
         self._step_lock = threading.Lock()
+        self._live_lock = threading.Lock()
+        self._live_batches: set[str] = set()
         self._live_steps: dict[str, dict[str, str]] = {}
         self._account_labels: dict[str, str] = {}
+        # Mỗi tài khoản tối đa 1 browser / 1 Page share tại một thời điểm (nhiều TK vẫn song song).
+        self._account_run_guard = threading.Lock()
+        self._account_run_locks: dict[str, threading.Lock] = {}
         self._tls = threading.local()
         self._cancel: set[str] = set()
 
+    def _account_share_lock(self, account_id: str) -> threading.Lock:
+        """Khóa theo account_id — không cho cùng TK mở 2 Firefox / chạy 2 Page cùng lúc."""
+        aid = str(account_id or "").strip() or "_unknown_"
+        with self._account_run_guard:
+            lock = self._account_run_locks.get(aid)
+            if lock is None:
+                lock = threading.Lock()
+                self._account_run_locks[aid] = lock
+            return lock
+
     def recover(self) -> dict[str, int]:
-        """Sau khi mở lại app: job đang dở được xác minh lại, job tạm dừng giữ nguyên."""
-        counts = {"discovery": 0, "join": 0, "share": 0}
+        """
+        Sau khi mở lại app: job đang dở được xác minh lại; batch RUNNING/DELAYING mồ côi
+        (process cũ chết) → READY để không khóa tài khoản mãi và còn chạy tiếp được.
+        """
+        counts = {"discovery": 0, "join": 0, "share": 0, "share_batches": 0}
         for job in self.store.discovery_jobs():
             if job.get("status") in DISCOVERY_ACTIVE:
                 job["status"] = "PENDING"
@@ -140,7 +164,58 @@ class GroupEngine:
                 job["error_message"] = "Khôi phục — kiểm tra bài đã đăng chưa trước khi đăng lại"
                 self.store.save_share_job(job)
                 counts["share"] += 1
+        orphan_status = {BATCH_VALIDATING, BATCH_RUNNING, BATCH_DELAYING}
+        for batch in self.store.share_batches():
+            if batch.get("status") not in orphan_status:
+                continue
+            batch_id = str(batch.get("id") or "")
+            pending = [
+                job
+                for job in self._batch_jobs(batch_id)
+                if job.get("status") in {SHARE_PENDING, SHARE_VERIFY_FIRST}
+            ]
+            if pending:
+                batch["status"] = BATCH_READY
+                batch["cooldown_remaining"] = 0
+                batch["error_message"] = "Khôi phục sau tắt/mở app — chờ chạy tiếp"
+            else:
+                failed = int(batch.get("failed_jobs") or 0)
+                done = int(batch.get("completed_jobs") or 0)
+                batch["status"] = BATCH_FAILED if failed and not done else BATCH_COMPLETED
+                batch["finished_at"] = batch.get("finished_at") or _now()
+                batch["cooldown_remaining"] = 0
+            self.store.save_share_batch(batch)
+            counts["share_batches"] += 1
+        if counts["share_batches"] or counts["share"]:
+            logger.info(
+                "Khôi phục chia sẻ: %s job, %s batch mồ côi → READY/COMPLETED.",
+                counts["share"],
+                counts["share_batches"],
+            )
         return counts
+
+    def incomplete_share_batch_ids_for_url(self, source_url: str) -> list[str]:
+        """Batch còn bài chưa xong của đúng video — dùng khi mở lại app để chạy tiếp, không tạo wave trùng."""
+        want = str(source_url or "").strip()
+        if not want:
+            return []
+        found: list[str] = []
+        for batch in self.store.share_batches():
+            if str(batch.get("source_url") or "").strip() != want:
+                continue
+            if batch.get("status") not in {BATCH_READY, BATCH_PAUSED}:
+                continue
+            batch_id = str(batch.get("id") or "")
+            if not batch_id:
+                continue
+            pending = [
+                job
+                for job in self._batch_jobs(batch_id)
+                if job.get("status") in {SHARE_PENDING, SHARE_VERIFY_FIRST}
+            ]
+            if pending:
+                found.append(batch_id)
+        return found
 
     def run_discovery(self, job_id: str) -> dict[str, Any]:
         job = self._discovery(job_id)
@@ -606,12 +681,33 @@ class GroupEngine:
         reel_seconds: int = 0,
         comment: str = "",
         like_video: bool = False,
+        engage_mode: str = "",
+        source_page: str = "",
     ) -> dict[str, Any]:
-        """Cùng một link cho nhiều page. Mỗi page xem một số giây ngẫu nhiên trong khoảng đã đặt."""
+        """Cùng một link cho nhiều page. Mỗi page xem một số giây ngẫu nhiên trong khoảng đã đặt.
+
+        ``like_video`` / ``comment``: ý định cấp video (Like-only / comment-only / cả hai / không).
+        Trong lượt: chỉ một phần Page nhận Like (~15–25%) hoặc bình luận (~23–31%),
+        còn lại chỉ chia sẻ — tránh 13 share → 13 comment.
+        """
         assert_link_only({"source_url": source_url, "text": text})
         images = normalize_share_images(image_paths)
         place = destination if destination in {"page", "joined", "both"} else "page"
         source_type = classify_source_url(source_url)
+        mode = str(engage_mode or "").strip().casefold()
+        if not mode:
+            mode = "both" if like_video and str(comment or "").strip() else (
+                "like" if like_video else ("comment" if str(comment or "").strip() else "none")
+            )
+        want_like = bool(like_video) or mode in {"like", "both"}
+        want_comment = bool(str(comment or "").strip()) or mode in {"comment", "both"}
+        if mode == "none":
+            want_like = False
+            want_comment = False
+        if mode == "like":
+            want_comment = False
+        if mode == "comment":
+            want_like = False
         watch_low = max(0, int(watch_seconds or 0))
         watch_high = max(watch_low, int(watch_max_seconds or 0))
         self._account_labels = {}
@@ -681,12 +777,31 @@ class GroupEngine:
                 )
         batches: list[dict[str, Any]] = []
         created = 0
-        comment_pool = parse_comment_lines(comment)
+        # Phân bổ Like/comment thưa trên toàn bộ Page nhận (không gắn mọi Page).
+        unique_page_ids: list[str] = []
+        seen_pid: set[str] = set()
+        for jobs in by_account.values():
+            for job in jobs:
+                pid = str(job.get("page_id") or "").strip()
+                if pid and pid not in seen_pid:
+                    seen_pid.add(pid)
+                    unique_page_ids.append(pid)
+        like_page_ids, comment_page_ids = allocate_wave_page_engage(
+            unique_page_ids,
+            want_like=want_like,
+            want_comment=want_comment and bool(parse_comment_lines(comment)),
+            rng=self._rng,
+        )
+        comment_pool = parse_comment_lines(comment) if comment_page_ids else []
         used_comments: list[str] = []
         page_comments: dict[tuple[str, str], str] = {}
         for jobs in by_account.values():
             for job in jobs:
                 key = (str(job.get("account_id") or ""), str(job.get("page_id") or ""))
+                pid = str(job.get("page_id") or "").strip()
+                if pid not in comment_page_ids:
+                    job["comment"] = ""
+                    continue
                 if key not in page_comments:
                     chosen = pick_share_comment(comment_pool, used_comments, self._rng)
                     if chosen:
@@ -697,6 +812,13 @@ class GroupEngine:
             if not jobs:
                 continue
             chosen_comment = next((str(job.get("comment") or "") for job in jobs if job.get("comment")), "")
+            batch_like_ids = sorted(
+                {
+                    str(job.get("page_id") or "").strip()
+                    for job in jobs
+                    if str(job.get("page_id") or "").strip() in like_page_ids
+                }
+            )
             batch = self.store.add_share_batch(
                 {
                     "account_id": account_id,
@@ -713,7 +835,10 @@ class GroupEngine:
                     "watch_max_seconds": watch_high,
                     "reel_seconds": max(0, int(reel_seconds or 0)),
                     "comment": chosen_comment,
-                    "like_video": bool(like_video),
+                    "like_video": bool(batch_like_ids),
+                    "like_page_ids": batch_like_ids,
+                    "engage_mode": mode,
+                    "source_page": str(source_page or "").strip(),
                 },
                 jobs,
             )
@@ -744,54 +869,209 @@ class GroupEngine:
                 self.store.save_share_batch(batch)
         return self.run_share_wave(batch_ids)
 
-    def run_share_wave(self, batch_ids: list[str]) -> dict[str, Any]:
-        """Mỗi tài khoản một trình duyệt. Cùng lúc mỗi tài khoản chỉ chia sẻ một Page, rồi sang Page kế của tài khoản đó."""
-        specs: list[tuple[str, str, int]] = []
-        for batch_id in batch_ids:
-            if batch_id in self._cancel:
+    @staticmethod
+    def _share_parallel_account_limit() -> int:
+        """
+        Số tài khoản chia sẻ song song tối đa (mỗi TK một browser).
+
+        Ưu tiên ``SHARE_PARALLEL_ACCOUNTS``, không thì ``BROWSER_CONCURRENCY`` (mặc định 3).
+        Tránh mở hàng chục Firefox cùng lúc khi wave lớn.
+        """
+        for key in ("SHARE_PARALLEL_ACCOUNTS", "BROWSER_CONCURRENCY"):
+            raw = str(os.environ.get(key) or "").strip()
+            if not raw:
                 continue
             try:
-                batch = self._batch(batch_id)
+                return max(1, int(raw))
+            except ValueError:
+                logger.warning("{}={!r} không hợp lệ — dùng mặc định 3.", key, raw)
+        return 3
+
+    def _pending_share_batch_ids(self, batch_ids: list[str]) -> list[str]:
+        """Batch READY/PAUSED còn job PENDING/VERIFY_FIRST — cần chạy tiếp."""
+        out: list[str] = []
+        for batch_id in batch_ids:
+            bid = str(batch_id or "").strip()
+            if not bid or bid in self._cancel:
+                continue
+            try:
+                batch = self._batch(bid)
             except KeyError:
                 continue
-            account_id = str(batch.get("account_id") or "")
-            jobs = self._batch_jobs(batch_id)
+            if batch.get("status") not in {BATCH_READY, BATCH_PAUSED}:
+                continue
+            pending = [
+                job
+                for job in self._batch_jobs(bid)
+                if job.get("status") in {SHARE_PENDING, SHARE_VERIFY_FIRST}
+            ]
+            if pending:
+                out.append(bid)
+        return out
+
+    def run_share_wave(self, batch_ids: list[str], *, _auto_resume_pass: int = 0) -> dict[str, Any]:
+        """
+        Nhiều tài khoản song song (``SHARE_PARALLEL_ACCOUNTS`` / ``BROWSER_CONCURRENCY``).
+
+        Cùng một tài khoản: **một** browser, tuần tự từng batch rồi từng Page —
+        không bao giờ 2 Page / 2 Firefox của cùng TK cùng lúc.
+        """
+        # Gom batch theo account — tránh 2 thread cùng một TK (resume nhiều batch dở).
+        by_account: dict[str, list[str]] = {}
+        account_pages: dict[str, int] = {}
+        all_batch_ids: list[str] = []
+        for batch_id in batch_ids:
+            bid = str(batch_id or "").strip()
+            if not bid or bid in self._cancel:
+                continue
+            try:
+                batch = self._batch(bid)
+            except KeyError:
+                continue
+            account_id = str(batch.get("account_id") or "").strip() or "_unknown_"
+            jobs = self._batch_jobs(bid)
             pages = len({str(item.get("page_id") or "") for item in jobs})
-            specs.append((batch_id, account_id, pages))
-        if not specs:
+            by_account.setdefault(account_id, []).append(bid)
+            account_pages[account_id] = account_pages.get(account_id, 0) + pages
+            all_batch_ids.append(bid)
+        if not by_account:
             return {"batches": []}
         with self._step_lock:
             self._live_steps.clear()
-        if len(specs) == 1:
-            batch_id, account_id, pages = specs[0]
-            self._note(f"Tài khoản {account_id}: {pages} page")
-            return {"batches": [self.run_share_batch(batch_id)]}
-        self._note(f"{len(specs)} tài khoản chạy cùng lúc, mỗi tài khoản một Page")
-        finished: list[dict[str, Any] | None] = [None] * len(specs)
-        threads: list[threading.Thread] = []
-        for index, (batch_id, account_id, pages) in enumerate(specs):
-            self._note(f"Tài khoản {account_id}: {pages} page, lần lượt từng Page")
 
-            def _work(slot: int = index, token: str = batch_id) -> None:
-                self._tls.provider = self._spawn_provider()
-                self._tls.session_ok = {}
-                try:
-                    finished[slot] = self.run_share_batch(token)
-                except Exception:  # noqa: BLE001
-                    logger.exception("Lượt chia sẻ của một tài khoản lỗi. Các tài khoản khác vẫn chạy.")
+        account_specs = list(by_account.items())  # (account_id, [batch_ids...])
+
+        def _run_account_batches(acc: str, tokens: list[str]) -> list[dict[str, Any]]:
+            """Chạy tuần tự mọi batch của một TK (đã giữ khóa account)."""
+            out: list[dict[str, Any]] = []
+            self._tls.provider = self._spawn_provider()
+            self._tls.session_ok = {}
+            try:
+                for token in tokens:
+                    if token in self._cancel:
+                        continue
                     try:
-                        finished[slot] = self._batch(token)
+                        out.append(self.run_share_batch(token))
                     except Exception:  # noqa: BLE001
-                        finished[slot] = None
+                        logger.exception(
+                            "Lượt chia sẻ account %s batch %s lỗi. TK khác vẫn chạy.",
+                            acc,
+                            token,
+                        )
+                        try:
+                            batch = self._batch(token)
+                            if batch.get("status") in {
+                                BATCH_RUNNING,
+                                BATCH_VALIDATING,
+                                BATCH_DELAYING,
+                            }:
+                                pending = [
+                                    job
+                                    for job in self._batch_jobs(token)
+                                    if job.get("status") in {SHARE_PENDING, SHARE_VERIFY_FIRST}
+                                ]
+                                if pending:
+                                    batch["status"] = BATCH_READY
+                                    batch["error_message"] = (
+                                        "Lỗi giữa chừng — giữ batch để chạy tiếp"
+                                    )
+                                    self.store.save_share_batch(batch)
+                            out.append(batch)
+                        except Exception:  # noqa: BLE001
+                            pass
+            finally:
+                self._tls.provider = None
+            return out
+
+        if len(account_specs) == 1:
+            account_id, tokens = account_specs[0]
+            label = self._account_labels.get(account_id) or account_id
+            pages = account_pages.get(account_id, 0)
+            self._note(f"{label}: {pages} page · 1 browser (lần lượt từng Page)")
+            finished_one = _run_account_batches(account_id, tokens)
+            return self._finish_share_wave(
+                all_batch_ids, finished_one, auto_resume_pass=_auto_resume_pass
+            )
+
+        limit = self._share_parallel_account_limit()
+        labels = [
+            f"{self._account_labels.get(aid) or aid} ({account_pages.get(aid, 0)} page)"
+            for aid, _toks in account_specs
+        ]
+        self._note(
+            f"{len(account_specs)} tài khoản · tối đa {limit} browser cùng lúc "
+            f"(mỗi TK 1 Page): " + " · ".join(labels)
+        )
+        logger.info(
+            "Chia sẻ wave: {} TK (đã gom batch), song song tối đa {} browser — mỗi TK tuần tự Page.",
+            len(account_specs),
+            limit,
+        )
+        finished_by_acc: list[list[dict[str, Any]] | None] = [None] * len(account_specs)
+        gate = threading.Semaphore(limit)
+        threads: list[threading.Thread] = []
+        for index, (account_id, tokens) in enumerate(account_specs):
+            label = self._account_labels.get(account_id) or account_id
+            logger.info(
+                "Hàng đợi luồng chia sẻ | account={} | batches={} | pages={}",
+                label,
+                len(tokens),
+                account_pages.get(account_id, 0),
+            )
+
+            def _work(
+                slot: int = index,
+                acc: str = account_id,
+                batch_list: list[str] = tokens,
+            ) -> None:
+                acquired = gate.acquire(timeout=3600)
+                if not acquired:
+                    logger.error("Hết giờ chờ slot browser cho account {} — bỏ lượt.", acc)
+                    finished_by_acc[slot] = []
+                    return
+                try:
+                    finished_by_acc[slot] = _run_account_batches(acc, batch_list)
                 finally:
-                    self._tls.provider = None
+                    gate.release()
 
             thread = threading.Thread(target=_work, name=f"share-{account_id}", daemon=True)
             threads.append(thread)
             thread.start()
         for thread in threads:
             thread.join()
-        return {"batches": [item for item in finished if item is not None]}
+        done: list[dict[str, Any]] = []
+        for rows in finished_by_acc:
+            if rows:
+                done.extend(rows)
+        return self._finish_share_wave(all_batch_ids, done, auto_resume_pass=_auto_resume_pass)
+
+    def _finish_share_wave(
+        self,
+        batch_ids: list[str],
+        finished: list[dict[str, Any]],
+        *,
+        auto_resume_pass: int,
+    ) -> dict[str, Any]:
+        """Gộp kết quả; nếu còn batch dở (browser chết…) thì tự chạy lại 1 vòng."""
+        leftover = self._pending_share_batch_ids(batch_ids)
+        if leftover and auto_resume_pass < 1:
+            logger.info(
+                "Tự chạy tiếp {} batch còn dở sau lỗi giữa chừng (lần {}).",
+                len(leftover),
+                auto_resume_pass + 1,
+            )
+            self._note(f"Tự chạy tiếp {len(leftover)} batch còn dở…")
+            more = self.run_share_wave(leftover, _auto_resume_pass=auto_resume_pass + 1)
+            by_id = {
+                str(row.get("id") or ""): row
+                for row in finished
+                if isinstance(row, dict) and str(row.get("id") or "")
+            }
+            for row in more.get("batches") or []:
+                if isinstance(row, dict) and str(row.get("id") or ""):
+                    by_id[str(row.get("id"))] = row
+            return {"batches": list(by_id.values())}
+        return {"batches": finished}
 
     def _spawn_provider(self) -> Any:
         """Profile riêng khi nhiều tài khoản chia sẻ cùng lúc. Test dùng chung provider giả."""
@@ -887,28 +1167,67 @@ class GroupEngine:
 
     def run_share_batch(self, batch_id: str) -> dict[str, Any]:
         batch = self._batch(batch_id)
-        if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED, BATCH_COMPLETED}:
+        if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED, BATCH_COMPLETED, BATCH_FAILED}:
             return batch
         account_id = str(batch.get("account_id") or "")
-        if self._publish_busy(account_id, str(batch.get("page_id") or ""), except_batch=batch_id):
-            return batch
-        # Không giữ khóa cả batch: mỗi Page chờ đăng lịch xong + giãn cách rồi mới chia sẻ.
-        self._begin(account_id)
+        acc_lock = self._account_share_lock(account_id)
+        # Khóa cứng theo TK — dù wave/resume tạo nhiều batch, vẫn chỉ 1 browser/TK.
+        waited = False
+        while True:
+            if acc_lock.acquire(blocking=False):
+                break
+            if batch_id in self._cancel:
+                return self._batch(batch_id)
+            batch = self._batch(batch_id)
+            if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED, BATCH_COMPLETED, BATCH_FAILED}:
+                return batch
+            if not waited:
+                self._share_step(
+                    batch,
+                    page_id="",
+                    page_name="—",
+                    step="Chờ trong TK — đang có Page khác chia sẻ…",
+                )
+                waited = True
+            self._sleep(1.0)
         try:
-            return self._run_share_batch(batch_id, account_id)
+            with self._live_lock:
+                self._live_batches.add(str(batch_id))
+            self._share_step(
+                batch,
+                page_id="",
+                page_name="—",
+                step="Đã mở luồng — chuẩn bị chia sẻ…",
+            )
+            self._begin(account_id)
+            try:
+                return self._run_share_batch(batch_id, account_id)
+            finally:
+                with self._live_lock:
+                    self._live_batches.discard(str(batch_id))
+                self._end(account_id)
+                self._clear_share_step(account_id)
         finally:
-            self._end(account_id)
+            try:
+                acc_lock.release()
+            except RuntimeError:
+                pass
 
-    def _conflict_gap_minutes(self) -> tuple[float, float]:
-        """Đọc khoảng giãn cách đăng→chia sẻ từ settings (fallback cấu hình hiện tại)."""
+    def _sync_conflict_gap_settings(self) -> None:
+        """Đồng bộ giãn đăng→chia sẻ từ store (auto / tay) vào FeatureBusy."""
+        from src.utils.feature_busy import set_conflict_gap_auto
+
         try:
             data = self.store.share_settings()
-            return parse_conflict_gap_minutes(
+            parse_conflict_gap_minutes(
                 data.get("conflict_gap_min"),
                 data.get("conflict_gap_max"),
             )
+            auto = data.get("conflict_gap_auto")
+            set_conflict_gap_auto(True if auto is None else bool(auto))
         except Exception:  # noqa: BLE001
-            return get_conflict_gap_minutes()
+            lo, hi = get_conflict_gap_minutes()
+            parse_conflict_gap_minutes(lo, hi)
 
     def _page_alias_index(self) -> dict[str, dict[str, Any]]:
         """Map local id / Meta id / URL → bản ghi Page (một lần mỗi engine)."""
@@ -951,7 +1270,7 @@ class GroupEngine:
         self._tls.session_ok = {}
         liked_pages: set[str] = set()
         failed_pages: set[str] = set()
-        gap_lo, gap_hi = self._conflict_gap_minutes()
+        self._sync_conflict_gap_settings()
         while True:
             batch = self._batch(batch_id)
             if batch.get("status") in {BATCH_PAUSED, BATCH_CANCELLED} or batch_id in self._cancel:
@@ -976,19 +1295,17 @@ class GroupEngine:
                 return batch_id in self._cancel
 
             def _wait_msg(text: str) -> None:
+                # Chỉ _share_step — giữ bảng nhiều tài khoản (không ghi đè 1 dòng chờ).
                 self._share_step(batch, page_id=page_id, page_name=name, step=text)
-                self._note(text)
 
-            # Ưu tiên đăng lịch: chờ xong → nghỉ theo khoảng người dùng cài → mới chia sẻ.
+            # Auto/tay: FeatureBusy chọn giãn theo tải lịch của TK (không truyền gap cố định).
             page_lease = acquire_share_after_schedule(
                 account_id=job_account,
                 page_keys=page_keys,
                 detail=f"share:{batch_id}:{page_id}",
-                poll=2.5,
+                poll=1.0,
                 should_stop=_stop_share,
                 on_wait=_wait_msg,
-                gap_min_minutes=gap_lo,
-                gap_max_minutes=gap_hi,
             )
             if page_lease is None:
                 logger.info(
@@ -1001,12 +1318,31 @@ class GroupEngine:
                 switched = self._switch_share_page(batch_id, job)
                 if switched == "stop":
                     return self._batch(batch_id)
+                if switched == "browser_dead":
+                    # Giữ job PENDING — không fail cả list khi Firefox đã tắt.
+                    logger.error(
+                        "Batch %s dừng: không mở lại được trình duyệt account %s.",
+                        batch_id,
+                        job_account,
+                    )
+                    batch = self._batch(batch_id)
+                    batch["status"] = BATCH_READY
+                    batch["error_message"] = "Trình duyệt đóng — giữ batch để chạy tiếp sau"
+                    self.store.save_share_batch(batch)
+                    break
                 if switched == "skip":
                     failed_pages.add(page_id)
                     continue
                 if self._browse_reels(batch_id, page_id):
                     return self._batch(batch_id)
-                share_like = bool(batch.get("like_video")) and page_id not in liked_pages
+                allowed_like = {
+                    str(x).strip() for x in (batch.get("like_page_ids") or []) if str(x).strip()
+                }
+                # Bản cũ không có like_page_ids: giữ like_video trên batch (mọi Page).
+                if allowed_like:
+                    share_like = page_id in allowed_like and page_id not in liked_pages
+                else:
+                    share_like = bool(batch.get("like_video")) and page_id not in liked_pages
                 stop, liked = self._engage_page_before_share(batch_id, page_id, like=share_like)
                 if stop:
                     return self._batch(batch_id)
@@ -1037,7 +1373,12 @@ class GroupEngine:
             if remaining is None:
                 break
             page_switch = str(remaining.get("page_id") or "") != str(job.get("page_id") or "")
-            self._delay_batch(batch, page_switch=page_switch)
+            self._delay_batch(
+                batch,
+                page_switch=page_switch,
+                page_id=str(job.get("page_id") or ""),
+                page_name=str(job.get("page_name") or ""),
+            )
         batch = self.store.refresh_batch_counts(batch_id) or self._batch(batch_id)
         self._clear_share_step(str(batch.get("account_id") or account_id))
         if batch.get("status") not in {BATCH_PAUSED, BATCH_CANCELLED, BATCH_FAILED}:
@@ -1072,10 +1413,13 @@ class GroupEngine:
             if self._pause_prepare(batch_id, result):
                 return "stop"
             if result.get("error_code"):
+                err = str(result.get("error_message") or "")
+                if "Không mở được trình duyệt" in err or str(result.get("error_code")) == "TIMEOUT":
+                    return "browser_dead"
                 self._fail_share_job(
                     job,
                     str(result.get("error_code") or "TEMPORARY_ERROR"),
-                    str(result.get("error_message") or f"Chưa chuyển được sang Page {name}"),
+                    err or f"Chưa chuyển được sang Page {name}",
                 )
                 return "skip"
         batch = self._batch(batch_id)
@@ -1510,16 +1854,31 @@ class GroupEngine:
         with self._step_lock:
             return "\n".join(item["line"] for item in self._live_steps.values())
 
-    def live_step_for(self, account_id: str, page_id: str) -> str:
-        """Bước hiện tại nếu Page này đang được tài khoản xử lý."""
+    def live_steps_snapshot(self) -> dict[str, dict[str, str]]:
+        """Bản sao bước đang chạy theo ``account_id`` — UI đọc không giữ khóa lâu."""
+        with self._step_lock:
+            return {key: dict(val) for key, val in self._live_steps.items()}
+
+    def live_step_for(self, account_id: str, page_id: str = "") -> str:
+        """
+        Bước hiện tại của tài khoản trên bảng Page.
+
+        - Đúng Page đang xử lý → câu bước đầy đủ.
+        - Page khác cùng TK còn chờ → ``Chờ trong TK — đang: {Page}``.
+        - Chưa gắn Page (mới mở luồng) → hiện bước chung cho mọi dòng TK đó.
+        """
         with self._step_lock:
             item = self._live_steps.get(str(account_id or ""))
         if not item:
             return ""
-        current = str(item.get("page_id") or "")
-        if page_id and current and current != str(page_id):
-            return ""
-        return str(item.get("step") or "")
+        current = str(item.get("page_id") or "").strip()
+        step = str(item.get("step") or "").strip()
+        page_name = str(item.get("page_name") or "").strip()
+        want = str(page_id or "").strip()
+        if not want or not current or current == want:
+            return step
+        where = page_name if page_name and page_name != "—" else current
+        return f"Chờ trong TK — đang: {where}"
 
     def _note(self, text: str) -> None:
         callback = getattr(self, "on_progress", None)
@@ -1579,7 +1938,14 @@ class GroupEngine:
         if seconds > 0:
             self._sleep(seconds)
 
-    def _delay_batch(self, batch: dict[str, Any], *, page_switch: bool = False) -> None:
+    def _delay_batch(
+        self,
+        batch: dict[str, Any],
+        *,
+        page_switch: bool = False,
+        page_id: str = "",
+        page_name: str = "",
+    ) -> None:
         """Nghỉ giữa các bài. Sang Page khác của cùng tài khoản thì nghỉ gấp đôi."""
         batch = dict(batch)
         batch["delay_enabled"] = True
@@ -1593,14 +1959,21 @@ class GroupEngine:
             seconds *= 2
         if seconds <= 0:
             return
+        live_pid = str(page_id or batch.get("live_page_id") or "").strip()
+        live_name = str(page_name or "").strip() or self._page_label(
+            str(batch.get("id") or ""), live_pid
+        )
         if page_switch:
-            self._share_step(batch, page_name=self._page_label(str(batch.get("id") or ""), str(batch.get("live_page_id") or "")), step=f"Nghỉ {seconds} giây trước Page tiếp theo")
+            step = f"Nghỉ {seconds} giây trước Page tiếp theo"
         else:
-            self._share_step(batch, step=f"Nghỉ {seconds} giây trước bài tiếp theo")
+            step = f"Nghỉ {seconds} giây trước bài tiếp theo"
+        self._share_step(batch, page_id=live_pid, page_name=live_name, step=step)
         batch_id = str(batch.get("id"))
         stored = self._batch(batch_id)
         stored["status"] = BATCH_DELAYING
         stored["cooldown_remaining"] = seconds
+        if live_pid:
+            stored["live_page_id"] = live_pid
         self.store.save_share_batch(stored)
         if seconds > 0 and batch_id not in self._cancel:
             self._sleep(seconds)
@@ -1611,15 +1984,33 @@ class GroupEngine:
             self.store.save_share_batch(stored)
 
     def _publish_busy(self, account_id: str, page_id: str, *, except_batch: str) -> bool:
-        """True nếu batch chia sẻ khác đang chạy cùng account/page (lịch đăng chờ ở acquire)."""
+        """
+        True nếu cùng tài khoản/Page đang chia sẻ **trong process này**.
+
+        Chỉ nhìn ``_live_batches`` — batch RUNNING/DELAYING mồ côi sau tắt app
+        không còn khóa tài khoản (đã đưa về READY ở ``recover``).
+        """
+        aid = str(account_id or "").strip()
+        pid = str(page_id or "").strip()
+        live = {str(x) for x in self._live_batches if str(x) != str(except_batch)}
+        if not live:
+            return False
+        for bid in live:
+            try:
+                batch = self._batch(bid)
+            except KeyError:
+                continue
+            if aid and str(batch.get("account_id") or "") == aid:
+                return True
         for job in self.store.share_jobs():
-            if str(job.get("batch_id")) == except_batch:
+            job_batch = str(job.get("batch_id") or "")
+            if job_batch == except_batch or job_batch not in live:
                 continue
             if job.get("status") not in SHARE_ACTIVE:
                 continue
-            if account_id and str(job.get("account_id")) == account_id:
+            if aid and str(job.get("account_id") or "") == aid:
                 return True
-            if page_id and str(job.get("page_id")) == page_id:
+            if pid and str(job.get("page_id") or "") == pid:
                 return True
         return False
 
