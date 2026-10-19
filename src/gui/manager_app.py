@@ -9986,8 +9986,10 @@ class _ManagerWindow:
             on_account_name=on_name,
         )
 
-    def _lookup_account_facebook_name(self, acc: dict[str, Any]) -> tuple[str, str]:
-        """Đọc tên Facebook qua cookie. Trả (tên, lý do nếu trống). Không ghi log cookie."""
+    def _lookup_account_facebook_name(
+        self, acc: dict[str, Any], *, timeout: float = 5.0
+    ) -> tuple[str, str]:
+        """Đọc tên Facebook qua cookie (timeout ngắn). Trả (tên, lý do nếu trống)."""
         from src.utils.account_proxy_mapper import lookup_account_public_name
         from src.utils.proxy_check import _requests_proxies_url, _strip_proxy_scheme
 
@@ -10025,7 +10027,9 @@ class _ManagerWindow:
             if not proxy_url:
                 return "", "không tạo được proxy"
         try:
-            found = lookup_account_public_name(cookie_path, proxy_url=proxy_url)
+            found = lookup_account_public_name(
+                cookie_path, proxy_url=proxy_url, timeout=max(2.0, float(timeout))
+            )
         except Exception:
             logger.warning("Không lấy được tên Facebook cho tài khoản {}", acc.get("id"))
             return "", "lỗi khi đọc Facebook"
@@ -10035,7 +10039,7 @@ class _ManagerWindow:
         return found, ""
 
     def _read_facebook_name_from_profile(self, account_id: str) -> tuple[str, str]:
-        """Mở Firefox của tài khoản, đọc tên trên trang cá nhân, rồi đóng."""
+        """Mở Firefox → vào facebook.com/me ngay, đọc tên, đóng (nhanh)."""
         aid = str(account_id or "").strip()
         for sess in list(getattr(self, "_manual_profile_sessions", []) or []):
             thread = sess.get("thread")
@@ -10045,39 +10049,95 @@ class _ManagerWindow:
                 alive = False
             if alive and str(sess.get("account_id") or "") == aid:
                 return "", "profile đang mở — đóng rồi bấm lại"
+        # Dọn Firefox sót trước khi mở — tránh treo / không vào facebook.com.
+        try:
+            from src.services.facebook_groups.facebook_provider import FacebookGroupProvider
+
+            FacebookGroupProvider._kill_stale_firefox(aid)
+        except Exception:  # noqa: BLE001
+            pass
         factory: BrowserFactory | None = None
         ctx = None
         try:
-            factory = BrowserFactory(accounts=self._accounts, headless=False)
-            ctx = factory.get_browser_context(aid, headless=False)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
             from src.services.device_browse import facebook_uid_on_page, read_account_display_name
+            from src.utils.account_proxy_mapper import prepare_account_dict_for_browser_run
 
-            uid = facebook_uid_on_page(page)
-            if not uid:
-                page.wait_for_timeout(2000)
-                uid = facebook_uid_on_page(page)
-            if not uid:
-                return "", "profile chưa đăng nhập Facebook"
-            page.goto(
-                f"https://www.facebook.com/profile.php?id={uid}",
-                wait_until="domcontentloaded",
-                timeout=60_000,
+            row = self._accounts.get_by_id(aid) if hasattr(self._accounts, "get_by_id") else None
+            if row is None:
+                rows = {str(r.get("id") or ""): r for r in self._accounts.load_all()}
+                row = rows.get(aid)
+            if not isinstance(row, dict):
+                return "", "không tìm thấy tài khoản"
+            factory = BrowserFactory(accounts=self._accounts, headless=False, playwright_shared=True)
+            acc = prepare_account_dict_for_browser_run(dict(row), require_proxy_live=False)
+            ctx = factory.launch_persistent_context_from_account_dict(
+                acc,
+                headless=False,
+                disable_notifications=True,
+                force_desktop_facebook=True,
             )
+            pages = list(ctx.pages) if ctx.pages else []
+            page = pages[0] if pages else ctx.new_page()
+            for extra in pages[1:]:
+                try:
+                    extra.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                page.bring_to_front()
+            except Exception:  # noqa: BLE001
+                pass
+
+            # UID từ cookie context (không cần đợi trang tải xong).
+            uid = ""
+            try:
+                for item in ctx.cookies("https://www.facebook.com") or []:
+                    if str(item.get("name") or "").strip().lower() == "c_user":
+                        uid = "".join(ch for ch in str(item.get("value") or "") if ch.isdigit())
+                        break
+            except Exception:  # noqa: BLE001
+                uid = ""
+
+            # Vào Facebook ngay — ưu tiên /me hoặc profile.php?id=
+            if uid:
+                target = f"https://www.facebook.com/profile.php?id={uid}"
+            else:
+                target = "https://www.facebook.com/me"
+            logger.info("Cập nhật tên {}: mở {}", aid, target)
+            page.goto(target, wait_until="domcontentloaded", timeout=35_000)
+            if not uid:
+                uid = facebook_uid_on_page(page)
+                if not uid:
+                    page.wait_for_timeout(800)
+                    uid = facebook_uid_on_page(page)
+                if not uid:
+                    # Thử trang chủ rồi /me lại.
+                    page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=35_000)
+                    page.wait_for_timeout(600)
+                    uid = facebook_uid_on_page(page)
+                    if not uid:
+                        return "", "profile chưa đăng nhập Facebook"
+                    page.goto(
+                        f"https://www.facebook.com/profile.php?id={uid}",
+                        wait_until="domcontentloaded",
+                        timeout=35_000,
+                    )
+
             found = ""
-            for _ in range(12):
+            for _ in range(6):
                 found = read_account_display_name(page, visit_profile=False)
                 if found and not account_name_is_placeholder(found, aid):
                     return found, ""
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(450)
             return "", "đã mở trang cá nhân nhưng chưa thấy tên người dùng"
         except Exception as exc:  # noqa: BLE001
             logger.warning("Không đọc tên từ profile {}: {}", aid, exc)
             return "", "không mở được Firefox"
         finally:
             try:
-                sync_close_persistent_context(ctx, log_label=f"account_name:{aid}", force_kill_firefox=False)
+                sync_close_persistent_context(
+                    ctx, log_label=f"account_name:{aid}", force_kill_firefox=True
+                )
             except Exception:
                 pass
             if factory is not None:
@@ -10111,40 +10171,66 @@ class _ManagerWindow:
         total = len(ids)
 
         def _worker() -> None:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             updated: list[tuple[str, str]] = []
             skipped: list[str] = []
-            for index, aid in enumerate(ids, start=1):
-                schedule_on_main_thread(
-                    self._root,
-                    lambda n=index, a=aid: self._lbl_state.configure(text=f"Đang cập nhật tên {n}/{total}: {a}"),
-                )
+            done_n = 0
+            lock = threading.Lock()
+
+            def _one(aid: str) -> tuple[str, str, str]:
+                """Trả (aid, found_name, skip_reason). found rỗng + reason = bỏ qua."""
                 acc = by_id.get(aid)
                 if not isinstance(acc, dict):
-                    skipped.append(f"{aid}: không tìm thấy bản ghi")
-                    continue
-                found, reason = self._lookup_account_facebook_name(acc)
+                    return aid, "", "không tìm thấy bản ghi"
+                # Cookie HTTP timeout ngắn (5s) — hết giờ thì mở Firefox vào facebook.com ngay.
+                found, reason = self._lookup_account_facebook_name(acc, timeout=5.0)
                 if not found:
-                    schedule_on_main_thread(
-                        self._root,
-                        lambda n=index, a=aid: self._lbl_state.configure(
-                            text=f"Đang mở Firefox để đọc tên {n}/{total}: {a}"
-                        ),
-                    )
                     found, reason = self._read_facebook_name_from_profile(aid)
                 current = str(acc.get("name") or "")
                 take = bool(found) and (
                     account_name_should_take_facebook_name(current, found, aid)
-                    or (forced and not account_name_is_placeholder(found, aid) and found.casefold() != current.casefold())
+                    or (
+                        forced
+                        and not account_name_is_placeholder(found, aid)
+                        and found.casefold() != current.casefold()
+                    )
                 )
                 if not take:
-                    skipped.append(f"{aid}: {reason or 'giữ tên hiện tại'}")
-                    continue
+                    return aid, "", reason or "giữ tên hiện tại"
                 try:
                     self._accounts.update_account_fields(aid, {"name": found})
                 except Exception as exc:  # noqa: BLE001
-                    skipped.append(f"{aid}: không lưu được ({exc})")
-                    continue
-                updated.append((aid, found))
+                    return aid, "", f"không lưu được ({exc})"
+                return aid, found, ""
+
+            # Song song tối đa 2 Firefox — nhanh hơn tuần tự, không đụng profile.
+            workers = 2 if total > 1 else 1
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="acc-name") as pool:
+                futures = {pool.submit(_one, aid): aid for aid in ids}
+                for fut in as_completed(futures):
+                    aid = futures[fut]
+                    try:
+                        out_aid, found, reason = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        out_aid, found, reason = aid, "", str(exc)
+                    with lock:
+                        done_n += 1
+                        n = done_n
+                        if found:
+                            updated.append((out_aid, found))
+                        else:
+                            skipped.append(f"{out_aid}: {reason or 'thất bại'}")
+                    schedule_on_main_thread(
+                        self._root,
+                        lambda n=n, a=out_aid, ok=bool(found): self._lbl_state.configure(
+                            text=(
+                                f"Đã lấy tên {n}/{total}: {a}"
+                                if ok
+                                else f"Cập nhật tên {n}/{total}: {a}"
+                            )
+                        ),
+                    )
 
             def _done() -> None:
                 self._account_name_refresh_busy = False

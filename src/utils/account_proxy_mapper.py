@@ -1890,9 +1890,16 @@ def profile_name_from_live_detail(detail: str) -> str:
     return text[:80]
 
 
-def lookup_public_profile_name(uid: str, *, proxy_url: str | None = None) -> str:
+def lookup_public_profile_name(
+    uid: str,
+    *,
+    proxy_url: str | None = None,
+    timeout: float = 8.0,
+) -> str:
     """Đọc tên hồ sơ công khai theo UID. Rỗng nếu Facebook không trả tên."""
-    status, detail = probe_facebook_uid_live(uid, proxy_url=proxy_url, timeout=12.0)
+    status, detail = probe_facebook_uid_live(
+        uid, proxy_url=proxy_url, timeout=max(3.0, float(timeout))
+    )
     if status != "login_ok":
         return ""
     return profile_name_from_live_detail(detail)
@@ -2091,7 +2098,12 @@ def name_from_profile_html(html: str) -> str:
     return ""
 
 
-def lookup_logged_in_profile_name(cookie_path: Path, *, proxy_url: str | None = None) -> str:
+def lookup_logged_in_profile_name(
+    cookie_path: Path,
+    *,
+    proxy_url: str | None = None,
+    timeout: float = 6.0,
+) -> str:
     """Đọc tên hồ sơ bằng cookie đăng nhập sẵn. Không gọi Graph API, không ghi log cookie."""
     header = _facebook_session_cookie_header(cookie_path)
     if "c_user=" not in header or "xs=" not in header:
@@ -2108,6 +2120,7 @@ def lookup_logged_in_profile_name(cookie_path: Path, *, proxy_url: str | None = 
         "Cookie": header,
     }
     proxies = {"http": proxy_url, "https": proxy_url} if str(proxy_url or "").strip() else None
+    wait = max(2.0, float(timeout))
     for url in (
         "https://mbasic.facebook.com/me",
         "https://m.facebook.com/me",
@@ -2116,7 +2129,7 @@ def lookup_logged_in_profile_name(cookie_path: Path, *, proxy_url: str | None = 
             response = requests.get(
                 url,
                 headers=headers,
-                timeout=20,
+                timeout=wait,
                 allow_redirects=True,
                 proxies=proxies,
             )
@@ -2128,10 +2141,16 @@ def lookup_logged_in_profile_name(cookie_path: Path, *, proxy_url: str | None = 
     return ""
 
 
-def lookup_account_public_name(cookie_path: Path, *, proxy_url: str | None = None) -> str:
+def lookup_account_public_name(
+    cookie_path: Path,
+    *,
+    proxy_url: str | None = None,
+    timeout: float = 6.0,
+) -> str:
     """Lấy tên thật: ưu tiên phiên đăng nhập, rồi hồ sơ công khai. Không ghi log cookie."""
     path = Path(cookie_path)
-    logged_in = lookup_logged_in_profile_name(path, proxy_url=proxy_url)
+    wait = max(2.0, float(timeout))
+    logged_in = lookup_logged_in_profile_name(path, proxy_url=proxy_url, timeout=wait)
     if logged_in:
         return logged_in
     if not path.is_file():
@@ -2143,7 +2162,7 @@ def lookup_account_public_name(cookie_path: Path, *, proxy_url: str | None = Non
     uid = facebook_uid_from_cookie_export(raw)
     if not uid:
         return ""
-    return lookup_public_profile_name(uid, proxy_url=proxy_url)
+    return lookup_public_profile_name(uid, proxy_url=proxy_url, timeout=wait)
 
 
 def classify_account_live(status: str, detail: str = "") -> str:
