@@ -816,6 +816,39 @@ def test_share_wave_watches_once_then_shares_with_page_text(tmp_path) -> None:
     assert engine.store.share_batches()[0]["source_prepared"] is True
 
 
+def test_share_skips_batch_when_source_reel_unavailable(tmp_path) -> None:
+    _store, engine, fake = _engine(tmp_path)
+
+    def prepare_source_video(**kwargs):
+        return {
+            "error_code": "VIDEO_UNAVAILABLE",
+            "source_unavailable": True,
+            "watched_seconds": kwargs["watch_seconds"],
+            "commented": False,
+            "liked": False,
+            "error_message": "Reel nguồn lỗi — đã chuyển xem reel khác",
+        }
+
+    fake.prepare_source_video = prepare_source_video
+    fake.publish_link = lambda **_k: (_ for _ in ()).throw(AssertionError("không chia sẻ reel lỗi"))
+    wave = engine.create_share_wave(
+        pages=[
+            {"account_id": "acc-a", "page_id": "page-1", "target_url": "https://www.facebook.com/page-1"},
+            {"account_id": "acc-a", "page_id": "page-2", "target_url": "https://www.facebook.com/page-2"},
+        ],
+        source_url="https://www.facebook.com/reel/29215402584727280",
+        text="x",
+        destination="page",
+        watch_seconds=8,
+        cooldown_fixed=0,
+    )
+    engine.run_share_wave(wave["batch_ids"])
+    jobs = engine.store.share_jobs()
+    assert jobs and all(row["status"] == "SKIPPED" for row in jobs)
+    assert all(row["error_code"] == "VIDEO_UNAVAILABLE" for row in jobs)
+    assert engine.store.share_batches()[0]["status"] == "COMPLETED"
+
+
 def test_same_account_waits_longer_before_the_next_page(tmp_path) -> None:
     store, engine, fake = _engine(tmp_path)
     store.upsert_membership(

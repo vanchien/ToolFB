@@ -58,24 +58,29 @@ from src.services.facebook_groups.store import GroupStore
 from src.gui.page_category_filter import PageCategoryFilter
 from src.utils.page_categories import normalize_page_category, page_category_label
 from src.utils.schedule_posts_filters import format_account_filter_label
+from src.utils.page_cross_account import (
+    filter_rows_one_account_per_facebook_page,
+    find_cross_account_page_groups,
+    load_page_owner_choices,
+    receiving_identity_key,
+)
+
 
 def receiving_page_key(row: dict[str, str]) -> str:
     """
     Khóa nhận diện cùng một Page Facebook dù gắn nhiều tài khoản / nhiều bản ghi.
 
-    Ưu tiên ``page_id`` (Meta), không có thì dùng ``target_url``.
+    Dùng ``fb_page_id`` / vanity URL / tên — không dùng id local (tránh coi hai bản ghi cùng Page là khác nhau).
     """
-    page_id = str(row.get("page_id") or "").strip()
-    if page_id:
-        return f"id:{page_id}"
-    url = str(row.get("target_url") or "").strip().rstrip("/").casefold()
-    if url:
-        return f"url:{url}"
-    return f"iid:{str(row.get('iid') or '').strip()}"
+    return receiving_identity_key(row)
 
 
 def dedupe_receiving_pages(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Giữ đúng một dòng đầu tiên cho mỗi Page Facebook trùng."""
+    """Mỗi Page Facebook chỉ một tài khoản (ưu tiên lựa chọn đã lưu)."""
+    choices = load_page_owner_choices()
+    collapsed = filter_rows_one_account_per_facebook_page(rows, choices)
+    if collapsed:
+        return collapsed
     seen: set[str] = set()
     unique: list[dict[str, str]] = []
     for row in rows:
@@ -85,6 +90,57 @@ def dedupe_receiving_pages(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         seen.add(key)
         unique.append(row)
     return unique
+
+
+def preferred_account_id_for_ticks(
+    pages: list[dict[str, str]],
+    checked_iids: set[str] | list[str],
+) -> str:
+    """Tài khoản có nhiều Page đang tick / theo dõi nhất — dùng khi mở lại app."""
+    wanted = {str(x).strip() for x in (checked_iids or []) if str(x).strip()}
+    if not wanted:
+        return ""
+    counts: dict[str, int] = {}
+    for row in pages or []:
+        iid = str(row.get("iid") or "").strip()
+        aid = str(row.get("account_id") or "").strip()
+        if not iid or not aid or iid not in wanted:
+            continue
+        counts[aid] = counts.get(aid, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def resolve_account_filter_id(
+    choice: str,
+    labels: dict[str, str],
+    pages: list[dict[str, str]],
+) -> str:
+    """
+    ``account_id`` đang lọc. ``*`` = tất cả; ``""`` = chưa chọn tài khoản.
+    """
+    raw = str(choice or "").strip()
+    if raw in ("", "Chọn tài khoản"):
+        return ""
+    if raw == "Tất cả tài khoản":
+        return "*"
+    mapped = str((labels or {}).get(raw) or "").strip()
+    if mapped:
+        return mapped
+    for label, aid in (labels or {}).items():
+        lab = str(label or "").strip()
+        if lab == raw or lab.startswith(raw + " ") or raw.startswith(lab + " "):
+            aid = str(aid or "").strip()
+            if aid:
+                return aid
+    for row in pages or []:
+        name = str(row.get("account_name") or "").strip()
+        if name and name == raw:
+            aid = str(row.get("account_id") or "").strip()
+            if aid:
+                return aid
+    return ""
 
 
 def interleave_pages_by_account(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -113,10 +169,29 @@ def interleave_pages_by_account(rows: list[dict[str, str]]) -> list[dict[str, st
     return out
 
 
+def share_has_video_work(
+    *,
+    running: bool = False,
+    live_batches: Iterable[Any] | None = None,
+    queue_states: Iterable[str] | None = None,
+) -> bool:
+    """Còn video nguồn để chia: wave live hoặc hàng chờ waiting/running (không kể worker kẹt)."""
+    del running
+    if live_batches:
+        return True
+    for state in queue_states or ():
+        if str(state or "") in {"waiting", "running"}:
+            return True
+    return False
+
+
 def describe_page_jobs(
     jobs: list[dict[str, Any]],
     paused_note: str = "",
     live_step: str = "",
+    *,
+    wave_active: bool = False,
+    share_idle: bool = False,
 ) -> tuple[str, str, str]:
     """Kết quả một page: nhãn, câu chi tiết, và màu (ok, fail, part, run, wait)."""
     if not jobs:
@@ -127,8 +202,16 @@ def describe_page_jobs(
     failed = [row for row in jobs if str(row.get("status") or "") in {"FAILED", "SKIPPED"}]
     active = [row for row in jobs if str(row.get("status") or "") in {"SUBMIT", "CHECKING_PERMISSION", "VERIFYING", "DELAYING"}]
     paused = [row for row in jobs if str(row.get("status") or "") == "PAUSED"]
-    pending = [row for row in jobs if str(row.get("status") or "") == "PENDING"]
+    pending = [row for row in jobs if str(row.get("status") or "") in {"PENDING", "VERIFY_FIRST"}]
     errors = [str(row.get("error_message") or "").strip() for row in failed + paused if str(row.get("error_message") or "").strip()]
+    if share_idle and pending and not active:
+        if done and not failed:
+            return "Thành công", f"Đã chia sẻ {len(done)} bài", "ok"
+        if done and failed:
+            return "Một phần", errors[0] if errors else f"Thành công {len(done)}, lỗi {len(failed)}", "part"
+        if failed and not done:
+            return "Lỗi", errors[0] if errors else "Chưa chia sẻ được", "fail"
+        return "", "", ""
     if done and not failed and not active and not paused and not pending:
         return "Thành công", f"Đã chia sẻ {len(done)} bài", "ok"
     if failed and not done and not active and not pending:
@@ -147,7 +230,10 @@ def describe_page_jobs(
     if pending and paused_note:
         return "Lỗi", paused_note, "fail"
     if pending:
-        return "Đang chờ", "Chưa tới lượt", "wait"
+        if wave_active:
+            return "Đang chờ", "Chưa tới lượt", "wait"
+        # Wave đã chết / không worker — đừng để «Chưa tới lượt» mãi.
+        return "Đang chờ", "Chờ chạy tiếp (batch dở)", "wait"
     return "Đang chờ", "", "wait"
 
 
@@ -161,6 +247,7 @@ class ShareTab:
         self.engine = GroupEngine(self.store, FacebookGroupProvider())
         self.engine.on_progress = self._on_progress
         self.pages: list[dict[str, str]] = []
+        self._dup_page_keys: set[str] = set()
         self._checked: set[str] = set()
         self._outcomes: dict[tuple[str, str], tuple[str, str, str]] = {}
         self.image_paths: list[str] = []
@@ -185,10 +272,12 @@ class ShareTab:
         self._watch_last_planned: datetime | None = None
         # Dấu vân tay plan chờ (share_now + gap) — đổi → xếp lại giờ waiting.
         self._live_plan_key: tuple[Any, ...] | None = None
+        self._last_heal_mono: float = 0.0
+        self._share_health_after: str | None = None
         self._build()
+        self._arm_share_health_tick()
         self._load_share_settings()
         self.reload_pages()
-        self._fill_results()
         try:
             recovered = self.engine.recover()
             if int(recovered.get("share_batches") or 0) or int(recovered.get("share") or 0):
@@ -198,9 +287,10 @@ class ShareTab:
                 )
         except Exception:  # noqa: BLE001
             pass
-        # Watch sau hàng chờ — tránh mở Firefox quét trùng lúc resume chia sẻ.
-        self.root.after(5500, self._resume_queue_if_needed)
-        self.root.after(12000, self._watch_resume_saved)
+        self._fill_results(heal=False)
+        # Vẽ xong bảng Page rồi mới resume / quét — đừng để kill Firefox chặn list.
+        self.root.after(400, self._resume_queue_if_needed)
+        self.root.after(900, self._watch_resume_saved)
 
     def _build(self) -> None:
         """
@@ -249,6 +339,7 @@ class ShareTab:
         self.filter_text = tk.StringVar()
         self._account_chosen = False
         self._account_labels: dict[str, str] = {}
+        self._saved_filter_account = ""
 
         self._build_auto_panel(parent)
         self._build_pages_panel(parent)
@@ -697,7 +788,17 @@ class ShareTab:
 
     def _watch_set_status(self, text: str) -> None:
         """Cập nhật dòng trạng thái theo dõi (gọi được từ luồng nền)."""
-        schedule_on_main_thread(self.root, lambda text=text: self.watch_status.set(text))
+
+        def _apply(text: str = text) -> None:
+            self.watch_status.set(text)
+            # Hết video mới → xóa «Đang chờ» trên bảng Page nhận ngay, không chờ health 25s.
+            if str(text).startswith("Quét xong") and "0 video" in str(text):
+                try:
+                    self._fill_results()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        schedule_on_main_thread(self.root, _apply)
 
     def _watch_toggle(self) -> None:
         """Bật hoặc tắt theo dõi Page nguồn."""
@@ -747,7 +848,9 @@ class ShareTab:
             self.watch_status.set("Đang bật theo dõi để ghi mốc video cuối trên Page nguồn…")
             if not self._watch_enable(interactive=True, delay_first_scan=False):
                 return
-            # Bật xong đã quét ngay (scan_immediately=True) — ghi mốc / lấy mới.
+            # Bật xong vòng _loop quét ngay; force_scan nếu vòng đó chưa kịp lấy khóa.
+            if self._watcher is not None:
+                self._watcher.force_scan()
             return
         try:
             scan_min, scan_max = parse_minute_range(
@@ -760,7 +863,9 @@ class ShareTab:
         self._watch_states = merge_source_states(self._watch_states, sources)
         self._watcher.update_settings(sources=sources, scan_min=scan_min, scan_max=scan_max)
         self.watch_status.set(f"Đang quét {len(sources)} Page nguồn — ghi mốc / tìm video mới…")
-        self._watcher.scan_now()
+        # force_scan: không chờ hết nghỉ 15–40 phút của vòng theo dõi.
+        if not self._watcher.force_scan():
+            self._watcher.scan_now()
 
     def _watch_enable(self, *, interactive: bool, delay_first_scan: bool = False) -> bool:
         """Kiểm tra cài đặt, chốt Page nhận rồi chạy luồng theo dõi."""
@@ -785,6 +890,13 @@ class ShareTab:
         if not sources:
             return _warn("Dán ít nhất một link Page nguồn.")
         if interactive:
+            picked = [row for row in self.pages if row["iid"] in self._checked]
+            resolved = self._resolve_duplicate_page_owners(picked)
+            if resolved is None:
+                return False
+            if resolved:
+                self._checked = {row["iid"] for row in resolved}
+                self._sync_checked_targets()
             targets = [row["iid"] for row in self._selected_pages()]
             if not targets:
                 return _warn("Tích cột «Nhận» ở bảng Page nhận trước khi bật theo dõi.")
@@ -792,10 +904,17 @@ class ShareTab:
         target_rows = dedupe_receiving_pages(
             [row for row in self.pages if row["iid"] in set(self._watch_targets)]
         )
-        self._watch_targets = [row["iid"] for row in target_rows]
-        self._checked = set(self._watch_targets)
+        if not target_rows:
+            fallback = [row for row in self.pages if row["iid"] in self._checked]
+            target_rows = dedupe_receiving_pages(fallback)
+        if target_rows:
+            self._watch_targets = [row["iid"] for row in target_rows]
+            self._checked = {row["iid"] for row in target_rows} | {
+                iid for iid in self._checked if iid not in {r["iid"] for r in self.pages}
+            }
         if not target_rows:
             return _warn("Không còn Page nhận nào. Tích Page rồi bấm Bật theo dõi.")
+        self._align_filter_to_receiving_pages(target_rows)
         try:
             from src.utils.db_manager import AccountsDatabaseManager
 
@@ -891,6 +1010,14 @@ class ShareTab:
             pass
         if not self._watch_enabled:
             return
+        if not str(self.watch_sources_box.get("1.0", tk.END) or "").strip():
+            try:
+                saved = str((self.store.share_settings().get("watch") or {}).get("sources") or "").strip()
+            except Exception:
+                saved = ""
+            if saved:
+                self.watch_sources_box.delete("1.0", tk.END)
+                self.watch_sources_box.insert("1.0", saved)
         if not self._watch_targets and self._checked:
             self._watch_targets = list(dict.fromkeys(self._checked))
         if not self._watch_targets:
@@ -903,7 +1030,7 @@ class ShareTab:
             self._schedule_save_settings()
             return
         self.watch_toggle_btn.configure(text="Đang khôi phục…")
-        ok = self._watch_enable(interactive=False, delay_first_scan=True)
+        ok = self._watch_enable(interactive=False, delay_first_scan=False)
         if not ok:
             self._watch_enabled = False
             self.watch_toggle_btn.configure(text="Bật theo dõi")
@@ -918,11 +1045,14 @@ class ShareTab:
         ``None`` = «Tất cả tài khoản» (mọi TK đang tick).
         ``set`` một id = chỉ chạy TK đó — tránh mở Firefox của TK khác khi đang xem 1 TK.
         """
-        choice = str(self.filter_account.get() or "").strip()
-        if choice in ("", "Chọn tài khoản", "Tất cả tài khoản"):
+        resolved = resolve_account_filter_id(
+            str(self.filter_account.get() or ""),
+            self._account_labels,
+            self.pages,
+        )
+        if resolved in ("", "*"):
             return None
-        aid = str(self._account_labels.get(choice) or "").strip()
-        return {aid} if aid else None
+        return {resolved}
 
     def _checked_account_ids(self) -> set[str]:
         """Các account_id còn ít nhất một Page đang tick «Nhận»."""
@@ -1017,7 +1147,7 @@ class ShareTab:
         # Siết phạm vi trước — wave cũ của TK đã bỏ lọc/tick không được chạy tiếp.
         self._enforce_run_scope(reason="mở lại app")
         scope = self._account_scope_ids()
-        if any(item.state == "waiting" for item in self._queue):
+        if any(item.state in {"waiting", "running"} for item in self._queue):
             overdue = self._promote_overdue_queue()
             waiting_n = sum(1 for i in self._queue if i.state == "waiting")
             extra = f" · {overdue} video quá giờ xếp chạy ngay" if overdue else ""
@@ -1062,11 +1192,16 @@ class ShareTab:
                 if aid:
                     orphan_accounts.append(aid)
         if orphan_ids:
-            self._kill_stale_browsers_for_accounts(orphan_accounts)
-            self.batch_ids = list(dict.fromkeys([*self.batch_ids, *orphan_ids]))
-            scope_hint = f" (lọc {self.filter_account.get().strip()})" if scope else ""
-            self.status.set(f"Còn {len(orphan_ids)} batch chia sẻ dở{scope_hint} — đang chạy tiếp.")
-            self.resume()
+            # Hàng chờ trống = hết video Page nguồn — không revive «Chưa tới lượt».
+            logger.info(
+                "[ShareTab] {} batch PENDING mồ côi nhưng hết video nguồn (hàng chờ trống) — không chạy tiếp.",
+                len(orphan_ids),
+            )
+            try:
+                self._kill_stale_browsers_for_accounts(orphan_accounts)
+            except Exception:  # noqa: BLE001
+                pass
+            return
 
     def _safe_parse_sources(self) -> list[str]:
         """Đọc Page nguồn trên form; ô trống → []; dòng lỗi bỏ qua (đang sửa)."""
@@ -1264,12 +1399,15 @@ class ShareTab:
     def _on_account_filter(self, _event: object = None) -> None:
         """Ghi nhận người dùng đã chọn tài khoản rồi vẽ lại bảng."""
         self._account_chosen = True
-        # Đổi lọc → dừng ngay TK không còn trong phạm vi (kể cả wave đang chạy).
-        self._enforce_run_scope(reason="đổi lọc tài khoản")
+        try:
+            self.category_filter.reset()
+        except Exception:
+            pass
         self._fill_pages()
+        self._enforce_run_scope(reason="đổi lọc tài khoản")
 
     def _refresh_account_filter(self) -> None:
-        """Đổ danh sách tài khoản. Lần đầu chỉ hiện Page của tài khoản đầu tiên."""
+        """Đổ danh sách tài khoản. Mở lại: ưu tiên TK đang tick/theo dõi, không phải TK đầu list."""
         labels = ["Chọn tài khoản"]
         mapping: dict[str, str] = {}
         seen: set[str] = set()
@@ -1287,8 +1425,21 @@ class ShareTab:
             labels.append("Tất cả tài khoản")
         self._account_labels = mapping
         self.filter_account_box.configure(values=tuple(labels))
-        current = self.filter_account.get()
+        current = str(self.filter_account.get() or "").strip()
         if current in labels and self._account_chosen:
+            return
+        tick_ids = set(self._checked) | set(self._watch_targets)
+        preferred_aid = preferred_account_id_for_ticks(self.pages, tick_ids)
+        if preferred_aid:
+            for label, aid in mapping.items():
+                if aid == preferred_aid and label in labels:
+                    self.filter_account.set(label)
+                    self._account_chosen = True
+                    return
+        saved = str(self._saved_filter_account or "").strip()
+        if saved in labels:
+            self.filter_account.set(saved)
+            self._account_chosen = True
             return
         if not self._account_chosen and len(labels) > 1 and labels[1] != "Tất cả tài khoản":
             self.filter_account.set(labels[1])
@@ -1306,32 +1457,57 @@ class ShareTab:
 
     def _account_scope_pages(self) -> list[dict[str, str]]:
         """Page của tài khoản đang chọn, chưa lọc phân loại — để đếm số trên ô Phân loại."""
-        choice = self.filter_account.get().strip()
-        if choice in ("", "Chọn tài khoản"):
+        resolved = resolve_account_filter_id(
+            str(self.filter_account.get() or ""),
+            self._account_labels,
+            self.pages,
+        )
+        if not resolved:
             return []
-        account_id = self._account_labels.get(choice, "")
-        return [row for row in self.pages if choice == "Tất cả tài khoản" or row["account_id"] == account_id]
+        if resolved == "*":
+            return list(self.pages)
+        return [row for row in self.pages if row["account_id"] == resolved]
 
     def _fill_pages(self) -> None:
-        self.category_filter.refresh(self._account_scope_pages())
-        self._refresh_outcomes()
+        """Vẽ bảng Page nhận. Lọc phân loại 0 dòng → về Tất cả, không để bảng trống."""
+        try:
+            self.category_filter.refresh(self._account_scope_pages())
+        except Exception:  # noqa: BLE001
+            logger.debug("category_filter.refresh", exc_info=True)
+        try:
+            self._dup_page_keys = {g.key for g in find_cross_account_page_groups(self.pages)}
+        except Exception:  # noqa: BLE001
+            self._dup_page_keys = set()
         visible = self._visible_pages()
+        scoped = self._account_scope_pages()
+        if not visible and scoped and self.category_filter.key():
+            try:
+                self.category_filter.reset()
+            except Exception:
+                pass
+            visible = self._visible_pages()
+            self.status.set(
+                "Lọc phân loại không còn Page nào của tài khoản này — đã hiện Tất cả phân loại."
+            )
+        specs: list[dict[str, Any]] = []
+        for index, row in enumerate(visible, start=1):
+            spec: dict[str, Any] = {"iid": row["iid"], "values": self._page_values(row, index)}
+            tags = self._page_tags(row)
+            if tags:
+                spec["tags"] = tags
+            specs.append(spec)
         tree_delete_all(self.tree)
         self._pages_tree_gen += 1
         gen = self._pages_tree_gen
-        specs = [
-            {
-                "iid": row["iid"],
-                "values": self._page_values(row, index),
-                "tags": self._page_tags(row),
-            }
-            for index, row in enumerate(visible, start=1)
-        ]
 
         def _done() -> None:
             if gen != self._pages_tree_gen:
                 return
             self._estimate()
+            try:
+                self.root.after(0, lambda: self._refresh_outcomes_and_paint())
+            except Exception:
+                self._refresh_outcomes_and_paint()
 
         if len(specs) < ASYNC_PREP_MIN_ROWS:
             for spec in specs:
@@ -1349,6 +1525,18 @@ class ShareTab:
             is_current=lambda g: g == self._pages_tree_gen,
             on_complete=_done,
         )
+
+    def _refresh_outcomes_and_paint(self) -> None:
+        """Gom kết quả job sau khi bảng Page đã hiện — không chặn lần vẽ đầu."""
+        try:
+            self._refresh_outcomes()
+        except Exception:  # noqa: BLE001
+            logger.debug("refresh_outcomes", exc_info=True)
+            return
+        try:
+            self._paint_live_result_column()
+        except Exception:  # noqa: BLE001
+            logger.debug("paint result column", exc_info=True)
 
     def _paint_result_tags(self, tree: ttk.Treeview) -> None:
         """Màu chữ: xanh là thành công, đỏ là lỗi."""
@@ -1374,13 +1562,19 @@ class ShareTab:
         for job in job_rows:
             key = (str(job.get("account_id") or ""), str(job.get("page_id") or ""))
             grouped.setdefault(key, []).append(job)
+        live_batches = getattr(self.engine, "_live_batches", None) or set()
+        has_work = self._share_has_video_work()
+        wave_active = bool(live_batches) or (bool(self._running) and has_work)
+        share_idle = not has_work
         found: dict[tuple[str, str], tuple[str, str, str]] = {}
         for row in self.pages:
             key = (row["account_id"], row["page_id"])
             found[key] = describe_page_jobs(
                 grouped.get(key, []),
                 notes.get(row["account_id"], ""),
-                self.engine.live_step_for(row["account_id"], row["page_id"]),
+                self.engine.live_step_for(row["account_id"], row["page_id"]) if has_work else "",
+                wave_active=wave_active,
+                share_idle=share_idle,
             )
         self._outcomes = found
 
@@ -1391,11 +1585,15 @@ class ShareTab:
             shown = f"{label} — {detail}"
         elif label:
             shown = label
+        name = row["page_name"]
+        key = receiving_page_key(row)
+        if key and key in getattr(self, "_dup_page_keys", set()):
+            name = f"{name} · trùng nhiều TK"
         return (
             str(index),
             "☑" if row["iid"] in self._checked else "☐",
             row["account_name"],
-            row["page_name"],
+            name,
             page_category_label(row.get("page_category")) if row.get("page_category") else "—",
             shown,
             row["target_url"],
@@ -1432,13 +1630,27 @@ class ShareTab:
         if row in self._checked:
             self._checked.discard(row)
         else:
-            dropped = self._uncheck_same_page(page) if page else []
-            self._checked.add(row)
-            if dropped:
-                name = (page or {}).get("page_name") or "Page"
-                self.status.set(
-                    f"«{name}» trùng trên nhiều tài khoản — chỉ nhận 1 dòng, đã bỏ {len(dropped)} dòng trùng."
-                )
+            dropped: list[str] = []
+            if page:
+                key = receiving_page_key(page)
+                twins = [r for r in self.pages if receiving_page_key(r) == key]
+                aids = {str(r.get("account_id") or "") for r in twins if r.get("account_id")}
+                if len(aids) > 1:
+                    resolved = self._resolve_duplicate_page_owners(twins)
+                    if resolved is None:
+                        return "break"
+                    dropped = self._uncheck_same_page(page)
+                    for item in resolved:
+                        self._checked.add(item["iid"])
+                    name = page.get("page_name") or "Page"
+                    acc = (resolved[0].get("account_name") if resolved else "") or ""
+                    extra = f" — chạy bằng «{acc}»" if acc else ""
+                    self.status.set(f"«{name}» gắn {len(aids)} TK{extra}. Chỉ một tài khoản đăng Page này.")
+                else:
+                    self._uncheck_same_page(page)
+                    self._checked.add(row)
+            else:
+                self._checked.add(row)
         self._sync_checked_targets()
         self._after_selection_changed()
         self._refresh_checkmarks()
@@ -1474,21 +1686,40 @@ class ShareTab:
         rows = self._scope_page_rows(rows)
         return interleave_pages_by_account(rows)
 
+    def _resolve_duplicate_page_owners(self, rows: list[dict[str, str]], *, force_ask: bool = False) -> list[dict[str, str]] | None:
+        """Hỏi TK nắm Page trùng rồi lọc 1 dòng / Page. ``None`` = hủy."""
+        from src.gui.page_owner_choice_dialog import ensure_one_account_per_facebook_page
+
+        labels = {
+            str(r.get("account_id") or ""): str(r.get("account_name") or r.get("account_id") or "")
+            for r in self.pages
+            if r.get("account_id")
+        }
+        return ensure_one_account_per_facebook_page(
+            self.root,
+            rows,
+            account_labels=labels,
+            force_ask=force_ask,
+        )
+
     def _select_all(self) -> None:
-        """Tích mọi Page đang hiện (theo tài khoản đang lọc); giữ tick của tài khoản khác."""
+        """Tích mọi Page đang hiện; Page trùng nhiều TK → hỏi chọn TK rồi chỉ tick 1 dòng."""
         visible = [row for row in self.pages if self._row_visible(row)]
-        self._checked.difference_update(row["iid"] for row in visible)
-        taken = {receiving_page_key(row) for row in self.pages if row["iid"] in self._checked}
-        skipped = 0
-        for row in visible:
-            key = receiving_page_key(row)
-            if key in taken:
-                skipped += 1
-                continue
-            self._checked.add(row["iid"])
-            taken.add(key)
+        resolved = self._resolve_duplicate_page_owners(visible)
+        if resolved is None:
+            return
+        keep_outside = {
+            row["iid"]
+            for row in self.pages
+            if row["iid"] in self._checked and not self._row_visible(row)
+        }
+        chosen = {row["iid"] for row in resolved}
+        skipped = max(0, len(visible) - len(chosen))
+        self._checked = keep_outside | chosen
         if skipped:
-            self.status.set(f"Đã bỏ qua {skipped} dòng Page trùng (cùng một Page Facebook).")
+            self.status.set(
+                f"Đã chọn {len(chosen)} Page — bỏ {skipped} dòng trùng (cùng Page, nhiều tài khoản)."
+            )
         self._sync_checked_targets()
         self._after_selection_changed()
         self._fill_pages()
@@ -1505,10 +1736,14 @@ class ShareTab:
 
     def _row_visible(self, row: dict[str, str]) -> bool:
         """Page này có đang nằm trong bộ lọc tài khoản và ô tìm hay không."""
-        choice = self.filter_account.get().strip()
-        if choice in ("", "Chọn tài khoản"):
+        resolved = resolve_account_filter_id(
+            str(self.filter_account.get() or ""),
+            self._account_labels,
+            self.pages,
+        )
+        if not resolved:
             return False
-        if choice != "Tất cả tài khoản" and row["account_id"] != self._account_labels.get(choice, ""):
+        if resolved != "*" and row["account_id"] != resolved:
             return False
         if not self.category_filter.matches(row):
             return False
@@ -1565,8 +1800,10 @@ class ShareTab:
         receivers = self._receiving_pages_for_stats()
         recv_n = len(receivers)
         accounts = len({row["account_id"] for row in receivers})
-        if self._watch_enabled:
+        if self._watch_enabled and self._running:
             mode = "đang theo dõi · đang chạy chia sẻ"
+        elif self._watch_enabled:
+            mode = "đang theo dõi"
         elif sources or recv_n:
             mode = "đã cấu hình (chưa bật theo dõi)"
         else:
@@ -1604,7 +1841,11 @@ class ShareTab:
         else:
             posts = len(selected) + groups
         extra = f" · {typed} nhóm đã nhập" if typed else ""
-        self.estimate.set(f"{len(selected)} page · {accounts} tài khoản · khoảng {posts} bài{extra}")
+        shown = len(self._visible_pages())
+        shown_bit = f"{shown} đang hiện · " if shown != len(selected) else ""
+        self.estimate.set(
+            f"{shown_bit}{len(selected)} page · {accounts} tài khoản · khoảng {posts} bài{extra}"
+        )
         self.group_uid_count.set(
             f"{typed} UID trong list" if typed else "Mỗi dòng một UID, hoặc cách nhau bằng dấu phẩy."
         )
@@ -1928,19 +2169,54 @@ class ShareTab:
             "engage_rate_percent": clamp_engage_rate_percent(self.engage_rate_percent.get()),
         }
 
+    def _align_filter_to_receiving_pages(self, rows: list[dict[str, str]]) -> None:
+        """Hiện đúng TK của Page nhận đang chạy — tránh bảng một TK, chia sẻ TK khác."""
+        aids = {str(r.get("account_id") or "").strip() for r in rows if str(r.get("account_id") or "").strip()}
+        if not aids:
+            return
+        want_label = ""
+        if len(aids) > 1:
+            want_label = "Tất cả tài khoản"
+        else:
+            aid = next(iter(aids))
+            want_label = next((lb for lb, mapped in self._account_labels.items() if mapped == aid), "")
+        if not want_label:
+            return
+        values = tuple(self.filter_account_box.cget("values") or ())
+        if want_label not in values and want_label != "Tất cả tài khoản":
+            return
+        if str(self.filter_account.get() or "").strip() == want_label:
+            return
+        self._account_chosen = True
+        self.filter_account.set(want_label)
+        try:
+            self.category_filter.reset()
+        except Exception:
+            pass
+        self._fill_pages()
+
     def _pages_for_item(self, item: PlannedShareLink, selected: list[dict[str, str]]) -> list[dict[str, str]]:
         """Page nhận của một link: link từ Page nguồn dùng Page đã chọn lúc bật theo dõi."""
         if item.targets:
             wanted = set(item.targets)
             rows = [row for row in self.pages if row["iid"] in wanted]
-        else:
-            rows = selected
-        return dedupe_receiving_pages(self._scope_page_rows(rows))
+            # Đích đã chốt lúc bật theo dõi — không cắt theo combobox đang xem TK khác.
+            return dedupe_receiving_pages(rows)
+        return dedupe_receiving_pages(self._scope_page_rows(selected))
 
     def start(self) -> None:
         if self._running:
             self.status.set("Đang chia sẻ. Bấm Dừng nếu muốn ngắt.")
             return
+        picked = [row for row in self.pages if row["iid"] in self._checked]
+        resolved = self._resolve_duplicate_page_owners(picked)
+        if resolved is None:
+            return
+        if resolved:
+            self._checked = {row["iid"] for row in resolved} | {
+                iid for iid in self._checked if iid not in {r["iid"] for r in picked}
+            }
+            self._sync_checked_targets()
         selected = self._selected_pages()
         typed = bool(self.source_url.get().strip())
         needs_pick = typed or any(item.state == "waiting" and not item.targets for item in self._queue)
@@ -2612,6 +2888,7 @@ class ShareTab:
             "conflict_gap_min": self.conflict_gap_min.get(),
             "conflict_gap_max": self.conflict_gap_max.get(),
             "conflict_gap_auto": bool(self.conflict_gap_auto.get()),
+            "filter_account": str(self.filter_account.get() or "").strip(),
             "watch": {
                 "sources": self.watch_sources_box.get("1.0", tk.END).strip(),
                 "scan_min": self.watch_scan_min.get(),
@@ -2674,6 +2951,7 @@ class ShareTab:
             parse_conflict_gap_minutes(self.conflict_gap_min.get(), self.conflict_gap_max.get())
             self._sync_conflict_gap_widgets()
             self._refresh_conflict_gap_hint()
+            self._saved_filter_account = str(data.get("filter_account") or "").strip()
             saved_ids = [str(item).strip() for item in (data.get("last_batch_ids") or []) if str(item).strip()]
             self.batch_ids = saved_ids or self.store.recent_share_batch_ids()
             if "queue" in data:
@@ -2741,8 +3019,183 @@ class ShareTab:
             self._refresh_queue()
             self._refresh_watch_stats()
 
-    def _fill_results(self) -> None:
-        """Một dòng một page: Thành công hoặc Lỗi, kèm câu lỗi."""
+    def _arm_share_health_tick(self) -> None:
+        """Chu kỳ 25s: heal batch kẹt + đẩy list chờ + làm mới cột Kết quả."""
+        if self._share_health_after:
+            try:
+                self.root.after_cancel(self._share_health_after)
+            except Exception:
+                pass
+            self._share_health_after = None
+
+        def _tick() -> None:
+            self._share_health_after = None
+            try:
+                self._heal_stale_share_state()
+            except Exception:  # noqa: BLE001
+                logger.debug("health heal", exc_info=True)
+            try:
+                self._ensure_source_watch_scanning()
+            except Exception:  # noqa: BLE001
+                logger.debug("health source watch", exc_info=True)
+            try:
+                if not self._running and any(i.state == "waiting" for i in self._queue):
+                    self._kick_queue_after_worker()
+            except Exception:  # noqa: BLE001
+                logger.debug("health kick queue", exc_info=True)
+            try:
+                if self.batch_ids or self._watch_enabled:
+                    self._fill_results()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._share_health_after = self.root.after(25_000, _tick)
+            except Exception:
+                self._share_health_after = None
+
+        try:
+            self._share_health_after = self.root.after(8_000, _tick)
+        except Exception:
+            self._share_health_after = None
+
+    def _share_has_video_work(self) -> bool:
+        """Còn video nguồn trong hàng chờ / đang gửi / wave live."""
+        live = getattr(self.engine, "_live_batches", None) or set()
+        try:
+            with self._queue_lock:
+                states = [str(item.state or "") for item in self._queue]
+        except Exception:  # noqa: BLE001
+            states = []
+        return share_has_video_work(
+            running=bool(self._running),
+            live_batches=live,
+            queue_states=states,
+        )
+
+    def _ensure_source_watch_scanning(self) -> None:
+        """Luôn quét khi tới giờ; luồng chết / kẹt thì bật lại; nút Quét ngay vẫn force_scan."""
+        if not self._watch_enabled:
+            return
+        sources = self._safe_parse_sources()
+        if not sources:
+            return
+        watcher = self._watcher
+        if watcher is None or not watcher.running:
+            logger.info("[ShareTab] Luồng quét Page nguồn đã tắt — bật lại.")
+            self._watch_enable(interactive=False, delay_first_scan=False)
+            return
+        if watcher.is_scan_stuck():
+            logger.warning("[ShareTab] Quét Page nguồn kẹt quá lâu — khởi động lại watcher.")
+            try:
+                watcher.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._watcher = None
+            self._watch_enable(interactive=False, delay_first_scan=False)
+            return
+        if watcher.is_overdue():
+            logger.info("[ShareTab] Tới giờ quét Page nguồn — force_scan.")
+            if not watcher.force_scan():
+                watcher.scan_now()
+
+    def _heal_stale_share_state(self) -> None:
+        """
+        Gỡ kẹt: FeatureBusy/lock sót + batch READY/RUNNING mồ côi còn PENDING.
+
+        Triệu chứng UI: hàng đống «Đang chờ — Chưa tới lượt», hàng chờ trống,
+        quét nguồn báo profile đang mở dù không còn Firefox.
+        """
+        if self._running:
+            return
+        now = time.monotonic()
+        if now - float(self._last_heal_mono or 0.0) < 18.0:
+            return
+        self._last_heal_mono = now
+        live = {str(x) for x in (getattr(self.engine, "_live_batches", None) or set())}
+        if live:
+            return
+        # Đưa RUNNING/DELAYING mồ côi (sau crash) về READY — giống recover lúc mở app.
+        try:
+            recovered = self.engine.recover()
+            if int(recovered.get("share_batches") or 0):
+                logger.info(
+                    "[ShareTab] recover mid-run: {} batch mồ côi",
+                    recovered.get("share_batches"),
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("heal recover thất bại", exc_info=True)
+        try:
+            from src.utils.feature_busy import FEATURE_SHARE, busy_reason, force_clear_account_feature
+
+            aids = self._checked_account_ids() or set()
+            if not aids:
+                aids = {
+                    str(row.get("account_id") or "").strip()
+                    for row in self.pages
+                    if str(row.get("account_id") or "").strip()
+                }
+            for aid in aids:
+                reason = busy_reason(account_id=aid) or ""
+                if not reason:
+                    continue
+                # Chỉ nhả khóa «chia sẻ» mồ côi — không đụng lịch đăng đang chạy.
+                if "chia sẻ" in reason.casefold() or "share" in reason.casefold():
+                    force_clear_account_feature(aid, feature=FEATURE_SHARE)
+                    logger.info("[ShareTab] Nhả FeatureBusy chia sẻ mồ côi | account={}", aid)
+        except Exception:  # noqa: BLE001
+            logger.debug("heal FeatureBusy thất bại", exc_info=True)
+
+        if not self._share_has_video_work():
+            # Hết video nguồn — không resume PENDING, cũng không giết Firefox
+            # (Quét Page / lịch đăng / tương tác có thể đang dùng cùng profile).
+            return
+
+        scope = self._account_scope_ids()
+        orphan_ids: list[str] = []
+        orphan_accounts: list[str] = []
+        try:
+            for batch in self.store.share_batches():
+                status = str(batch.get("status") or "")
+                if status not in {"READY", "PAUSED"}:
+                    continue
+                aid = str(batch.get("account_id") or "").strip()
+                if scope is not None and aid not in scope:
+                    continue
+                bid = str(batch.get("id") or "")
+                if not bid:
+                    continue
+                pending = [
+                    job
+                    for job in self.store.share_jobs()
+                    if str(job.get("batch_id") or "") == bid
+                    and str(job.get("status") or "") in {"PENDING", "VERIFY_FIRST"}
+                ]
+                if pending:
+                    orphan_ids.append(bid)
+                    if aid:
+                        orphan_accounts.append(aid)
+        except Exception:  # noqa: BLE001
+            return
+        if not orphan_ids:
+            return
+        self._kill_stale_browsers_for_accounts(orphan_accounts)
+        self.batch_ids = list(dict.fromkeys([*self.batch_ids, *orphan_ids]))
+        self.status.set(
+            f"Phát hiện {len(orphan_ids)} batch chia sẻ dở — đang chạy tiếp "
+            f"({len(set(orphan_accounts))} TK), đồng thời cho phép quét nguồn."
+        )
+        try:
+            self.resume()
+        except Exception:  # noqa: BLE001
+            logger.exception("heal resume batch dở thất bại")
+
+    def _fill_results(self, *, heal: bool = False) -> None:
+        """Cập nhật cột kết quả. ``heal`` chỉ từ chu kỳ 25s — không chặn vẽ bảng Page."""
+        if heal:
+            try:
+                self._heal_stale_share_state()
+            except Exception:  # noqa: BLE001
+                logger.debug("heal_stale_share_state", exc_info=True)
         jobs = self._jobs()
         self._refresh_outcomes(jobs=jobs)
         # Cập nhật cột Kết quả tại chỗ — không xóa/vẽ lại cả bảng Page (tối ưu 50–200 dòng).
@@ -2786,6 +3239,10 @@ class ShareTab:
             parts.append(f"Lỗi {len(bad_lines)} page. Xem cột Chi tiết, không liệt kê hết ở đây.")
         if parts:
             self.outcome.set(". ".join(parts))
+        elif not self._share_has_video_work() and (self._watch_enabled or self._watcher is not None):
+            self.outcome.set(
+                "Không còn video mới từ Page nguồn. Cột Kết quả trống — chờ quét lại hoặc bấm Quét ngay."
+            )
         elif self.batch_ids:
             self.outcome.set("Đang chờ kết quả. Cột Kết quả cập nhật theo từng page.")
         else:

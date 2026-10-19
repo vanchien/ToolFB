@@ -163,10 +163,15 @@ def apply_page_split(
     """
     auto = not videos_per_page
     vpp = 0 if auto else clamp_videos_per_page(videos_per_page)
+    raw_dests: list[dict[str, str]] = [dict(row) for row in dests or [] if isinstance(row, dict)]
+    try:
+        from src.utils.page_cross_account import filter_rows_one_account_per_facebook_page, load_page_owner_choices
+
+        raw_dests = filter_rows_one_account_per_facebook_page(raw_dests, load_page_owner_choices())
+    except Exception:
+        pass
     clean_dests: list[dict[str, str]] = []
-    for row in dests or []:
-        if not isinstance(row, dict):
-            continue
+    for row in raw_dests:
         aid = str(row.get("account_id") or "").strip()
         pid = str(row.get("page_id") or "").strip()
         if aid and pid:

@@ -100,6 +100,16 @@ def test_counts_and_per_account() -> None:
     assert pages_per_account(pages) == {"acc1": 2, "acc2": 1}
 
 
+def test_page_filter_includes_accounts_without_pages() -> None:
+    """TK mới trong accounts.json vẫn vào ô lọc Page dù chưa quét Page."""
+    from src.services.page_health import account_ids_for_page_filter
+
+    pages = [_page("a1", "acc1"), _page("b1", "acc2")]
+    accounts = [{"id": "acc3", "name": "Mới"}, {"id": "acc1", "name": "Cũ"}]
+    ids = account_ids_for_page_filter(pages, accounts)
+    assert ids == ["acc3", "acc1", "acc2"]
+
+
 def test_single_recent_fail_is_failing() -> None:
     """Một lần lỗi gần đây (có job chờ) vẫn báo «Lỗi đăng» — dễ lọc trên tab Page."""
     jobs = [

@@ -499,11 +499,50 @@ class SourceWatcher:
         self._thread: threading.Thread | None = None
         self._scan_immediately = True
         self._settle_seconds = 0
+        self._scan_lock = threading.Lock()
+        self._force_scan_thread: threading.Thread | None = None
+        self._last_cycle_mono = 0.0
+        self._scan_started_mono = 0.0
+        self._due_at_mono = 0.0
+        self._last_scan_skipped = False
 
     @property
     def running(self) -> bool:
         """Luồng theo dõi còn sống."""
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def scan_in_progress(self) -> bool:
+        """Đang giữ khóa quét (force_scan hoặc vòng _loop)."""
+        return self._scan_lock.locked()
+
+    def is_overdue(self) -> bool:
+        """Tới giờ quét (hết nghỉ scan_max / mốc ``_due_at_mono``) và không đang quét."""
+        if self._stop.is_set():
+            return False
+        if self._scan_lock.locked():
+            return False
+        now = time.monotonic()
+        due = float(getattr(self, "_due_at_mono", 0.0) or 0.0)
+        if due > 0:
+            return now >= due
+        last = float(getattr(self, "_last_cycle_mono", 0.0) or 0.0)
+        if last <= 0:
+            return bool(self.running)
+        limit = max(int(self.scan_max), int(self.scan_min)) * 60 + 15
+        return (now - last) >= limit
+
+    def is_scan_stuck(self, *, timeout_sec: float | None = None) -> bool:
+        """Khóa quét giữ quá lâu (browser kẹt) — health tick sẽ khởi động lại watcher."""
+        if not self._scan_lock.locked():
+            return False
+        started = float(getattr(self, "_scan_started_mono", 0.0) or 0.0)
+        if started <= 0:
+            return False
+        n_src = max(1, len(self.sources))
+        # Mỗi Page nguồn tối đa ~2.5 phút quét + mở browser.
+        limit = float(timeout_sec) if timeout_sec is not None else (n_src * 210.0 + 60.0)
+        return (time.monotonic() - started) >= max(90.0, limit)
 
     def start(self, *, scan_immediately: bool = True, settle_seconds: int | None = None) -> None:
         """
@@ -531,15 +570,51 @@ class SourceWatcher:
         self._wake.set()
 
     def scan_now(self) -> None:
-        """Bỏ thời gian nghỉ, quét vòng kế tiếp ngay."""
+        """Bỏ thời gian nghỉ giữa các vòng — vòng ``_loop`` kế tiếp quét ngay."""
         self._wake.set()
 
-    def _wait_account_browser_idle(self, *, timeout_sec: float = 3600.0) -> bool:
+    def force_scan(self) -> bool:
         """
-        Chờ tài khoản rảnh (không chia sẻ / đăng lịch) rồi mới quét Page nguồn.
+        Quét ngay trên luồng riêng (nút «Quét ngay»).
 
-        Tránh mở Firefox thứ 2 trên cùng profile. False nếu bị dừng hoặc hết giờ.
+        Không chờ hết nghỉ 15–40 phút của ``_loop``. Có khóa chống chồng 2 lần quét.
+        Trả True nếu đã xếp luồng quét (hoặc đang quét).
         """
+        if self._stop.is_set():
+            return False
+        self._wake.set()
+        alive = self._force_scan_thread is not None and self._force_scan_thread.is_alive()
+        if alive or self._scan_lock.locked():
+            self._on_status("Đang quét Page nguồn…")
+            return True
+
+        def _run() -> None:
+            try:
+                found = self.scan_once()
+                if not self._stop.is_set():
+                    self._on_status(
+                        f"Quét xong — {found} video mới. "
+                        f"Vòng tự động tiếp theo sau {self.scan_min}–{self.scan_max} phút."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[Theo dõi nguồn] force_scan lỗi: {}", exc)
+                self._on_status(f"Lỗi quét ngay: {exc}")
+
+        self._force_scan_thread = threading.Thread(
+            target=_run, name="share-source-force-scan", daemon=True
+        )
+        self._force_scan_thread.start()
+        return True
+
+    def _wait_account_browser_idle(self, *, timeout_sec: float = 0.0) -> bool:
+        """
+        Không chặn quét khi TK đang chia sẻ — dùng bản sao profile.
+
+        Chỉ ghi chú trạng thái (1 lần) rồi trả True. ``timeout_sec`` giữ tương thích API.
+        """
+        del timeout_sec
+        if self._stop.is_set():
+            return False
         aid = str(
             self.account.get("id")
             or self.account.get("account_id")
@@ -547,32 +622,19 @@ class SourceWatcher:
         ).strip()
         if not aid:
             return True
-        deadline = time.monotonic() + max(30.0, float(timeout_sec))
-        noted = False
-        while not self._stop.is_set():
-            reason = ""
-            try:
-                from src.utils.feature_busy import busy_reason
+        reason = ""
+        try:
+            from src.utils.feature_busy import busy_reason
 
-                reason = busy_reason(account_id=aid) or ""
-            except Exception:  # noqa: BLE001
-                reason = ""
-            if not reason:
-                return True
-            if time.monotonic() >= deadline:
-                self._on_status(
-                    f"Chờ TK rảnh quá lâu ({reason}) — bỏ vòng quét này, thử sau."
-                )
-                return False
-            if not noted:
-                self._on_status(
-                    f"TK đang {reason} — tạm dừng quét nguồn (1 browser / TK)…"
-                )
-                noted = True
-            # Đánh thức sớm nếu user bấm dừng.
-            self._wake.wait(timeout=2.0)
-            self._wake.clear()
-        return False
+            reason = busy_reason(account_id=aid) or ""
+        except Exception:  # noqa: BLE001
+            reason = ""
+        if reason:
+            self._on_status(
+                f"TK đang {reason} — vẫn quét nguồn bằng bản sao session "
+                "(chia sẻ / đăng lịch không bị gián đoạn)."
+            )
+        return True
 
     def update_settings(
         self,
@@ -624,16 +686,32 @@ class SourceWatcher:
 
         Mỗi Page giữ lịch sử ``seen`` / ``latest_id`` riêng để đối chiếu video mới.
         """
+        if not self._scan_lock.acquire(blocking=False):
+            self._last_scan_skipped = True
+            self._on_status("Đang có lượt quét khác — chờ xong rồi chạy tiếp.")
+            return 0
+        self._last_scan_skipped = False
+        self._scan_started_mono = time.monotonic()
+        try:
+            return self._scan_once_locked()
+        finally:
+            self._last_cycle_mono = time.monotonic()
+            self._scan_started_mono = 0.0
+            self._due_at_mono = 0.0
+            self._scan_lock.release()
+
+    def _scan_once_locked(self) -> int:
+        """Thân ``scan_once`` — caller đã giữ ``_scan_lock``."""
         total = 0
         if not self.sources:
             self._on_status("Chưa có Page nguồn để quét.")
             return 0
         n_src = len(self.sources)
+        # Một lần / vòng: ghi chú nếu TK bận — không chờ từng Page nguồn.
+        if not self._wait_account_browser_idle():
+            return 0
         for index, url in enumerate(self.sources, start=1):
             if self._stop.is_set():
-                break
-            # Không quét khi cùng TK đang chia sẻ / đăng lịch — tránh mở Firefox thứ 2.
-            if not self._wait_account_browser_idle():
                 break
             key = source_state_key(url)
             state = self.states.setdefault(key, SourceState())
@@ -737,10 +815,11 @@ class SourceWatcher:
                 f"Theo dõi {len(self.sources)} Page nguồn — chờ lịch đăng nhả profile "
                 f"~{settle}s, quét lần đầu lúc {at}."
             )
+            self._due_at_mono = time.monotonic() + settle
             self._wake.clear()
             self._wake.wait(settle)
         while not self._stop.is_set():
-            found = self.scan_once()
+            found = self._scan_or_wait_peer()
             if self._stop.is_set():
                 break
             wait_min = self._rng.randint(self.scan_min, self.scan_max)
@@ -748,6 +827,21 @@ class SourceWatcher:
             self._on_status(
                 f"Theo dõi {len(self.sources)} Page nguồn — vòng này {found} video mới. Quét lại lúc {at}."
             )
+            self._due_at_mono = time.monotonic() + wait_min * 60
             self._wake.clear()
             self._wake.wait(wait_min * 60)
+        self._due_at_mono = 0.0
         self._on_status("Đã tắt theo dõi Page nguồn.")
+
+    def _scan_or_wait_peer(self) -> int:
+        """
+        Quét một vòng. Nếu ``force_scan`` đang giữ khóa thì chờ xong rồi quét (hoặc
+        nhận kết quả peer), không coi là đã quét rồi nghỉ 15–40 phút.
+        """
+        while not self._stop.is_set():
+            found = self.scan_once()
+            if getattr(self, "_last_scan_skipped", False):
+                self._wake.wait(0.4)
+                continue
+            return found
+        return 0

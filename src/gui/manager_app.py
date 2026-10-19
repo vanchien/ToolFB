@@ -158,6 +158,14 @@ from src.services.video_editor.page_split import (
     pages_already_used,
     preview_page_split,
 )
+from src.utils.page_cross_account import (
+    duplicate_summary,
+    facebook_page_group_key,
+    filter_rows_one_account_per_facebook_page,
+    find_cross_account_page_groups,
+    load_page_owner_choices,
+    save_page_owner_choices,
+)
 from src.services.schedule_alerts import can_reschedule, is_missed, is_stuck, reschedule_jobs
 from src.services.page_health import (
     HEALTH_FAILING,
@@ -169,6 +177,7 @@ from src.services.page_health import (
     format_last_outcome_cell,
     format_schedule_cell,
     format_status_label,
+    account_ids_for_page_filter,
     pages_per_account,
     summarize_health,
 )
@@ -1585,6 +1594,9 @@ class _ManagerWindow:
                 self._fill_ve_pending_export_jobs_tree()
             except Exception:
                 pass
+        pg_tab = getattr(self, "_tab_facebook_pages", None)
+        if pg_tab is not None and str(sel) == str(pg_tab):
+            self._sync_page_tab_accounts()
 
     def _set_ui_busy(self, label: str) -> None:
         """Đánh dấu tác vụ UI hiện tại để watchdog log đúng ngữ cảnh."""
@@ -2024,6 +2036,7 @@ class _ManagerWindow:
                 return
             try:
                 self._fill_tree(rows)
+                self._sync_page_tab_accounts()
                 logger.info("Đã làm mới danh sách từ đĩa: {} tài khoản.", len(rows))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Làm mới danh sách thất bại: {}", exc)
@@ -2049,6 +2062,7 @@ class _ManagerWindow:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Không chuyển tab Tài khoản: {}", exc)
         self._refresh_tree()
+        self._sync_page_tab_accounts()
         if registry_ids:
             self._root.after(600, lambda: self._select_accounts_in_tree(registry_ids))
 
@@ -3222,10 +3236,23 @@ class _ManagerWindow:
         self._pages_account_chosen = True
         self._render_pages_tree()
 
+    def _sync_page_tab_accounts(self) -> None:
+        """Đổ lại ô lọc Page từ accounts.json — TK mới thêm hiện ngay (kể cả 0 Page)."""
+        if not hasattr(self, "_cb_pages_filter_account"):
+            return
+        try:
+            self._refresh_pages_filter_choices()
+        except Exception:  # noqa: BLE001
+            logger.debug("sync ô lọc Page sau khi đổi tài khoản", exc_info=True)
+
     def _refresh_pages_filter_choices(self) -> None:
-        """Đổ combobox tài khoản. Lần đầu chỉ hiện Page của tài khoản đầu, không đổ hết."""
+        """Đổ combobox: mọi tài khoản trong registry + owner đang có Page."""
         rows = list(getattr(self, "_all_pages", []) or [])
-        owners = sorted({str(r.get("account_id", "")).strip() for r in rows if str(r.get("account_id", "")).strip()})
+        try:
+            account_rows = list(self._accounts.load_all())
+        except Exception:  # noqa: BLE001
+            account_rows = []
+        owners = account_ids_for_page_filter(rows, account_rows)
         names = self._page_account_name_map()
         selected_id = ""
         if hasattr(self, "_var_pages_filter_account"):
@@ -3233,8 +3260,17 @@ class _ManagerWindow:
         labels = ["Chọn tài khoản"]
         mapping: dict[str, str] = {}
         page_counts = pages_per_account(rows)
+        owners.sort(
+            key=lambda aid: (
+                page_counts.get(aid, 0) > 0,
+                (names.get(aid) or aid).casefold(),
+                aid,
+            )
+        )
         for aid in owners:
-            label = f"{format_account_filter_label(aid, names.get(aid, ''))} · {page_counts.get(aid, 0)} Page"
+            n_pages = int(page_counts.get(aid, 0) or 0)
+            base = format_account_filter_label(aid, names.get(aid, ""))
+            label = f"{base} · {n_pages} Page" if n_pages else f"{base} · chưa có Page"
             if label in mapping:
                 label = f"{label} ({aid})"
             mapping[label] = aid
@@ -4119,6 +4155,9 @@ class _ManagerWindow:
                     "page_label": plb,
                     "page_category": cat,
                     "choice_label": f"{al}  →  {plb}",
+                    "page_name": str(p.get("page_name") or plb),
+                    "page_url": str(p.get("page_url") or ""),
+                    "fb_page_id": str(p.get("fb_page_id") or ""),
                     "row": p,
                 }
             )
@@ -4166,7 +4205,9 @@ class _ManagerWindow:
             f"Job có {n_total} video ({n_all} chưa lên lịch). Auto = chia đều toàn bộ cho các Page đã chọn; "
             "hoặc bỏ Auto và đặt số video mỗi Page (phần thừa để lần sau). "
             "Bật «Lên lịch luôn»: khung giờ/số bài lấy theo lịch cũ, bài mới cộng tiếp sau slot cuối "
-            "của từng Page — không trùng giờ cùng Page / cùng tài khoản."
+            "của từng Page — không trùng giờ cùng Page / cùng tài khoản. "
+            "Cùng một Page Facebook gắn nhiều tài khoản: chọn đúng một TK nắm Page (nút dưới list) — "
+            "không chia/lặp bài cho mọi TK trong ngày."
         )
         if resume_split:
             intro += (
@@ -4254,11 +4295,30 @@ class _ManagerWindow:
             shown.clear()
             shown.extend(_visible_rows())
             lb_pages.delete(0, tk.END)
-            for i, row in enumerate(shown):
+            dup_map = {g.key: g for g in find_cross_account_page_groups(page_rows)}
+            owners = load_page_owner_choices()
+            for row in shown:
                 pid = str(row.get("page_id") or "")
                 label = str(row.get("choice_label") or "")
                 if pid in used_page_ids:
                     label += "   (đã nhận video)"
+                gk = facebook_page_group_key(row)
+                group = dup_map.get(gk) if gk else None
+                if group is not None:
+                    n_acc = len(group.account_ids)
+                    owner = str(owners.get(gk) or "").strip()
+                    if owner:
+                        ol = str(row.get("account_label") or owner) if owner == str(row.get("account_id") or "") else next(
+                            (
+                                str(r.get("account_label") or owner)
+                                for r in group.rows
+                                if str(r.get("account_id") or "") == owner
+                            ),
+                            owner,
+                        )
+                        label += f"   · trùng {n_acc} TK · chạy: {ol}"
+                    else:
+                        label += f"   · trùng {n_acc} TK — chọn TK chạy"
                 lb_pages.insert(tk.END, label)
                 if resume_split:
                     if pid not in used_page_ids:
@@ -4275,7 +4335,11 @@ class _ManagerWindow:
                     dests.append(
                         {
                             "account_id": str(row.get("account_id") or ""),
+                            "account_label": str(row.get("account_label") or ""),
                             "page_id": str(row.get("page_id") or ""),
+                            "page_name": str(row.get("page_name") or row.get("page_label") or ""),
+                            "page_url": str(row.get("page_url") or ""),
+                            "fb_page_id": str(row.get("fb_page_id") or ""),
                         }
                     )
             return dests
@@ -4300,8 +4364,14 @@ class _ManagerWindow:
             if callable(fn):
                 fn()
                 return
-            info = preview_page_split(_candidate_count(), len(_selected_dests()), _vpp_or_auto())
-            var_preview.set(format_split_preview(info))
+            dests = _selected_dests()
+            unique_dests = filter_rows_one_account_per_facebook_page(dests, load_page_owner_choices())
+            info = preview_page_split(_candidate_count(), len(unique_dests) or len(dests), _vpp_or_auto())
+            text = format_split_preview(info)
+            note = duplicate_summary(find_cross_account_page_groups(dests), load_page_owner_choices())
+            if note:
+                text += " " + note
+            var_preview.set(text)
 
         lb_pages.bind("<<ListboxSelect>>", _refresh_preview)
         var_vpp.trace_add("write", _refresh_preview)
@@ -4321,6 +4391,38 @@ class _ManagerWindow:
             text="Bỏ chọn",
             command=lambda: (lb_pages.selection_clear(0, tk.END), _refresh_preview()),
         ).pack(side=tk.LEFT)
+
+        def _pick_duplicate_owners() -> None:
+            from src.gui.page_owner_choice_dialog import ask_page_owner_choices
+
+            groups = find_cross_account_page_groups(page_rows)
+            if not groups:
+                messagebox.showinfo(
+                    "Page trùng",
+                    "Không có Page nào đang gắn trên nhiều tài khoản.",
+                    parent=top,
+                )
+                return
+            labels = {
+                str(r.get("account_id") or ""): str(r.get("account_label") or r.get("account_id") or "")
+                for r in page_rows
+                if r.get("account_id")
+            }
+            picked = ask_page_owner_choices(
+                top,
+                groups,
+                current=load_page_owner_choices(),
+                account_labels=labels,
+            )
+            if picked is None:
+                return
+            save_page_owner_choices(picked)
+            _fill_page_list()
+            _refresh_preview()
+
+        ttk.Button(act, text="Chọn TK chạy Page trùng", command=_pick_duplicate_owners).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
 
         sched_prefs = prefs.get("schedule") if isinstance(prefs.get("schedule"), dict) else {}
         inferred = {"windows": DEFAULT_DAILY_WINDOWS, "per_day": DEFAULT_PER_DAY}
@@ -4373,13 +4475,18 @@ class _ManagerWindow:
         )
 
         def _refresh_preview_with_days(*_a: Any) -> None:
-            info = preview_page_split(_candidate_count(), len(_selected_dests()), _vpp_or_auto())
+            dests = _selected_dests()
+            unique_dests = filter_rows_one_account_per_facebook_page(dests, load_page_owner_choices())
+            info = preview_page_split(_candidate_count(), len(unique_dests) or len(dests), _vpp_or_auto())
             text = format_split_preview(info)
             if var_sched_on.get() and info.get("used_pages"):
                 hi = int(info.get("max_per_page") or info.get("videos_per_page") or 0)
                 if hi:
                     days = (hi + _per_day() - 1) // _per_day()
                     text += f" Lịch: {_per_day()} video/ngày mỗi Page → khoảng {days} ngày."
+            note = duplicate_summary(find_cross_account_page_groups(dests), load_page_owner_choices())
+            if note:
+                text += " " + note
             var_preview.set(text)
 
         _refresh_preview_impl["fn"] = _refresh_preview_with_days
@@ -4390,6 +4497,50 @@ class _ManagerWindow:
             dests = _selected_dests()
             if not dests:
                 messagebox.showwarning("Chưa chọn Page", "Chọn ít nhất một Page trong list.", parent=top)
+                return
+            from src.gui.page_owner_choice_dialog import ensure_one_account_per_facebook_page
+
+            labels = {
+                str(r.get("account_id") or ""): str(r.get("account_label") or r.get("account_id") or "")
+                for r in page_rows
+                if r.get("account_id")
+            }
+            orig_pids = {str(d.get("page_id") or "") for d in dests}
+            orig_keys = {facebook_page_group_key(d) for d in dests if facebook_page_group_key(d)}
+            expanded = list(dests)
+            have = {
+                (facebook_page_group_key(d) or str(d.get("page_id") or ""), str(d.get("account_id") or ""))
+                for d in expanded
+            }
+            for row in page_rows:
+                gk = facebook_page_group_key(row)
+                if not gk or gk not in orig_keys:
+                    continue
+                tok = (gk, str(row.get("account_id") or ""))
+                if tok in have:
+                    continue
+                have.add(tok)
+                expanded.append(
+                    {
+                        "account_id": str(row.get("account_id") or ""),
+                        "account_label": str(row.get("account_label") or ""),
+                        "page_id": str(row.get("page_id") or ""),
+                        "page_name": str(row.get("page_name") or row.get("page_label") or ""),
+                        "page_url": str(row.get("page_url") or ""),
+                        "fb_page_id": str(row.get("fb_page_id") or ""),
+                    }
+                )
+            resolved = ensure_one_account_per_facebook_page(top, expanded, account_labels=labels)
+            if resolved is None:
+                return
+            dests = [
+                r
+                for r in resolved
+                if (facebook_page_group_key(r) and facebook_page_group_key(r) in orig_keys)
+                or str(r.get("page_id") or "") in orig_pids
+            ]
+            if not dests:
+                messagebox.showwarning("Chưa chọn Page", "Không còn Page hợp lệ sau khi lọc trùng.", parent=top)
                 return
             sched_on = bool(var_sched_on.get())
             windows: list[Any] = []
@@ -10984,6 +11135,7 @@ class _ManagerWindow:
                 messagebox.showerror("Lỗi lưu", str(exc), parent=self._root)
                 return
             self._refresh_tree()
+            self._sync_page_tab_accounts()
             self._warn_if_scheduler_running_after_config_change()
             n = len(dlg.result) if isinstance(dlg.result, list) else 1
             logger.info("Đã lưu {} tài khoản từ form thêm.", n)
@@ -11029,6 +11181,7 @@ class _ManagerWindow:
             messagebox.showerror("Lỗi lưu", str(exc), parent=self._root)
             return
         self._refresh_tree()
+        self._sync_page_tab_accounts()
         self._warn_if_scheduler_running_after_config_change()
         n = len(saved)
         logger.info("Đã import {} tài khoản từ thư mục profile (đã copy vào data/profiles).", n)
@@ -11327,6 +11480,7 @@ class _ManagerWindow:
                 messagebox.showerror("Lỗi lưu", str(exc), parent=self._root)
                 return
             self._refresh_tree()
+            self._sync_page_tab_accounts()
             self._warn_if_scheduler_running_after_config_change()
             logger.info("Đã nhân bản từ {} → {}", aid, dlg.result.get("id"))
 
@@ -11343,6 +11497,7 @@ class _ManagerWindow:
         """
         import_accounts_append(self._accounts, self._root)
         self._refresh_tree()
+        self._sync_page_tab_accounts()
         self._warn_if_scheduler_running_after_config_change()
 
     def _begin_sync_work(self, text: str) -> None:

@@ -226,6 +226,31 @@ def pages_per_account(pages: Iterable[dict[str, Any]]) -> dict[str, int]:
     return out
 
 
+def account_ids_for_page_filter(
+    pages: Iterable[dict[str, Any]],
+    accounts: Iterable[dict[str, Any]] | None = None,
+) -> list[str]:
+    """
+    Tài khoản hiện trên ô lọc / hộp quét Page.
+
+    Mọi id trong ``accounts.json`` (kể cả 0 Page) rồi mới tới owner còn sót
+    trong pages.json — TK mới thêm vẫn chọn được để quét.
+    """
+    seen: list[str] = []
+    known: set[str] = set()
+    for acc in accounts or ():
+        aid = str(acc.get("id") or acc.get("account_id") or "").strip()
+        if aid and aid not in known:
+            known.add(aid)
+            seen.append(aid)
+    for page in pages:
+        aid = str(page.get("account_id") or "").strip()
+        if aid and aid not in known:
+            known.add(aid)
+            seen.append(aid)
+    return seen
+
+
 def format_schedule_cell(h: PageHealth | None, *, now: datetime | None = None) -> str:
     """Ô «Lịch chờ»: số bài chờ + giờ bài kế tiếp (giờ máy)."""
     if h is None or h.upcoming <= 0:

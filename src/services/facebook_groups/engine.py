@@ -66,6 +66,7 @@ from .states import (
     SHARE_ACTIVE,
     SHARE_CHECKING_PERMISSION,
     SHARE_COMPLETED,
+    SHARE_DONE,
     SHARE_DUPLICATE,
     SHARE_FAILED,
     SHARE_PAUSED,
@@ -1483,6 +1484,24 @@ class GroupEngine:
         self.store.save_share_batch(batch)
         return ""
 
+    def _skip_batch_source_unavailable(self, batch_id: str, message: str) -> None:
+        """Reel nguồn lỗi: bỏ job còn lại để hàng chờ chuyển sang video khác."""
+        note = (message or "Reel nguồn lỗi — đã chuyển xem reel khác").strip()
+        for job in self._batch_jobs(batch_id):
+            if str(job.get("status") or "") in SHARE_DONE:
+                continue
+            job["status"] = SHARE_SKIPPED
+            job["error_code"] = "VIDEO_UNAVAILABLE"
+            job["error_message"] = note
+            job["finished_at"] = _now()
+            self.store.save_share_job(job)
+        batch = self.store.refresh_batch_counts(batch_id) or self._batch(batch_id)
+        batch["status"] = BATCH_COMPLETED
+        batch["watch_note"] = note
+        batch["error_message"] = note
+        self.store.save_share_batch(batch)
+        self._share_step(batch, page_id="", page_name="", step="Reel lỗi — sang video khác")
+
     def _fail_share_job(self, job: dict[str, Any], code: str, message: str) -> None:
         """Đánh lỗi một bài để sang Page sau, không chia sẻ nhầm vai trò."""
         job["status"] = SHARE_FAILED
@@ -1584,6 +1603,12 @@ class GroupEngine:
             should_stop=lambda: batch_id in self._cancel,
         )
         if self._pause_prepare(batch_id, result):
+            return True, False
+        if str(result.get("error_code") or "") == "VIDEO_UNAVAILABLE" or result.get("source_unavailable"):
+            self._skip_batch_source_unavailable(
+                batch_id,
+                str(result.get("error_message") or "Reel nguồn lỗi — đã chuyển xem reel khác"),
+            )
             return True, False
         liked = bool(like and result.get("liked"))
         batch = self._batch(batch_id)

@@ -333,6 +333,7 @@ def test_feature_busy_no_deadlock_under_parallel_pressure() -> None:
 
 
 def test_share_parallel_limit_reads_env(monkeypatch) -> None:
+    monkeypatch.setenv("TOOLFB_MANUAL_CONCURRENCY", "1")  # không để reconcile hạ slot giữa test
     monkeypatch.setenv("SHARE_PARALLEL_ACCOUNTS", "7")
     assert GroupEngine._share_parallel_account_limit() == 7
     monkeypatch.delenv("SHARE_PARALLEL_ACCOUNTS", raising=False)

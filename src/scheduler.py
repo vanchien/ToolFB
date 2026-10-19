@@ -960,6 +960,32 @@ def _maybe_append_post_history(
         logger.warning("Không ghi post history Page {}: {}", pid, exc)
 
 
+def _duplicate_page_owner_skip(
+    account_id: str,
+    page_id: str,
+    page_row: dict[str, Any] | None,
+) -> str:
+    """Rỗng nếu được đăng; câu tiếng Việt nếu Page trùng TK khác đã nắm."""
+    try:
+        from src.utils.page_cross_account import duplicate_page_skip_reason, load_page_owner_choices
+
+        row = dict(page_row) if isinstance(page_row, dict) else None
+        pid = str(page_id or "").strip()
+        if row is None and pid:
+            found = get_default_pages_manager().get_by_id(pid)
+            row = dict(found) if found else None
+        siblings = get_default_pages_manager().load_all()
+        return duplicate_page_skip_reason(
+            row,
+            account_id,
+            sibling_rows=siblings,
+            choices=load_page_owner_choices(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Không kiểm tra Page trùng nhiều TK: {}", exc)
+        return ""
+
+
 def _select_page_for_scheduled_post(account_id: str, account_schedule: str) -> dict[str, Any] | None:
     """
     Chọn một Page trong ``pages.json`` thuộc ``account_id``.
@@ -973,6 +999,20 @@ def _select_page_for_scheduled_post(account_id: str, account_schedule: str) -> d
         return None
     if not rows:
         return None
+    try:
+        from src.utils.page_cross_account import load_page_owner_choices, should_run_page_on_account
+
+        all_pages = get_default_pages_manager().load_all()
+        choices = load_page_owner_choices()
+        owned = [
+            p
+            for p in rows
+            if should_run_page_on_account(p, account_id, sibling_rows=all_pages, choices=choices)
+        ]
+        if owned:
+            rows = owned
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Không lọc Page trùng nhiều TK khi chọn đích đăng: {}", exc)
     acc_s = str(account_schedule).strip()
     if acc_s:
         for p in rows:
@@ -1165,6 +1205,12 @@ def _finalize_schedule_post_job_record(job_id: str | None, success: bool, error_
                 sp.update_job_fields(jid, status="success", posted_at=now_iso, error_note=note, retry_count=0)
         else:
             note = (error_note or "Đăng thất bại")[:900]
+            from src.utils.page_cross_account import DUP_PAGE_SKIP_MARK
+
+            if DUP_PAGE_SKIP_MARK in note:
+                sp.update_job_fields(jid, status="cancelled", error_note=note, retry_count=rc)
+                logger.info("Job {} — cancelled (Page trùng nhiều TK).", jid)
+                return
             from src.services.ai_fleet.gate import is_approval_block
 
             if is_approval_block(note):
@@ -1459,6 +1505,15 @@ def tick_schedule_post_jobs() -> None:
             except Exception:  # noqa: BLE001
                 page_row_peek = None
             peek_keys = normalize_page_keys(pid, page_row=page_row_peek)
+            dup_reason = _duplicate_page_owner_skip(aid, pid, page_row_peek)
+            if dup_reason:
+                logger.info("[Queue dispatcher] Bỏ job {} — {}", jid, dup_reason)
+                try:
+                    sp.update_job_fields(jid, status="cancelled", error_note=dup_reason[:900])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Job {} không đánh cancelled (Page trùng TK): {}", jid, exc)
+                queued_waiting += 1
+                continue
             if is_cross_busy(feature=FEATURE_SCHEDULE, account_id=aid, page_keys=peek_keys):
                 reason = busy_reason(account_id=aid, page_keys=peek_keys) or "đang chia sẻ"
                 logger.info(
@@ -2120,6 +2175,11 @@ def run_scheduled_post_for_account(
                 )
                 return False
             page_row = dict(pr)
+            dup_reason = _duplicate_page_owner_skip(account_id, pid_raw, page_row)
+            if dup_reason:
+                logger.info("Bỏ qua đăng: {}", dup_reason)
+                err_msg = dup_reason
+                return False
             entity_dict = _page_record_to_entity_dict(page_row)
             logger.info(
                 "[Chuẩn bị đăng] id={} | pages.json page_id={} | page_name={!r}",

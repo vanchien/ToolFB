@@ -129,15 +129,16 @@ def test_clone_profile_skips_lock_and_cache(tmp_path) -> None:
         shutil.rmtree(dst.parent, ignore_errors=True)
 
 
-def test_wait_profile_unlocked_times_out_while_locked(tmp_path) -> None:
-    """Profile đang mở → chờ hết giờ trả False (không clone / không mở Firefox 2)."""
-    from src.services.facebook_reels_catalog import _wait_profile_unlocked
+def test_wait_profile_unlocked_times_out_while_locked(tmp_path, monkeypatch) -> None:
+    """Firefox thật còn sống + lock → chờ hết giờ trả False (caller sẽ clone)."""
+    from src.services import facebook_reels_catalog as cat
 
     src = tmp_path / "profile"
     src.mkdir()
     (src / "parent.lock").write_text("locked", encoding="utf-8")
+    monkeypatch.setattr(cat, "_firefox_profile_has_live_process", lambda _p: True)
     notes: list[str] = []
-    ok = _wait_profile_unlocked(
+    ok = cat._wait_profile_unlocked(
         src,
         "firefox",
         timeout_sec=0.6,
@@ -145,7 +146,20 @@ def test_wait_profile_unlocked_times_out_while_locked(tmp_path) -> None:
         status=notes.append,
     )
     assert ok is False
-    assert notes and "không mở Firefox thứ 2" in notes[0]
+    assert notes and "bản sao" in notes[0]
+
+
+def test_orphan_parent_lock_without_firefox_is_cleared(tmp_path, monkeypatch) -> None:
+    """parent.lock sót, không còn firefox.exe → xóa lock, coi như rảnh để quét."""
+    from src.services import facebook_reels_catalog as cat
+
+    src = tmp_path / "profile"
+    src.mkdir()
+    lock = src / "parent.lock"
+    lock.write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(cat, "_firefox_profile_has_live_process", lambda _p: False)
+    assert cat._is_profile_locked(src, "firefox") is False
+    assert not lock.exists()
 
 
 def test_wait_profile_unlocked_ok_when_free(tmp_path) -> None:

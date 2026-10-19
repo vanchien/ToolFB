@@ -2384,6 +2384,17 @@ class ScheduleBatchJobDialog:
             return
         aid = self._cb_acc.get().strip()
         pid = self._selected_page_id()
+        try:
+            from src.gui.page_owner_choice_dialog import resolve_owner_account_and_page
+
+            all_pages = [dict(p) for p in self._pages.load_all() if isinstance(p, dict)]
+            page_row = next((p for p in all_pages if str(p.get("id") or "").strip() == pid), None)
+            resolved = resolve_owner_account_and_page(self._top, aid, page_row, all_pages)
+            if resolved is None:
+                return
+            aid, pid = resolved
+        except Exception:
+            pass
         pt = post_type_for_kind(self._kind_key())
         ok_rows = [
             r

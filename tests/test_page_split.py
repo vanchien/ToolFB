@@ -49,3 +49,32 @@ def test_fixed_mode_leaves_rest_for_other_pages_next_time() -> None:
     second = apply_page_split(items, others, None, only_unassigned=True)
     assert second["assigned"] == 18
     assert collect_split_indexes(items, only_unassigned=True) == []
+
+
+def test_apply_page_split_keeps_one_account_per_facebook_page(monkeypatch) -> None:
+    monkeypatch.setattr("src.utils.page_cross_account.load_page_owner_choices", lambda **_k: {})
+    items = _items(4)
+    dests = [
+        {
+            "account_id": "acc1",
+            "page_id": "local-a",
+            "page_name": "Happy",
+            "page_url": "https://www.facebook.com/HappyStoriesTime",
+        },
+        {
+            "account_id": "acc2",
+            "page_id": "local-b",
+            "page_name": "Happy",
+            "page_url": "https://www.facebook.com/happystoriestime",
+        },
+        {
+            "account_id": "acc1",
+            "page_id": "local-c",
+            "page_name": "Other",
+            "page_url": "https://www.facebook.com/OtherPage",
+        },
+    ]
+    res = apply_page_split(items, dests, None)
+    assert res["pages_used"] == 2
+    pages = {it["item_preset_fb_page_id"] for it in items if it.get("item_preset_fb_page_id")}
+    assert pages == {"local-a", "local-c"}

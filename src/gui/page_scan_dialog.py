@@ -23,6 +23,7 @@ from src.automation.meta_business_scanner import scan_meta_business_pages_for_ac
 from src.gui.treeview_shortcuts import install_treeview_shortcuts
 from src.utils.db_manager import AccountsDatabaseManager
 from src.utils.page_categories import PAGE_CATEGORY_CHOICES, UNCATEGORIZED_LABEL, normalize_page_category
+from src.services.page_health import pages_per_account
 from src.utils.pages_manager import PagesManager
 
 
@@ -50,6 +51,10 @@ class PageScanDialog:
         self._selected_account_label: str = ""
         self._saved_count: int = 0
         self._scan_running: bool = False
+        self._scan_queue: list[str] = []
+        self._auto_save_meta: bool = False
+        self._page_counts: dict[str, int] = {}
+        self._account_rows_by_id: dict[str, dict[str, Any]] = {}
 
         self._top = tk.Toplevel(parent)
         self._top.title("Quét Page — Meta Business Suite")
@@ -74,21 +79,16 @@ class PageScanDialog:
         top.columnconfigure(1, weight=1)
 
         ttk.Label(top, text="Tài khoản:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        from src.services.page_creation.naming import account_display_label
-
-        # Hiện tên người dùng thay cho mã acc_…; mã id vẫn giữ để quét đúng tài khoản.
-        self._account_id_by_label: dict[str, str] = {}
-        for acc in self._accounts.load_all():
-            aid = str(acc.get("id") or "").strip()
-            if not aid:
-                continue
-            label = account_display_label(acc)
-            if label in self._account_id_by_label:
-                label = f"{label} · {aid}"
-            self._account_id_by_label[label] = aid
+        self._reload_account_choices()
+        self._cb_account = ttk.Combobox(top, values=list(self._account_id_by_label), state="readonly")
+        first_empty = next(
+            (label for label, aid in self._account_id_by_label.items() if not self._page_counts.get(aid, 0)),
+            "",
+        )
         labels = list(self._account_id_by_label)
-        self._cb_account = ttk.Combobox(top, values=labels, state="readonly")
-        if labels:
+        if first_empty:
+            self._cb_account.set(first_empty)
+        elif labels:
             self._cb_account.set(labels[0])
         self._cb_account.grid(row=0, column=1, sticky="ew")
 
@@ -96,6 +96,10 @@ class PageScanDialog:
         btnf.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self._btn_scan = ttk.Button(btnf, text="Quét", command=self._on_start_scan)
         self._btn_scan.pack(side=tk.LEFT)
+        self._btn_scan_missing = ttk.Button(
+            btnf, text="Quét TK chưa có Page", command=self._on_scan_accounts_without_pages
+        )
+        self._btn_scan_missing.pack(side=tk.LEFT, padx=(8, 0))
 
         # Tuỳ chọn chạy quét.
         # Mặc định: ẩn browser; user có thể bỏ tick để quan sát trực quan khi cần.
@@ -236,8 +240,115 @@ class PageScanDialog:
 
     # --- Scan ---
 
+    def _reload_account_choices(self) -> None:
+        """Đọc lại accounts.json + pages.json — TK mới thêm hiện trong ô quét."""
+        from src.services.page_creation.naming import account_display_label
+
+        try:
+            self._accounts.reload_from_disk()
+        except Exception:  # noqa: BLE001
+            logger.debug("reload accounts cho Quét Page", exc_info=True)
+        try:
+            page_rows = list(self._pages.load_all())
+        except Exception:  # noqa: BLE001
+            page_rows = []
+        self._page_counts = pages_per_account(page_rows)
+        self._account_id_by_label = {}
+        self._account_rows_by_id = {}
+        rows = []
+        for acc in self._accounts.load_all():
+            aid = str(acc.get("id") or "").strip()
+            if not aid:
+                continue
+            self._account_rows_by_id[aid] = dict(acc)
+            n_pages = int(self._page_counts.get(aid, 0) or 0)
+            label = account_display_label(acc)
+            label = f"{label} · {n_pages} Page" if n_pages else f"{label} · chưa có Page"
+            if label in self._account_id_by_label:
+                label = f"{label} · {aid}"
+            rows.append((n_pages > 0, label.casefold(), aid, label))
+        rows.sort()
+        for _has, _cf, aid, label in rows:
+            self._account_id_by_label[label] = aid
+
+    def _missing_page_account_ids(self) -> list[str]:
+        """Tài khoản trong registry chưa có dòng nào trong pages.json."""
+        return [
+            aid
+            for aid in (self._account_id_by_label.values())
+            if int(self._page_counts.get(aid, 0) or 0) <= 0
+        ]
+
+    def _label_for_account_id(self, account_id: str) -> str:
+        for label, aid in self._account_id_by_label.items():
+            if aid == account_id:
+                return label
+        return account_id
+
     def _append_status(self, msg: str) -> None:
         self._log_var.set(msg)
+
+    def _on_scan_accounts_without_pages(self) -> None:
+        """Quét lần lượt mọi tài khoản mới / chưa có Page, tự lưu Page có Meta ID."""
+        if self._scan_thread and self._scan_thread.is_alive():
+            messagebox.showinfo("Đang chạy", "Đang có tiến trình quét, vui lòng chờ.", parent=self._top)
+            return
+        self._reload_account_choices()
+        if hasattr(self, "_cb_account"):
+            self._cb_account.configure(values=list(self._account_id_by_label))
+        missing = list(dict.fromkeys(self._missing_page_account_ids()))
+        if not missing:
+            messagebox.showinfo(
+                "Quét Page",
+                "Mọi tài khoản đã có Page trong pages.json. Chọn từng TK rồi bấm Quét nếu muốn quét lại.",
+                parent=self._top,
+            )
+            return
+        if not messagebox.askyesno(
+            "Quét tài khoản chưa có Page",
+            f"Sẽ quét lần lượt {len(missing)} tài khoản chưa có Page và tự lưu Page có Meta ID.\n"
+            "Tài khoản lỗi sẽ bỏ qua, sang TK tiếp. Tiếp tục?",
+            parent=self._top,
+        ):
+            return
+        self._scan_queue = list(missing)
+        self._auto_save_meta = True
+        self._saved_count = 0
+        self._start_next_queued_scan()
+
+    def _start_next_queued_scan(self) -> None:
+        try:
+            if not self._top.winfo_exists():
+                self._scan_queue = []
+                self._auto_save_meta = False
+                return
+        except tk.TclError:
+            self._scan_queue = []
+            self._auto_save_meta = False
+            return
+        if not self._scan_queue:
+            n = int(self._saved_count or 0)
+            self._auto_save_meta = False
+            self._append_status(f"Đã quét xong các tài khoản chưa có Page. Đã lưu {n} Page.")
+            try:
+                messagebox.showinfo(
+                    "Quét xong",
+                    f"Đã quét hết tài khoản chưa có Page.\nĐã lưu {n} Page vào pages.json.",
+                    parent=self._top,
+                )
+            except tk.TclError:
+                pass
+            return
+        aid = self._scan_queue.pop(0)
+        label = self._label_for_account_id(aid)
+        if hasattr(self, "_cb_account"):
+            try:
+                self._cb_account.set(label)
+            except tk.TclError:
+                pass
+        left = len(self._scan_queue)
+        self._append_status(f"Hàng đợi: đang quét {label} (còn {left} TK).")
+        self._begin_scan(aid, label)
 
     def _on_start_scan(self) -> None:
         label = self._cb_account.get().strip()
@@ -248,6 +359,11 @@ class PageScanDialog:
         if self._scan_thread and self._scan_thread.is_alive():
             messagebox.showinfo("Đang chạy", "Đang có tiến trình quét, vui lòng chờ.", parent=self._top)
             return
+        self._scan_queue = []
+        self._auto_save_meta = False
+        self._begin_scan(aid, label)
+
+    def _begin_scan(self, aid: str, label: str) -> None:
         self._selected_account_id = aid
         self._selected_account_label = label
         self._results = []
@@ -255,6 +371,8 @@ class PageScanDialog:
             self._tree.delete(i)
         self._btn_save.configure(state=tk.DISABLED)
         self._btn_scan.configure(state=tk.DISABLED)
+        if hasattr(self, "_btn_scan_missing"):
+            self._btn_scan_missing.configure(state=tk.DISABLED)
         self._cb_account.configure(state=tk.DISABLED)
         self._cb_headless.configure(state=tk.DISABLED)
         self._cb_lock_ui.configure(state=tk.DISABLED)
@@ -282,14 +400,31 @@ class PageScanDialog:
                 pass
 
         def worker() -> None:
+            from src.utils.concurrency_runtime import KIND_BROWSER_POST, workload_begin, workload_end
+            from src.utils.feature_busy import busy_reason
+
             factory: BrowserFactory | None = None
             ctx = None
             pages_out: list[ScannedPage] = []
+            workload_begin(KIND_BROWSER_POST)
             try:
+                reason = busy_reason(account_id=aid) or ""
+                if reason:
+                    self._err_holder.append(
+                        f"Bỏ qua — {reason} (tránh mở trùng Firefox với chia sẻ/lịch đăng)."
+                    )
+                    return
                 factory = BrowserFactory(accounts=self._accounts, headless=run_headless)
-                ctx = factory.get_browser_context(aid, headless=run_headless)
                 acc_row = self._accounts.get_by_id(aid)
                 acc_dict = dict(acc_row) if acc_row else None
+                if acc_dict:
+                    ctx = factory.launch_persistent_context_from_account_dict(
+                        acc_dict,
+                        headless=run_headless,
+                        launch_slot_timeout_sec=40.0,
+                    )
+                else:
+                    ctx = factory.get_browser_context(aid, headless=run_headless)
                 pages_out = scan_meta_business_pages_for_account(
                     ctx,
                     account_id=aid,
@@ -300,6 +435,7 @@ class PageScanDialog:
                 self._err_holder.append(str(exc))
                 logger.exception("scan_meta_business_pages_for_account({}) lỗi", aid)
             finally:
+                workload_end(KIND_BROWSER_POST)
                 sync_close_persistent_context(ctx, log_label=f"page_scan:{aid}")
                 if factory is not None:
                     try:
@@ -329,6 +465,8 @@ class PageScanDialog:
             return
         # Scan xong → render bảng.
         self._btn_scan.configure(state=tk.NORMAL)
+        if hasattr(self, "_btn_scan_missing"):
+            self._btn_scan_missing.configure(state=tk.NORMAL)
         self._cb_account.configure(state="readonly")
         self._cb_headless.configure(state=tk.NORMAL)
         self._cb_lock_ui.configure(state=tk.NORMAL)
@@ -337,8 +475,16 @@ class PageScanDialog:
             self._top.grab_set()
         except tk.TclError:
             pass
+        queued = bool(self._scan_queue or self._auto_save_meta)
         if self._err_holder:
-            self._append_status(f"Lỗi: {self._err_holder[0]}")
+            self._append_status(f"Lỗi {self._selected_account_label}: {self._err_holder[0]}")
+            if queued:
+                logger.warning("Quét Page {} lỗi — sang TK tiếp: {}", self._selected_account_id, self._err_holder[0])
+                try:
+                    self._top.after(200, self._start_next_queued_scan)
+                except tk.TclError:
+                    return
+                return
             messagebox.showerror(
                 "Quét thất bại",
                 self._err_holder[0],
@@ -351,6 +497,18 @@ class PageScanDialog:
         )
         if self._results:
             self._btn_save.configure(state=tk.NORMAL)
+        if self._auto_save_meta:
+            saved = 0
+            if self._results:
+                saved = self._save_results(only_with_meta_id=True, confirm=False)
+            self._append_status(
+                f"{self._selected_account_label}: lưu {saved} Page có Meta ID. "
+                f"Còn {len(self._scan_queue)} TK."
+            )
+            try:
+                self._top.after(250, self._start_next_queued_scan)
+            except tk.TclError:
+                return
 
     # --- Tree helpers ---
 
@@ -405,35 +563,51 @@ class PageScanDialog:
     # --- Save ---
 
     def _on_save_selected(self) -> None:
+        self._save_results(only_with_meta_id=False, confirm=True)
+
+    def _save_results(self, *, only_with_meta_id: bool, confirm: bool) -> int:
         if not self._selected_account_id:
-            messagebox.showwarning("Thiếu account", "Không có account chủ sở hữu.", parent=self._top)
-            return
+            if confirm:
+                messagebox.showwarning("Thiếu account", "Không có account chủ sở hữu.", parent=self._top)
+            return 0
         to_save: list[ScannedPage] = []
-        for iid in self._tree.get_children():
-            vals = self._tree.item(iid, "values")
-            if len(vals) < 2 or vals[1] != "☑":
-                continue
-            to_save.append(
-                ScannedPage(
-                    page_name=str(vals[2]),
-                    fb_page_id=str(vals[3]).strip(),
-                    business_name=str(vals[4]).strip(),
-                    business_id=str(vals[5]).strip(),
-                    page_url=str(vals[6]),
-                    source=str(vals[7]),
-                    role=str(vals[8]).strip() if len(vals) > 8 else "unknown",
-                )
-            )
+        if self._tree.get_children():
+            for iid in self._tree.get_children():
+                vals = self._tree.item(iid, "values")
+                if len(vals) < 2:
+                    continue
+                if vals[1] != "☑" and not only_with_meta_id:
+                    continue
+                meta_id = str(vals[3]).strip() if len(vals) > 3 else ""
+                if only_with_meta_id and not meta_id:
+                    continue
+                if only_with_meta_id or vals[1] == "☑":
+                    to_save.append(
+                        ScannedPage(
+                            page_name=str(vals[2]),
+                            fb_page_id=meta_id,
+                            business_name=str(vals[4]).strip(),
+                            business_id=str(vals[5]).strip(),
+                            page_url=str(vals[6]),
+                            source=str(vals[7]),
+                            role=str(vals[8]).strip() if len(vals) > 8 else "unknown",
+                        )
+                    )
+        elif only_with_meta_id:
+            for p in self._results:
+                if str(p.get("fb_page_id") or "").strip():
+                    to_save.append(p)
         if not to_save:
-            messagebox.showinfo("Chưa chọn", "Tick ít nhất một Page để lưu.", parent=self._top)
-            return
-        if not messagebox.askyesno(
+            if confirm:
+                messagebox.showinfo("Chưa chọn", "Tick ít nhất một Page để lưu.", parent=self._top)
+            return 0
+        if confirm and not messagebox.askyesno(
             "Xác nhận",
             f"Sẽ thêm/cập nhật {len(to_save)} Page cho tài khoản «{self._selected_account_label or self._selected_account_id}» "
             f"vào pages.json. Tiếp tục?",
             parent=self._top,
         ):
-            return
+            return 0
         existing = {(str(r.get("page_url", "")).strip().lower()): r for r in self._pages.load_all()}
         save_category = normalize_page_category(self._save_category_var.get())
         count_new = 0
@@ -483,14 +657,19 @@ class PageScanDialog:
         stats = {"new": 0, "updated": 0, "skipped_duplicate_meta_id": 0}
         if batch_rows:
             stats = self._pages.upsert_many(batch_rows)  # type: ignore[arg-type]
-        self._saved_count = int(stats.get("new", 0)) + int(stats.get("updated", 0))
+        saved_now = int(stats.get("new", 0)) + int(stats.get("updated", 0))
+        if only_with_meta_id:
+            self._saved_count += saved_now
+        else:
+            self._saved_count = saved_now
         dup_skip = int(stats.get("skipped_duplicate_meta_id", 0))
-        messagebox.showinfo(
-            "Đã lưu",
-            f"Thêm mới: {int(stats.get('new', 0))} | Cập nhật: {int(stats.get('updated', 0))}"
-            + (f" | Bỏ qua trùng Meta ID: {dup_skip}" if dup_skip > 0 else "."),
-            parent=self._top,
-        )
+        if confirm:
+            messagebox.showinfo(
+                "Đã lưu",
+                f"Thêm mới: {int(stats.get('new', 0))} | Cập nhật: {int(stats.get('updated', 0))}"
+                + (f" | Bỏ qua trùng Meta ID: {dup_skip}" if dup_skip > 0 else "."),
+                parent=self._top,
+            )
         logger.info(
             "[PageScan] account={} new={} update={} skip_dup_meta={}",
             self._selected_account_id,
@@ -498,10 +677,23 @@ class PageScanDialog:
             int(stats.get("updated", 0)),
             dup_skip,
         )
+        self._page_counts[self._selected_account_id] = int(
+            self._page_counts.get(self._selected_account_id, 0) or 0
+        ) + int(stats.get("new", 0) or 0)
+        return saved_now
 
     # --- Close ---
 
     def _on_close(self) -> None:
+        if self._scan_queue or self._auto_save_meta:
+            if not messagebox.askyesno(
+                "Đang quét lần lượt",
+                "Còn tài khoản trong hàng đợi quét Page. Đóng và dừng hàng đợi?",
+                parent=self._top,
+            ):
+                return
+            self._scan_queue = []
+            self._auto_save_meta = False
         if self._scan_running:
             if self._lock_ui_var.get():
                 messagebox.showinfo(

@@ -497,6 +497,95 @@ def pick_page_watch_seconds(low: int, high: int, rng: random.Random | None = Non
     return (rng or random.Random()).randint(start, end)
 
 
+_REELS_HOME = "https://www.facebook.com/reels/"
+_REEL_BROKEN_MARKERS = (
+    "this page isn't available",
+    "this page isn’t available",
+    "this content isn't available",
+    "this content isn’t available",
+    "content isn't available right now",
+    "this video isn't available",
+    "this video is unavailable",
+    "reel isn't available",
+    "try reloading this page",
+    "we're working to get fixed",
+    "the link you followed may be broken",
+    "nội dung này hiện không có",
+    "nội dung này hiện không khả dụng",
+    "trang này hiện không khả dụng",
+    "trang này không khả dụng",
+    "trang này không hiển thị",
+    "thử tải lại trang",
+    "video này không khả dụng",
+)
+
+
+def _page_visible_text(page: Any) -> str:
+    """Chữ trên màn hình (không đọc mã nguồn)."""
+    reader = getattr(page, "inner_text", None)
+    if callable(reader):
+        try:
+            return str(reader("body") or "")
+        except TypeError:
+            try:
+                return str(reader() or "")
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+    extra = getattr(page, "visible_text", None)
+    if extra is not None and not callable(extra):
+        return str(extra or "")
+    return ""
+
+
+def reel_page_is_broken(page: Any) -> bool:
+    """Reel/video Facebook báo lỗi kỹ thuật / không còn xem được."""
+    text = " ".join(_page_visible_text(page).split()).casefold()
+    if not text:
+        return False
+    return any(marker in text for marker in _REEL_BROKEN_MARKERS)
+
+
+def _reel_identity(page: Any) -> str:
+    """ID reel đang mở, hoặc URL nếu không tách được."""
+    url = str(getattr(page, "url", "") or "")
+    try:
+        from src.services.facebook_groups.source_watch import video_id_from_url
+
+        vid = video_id_from_url(url)
+        if vid:
+            return vid
+    except Exception:  # noqa: BLE001
+        pass
+    return url.rstrip("/").casefold()
+
+
+def skip_broken_reel(page: Any, *, attempts: int = 5) -> bool:
+    """
+    Reel lỗi → ArrowDown hoặc mở ``/reels/`` lấy clip khác.
+
+    True nếu đã rời trang lỗi.
+    """
+    if not reel_page_is_broken(page):
+        return True
+    origin = _reel_identity(page)
+    for index in range(max(1, int(attempts))):
+        if index == 1:
+            _goto_reels_home(page)
+        else:
+            _next_reel(page)
+        _pause(page, 700)
+        if reel_page_is_broken(page):
+            continue
+        now = _reel_identity(page)
+        if now and now != origin:
+            return True
+        if not reel_page_is_broken(page):
+            return True
+    return not reel_page_is_broken(page)
+
+
 def browse_reels_feed(
     page: Any,
     *,
@@ -508,6 +597,8 @@ def browse_reels_feed(
     if blocked:
         return {"error_code": blocked, "browsed_seconds": 0}
     _open_reels(page)
+    if reel_page_is_broken(page):
+        skip_broken_reel(page)
     _lock_user(page)
     blocked = _session_block(page)
     if blocked:
@@ -517,11 +608,15 @@ def browse_reels_feed(
     while watched_ms < target_ms:
         if should_stop is not None and should_stop():
             return {"error_code": "CANCELLED", "browsed_seconds": watched_ms // 1000}
+        if reel_page_is_broken(page):
+            skip_broken_reel(page)
         chunk = min(1000, target_ms - watched_ms)
         page.wait_for_timeout(chunk)
         watched_ms += chunk
         if watched_ms < target_ms and watched_ms % 3000 == 0:
             _next_reel(page)
+            if reel_page_is_broken(page):
+                skip_broken_reel(page)
     return {"error_code": "", "browsed_seconds": int(seconds)}
 
 
@@ -563,15 +658,23 @@ def _session_block(page: Any) -> str:
     return ""
 
 
-def _open_reels(page: Any) -> None:
-    """Mở bảng Reel nếu trình duyệt chưa ở đó."""
-    url = str(getattr(page, "url", "") or "").casefold()
-    if "/reel" in url:
-        return
+def _goto_reels_home(page: Any) -> None:
+    """Mở bảng Reels toàn cục để lấy clip khác."""
     goto = getattr(page, "goto", None)
     if goto is None:
         return
-    goto("https://www.facebook.com/reels/", wait_until="domcontentloaded", timeout=60_000)
+    try:
+        goto(_REELS_HOME, wait_until="domcontentloaded", timeout=60_000)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _open_reels(page: Any) -> None:
+    """Mở bảng Reel nếu trình duyệt chưa ở đó. Reel lỗi thì không coi là đã vào."""
+    url = str(getattr(page, "url", "") or "").casefold()
+    if "/reel" in url and not reel_page_is_broken(page):
+        return
+    _goto_reels_home(page)
 
 
 def _next_reel(page: Any) -> None:
@@ -634,7 +737,15 @@ def engage_source_video(
         return {"error_code": blocked, "watched_seconds": 0, "commented": False, "liked": False}
     rnd = rng or random.Random()
     text = str(comment or "").strip()
-    actions = [name for name, on in (("like", like), ("comment", bool(text))) if on]
+    source_unavailable = reel_page_is_broken(page)
+    if source_unavailable:
+        skip_broken_reel(page)
+    # Không Like/bình luận nhầm clip thay thế khi reel nguồn đã lỗi.
+    actions = (
+        []
+        if source_unavailable
+        else [name for name, on in (("like", like), ("comment", bool(text))) if on]
+    )
     rnd.shuffle(actions)
     target_ms = max(0, int(watch_seconds)) * 1000
     marks = _action_marks_ms(target_ms, len(actions), rnd)
@@ -666,12 +777,21 @@ def engage_source_video(
                     "watched_seconds": watched_ms // 1000,
                     **done,
                 }
+            if reel_page_is_broken(page):
+                source_unavailable = True
+                actions = []
+                marks = []
+                skip_broken_reel(page)
             next_stop = min(target_ms, marks[0]) if marks else target_ms
             chunk = max(1, min(1000, next_stop - watched_ms))
             page.wait_for_timeout(chunk)
             watched_ms += chunk
         result: dict[str, Any] = {"error_code": "", "watched_seconds": int(watch_seconds), **done}
-        if comment_error:
+        if source_unavailable:
+            result["error_code"] = "VIDEO_UNAVAILABLE"
+            result["source_unavailable"] = True
+            result["error_message"] = "Reel nguồn lỗi — đã chuyển xem reel khác"
+        elif comment_error:
             result["error_message"] = comment_error
         return result
     finally:

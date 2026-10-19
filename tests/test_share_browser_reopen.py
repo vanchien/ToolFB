@@ -23,7 +23,7 @@ def test_begin_account_reopens_when_page_object_is_dead(monkeypatch) -> None:
         provider._account_id = account_id
 
     monkeypatch.setattr(provider, "_open_browser", _open)
-    monkeypatch.setattr(provider, "end_account", lambda _aid: None)
+    monkeypatch.setattr(provider, "end_account", lambda _aid, **_k: None)
     provider.begin_account("acc-a")
     assert opened == ["acc-a"]
     assert provider._page_is_alive() is True
@@ -41,6 +41,6 @@ def test_ensure_browser_recovers_closed_page(monkeypatch) -> None:
         provider._account_id = account_id
 
     monkeypatch.setattr(provider, "_open_browser", _open)
-    monkeypatch.setattr(provider, "end_account", lambda _aid: None)
+    monkeypatch.setattr(provider, "end_account", lambda _aid, **_k: None)
     assert provider.ensure_browser("acc-a") is True
     assert opened == ["acc-a"]

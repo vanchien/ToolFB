@@ -161,8 +161,20 @@ def _interruptible_step_pause(
     return _interruptible_sleep(random.uniform(0.4, 1.2), should_stop=should_stop)
 
 
+def _skip_broken_reel_if_needed(page: Page) -> None:
+    """Reel Facebook báo lỗi kỹ thuật → chuyển clip khác."""
+    try:
+        from src.services.facebook_groups.video_engage import reel_page_is_broken, skip_broken_reel
+
+        if reel_page_is_broken(page):
+            skip_broken_reel(page)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _reels_clip_wait(page: Page, cfg: HumanInteractionProfile) -> None:
     """Xem một clip Reels — thời lượng theo preset."""
+    _skip_broken_reel_if_needed(page)
     lo = max(1500, int(cfg.reels_clip_min_ms))
     hi = max(lo, int(cfg.reels_clip_max_ms))
     page.wait_for_timeout(random.randint(lo, hi))
@@ -644,6 +656,7 @@ def module_reels_watch(
         if "reel" not in (page.url or "").lower():
             page.goto("https://www.facebook.com/reel/", wait_until="domcontentloaded", timeout=45_000)
             _page_load_pause(profile)
+        _skip_broken_reel_if_needed(page)
         _module_micro_pause(profile, label="reels_load")
         _scroll_feed_top_to_bottom(
             ha,

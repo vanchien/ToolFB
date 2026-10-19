@@ -9,6 +9,8 @@ import pytest
 from src.services.facebook_groups.video_engage import (
     browse_reels_feed,
     clamp_reel_seconds,
+    reel_page_is_broken,
+    skip_broken_reel,
     clamp_watch_bounds,
     clamp_watch_max_minutes,
     clamp_watch_seconds,
@@ -84,6 +86,11 @@ class _Page:
         self.play = _Control("Play")
         self.comment = _Control("Write a comment")
         self._roles = {"button": [self.like, self.play], "textbox": [self.comment]}
+        self.visible_text = ""
+
+    def inner_text(self, selector: str = "body") -> str:
+        del selector
+        return self.visible_text
 
     def get_by_role(self, role: str, name: str | None = None) -> _Roles:
         del name
@@ -661,6 +668,70 @@ def test_browse_reels_moves_down_without_clicking() -> None:
     assert page.keyboard.keys == ["ArrowDown"]
     assert page.like.clicked is False
     assert page.play.clicked is False
+
+
+def test_broken_reel_is_detected() -> None:
+    page = _Page("https://www.facebook.com/reel/29215402584727280")
+    page.visible_text = (
+        "This page isn't available right now. "
+        "This may be because of a technical error that we're working to get fixed. "
+        "Try reloading this page."
+    )
+    assert reel_page_is_broken(page) is True
+    page.visible_text = "Like Comment Share"
+    assert reel_page_is_broken(page) is False
+
+
+def test_skip_broken_reel_opens_reels_home() -> None:
+    page = _Page("https://www.facebook.com/reel/29215402584727280")
+    page.visible_text = "This page isn't available right now. Try reloading this page."
+    opened: list[str] = []
+
+    def goto(url: str, wait_until: str = "", timeout: int = 0) -> None:
+        del wait_until, timeout
+        opened.append(url)
+        page.url = url
+        page.visible_text = "Like Comment Share"
+
+    page.goto = goto
+    assert skip_broken_reel(page) is True
+    assert opened == ["https://www.facebook.com/reels/"]
+    assert page.keyboard.keys == ["ArrowDown"]
+
+
+def test_browse_reels_leaves_broken_reel() -> None:
+    page = _Page("https://www.facebook.com/reel/29215402584727280")
+    page.visible_text = "This page isn't available right now. Try reloading this page."
+    opened: list[str] = []
+
+    def goto(url: str, wait_until: str = "", timeout: int = 0) -> None:
+        del wait_until, timeout
+        opened.append(url)
+        page.url = url
+        page.visible_text = "Like Comment Share"
+
+    page.goto = goto
+    result = browse_reels_feed(page, seconds=1)
+    assert result["error_code"] == ""
+    assert opened == ["https://www.facebook.com/reels/"]
+
+
+def test_engage_broken_source_switches_reel_and_skips_comment() -> None:
+    page = _Page("https://www.facebook.com/reel/29215402584727280")
+    page.visible_text = "This page isn't available right now. Try reloading this page."
+
+    def goto(url: str, wait_until: str = "", timeout: int = 0) -> None:
+        del wait_until, timeout
+        page.url = "https://www.facebook.com/reel/111"
+        page.visible_text = "Like Comment Share"
+
+    page.goto = goto
+    result = engage_source_video(page, watch_seconds=2, comment="Hay quá", like=True)
+    assert result["error_code"] == "VIDEO_UNAVAILABLE"
+    assert result["source_unavailable"] is True
+    assert result["commented"] is False
+    assert result["liked"] is False
+    assert result["watched_seconds"] == 2
 
 
 def test_browse_reels_stops_on_checkpoint() -> None:
